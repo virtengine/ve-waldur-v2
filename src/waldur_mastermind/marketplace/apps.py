@@ -13,6 +13,18 @@ class MarketplaceConfig(AppConfig):
 
         signals.post_save.connect(
             handlers.create_screenshot_thumbnail,
-            sender=models.Screenshots,
+            sender=models.Screenshot,
             dispatch_uid='waldur_mastermind.marketplace.create_screenshot_thumbnail',
+        )
+
+        signals.post_save.connect(
+            handlers.notifications_order_approval,
+            sender=models.Order,
+            dispatch_uid='waldur_mastermind.marketplace.notifications_order_approval',
+        )
+
+        signals.post_save.connect(
+            handlers.order_set_state_done,
+            sender=models.OrderItem,
+            dispatch_uid='waldur_mastermind.marketplace.order_set_state_done',
         )

@@ -26,7 +26,7 @@
 Name: waldur-mastermind
 Summary: Waldur MasterMind
 Group: Development/Libraries
-Version: 3.0.5
+Version: 3.0.7
 Release: 1.el7
 License: MIT
 Url: https://waldur.com
@@ -291,9 +291,9 @@ Next steps:
      systemctl start %{__celerybeat_service_name}
      systemctl start %{__uwsgi_service_name}
 
-7. Create first superuser (if needed and not yet done):
+7. Create first staff user (if needed and not yet done):
 
-     su - %{__user} -c "waldur createsuperuser"
+     su - %{__user} -c "waldur createstaffuser -u staff -p staffSecretPasswordChangeMe"
 
 All done.
 ------------------------------------------------------------------------
@@ -318,6 +318,12 @@ fi
 %systemd_postun_with_restart %{__uwsgi_service_name}.service
 
 %changelog
+* Tue Aug 14 2018 Jenkins <jenkins@opennodecloud.com> - 3.0.7-1.el7
+- New upstream release
+
+* Sun Aug 12 2018 Jenkins <jenkins@opennodecloud.com> - 3.0.6-1.el7
+- New upstream release
+
 * Fri Aug 10 2018 Jenkins <jenkins@opennodecloud.com> - 3.0.5-1.el7
 - New upstream release
 

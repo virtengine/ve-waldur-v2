@@ -6,12 +6,14 @@ from django.utils.translation import ugettext_lazy as _
 from rest_framework import exceptions as rf_exceptions
 from rest_framework import serializers
 
-from waldur_core.core import serializers as core_serializers
 from waldur_core.core import signals as core_signals
+from waldur_core.core import serializers as core_serializers
 from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure import serializers as structure_serializers
+from waldur_core.structure import models as structure_models
+from waldur_mastermind.common.serializers import validate_options
 
-from . import models, attribute_types
+from . import models, attribute_types, plugins
 
 
 class ServiceProviderSerializer(core_serializers.AugmentedSerializerMixin,
@@ -34,18 +36,18 @@ class ServiceProviderSerializer(core_serializers.AugmentedSerializerMixin,
         return attrs
 
 
-class NesterAttributeOptionSerializer(serializers.ModelSerializer):
+class NestedAttributeOptionSerializer(serializers.ModelSerializer):
     class Meta(object):
         model = models.AttributeOption
         fields = ('key', 'title')
 
 
 class NestedAttributeSerializer(serializers.ModelSerializer):
-    options = NesterAttributeOptionSerializer(many=True)
+    options = NestedAttributeOptionSerializer(many=True)
 
     class Meta(object):
         model = models.Attribute
-        fields = ('key', 'title', 'type', 'options')
+        fields = ('key', 'title', 'type', 'options', 'required',)
 
 
 class NestedSectionSerializer(serializers.ModelSerializer):
@@ -53,7 +55,7 @@ class NestedSectionSerializer(serializers.ModelSerializer):
 
     class Meta(object):
         model = models.Section
-        fields = ('key', 'title', 'attributes')
+        fields = ('key', 'title', 'attributes', 'is_standalone')
 
 
 class CategorySerializer(core_serializers.AugmentedSerializerMixin,
@@ -79,18 +81,136 @@ class CategorySerializer(core_serializers.AugmentedSerializerMixin,
         }
 
 
+class PlanComponentSerializer(serializers.ModelSerializer):
+    class Meta(object):
+        model = models.PlanComponent
+        fields = ('type', 'amount', 'price')
+
+
+class PlanSerializer(core_serializers.AugmentedSerializerMixin,
+                     serializers.HyperlinkedModelSerializer):
+    class Meta(object):
+        model = models.Plan
+        fields = ('url', 'uuid', 'name', 'description', 'unit_price', 'unit', 'offering')
+        protected_fields = ('offering',)
+        extra_kwargs = {
+            'url': {'lookup_field': 'uuid', 'view_name': 'marketplace-plan-detail'},
+            'offering': {'lookup_field': 'uuid', 'view_name': 'marketplace-offering-detail'},
+        }
+
+    def validate(self, attrs):
+        if not self.instance:
+            structure_permissions.is_owner(self.context['request'], None, attrs['offering'].customer)
+
+        self._validate_components(attrs)
+        return attrs
+
+    def _validate_components(self, attrs):
+        offering = attrs.get('offering', getattr(self.instance, 'offering', None))
+        components = plugins.manager.get_components(offering.type)
+        if components:
+            expected = sorted(components.keys())
+            actual = sorted(component['type'] for component in attrs.get('components', []))
+            if actual != expected:
+                raise serializers.ValidationError({'components': _('Invalid component types.')})
+            attrs['unit_price'] = sum(component['amount'] * component['price']
+                                      for component in attrs.get('components', []))
+
+
+class NestedPlanSerializer(core_serializers.AugmentedSerializerMixin,
+                           serializers.HyperlinkedModelSerializer):
+    components = PlanComponentSerializer(many=True, required=False)
+
+    class Meta(object):
+        model = models.Plan
+        fields = ('url', 'uuid', 'name', 'description', 'unit_price', 'unit', 'components')
+        extra_kwargs = {
+            'url': {'lookup_field': 'uuid', 'view_name': 'marketplace-plan-detail'},
+            'unit': {'required': True}
+        }
+
+
+class NestedScreenshotSerializer(serializers.ModelSerializer):
+    class Meta(object):
+        model = models.Screenshot
+        fields = ('name', 'description', 'image', 'thumbnail')
+
+
+class ScreenshotSerializer(core_serializers.AugmentedSerializerMixin,
+                           serializers.HyperlinkedModelSerializer):
+    class Meta(object):
+        model = models.Screenshot
+        fields = ('url', 'uuid', 'name', 'description', 'image', 'thumbnail', 'offering')
+        protected_fields = ('offering', 'image')
+        extra_kwargs = {
+            'url': {'lookup_field': 'uuid'},
+            'offering': {'lookup_field': 'uuid', 'view_name': 'marketplace-offering-detail'},
+        }
+
+    def validate(self, attrs):
+        if not self.instance:
+            structure_permissions.is_owner(self.context['request'], None, attrs['offering'].customer)
+        return attrs
+
+
+FIELD_TYPES = (
+    'boolean',
+    'integer',
+    'money',
+    'string',
+    'text',
+    'html_text',
+    'select_string',
+    'select_openstack_tenant',
+)
+
+
+class DefaultField(serializers.Field):
+    def to_internal_value(self, data):
+        return data
+
+
+class OptionFieldSerializer(serializers.Serializer):
+    type = serializers.ChoiceField(choices=FIELD_TYPES)
+    label = serializers.CharField()
+    help_text = serializers.CharField(required=False)
+    required = serializers.BooleanField(default=False)
+    choices = serializers.ListField(child=serializers.CharField(), required=False)
+    default = DefaultField(required=False)
+    min = serializers.IntegerField(required=False)
+    max = serializers.IntegerField(required=False)
+
+
+class OfferingOptionsSerializer(serializers.Serializer):
+    order = serializers.ListField(child=serializers.CharField())
+    options = serializers.DictField(child=OptionFieldSerializer())
+
+
 class OfferingSerializer(core_serializers.AugmentedSerializerMixin,
+                         core_serializers.RestrictedSerializerMixin,
                          serializers.HyperlinkedModelSerializer):
     attributes = serializers.JSONField(required=False)
-    category_title = serializers.ReadOnlyField(source='category.title')
+    options = serializers.JSONField(required=False)
+    geolocations = core_serializers.GeoLocationField(required=False)
     order_item_count = serializers.SerializerMethodField()
+    plans = NestedPlanSerializer(many=True, required=False)
+    screenshots = NestedScreenshotSerializer(many=True, read_only=True)
+    state = serializers.ReadOnlyField(source='get_state_display')
 
     class Meta(object):
         model = models.Offering
-        fields = ('url', 'uuid', 'created', 'name', 'description', 'full_description', 'customer',
-                  'category', 'category_title', 'rating', 'attributes', 'geolocations',
-                  'is_active', 'native_name', 'native_description', 'thumbnail', 'order_item_count')
-        protected_fields = ('customer',)
+        fields = ('url', 'uuid', 'created', 'name', 'description', 'full_description',
+                  'customer', 'customer_uuid', 'customer_name',
+                  'category', 'category_uuid', 'category_title',
+                  'rating', 'attributes', 'options', 'geolocations',
+                  'state', 'native_name', 'native_description', 'vendor_details',
+                  'thumbnail', 'order_item_count', 'plans', 'screenshots', 'type', 'shared')
+        related_paths = {
+            'customer': ('uuid', 'name'),
+            'category': ('uuid', 'title'),
+        }
+        protected_fields = ('customer', 'type')
+        read_only_fields = ('state',)
         extra_kwargs = {
             'url': {'lookup_field': 'uuid', 'view_name': 'marketplace-offering-detail'},
             'customer': {'lookup_field': 'uuid', 'view_name': 'customer-detail'},
@@ -117,7 +237,13 @@ class OfferingSerializer(core_serializers.AugmentedSerializerMixin,
             category = attrs.get('category', getattr(self.instance, 'category', None))
             self._validate_attributes(offering_attributes, category)
 
+        self._validate_plans(attrs)
         return attrs
+
+    def validate_type(self, offering_type):
+        if offering_type not in plugins.manager.backends.keys():
+            raise rf_exceptions.ValidationError(_('Invalid value.'))
+        return offering_type
 
     def _validate_attributes(self, offering_attributes, category):
         offering_attribute_keys = offering_attributes.keys()
@@ -136,42 +262,96 @@ class OfferingSerializer(core_serializers.AugmentedSerializerMixin,
                         err = rf_exceptions.ValidationError({'attributes': e.message})
                         raise err
 
+    def validate_options(self, options):
+        serializer = OfferingOptionsSerializer(data=options)
+        serializer.is_valid(raise_exception=True)
+        return options
 
-class ScreenshotSerializer(core_serializers.AugmentedSerializerMixin,
-                           serializers.HyperlinkedModelSerializer):
-    class Meta(object):
-        model = models.Screenshots
-        fields = ('url', 'uuid', 'name', 'description', 'image', 'thumbnail', 'offering')
-        protected_fields = ('offering', 'image')
-        extra_kwargs = {
-            'url': {'lookup_field': 'uuid'},
-            'offering': {'lookup_field': 'uuid', 'view_name': 'marketplace-offering-detail'},
-        }
+    def _validate_plans(self, attrs):
+        offering_type = attrs.get('type', getattr(self.instance, 'type', None))
+        components = plugins.manager.get_components(offering_type)
+        if components:
+            expected = sorted(components.keys())
+            plans = attrs.get('plans', [])
+            for plan in plans:
+                actual = sorted(component['type'] for component in plan.get('components', []))
+                if actual != expected:
+                    raise serializers.ValidationError({'plans': _('Invalid plan components.')})
+                plan['unit_price'] = sum(component['amount'] * component['price']
+                                         for component in plan.get('components', []))
 
-    def validate(self, attrs):
-        if not self.instance:
-            structure_permissions.is_owner(self.context['request'], None, attrs['offering'].customer)
-        return attrs
+    @transaction.atomic
+    def create(self, validated_data):
+        plans = validated_data.pop('plans', [])
+        offering = super(OfferingSerializer, self).create(validated_data)
+        for plan_data in plans:
+            components = plan_data.pop('components', [])
+            plan = models.Plan.objects.create(offering=offering, **plan_data)
+            for component_data in components:
+                models.PlanComponent.objects.create(plan=plan, **component_data)
+        return offering
+
+    def update(self, instance, validated_data):
+        # TODO: Implement support for nested plan update
+        validated_data.pop('plans', [])
+        offering = super(OfferingSerializer, self).update(instance, validated_data)
+        return offering
 
 
-class ItemSerializer(core_serializers.AugmentedSerializerMixin,
-                     serializers.HyperlinkedModelSerializer):
+class OrderItemSerializer(core_serializers.AugmentedSerializerMixin,
+                          serializers.HyperlinkedModelSerializer):
 
-    offering_name = serializers.ReadOnlyField(source='offering.name')
+    provider_name = serializers.ReadOnlyField(source='offering.customer.name')
+    provider_uuid = serializers.ReadOnlyField(source='offering.customer.uuid')
+    offering_thumbnail = serializers.FileField(source='offering.thumbnail', read_only=True)
+    resource_uuid = serializers.SerializerMethodField()
+    resource_type = serializers.SerializerMethodField()
+    state = serializers.ReadOnlyField(source='get_state_display')
+
+    def get_resource_uuid(self, order_item):
+        if order_item.scope:
+            return order_item.scope.uuid
+
+    def get_resource_type(self, order_item):
+        if order_item.scope:
+            return order_item.scope.get_scope_type()
 
     class Meta(object):
         model = models.OrderItem
-        fields = ('offering', 'offering_name', 'attributes', 'cost')
-        read_only_fields = ('cost',)
-        protected_fields = ('offering',)
+        fields = ('offering', 'offering_name', 'offering_uuid',
+                  'offering_description', 'offering_thumbnail',
+                  'provider_name', 'provider_uuid',
+                  'attributes', 'cost', 'plan', 'resource_uuid', 'resource_type', 'state',)
+
+        related_paths = {
+            'offering': ('name', 'uuid', 'description'),
+        }
+        read_only_fields = ('cost', 'state',)
+        protected_fields = ('offering', 'plan')
         extra_kwargs = {
             'offering': {'lookup_field': 'uuid', 'view_name': 'marketplace-offering-detail'},
+            'plan': {'lookup_field': 'uuid', 'view_name': 'marketplace-plan-detail'},
         }
 
     def validate_offering(self, offering):
-        if not offering.is_active:
+        if not offering.state == models.Offering.States.ACTIVE:
             raise rf_exceptions.ValidationError(_('Offering is not available.'))
         return offering
+
+    def validate(self, attrs):
+        offering = attrs['offering']
+        plan = attrs.get('plan')
+
+        if plan:
+            if plan.offering != offering:
+                raise rf_exceptions.ValidationError({
+                    'plan': _('This plan is not available for selected offering.')
+                })
+
+        if offering.options:
+            validate_options(offering.options['options'], attrs.get('attributes'))
+
+        return attrs
 
 
 class OrderSerializer(structure_serializers.PermissionFieldFilteringMixin,
@@ -179,7 +359,7 @@ class OrderSerializer(structure_serializers.PermissionFieldFilteringMixin,
                       serializers.HyperlinkedModelSerializer):
 
     state = serializers.ReadOnlyField(source='get_state_display')
-    items = ItemSerializer(many=True)
+    items = OrderItemSerializer(many=True)
 
     class Meta(object):
         model = models.Order
@@ -206,18 +386,43 @@ class OrderSerializer(structure_serializers.PermissionFieldFilteringMixin,
         validated_data['created_by'] = user
         items = validated_data.pop('items')
         order = super(OrderSerializer, self).create(validated_data)
-        models.OrderItem.objects.bulk_create([
-            models.OrderItem(
+        new_items = []
+        total_cost = 0
+        for item in items:
+            plan = item.get('plan')
+            cost = 0
+            if plan:
+                cost = plan.unit_price
+            total_cost += cost
+            order_item = models.OrderItem(
                 order=order,
                 offering=item['offering'],
                 attributes=item.get('attributes', {}),
+                plan=plan,
+                cost=cost,
             )
-            for item in items
-        ])
+            plugins.manager.validate(order_item, self.context['request'])
+            new_items.append(order_item)
+        models.OrderItem.objects.bulk_create(new_items)
+        order.total_cost = total_cost
+        order.save()
         return order
 
     def get_filtered_field_names(self):
         return 'project',
+
+
+class CustomerOfferingSerializer(serializers.HyperlinkedModelSerializer):
+    offering_set = serializers.HyperlinkedRelatedField(
+        many=True,
+        view_name='marketplace-offering-detail',
+        lookup_field='uuid',
+        queryset=models.Offering.objects.all()
+    )
+
+    class Meta(object):
+        model = structure_models.Customer
+        fields = ('offering_set',)
 
 
 def get_is_service_provider(serializer, scope):
