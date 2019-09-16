@@ -12,9 +12,11 @@ class StructureConfig(AppConfig):
     def ready(self):
         from waldur_core.core.models import CoordinatesMixin, User
         from waldur_core.structure.executors import check_cleanup_executors
-        from waldur_core.structure.models import ResourceMixin, Service, TagMixin, VirtualMachine
+        from waldur_core.structure.models import ResourceMixin, SubResource, Service, TagMixin, VirtualMachine, \
+            ServiceProjectLink
         from waldur_core.structure import handlers
         from waldur_core.structure import signals as structure_signals
+        from waldur_core.quotas import signals as quota_signals
 
         from django.core import checks
         checks.register(check_cleanup_executors)
@@ -110,7 +112,8 @@ class StructureConfig(AppConfig):
             dispatch_uid='waldur_core.structure.handlers.revoke_roles_on_project_deletion',
         )
 
-        for index, model in enumerate(ResourceMixin.get_all_models()):
+        resource_and_subresources = ResourceMixin.get_all_models() + SubResource.get_all_models()
+        for index, model in enumerate(resource_and_subresources):
             signals.pre_delete.connect(
                 handlers.log_resource_deleted,
                 sender=model,
@@ -207,3 +210,25 @@ class StructureConfig(AppConfig):
             sender=User,
             dispatch_uid='waldur_core.structure.handlers.notify_about_user_profile_changes',
         )
+
+        quota_signals.recalculate_quotas.connect(
+            handlers.update_customer_users_count,
+            dispatch_uid='waldur_core.structure.handlers.update_customer_users_count',
+        )
+
+        for index, spl_model in enumerate(ServiceProjectLink.get_all_models()):
+            signals.post_save.connect(
+                handlers.log_spl_create,
+                sender=spl_model,
+                dispatch_uid='waldur_core.structure.handlers.log_spl_{}_create_{}'.format(
+                    spl_model.__name__, index
+                ),
+            )
+
+            signals.pre_delete.connect(
+                handlers.log_spl_delete,
+                sender=spl_model,
+                dispatch_uid='waldur_core.structure.handlers.log_spl_{}_delete_{}'.format(
+                    spl_model.__name__, index
+                ),
+            )

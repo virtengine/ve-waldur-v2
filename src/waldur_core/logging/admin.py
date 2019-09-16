@@ -3,11 +3,19 @@ import json
 from django import forms
 from django.contrib import admin
 from django.contrib.auth.models import Group
-from django.forms import ModelForm
-from jsoneditor.forms import JSONEditor
+from django.db import transaction
+from django.shortcuts import redirect
+from django.template.defaultfilters import filesizeformat
+from django.urls import reverse
+from django.utils.translation import ugettext_lazy as _
 import six
 
-from waldur_core.logging import models
+from waldur_core.core.admin import (
+    format_json_field, ReadOnlyAdminMixin,
+    ExtraActionsMixin, UpdateOnlyModelAdmin
+)
+from waldur_core.core.utils import serialize_instance
+from waldur_core.logging import models, tasks
 from waldur_core.logging.loggers import get_valid_events, get_event_groups
 
 
@@ -49,24 +57,24 @@ class SystemNotificationForm(BaseHookForm):
         self.fields['hook_content_type'].queryset = models.BaseHook.get_all_content_types()
 
 
-class AlertAdminForm(ModelForm):
-    class Meta:
-        widgets = {
-            'context': JSONEditor(),
-        }
-
-
 class SystemNotificationAdmin(admin.ModelAdmin):
     form = SystemNotificationForm
     list_display = ('name', 'hook_content_type', 'roles')
 
 
-class AlertAdmin(admin.ModelAdmin):
-    list_display = ('uuid', 'alert_type', 'created', 'closed', 'scope', 'severity')
-    list_filter = ('alert_type', 'created', 'closed', 'severity')
-    ordering = ('alert_type',)
-    base_model = models.Alert
-    form = AlertAdminForm
+class EventAdmin(ReadOnlyAdminMixin, admin.ModelAdmin):
+    list_display = ('uuid', 'event_type', 'message', 'created')
+    readonly_fields = ('event_type', 'message', 'format_context')
+    exclude = ('context',)
+    list_filter = ('event_type', 'created')
+    search_fields = ('message',)
+    ordering = ('-created',)
+
+    def format_context(self, obj):
+        return format_json_field(obj.context)
+
+    format_context.allow_tags = True
+    format_context.short_description = _('Details')
 
 
 class BaseHookAdmin(admin.ModelAdmin):
@@ -86,12 +94,41 @@ class PushHookAdmin(BaseHookAdmin):
     list_display = BaseHookAdmin.list_display + ('type', 'device_id')
 
 
+class ReportAdmin(UpdateOnlyModelAdmin, ExtraActionsMixin, admin.ModelAdmin):
+    list_display = ('created', 'state', 'get_filesize')
+    readonly_fields = ('state', 'file', 'get_filesize', 'error_message')
+    exclude = ('file_size',)
+
+    def get_filesize(self, obj):
+        if obj.file_size:
+            return filesizeformat(obj.file_size)
+        else:
+            return 'N/A'
+
+    get_filesize.short_description = 'File size'
+
+    def get_extra_actions(self):
+        return [self.create_report]
+
+    def create_report(self, request):
+        with transaction.atomic():
+            report = models.Report.objects.create()
+            serialized_report = serialize_instance(report)
+            transaction.on_commit(lambda: tasks.create_report.delay(serialized_report))
+        message = _('Report creation has been scheduled')
+        self.message_user(request, message)
+        return redirect(reverse('admin:logging_report_changelist'))
+
+    create_report.short_description = _('Create report')
+
+
 # This hack is needed because core admin is imported several times.
 if admin.site.is_registered(Group):
     admin.site.unregister(Group)
 
-admin.site.register(models.Alert, AlertAdmin)
 admin.site.register(models.SystemNotification, SystemNotificationAdmin)
 admin.site.register(models.WebHook, WebHookAdmin)
 admin.site.register(models.EmailHook, EmailHookAdmin)
 admin.site.register(models.PushHook, PushHookAdmin)
+admin.site.register(models.Report, ReportAdmin)
+admin.site.register(models.Event, EventAdmin)

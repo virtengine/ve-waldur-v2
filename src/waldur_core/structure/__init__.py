@@ -112,9 +112,9 @@ class SupportedServices(object):
         cls._setdefault(key)
         model_str = cls._get_model_str(model)
         cls._registry[key]['resources'].setdefault(model_str, {'name': model.__name__})
-        cls._registry[key]['resources'][model_str]['detail_view'] = cls.get_detail_view_for_model(model)
-        cls._registry[key]['resources'][model_str]['list_view'] = cls.get_list_view_for_model(model)
-        cls._registry[key]['resources'][model_str]['serializer'] = serializer
+        cls._registry[key]['resources'][model_str].setdefault('detail_view', cls.get_detail_view_for_model(model))
+        cls._registry[key]['resources'][model_str].setdefault('list_view', cls.get_list_view_for_model(model))
+        cls._registry[key]['resources'][model_str].setdefault('serializer', serializer)
 
     @classmethod
     def register_resource_filter(cls, model, filter):
@@ -173,6 +173,10 @@ class SupportedServices(object):
     @classmethod
     def get_service_serializer(cls, model):
         key = cls.get_model_key(model)
+        return cls.get_service_serializer_for_key(key)
+
+    @classmethod
+    def get_service_serializer_for_key(cls, key):
         return cls._registry[key]['serializer']
 
     @classmethod
@@ -303,6 +307,13 @@ class SupportedServices(object):
         """ Get resource models by service model """
         key = cls.get_model_key(model)
         return cls.get_service_name_resources(key)
+
+    @classmethod
+    @lru_cache(maxsize=20)
+    def get_resource_serializers(cls):
+        return [resource['serializer']
+                for provider in cls._registry.values()
+                for resource in provider['resources'].values()]
 
     @classmethod
     @lru_cache(maxsize=20)
@@ -448,29 +459,22 @@ class ServiceBackend(object):
     def ping(self, raise_exception=False):
         raise ServiceBackendNotImplemented
 
-    def ping_resource(self, resource):
-        raise ServiceBackendNotImplemented
-
     def sync(self):
-        raise ServiceBackendNotImplemented
+        self.pull_service_properties()
+        self.pull_resources()
+        self.pull_subresources()
+
+    def pull_service_properties(self):
+        pass
+
+    def pull_resources(self):
+        pass
+
+    def pull_subresources(self):
+        pass
 
     def has_global_properties(self):
         return False
-
-    def provision(self, resource, *args, **kwargs):
-        raise ServiceBackendNotImplemented
-
-    def destroy(self, resource, force=False):
-        raise ServiceBackendNotImplemented
-
-    def stop(self, resource):
-        raise ServiceBackendNotImplemented
-
-    def start(self, resource):
-        raise ServiceBackendNotImplemented
-
-    def restart(self, resource):
-        raise ServiceBackendNotImplemented
 
     def get_resources_for_import(self):
         raise ServiceBackendNotImplemented

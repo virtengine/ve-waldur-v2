@@ -2,24 +2,27 @@ from __future__ import unicode_literals
 
 import collections
 import logging
-
-from django.core.exceptions import ObjectDoesNotExist
-import pytz
 import re
 
+from django.core.exceptions import ObjectDoesNotExist
+from django.conf import settings as django_settings
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 from django.utils.translation import ugettext, ugettext_lazy as _
+import pytz
 from rest_framework import serializers
 from rest_framework.reverse import reverse
 
 from waldur_core.core import (serializers as core_serializers,
                               utils as core_utils,
                               signals as core_signals)
+from waldur_core.quotas import serializers as quotas_serializers
 from waldur_core.structure import serializers as structure_serializers
+from waldur_core.structure import models as structure_models
 from waldur_openstack.openstack import serializers as openstack_serializers
 from waldur_openstack.openstack_base.backend import OpenStackBackendError
+from waldur_openstack.openstack_tenant.utils import get_valid_availability_zones
 
 from . import models, fields
 
@@ -40,11 +43,18 @@ class ServiceSerializer(core_serializers.ExtraFieldOptionsMixin,
         'availability_zone': _('Default availability zone for provisioned instances'),
         'flavor_exclude_regex': _('Flavors matching this regex expression will not be pulled from the backend.'),
         'external_network_id': _('It is used to automatically assign floating IP to your virtual machine.'),
+        'console_type': _('The type of remote console. '
+                          'The valid values are novnc, xvpvnc, rdp-html5, '
+                          'spice-html5, serial, and webmks.'),
     }
+
+    # Expose service settings quotas as service quotas as a temporary workaround.
+    # It is needed in order to render quotas table in service provider details dialog.
+    quotas = quotas_serializers.BasicQuotaSerializer(many=True, read_only=True, source='settings.quotas')
 
     class Meta(structure_serializers.BaseServiceSerializer.Meta):
         model = models.OpenStackTenantService
-        required_fields = ('backend_url', 'username', 'password', 'tenant_id')
+        required_fields = ('backend_url', 'username', 'password', 'tenant_id',)
         extra_field_options = {
             'backend_url': {
                 'label': 'API URL',
@@ -58,7 +68,10 @@ class ServiceSerializer(core_serializers.ExtraFieldOptionsMixin,
             },
             'external_network_id': {
                 'required': True,
-            }
+            },
+            'console_type': {
+                'default_value': 'novnc',
+            },
         }
 
 
@@ -67,6 +80,23 @@ class ServiceProjectLinkSerializer(structure_serializers.BaseServiceProjectLinkS
         model = models.OpenStackTenantServiceProjectLink
         extra_kwargs = {
             'service': {'lookup_field': 'uuid', 'view_name': 'openstacktenant-detail'},
+        }
+
+
+class BaseAvailabilityZoneSerializer(structure_serializers.BasePropertySerializer):
+    settings = serializers.HyperlinkedRelatedField(
+        queryset=structure_models.ServiceSettings.objects.all(),
+        view_name='servicesettings-detail',
+        lookup_field='uuid',
+        allow_null=True,
+        required=False,
+    )
+
+    class Meta(structure_serializers.BasePropertySerializer.Meta):
+        fields = ('url', 'uuid', 'name', 'settings', 'available')
+        extra_kwargs = {
+            'url': {'lookup_field': 'uuid'},
+            'settings': {'lookup_field': 'uuid'},
         }
 
 
@@ -170,7 +200,7 @@ class VolumeImportableSerializer(core_serializers.AugmentedSerializerMixin,
 
     class Meta(object):
         model = models.Volume
-        model_fields = ('name', 'description', 'size', 'bootable', 'type', 'device',
+        model_fields = ('name', 'description', 'size', 'bootable', 'device',
                         'runtime_state', 'instance_name', 'instance_uuid')
         fields = ('service_project_link', 'backend_id') + model_fields
         read_only_fields = model_fields + ('backend_id',)
@@ -208,6 +238,11 @@ class VolumeImportSerializer(VolumeImportableSerializer):
         return volume
 
 
+class VolumeAvailabilityZoneSerializer(BaseAvailabilityZoneSerializer):
+    class Meta(BaseAvailabilityZoneSerializer.Meta):
+        model = models.VolumeAvailabilityZone
+
+
 class VolumeSerializer(structure_serializers.BaseResourceSerializer):
     service = serializers.HyperlinkedRelatedField(
         source='service_project_link.service',
@@ -225,25 +260,30 @@ class VolumeSerializer(structure_serializers.BaseResourceSerializer):
     action_details = serializers.JSONField(read_only=True)
     metadata = serializers.JSONField(read_only=True)
     instance_name = serializers.SerializerMethodField()
+    type_name = serializers.CharField(source='type.name', read_only=True)
+    availability_zone_name = serializers.CharField(source='availability_zone.name', read_only=True)
 
     class Meta(structure_serializers.BaseResourceSerializer.Meta):
         model = models.Volume
         fields = structure_serializers.BaseResourceSerializer.Meta.fields + (
             'source_snapshot', 'size', 'bootable', 'metadata',
-            'image', 'image_metadata', 'image_name', 'type', 'runtime_state',
+            'image', 'image_metadata', 'image_name', 'type', 'type_name', 'runtime_state',
+            'availability_zone', 'availability_zone_name',
             'device', 'action', 'action_details', 'instance', 'instance_name',
         )
         read_only_fields = structure_serializers.BaseResourceSerializer.Meta.read_only_fields + (
             'image_metadata', 'image_name', 'bootable', 'source_snapshot', 'runtime_state', 'device', 'metadata',
-            'action', 'instance', 'type',
+            'action', 'instance'
         )
         protected_fields = structure_serializers.BaseResourceSerializer.Meta.protected_fields + (
-            'size', 'image',
+            'size', 'image', 'type', 'availability_zone',
         )
         extra_kwargs = dict(
             instance={'lookup_field': 'uuid', 'view_name': 'openstacktenant-instance-detail'},
             image={'lookup_field': 'uuid', 'view_name': 'openstacktenant-image-detail'},
             source_snapshot={'lookup_field': 'uuid', 'view_name': 'openstacktenant-snapshot-detail'},
+            type={'lookup_field': 'uuid', 'view_name': 'openstacktenant-volume-type-detail'},
+            availability_zone={'lookup_field': 'uuid', 'view_name': 'openstacktenant-volume-availability-zone-detail'},
             size={'required': False, 'allow_null': True},
             **structure_serializers.BaseResourceSerializer.Meta.extra_kwargs
         )
@@ -274,6 +314,21 @@ class VolumeSerializer(structure_serializers.BaseResourceSerializer):
                 raise serializers.ValidationError({
                     'size': _('Volume size should be equal or greater than %s for selected image') % image.min_disk
                 })
+            # type validation
+            type = attrs.get('type')
+            if type and type.settings != spl.service.settings:
+                raise serializers.ValidationError({'type': _('Volume type must belong to the same service settings')})
+
+            availability_zone = attrs.get('availability_zone')
+            if availability_zone and availability_zone.settings != spl.service.settings:
+                raise serializers.ValidationError(
+                    _('Availability zone must belong to the same service settings.'))
+            if availability_zone and not availability_zone.available:
+                raise serializers.ValidationError(_('Zone is not available.'))
+            if not availability_zone and django_settings.WALDUR_OPENSTACK_TENANT['REQUIRE_AVAILABILITY_ZONE']:
+                if models.VolumeAvailabilityZone.objects.filter(settings=spl.service.settings).count() > 0:
+                    raise serializers.ValidationError(_('Availability zone is mandatory.'))
+
         return attrs
 
     def create(self, validated_data):
@@ -344,6 +399,11 @@ class VolumeAttachSerializer(structure_serializers.PermissionFieldFilteringMixin
         volume = self.instance
         if instance.service_project_link != volume.service_project_link:
             raise serializers.ValidationError(_('Volume and instance should belong to the same service and project.'))
+        if volume.availability_zone and instance.availability_zone:
+            valid_zones = get_valid_availability_zones(volume)
+            if valid_zones and valid_zones.get(instance.availability_zone.name) != volume.availability_zone.name:
+                raise serializers.ValidationError(
+                    _('Volume cannot be attached to virtual machine related to the other availability zone.'))
         return instance
 
     def validate(self, attrs):
@@ -385,9 +445,6 @@ class SnapshotRestorationSerializer(core_serializers.AugmentedSerializerMixin, s
             size=snapshot.size,
         )
 
-        if 'source_volume_image_metadata' in snapshot.metadata:
-            volume.image_metadata = snapshot.metadata['source_volume_image_metadata']
-
         volume.save()
         volume.increase_backend_quotas_usage()
         validated_data['volume'] = volume
@@ -395,7 +452,7 @@ class SnapshotRestorationSerializer(core_serializers.AugmentedSerializerMixin, s
         return super(SnapshotRestorationSerializer, self).create(validated_data)
 
 
-class SnapshotSerializer(structure_serializers.BaseResourceSerializer):
+class SnapshotSerializer(structure_serializers.BaseResourceActionSerializer):
     service = serializers.HyperlinkedRelatedField(
         source='service_project_link.service',
         view_name='openstacktenant-detail',
@@ -420,6 +477,7 @@ class SnapshotSerializer(structure_serializers.BaseResourceSerializer):
         )
         read_only_fields = structure_serializers.BaseResourceSerializer.Meta.read_only_fields + (
             'size', 'source_volume', 'metadata', 'runtime_state', 'action', 'snapshot_schedule',
+            'service_settings', 'project',
         )
         extra_kwargs = dict(
             source_volume={'lookup_field': 'uuid', 'view_name': 'openstacktenant-volume-detail'},
@@ -435,16 +493,7 @@ class SnapshotSerializer(structure_serializers.BaseResourceSerializer):
         attrs['source_volume'] = source_volume = self.context['view'].get_object()
         attrs['service_project_link'] = source_volume.service_project_link
         attrs['size'] = source_volume.size
-        attrs['metadata'] = self.get_snapshot_metadata(source_volume)
         return super(SnapshotSerializer, self).validate(attrs)
-
-    @staticmethod
-    def get_snapshot_metadata(volume):
-        return {
-            'source_volume_name': volume.name,
-            'source_volume_description': volume.description,
-            'source_volume_image_metadata': volume.image_metadata,
-        }
 
 
 class SnapshotImportableSerializer(core_serializers.AugmentedSerializerMixin,
@@ -505,12 +554,15 @@ class NestedVolumeSerializer(core_serializers.AugmentedSerializerMixin,
                              serializers.HyperlinkedModelSerializer,
                              structure_serializers.BasicResourceSerializer):
     state = serializers.ReadOnlyField(source='get_state_display')
+    type_name = serializers.CharField(source='type.name', read_only=True)
 
     class Meta:
         model = models.Volume
-        fields = 'url', 'uuid', 'name', 'image_name', 'state', 'bootable', 'size', 'device', 'resource_type'
+        fields = ('url', 'uuid', 'name', 'image_name', 'state', 'bootable', 'size', 'device', 'resource_type',
+                  'type', 'type_name')
         extra_kwargs = {
-            'url': {'lookup_field': 'uuid'}
+            'url': {'lookup_field': 'uuid'},
+            'type': {'lookup_field': 'uuid', 'view_name': 'openstacktenant-volume-type-detail'},
         }
 
 
@@ -565,7 +617,7 @@ class NestedInternalIPSerializer(core_serializers.AugmentedSerializerMixin, seri
 
     def to_internal_value(self, data):
         internal_value = super(NestedInternalIPSerializer, self).to_internal_value(data)
-        return models.InternalIP(subnet=internal_value['subnet'])
+        return models.InternalIP(subnet=internal_value['subnet'], settings=internal_value['subnet'].settings)
 
 
 class NestedFloatingIPSerializer(core_serializers.AugmentedSerializerMixin,
@@ -670,11 +722,16 @@ def _connect_floating_ip_to_instance(floating_ip, subnet, instance):
         If floating IP is not defined - take exist free one or create a new one.
     """
     settings = instance.service_project_link.service.settings
+    external_network_id = settings.options.get('external_network_id')
+    if not core_utils.is_uuid_like(external_network_id):
+        raise serializers.ValidationError(
+            ugettext('Service provider does not have valid value of external_network_id'))
+
     if not floating_ip:
         kwargs = {
             'settings': settings,
             'is_booked': False,
-            'backend_network_id': settings.options['external_network_id'],
+            'backend_network_id': external_network_id,
         }
         # TODO: figure out why internal_ip__isnull throws errors when added to kwargs
         floating_ip = models.FloatingIP.objects.filter(internal_ip__isnull=True).filter(**kwargs).first()
@@ -685,6 +742,11 @@ def _connect_floating_ip_to_instance(floating_ip, subnet, instance):
     floating_ip.internal_ip = models.InternalIP.objects.filter(instance=instance, subnet=subnet).first()
     floating_ip.save()
     return floating_ip
+
+
+class InstanceAvailabilityZoneSerializer(BaseAvailabilityZoneSerializer):
+    class Meta(BaseAvailabilityZoneSerializer.Meta):
+        model = models.InstanceAvailabilityZone
 
 
 class InstanceSerializer(structure_serializers.VirtualMachineSerializer):
@@ -728,19 +790,30 @@ class InstanceSerializer(structure_serializers.VirtualMachineSerializer):
     volumes = NestedVolumeSerializer(many=True, required=False, read_only=True)
     action_details = serializers.JSONField(read_only=True)
 
+    availability_zone_name = serializers.CharField(source='availability_zone.name', read_only=True)
+
     class Meta(structure_serializers.VirtualMachineSerializer.Meta):
         model = models.Instance
         fields = structure_serializers.VirtualMachineSerializer.Meta.fields + (
             'flavor', 'image', 'system_volume_size', 'data_volume_size',
             'security_groups', 'internal_ips', 'flavor_disk', 'flavor_name',
             'floating_ips', 'volumes', 'runtime_state', 'action', 'action_details', 'internal_ips_set',
+            'availability_zone', 'availability_zone_name',
         )
         protected_fields = structure_serializers.VirtualMachineSerializer.Meta.protected_fields + (
             'flavor', 'image', 'system_volume_size', 'data_volume_size',
             'floating_ips', 'security_groups', 'internal_ips_set',
+            'availability_zone',
         )
         read_only_fields = structure_serializers.VirtualMachineSerializer.Meta.read_only_fields + (
             'flavor_disk', 'runtime_state', 'flavor_name', 'action',
+        )
+        extra_kwargs = dict(
+            availability_zone={
+                'lookup_field': 'uuid',
+                'view_name': 'openstacktenant-instance-availability-zone-detail'
+            },
+            **structure_serializers.VirtualMachineSerializer.Meta.extra_kwargs
         )
 
     def get_fields(self):
@@ -753,8 +826,8 @@ class InstanceSerializer(structure_serializers.VirtualMachineSerializer):
         return fields
 
     @staticmethod
-    def eager_load(queryset):
-        queryset = structure_serializers.VirtualMachineSerializer.eager_load(queryset)
+    def eager_load(queryset, request):
+        queryset = structure_serializers.VirtualMachineSerializer.eager_load(queryset, request)
         return queryset.prefetch_related(
             'security_groups',
             'security_groups__rules',
@@ -791,7 +864,38 @@ class InstanceSerializer(structure_serializers.VirtualMachineSerializer):
         subnets = [internal_ip.subnet for internal_ip in internal_ips]
         _validate_instance_floating_ips(attrs.get('floating_ips', []), settings, subnets)
 
+        availability_zone = attrs.get('availability_zone')
+        if availability_zone and availability_zone.settings != settings:
+            raise serializers.ValidationError(
+                _('Instance and availability zone must belong to the same service settings as service project link.'))
+        if availability_zone and not availability_zone.available:
+            raise serializers.ValidationError(_('Zone is not available.'))
+
+        if not availability_zone and django_settings.WALDUR_OPENSTACK_TENANT['REQUIRE_AVAILABILITY_ZONE']:
+            if models.InstanceAvailabilityZone.objects.filter(settings=settings).count() > 0:
+                raise serializers.ValidationError(_('Availability zone is mandatory.'))
+
         return attrs
+
+    def _find_volume_availability_zone(self, instance):
+        # Find volume AZ using instance AZ. It is assumed that user can't select arbitrary
+        # combination of volume and instance AZ. Once instance AZ is selected,
+        # volume AZ is taken from settings.
+
+        volume_availability_zone = None
+        valid_zones = get_valid_availability_zones(instance)
+        if instance.availability_zone and valid_zones:
+            volume_availability_zone_name = valid_zones.get(instance.availability_zone.name)
+            if volume_availability_zone_name:
+                try:
+                    volume_availability_zone = models.VolumeAvailabilityZone.objects.get(
+                        name=volume_availability_zone_name,
+                        settings=instance.service_project_link.service.settings,
+                        available=True,
+                    )
+                except models.VolumeAvailabilityZone.DoesNotExist:
+                    pass
+        return volume_availability_zone
 
     @transaction.atomic
     def create(self, validated_data):
@@ -837,6 +941,9 @@ class InstanceSerializer(structure_serializers.VirtualMachineSerializer):
         # floating IPs
         for floating_ip, subnet in floating_ips_with_subnets:
             _connect_floating_ip_to_instance(floating_ip, subnet, instance)
+
+        volume_availability_zone = self._find_volume_availability_zone(instance)
+
         # volumes
         volumes = []
         system_volume = models.Volume.objects.create(
@@ -846,6 +953,7 @@ class InstanceSerializer(structure_serializers.VirtualMachineSerializer):
             image=image,
             image_name=image.name,
             bootable=True,
+            availability_zone=volume_availability_zone,
         )
         volumes.append(system_volume)
 
@@ -854,6 +962,7 @@ class InstanceSerializer(structure_serializers.VirtualMachineSerializer):
                 name='{0}-data'.format(instance.name[:145]),  # volume name cannot be longer than 150 symbols
                 service_project_link=spl,
                 size=data_volume_size,
+                availability_zone=volume_availability_zone,
             )
             volumes.append(data_volume)
 
@@ -903,10 +1012,18 @@ class InstanceFlavorChangeSerializer(structure_serializers.PermissionFieldFilter
     def update(self, instance, validated_data):
         flavor = validated_data.get('flavor')
 
-        settings = instance.service_project_link.service.settings
         spl = instance.service_project_link
+        settings = spl.service.settings
+        quota_holders = [spl, settings]
 
-        for quota_holder in [settings, spl]:
+        # Service settings has optional field for related tenant resource.
+        # We should update tenant quotas if related tenant is defined.
+        # Otherwise stale quotas would be used for quota validation during instance provisioning.
+        # Note that all tenant quotas are injected to service settings when application is bootstrapped.
+        if settings.scope:
+            quota_holders.append(settings.scope)
+
+        for quota_holder in quota_holders:
             quota_holder.add_quota_usage(quota_holder.Quotas.ram, flavor.ram - instance.ram, validate=True)
             quota_holder.add_quota_usage(quota_holder.Quotas.vcpu, flavor.cores - instance.cores, validate=True)
 
@@ -993,7 +1110,9 @@ class InstanceInternalIPsSetUpdateSerializer(serializers.Serializer):
         for internal_ip in internal_ips_set:
             match = models.InternalIP.objects.filter(instance=instance, subnet=internal_ip.subnet).first()
             if not match:
-                models.InternalIP.objects.create(instance=instance, subnet=internal_ip.subnet)
+                models.InternalIP.objects.create(instance=instance,
+                                                 subnet=internal_ip.subnet,
+                                                 settings=internal_ip.subnet.settings)
 
         return instance
 
@@ -1074,16 +1193,9 @@ class BackupRestorationSerializer(serializers.HyperlinkedModelSerializer):
             settings = backup.instance.service_project_link.service.settings
             fields['flavor'].display_name_field = 'name'
             fields['flavor'].view_name = 'openstacktenant-flavor-detail'
-            # It is assumed that valid OpenStack Instance has exactly one bootable volume
-            try:
-                system_volume = backup.instance.volumes.get(bootable=True)
-                fields['flavor'].query_params = {
-                    'settings_uuid': backup.service_project_link.service.settings.uuid,
-                    'disk__gte': system_volume.size,
-                }
-            except ObjectDoesNotExist:
-                # Validation exception is raised in validate method below
-                pass
+            fields['flavor'].query_params = {
+                'settings_uuid': backup.service_project_link.service.settings.uuid,
+            }
 
             floating_ip_field = fields.get('floating_ips')
             if floating_ip_field:
@@ -1117,7 +1229,7 @@ class BackupRestorationSerializer(serializers.HyperlinkedModelSerializer):
         flavor = attrs['flavor']
         backup = self.context['view'].get_object()
         try:
-            system_volume = backup.instance.volumes.get(bootable=True)
+            backup.instance.volumes.get(bootable=True)
         except ObjectDoesNotExist:
             raise serializers.ValidationError(_('OpenStack instance should have bootable volume.'))
 
@@ -1125,8 +1237,6 @@ class BackupRestorationSerializer(serializers.HyperlinkedModelSerializer):
 
         if flavor.settings != settings:
             raise serializers.ValidationError({'flavor': _('Flavor is not within services\' settings.')})
-        if flavor.disk < system_volume.size:
-            raise serializers.ValidationError({'flavor': _('Flavor disk size should match system volume size.')})
 
         _validate_instance_security_groups(attrs.get('security_groups', []), settings)
 
@@ -1180,15 +1290,13 @@ class BackupRestorationSerializer(serializers.HyperlinkedModelSerializer):
                 description='Restored from backup %s' % backup.uuid.hex,
                 size=snapshot.size,
             )
-            if 'source_volume_image_metadata' in snapshot.metadata:
-                volume.image_metadata = snapshot.metadata['source_volume_image_metadata']
             volume.save()
             volume.increase_backend_quotas_usage()
             instance.volumes.add(volume)
         return backup_restoration
 
 
-class BackupSerializer(structure_serializers.BaseResourceSerializer):
+class BackupSerializer(structure_serializers.BaseResourceActionSerializer):
     # Serializer requires OpenStack Instance in context on creation
     service = serializers.HyperlinkedRelatedField(
         source='service_project_link.service',
@@ -1218,7 +1326,7 @@ class BackupSerializer(structure_serializers.BaseResourceSerializer):
             'backup_schedule', 'backup_schedule_uuid',
             'instance_security_groups', 'instance_internal_ips_set', 'instance_floating_ips')
         read_only_fields = structure_serializers.BaseResourceSerializer.Meta.read_only_fields + (
-            'instance', 'service_project_link', 'backup_schedule')
+            'instance', 'service_project_link', 'backup_schedule', 'service_settings', 'project')
         extra_kwargs = {
             'url': {'lookup_field': 'uuid'},
             'instance': {'lookup_field': 'uuid', 'view_name': 'openstacktenant-instance-detail'},
@@ -1265,13 +1373,12 @@ class BackupSerializer(structure_serializers.BaseResourceSerializer):
                 size=volume.size,
                 source_volume=volume,
                 description='Part of backup %s (UUID: %s)' % (backup.name, backup.uuid.hex),
-                metadata=SnapshotSerializer.get_snapshot_metadata(volume),
             )
             snapshot.increase_backend_quotas_usage()
             backup.snapshots.add(snapshot)
 
 
-class BaseScheduleSerializer(structure_serializers.BaseResourceSerializer):
+class BaseScheduleSerializer(structure_serializers.BaseResourceActionSerializer):
     timezone = serializers.ChoiceField(choices=[(t, t) for t in pytz.all_timezones],
                                        initial=timezone.get_current_timezone_name(),
                                        default=timezone.get_current_timezone_name())
@@ -1290,7 +1397,7 @@ class BaseScheduleSerializer(structure_serializers.BaseResourceSerializer):
             'retention_time', 'timezone', 'maximal_number_of_resources', 'schedule',
             'is_active', 'next_trigger_at')
         read_only_fields = structure_serializers.BaseResourceSerializer.Meta.read_only_fields + (
-            'is_active', 'next_trigger_at', 'service_project_link')
+            'is_active', 'next_trigger_at', 'service_project_link', 'service_settings', 'project')
 
 
 class BackupScheduleSerializer(BaseScheduleSerializer):
@@ -1464,3 +1571,33 @@ class InstanceImportSerializer(InstanceImportableSerializer):
             })
 
         return instance
+
+
+class ConsoleLogSerializer(serializers.Serializer):
+    length = serializers.IntegerField(required=False)
+
+
+class VolumeTypeSerializer(structure_serializers.BasePropertySerializer):
+    settings = serializers.HyperlinkedRelatedField(
+        queryset=structure_models.ServiceSettings.objects.all(),
+        view_name='servicesettings-detail',
+        lookup_field='uuid',
+        allow_null=True,
+        required=False,
+    )
+
+    class Meta(structure_serializers.BasePropertySerializer.Meta):
+        model = models.VolumeType
+        fields = ('url', 'uuid', 'name', 'description', 'settings')
+        extra_kwargs = {
+            'url': {'lookup_field': 'uuid'},
+            'settings': {'lookup_field': 'uuid'},
+        }
+
+
+class SharedSettingsCustomerSerializer(serializers.Serializer):
+    name = serializers.ReadOnlyField()
+    uuid = serializers.ReadOnlyField()
+    created = serializers.ReadOnlyField()
+    abbreviation = serializers.ReadOnlyField()
+    vm_count = serializers.ReadOnlyField()

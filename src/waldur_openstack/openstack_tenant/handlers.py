@@ -6,6 +6,7 @@ from django.core import exceptions as django_exceptions
 from django.db import transaction, IntegrityError
 
 from waldur_core.core.models import StateMixin
+from waldur_core.quotas.models import Quota
 from waldur_core.structure import models as structure_models
 
 from ..openstack import models as openstack_models, apps as openstack_apps
@@ -26,6 +27,8 @@ def _log_scheduled_action(resource, action, action_details):
 
 
 def _log_succeeded_action(resource, action, action_details):
+    if not action:
+        return
     class_name = resource.__class__.__name__.lower()
     message = _get_action_message(action, action_details)
     log.event_logger.openstack_resource_action.info(
@@ -106,7 +109,7 @@ def log_snapshot_schedule_action(sender, instance, created=False, **kwargs):
                 snapshot_schedule.name, snapshot_schedule.error_message)
         else:
             message = 'Snapshot schedule "%s" has been deactivated' % snapshot_schedule.name
-        log.event_logger.openstack_snapshot_schedule.info(
+        log.event_logger.openstack_snapshot_schedule.warning(
             message,
             event_type='resource_snapshot_schedule_deactivated',
             event_context=context,
@@ -152,7 +155,7 @@ def log_backup_schedule_action(sender, instance, created=False, **kwargs):
                 backup_schedule.name, backup_schedule.error_message)
         else:
             message = 'Backup schedule "%s" has been deactivated' % backup_schedule.name
-        log.event_logger.openstack_backup_schedule.info(
+        log.event_logger.openstack_backup_schedule.warning(
             message,
             event_type='resource_backup_schedule_deactivated',
             event_context=context,
@@ -248,6 +251,15 @@ class BaseSynchronizationHandler(object):
         Creates service property on resource transition from 'CREATING' state to 'OK'.
         """
         if source == StateMixin.States.CREATING and target == StateMixin.States.OK:
+            settings = self.get_service_settings(instance)
+            if settings and not self.get_service_property(instance, settings):
+                self.create_service_property(instance, settings)
+
+    def import_handler(self, sender, instance, created=False, **kwargs):
+        """
+        Creates service property on when resource is imported.
+        """
+        if created and instance.state == StateMixin.States.OK:
             settings = self.get_service_settings(instance)
             if settings and not self.get_service_property(instance, settings):
                 self.create_service_property(instance, settings)
@@ -419,6 +431,11 @@ def create_service_from_tenant(sender, instance, created=False, **kwargs):
             'tenant_id': tenant.backend_id,
         },
     )
+
+    if admin_settings.options.get('console_type'):
+        service_settings.options['console_type'] = admin_settings.options.get('console_type')
+        service_settings.save()
+
     service = models.OpenStackTenantService.objects.create(
         settings=service_settings,
         customer=customer,
@@ -437,9 +454,13 @@ def update_service_settings(sender, instance, created=False, **kwargs):
         return
 
     try:
-        service_settings = structure_models.ServiceSettings.objects.get(scope=tenant,
-                                                                        type=apps.OpenStackTenantConfig.service_name)
+        service_settings = structure_models.ServiceSettings.objects.get(
+            scope=tenant,
+            type=apps.OpenStackTenantConfig.service_name
+        )
     except structure_models.ServiceSettings.DoesNotExist:
+        return
+    except structure_models.ServiceSettings.MultipleObjectsReturned:
         return
     else:
         service_settings.options['external_network_id'] = tenant.external_network_id
@@ -450,3 +471,19 @@ def update_service_settings(sender, instance, created=False, **kwargs):
 def sync_price_list_item_for_flavor(sender, instance, created=False, **kwargs):
     if created:
         utils.sync_price_list_item(instance)
+
+
+def sync_private_settings_quotas_with_tenant_quotas(sender, instance, created=False, **kwargs):
+    if created:
+        return
+
+    quota = instance
+    if not isinstance(quota.scope, openstack_models.Tenant):
+        return
+
+    tenant = quota.scope
+    private_settings = structure_models.ServiceSettings.objects.filter(scope=tenant)
+
+    Quota.objects\
+        .filter(scope__in=private_settings, name=quota.name)\
+        .update(limit=quota.limit, usage=quota.usage)

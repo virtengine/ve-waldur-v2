@@ -7,16 +7,17 @@ from freezegun import freeze_time
 
 from waldur_core.core.tests.helpers import override_waldur_core_settings
 from waldur_mastermind.invoices.tasks import format_invoice_csv
+from waldur_mastermind.support.tests import factories as support_factories
 
 from .. import models, tasks
-from . import fixtures, factories, utils
+from . import fixtures, utils
 
 
 class BaseReportFormatterTest(TransactionTestCase):
     def setUp(self):
-        fixture = fixtures.InvoiceFixture()
-        package = fixtures.create_package(100, fixture.openstack_tenant)
-        package.template.name = 'PackageTemplate'
+        self.fixture = fixtures.InvoiceFixture()
+        package = fixtures.create_package(100, self.fixture.openstack_tenant)
+        package.template.name = 'New package template'
         package.template.save()
         self.customer = package.tenant.service_project_link.project.customer
 
@@ -41,14 +42,15 @@ class GenericReportFormatterTest(BaseReportFormatterTest):
         self.assertEqual(lines[0], expected_header)
 
     def test_offering_items_are_serialized(self):
-        self.offering_item = factories.OfferingItemFactory(invoice=self.invoice,
-                                                           offering__template__name='OFFERING-001')
-        self.offering_item.offering.save()
-
+        offering = support_factories.OfferingFactory(
+            template__name='OFFERING-001',
+            project=self.fixture.project)
+        offering.state = offering.__class__.States.OK
+        offering.save()
         report = format_invoice_csv(self.invoice)
         lines = report.splitlines()
         self.assertEqual(3, len(lines))
-        self.assertTrue('OFFERING-001' in lines[-1])
+        self.assertTrue('OFFERING-001' in ''.join(lines))
 
 
 INVOICE_REPORTING = {
@@ -78,13 +80,37 @@ class SafReportFormatterTest(BaseReportFormatterTest):
                           'ARTPROJEKT;ARTNIMI;VALI;U_KONEDEARV;H_PERIOOD'
         self.assertEqual(lines[0], expected_header)
 
-        expected_data = '{};30.09.2017;26.09.2017;26.10.2017;100;100;;5;1500.00;0.00;20%;' \
-                        'PROJEKT; (Small / PackageTemplate);;;01.09.2017-30.09.2017'.format(self.invoice.number)
+        expected_data = (
+            '{};30.09.2017;26.09.2017;26.10.2017;100;100;;5;1500.00;0.00;20%;'
+            'PROJEKT;{} (Small / PackageTemplate);;;01.09.2017-30.09.2017'.format(
+                self.invoice.number, self.fixture.openstack_tenant)
+        )
         self.assertEqual(lines[1], expected_data)
+
+    def test_usage_based_item_is_skipped_if_quantity_is_zero(self):
+        item = self.invoice.items.first()
+        item.unit = models.InvoiceItem.Units.QUANTITY
+        item.quantity = 0
+        item.save()
+
+        report = format_invoice_csv(self.invoice)
+        lines = report.splitlines()
+        self.assertEqual(0, len(lines))
+
+    def test_usage_based_item_is_skipped_if_unit_price_is_zero(self):
+        item = self.invoice.items.first()
+        item.unit = models.InvoiceItem.Units.QUANTITY
+        item.quantity = 10
+        item.unit_price = 0
+        item.save()
+
+        report = format_invoice_csv(self.invoice)
+        lines = report.splitlines()
+        self.assertEqual(0, len(lines))
 
 
 @freeze_time('2017-11-01')
-@mock.patch('waldur_mastermind.invoices.tasks.utils.send_mail_attachment')
+@mock.patch('waldur_mastermind.invoices.tasks.core_utils.send_mail_with_attachment')
 class InvoiceReportTaskTest(BaseReportFormatterTest):
     def setUp(self):
         super(InvoiceReportTaskTest, self).setUp()
@@ -98,7 +124,7 @@ class InvoiceReportTaskTest(BaseReportFormatterTest):
         self.customer.accounting_start_date = timezone.now() + datetime.timedelta(days=10)
         self.customer.save()
         tasks.send_invoice_report()
-        message = send_mail_mock.call_args[1]['attach_text']
+        message = send_mail_mock.call_args[1]['attachment']
         lines = message.splitlines()
         self.assertEqual(0, len(lines))
 
@@ -108,7 +134,7 @@ class InvoiceReportTaskTest(BaseReportFormatterTest):
         self.customer.accounting_start_date = timezone.now() + datetime.timedelta(days=10)
         self.customer.save()
         tasks.send_invoice_report()
-        message = send_mail_mock.call_args[1]['attach_text']
+        message = send_mail_mock.call_args[1]['attachment']
         lines = message.splitlines()
         self.assertEqual(2, len(lines))
 
@@ -118,7 +144,17 @@ class InvoiceReportTaskTest(BaseReportFormatterTest):
         self.customer.accounting_start_date = timezone.now() - datetime.timedelta(days=50)
         self.customer.save()
         tasks.send_invoice_report()
-        message = send_mail_mock.call_args[1]['attach_text']
+        message = send_mail_mock.call_args[1]['attachment']
+        lines = message.splitlines()
+        self.assertEqual(2, len(lines))
+
+    @utils.override_invoices_settings(INVOICE_REPORTING=INVOICE_REPORTING)
+    @override_waldur_core_settings(ENABLE_ACCOUNTING_START_DATE=True)
+    def test_active_customer_is_not_skipped_if_it_has_been_actived_in_previous_month(self, send_mail_mock):
+        self.customer.accounting_start_date = timezone.now() - datetime.timedelta(days=15)
+        self.customer.save()
+        tasks.send_invoice_report()
+        message = send_mail_mock.call_args[1]['attachment']
         lines = message.splitlines()
         self.assertEqual(2, len(lines))
 
@@ -131,7 +167,21 @@ class InvoiceReportTaskTest(BaseReportFormatterTest):
             item.delete()
 
         tasks.send_invoice_report()
-        message = send_mail_mock.call_args[1]['attach_text']
+        message = send_mail_mock.call_args[1]['attachment']
+        lines = message.splitlines()
+        self.assertEqual(0, len(lines))
+
+    @utils.override_invoices_settings(INVOICE_REPORTING=INVOICE_REPORTING)
+    @override_waldur_core_settings(ENABLE_ACCOUNTING_START_DATE=True)
+    def test_empty_invoice_item_is_skipped(self, send_mail_mock):
+        self.customer.accounting_start_date = timezone.now() - datetime.timedelta(days=50)
+        self.customer.save()
+        for item in self.invoice.items:
+            item.unit_price = 0
+            item.save()
+
+        tasks.send_invoice_report()
+        message = send_mail_mock.call_args[1]['attachment']
         lines = message.splitlines()
         self.assertEqual(0, len(lines))
 
@@ -157,6 +207,6 @@ class InvoiceReportTaskTest(BaseReportFormatterTest):
         customer.save()
 
         tasks.send_invoice_report()
-        message = send_mail_mock.call_args[1]['attach_text']
+        message = send_mail_mock.call_args[1]['attachment']
         lines = message.splitlines()
         self.assertEqual(3, len(lines))

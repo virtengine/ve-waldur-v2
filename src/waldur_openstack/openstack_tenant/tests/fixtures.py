@@ -10,20 +10,22 @@ from .. import models
 class OpenStackTenantFixture(ProjectFixture):
 
     @cached_property
+    def tenant(self):
+        return openstack_fixtures.OpenStackFixture().tenant
+
+    @cached_property
     def openstack_tenant_service_settings(self):
         # has to be cached, otherwise all referenced objects are not going to be cached (e.g. scope).
-        openstack_fixture = openstack_fixtures.OpenStackFixture()
-
         return factories.OpenStackTenantServiceSettingsFactory(
-            name=openstack_fixture.tenant.name,
-            scope=openstack_fixture.tenant,
+            name=self.tenant.name,
+            scope=self.tenant,
             customer=self.customer,
-            backend_url=openstack_fixture.openstack_service_settings.backend_url,
-            username=openstack_fixture.tenant.user_username,
-            password=openstack_fixture.tenant.user_password,
+            backend_url=self.tenant.service_settings.backend_url,
+            username=self.tenant.user_username,
+            password=self.tenant.user_password,
             options={
-                'availability_zone': openstack_fixture.tenant.availability_zone,
-                'tenant_id': openstack_fixture.tenant.backend_id,
+                'availability_zone': self.tenant.availability_zone,
+                'tenant_id': self.tenant.backend_id,
             },
         )
 
@@ -53,6 +55,14 @@ class OpenStackTenantFixture(ProjectFixture):
             service_project_link=self.spl,
             state=models.Volume.States.OK,
             runtime_state=models.Volume.RuntimeStates.OFFLINE,
+            type=self.volume_type,
+            availability_zone=self.volume_availability_zone,
+        )
+
+    @cached_property
+    def instance_availability_zone(self):
+        return factories.InstanceAvailabilityZoneFactory(
+            settings=self.openstack_tenant_service_settings,
         )
 
     @cached_property
@@ -108,4 +118,16 @@ class OpenStackTenantFixture(ProjectFixture):
         return factories.InternalIPFactory(
             subnet=self.subnet,
             instance=self.instance,
+        )
+
+    @cached_property
+    def volume_type(self):
+        return factories.VolumeTypeFactory(
+            settings=self.openstack_tenant_service_settings,
+        )
+
+    @cached_property
+    def volume_availability_zone(self):
+        return factories.VolumeAvailabilityZoneFactory(
+            settings=self.openstack_tenant_service_settings,
         )

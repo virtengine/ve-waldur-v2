@@ -195,6 +195,10 @@ class Tenant(structure_models.PrivateCloud):
         max_length=100, blank=True,
         help_text=_('Optional availability group. Will be used for all instances provisioned in this tenant')
     )
+    default_volume_type_name = models.CharField(
+        max_length=100, blank=True,
+        help_text=_('Volume type name to use when creating volumes.')
+    )
     user_username = models.CharField(max_length=50, blank=True)
     user_password = models.CharField(max_length=50, blank=True)
 
@@ -276,6 +280,7 @@ class SubNet(structure_models.SubResource):
     gateway_ip = models.GenericIPAddressField(protocol='IPv4', null=True)
     allocation_pools = JSONField(default=dict)
     ip_version = models.SmallIntegerField(default=4)
+    disable_gateway = models.BooleanField(default=False)
     enable_dhcp = models.BooleanField(default=True)
     dns_nameservers = JSONField(default=list, help_text=_('List of DNS name servers associated with the subnet.'))
 

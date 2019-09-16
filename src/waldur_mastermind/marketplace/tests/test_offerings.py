@@ -1,24 +1,28 @@
 from __future__ import unicode_literals
 
 import json
+import uuid
 
 from ddt import data, ddt
+import mock
 from rest_framework import exceptions as rest_exceptions
 from rest_framework import test, status
 
-from waldur_core.core.tests.utils import PostgreSQLTest
-from waldur_core.structure.tests import fixtures
+from waldur_core.media.utils import dummy_image
 from waldur_core.structure.tests import factories as structure_factories
-from waldur_mastermind.marketplace import models
+from waldur_core.structure.tests import fixtures
+from waldur_core.structure.tests.fixtures import ServiceFixture
 from waldur_mastermind.common.mixins import UnitPriceMixin
+from waldur_mastermind.marketplace import models
 from waldur_mastermind.marketplace.tests.factories import OFFERING_OPTIONS
+from waldur_mastermind.marketplace_vmware import VIRTUAL_MACHINE_TYPE
 
 from . import factories
 from .. import serializers
 
 
 @ddt
-class OfferingGetTest(PostgreSQLTest):
+class OfferingGetTest(test.APITransactionTestCase):
 
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
@@ -39,7 +43,7 @@ class OfferingGetTest(PostgreSQLTest):
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
 
-class OfferingFilterTest(PostgreSQLTest):
+class OfferingFilterTest(test.APITransactionTestCase):
 
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
@@ -48,7 +52,8 @@ class OfferingFilterTest(PostgreSQLTest):
             'userSupportOption': ['phone'],
         }
         self.offering = factories.OfferingFactory(customer=self.fixture.customer,
-                                                  attributes=attributes)
+                                                  attributes=attributes,
+                                                  shared=False)
         self.url = factories.OfferingFactory.get_list_url()
         self.client.force_authenticate(self.fixture.staff)
 
@@ -135,9 +140,22 @@ class OfferingFilterTest(PostgreSQLTest):
         response = self.client.get(self.url)
         self.assertEqual(len(response.data), 1)
 
+    def test_filter_offerings_by_project(self):
+        fixture = ServiceFixture()
+        self.offering.scope = fixture.service_settings
+        self.offering.save()
+        fixture.service_project_link
+
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {'project_uuid': fixture.project.uuid.hex})
+        self.assertEqual(len(response.data), 1)
+
+        response = self.client.get(self.url, {'project_uuid': self.fixture.project.uuid.hex})
+        self.assertEqual(len(response.data), 0)
+
 
 @ddt
-class OfferingCreateTest(PostgreSQLTest):
+class OfferingCreateTest(test.APITransactionTestCase):
 
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
@@ -154,7 +172,7 @@ class OfferingCreateTest(PostgreSQLTest):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertTrue(models.Offering.objects.filter(customer=self.customer).exists())
 
-    def test_validate_uncorrect_geolocations(self):
+    def test_validate_invalid_geolocations(self):
         response = self.create_offering('staff', add_payload={'geolocations': [{'longitude': 345}]})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertTrue('geolocations' in response.data.keys())
@@ -219,40 +237,253 @@ class OfferingCreateTest(PostgreSQLTest):
         response = self.client.post(url, payload)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    @mock.patch('waldur_azure.backend.AzureClient')
+    def test_create_offering_with_shared_service_settings(self, mocked_backend):
+        plans_request = {
+            'type': 'Azure.VirtualMachine',
+            'service_attributes': {
+                'tenant_id': uuid.uuid4(),
+                'client_id': uuid.uuid4(),
+                'client_secret': uuid.uuid4(),
+                'subscription_id': uuid.uuid4(),
+            },
+            'shared': True
+        }
+        response = self.create_offering('owner', add_payload=plans_request)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        offering = models.Offering.objects.get(uuid=response.data['uuid'])
+        self.assertIsNotNone(response.data['scope'])
+        self.assertEqual(offering.scope.type, 'Azure')
+        self.assertTrue(offering.scope.shared)
+
+    @mock.patch('waldur_azure.backend.AzureClient')
+    def test_create_offering_with_private_service_settings(self, mocked_backend):
+        plans_request = {
+            'type': 'Azure.VirtualMachine',
+            'service_attributes': {
+                'tenant_id': uuid.uuid4(),
+                'client_id': uuid.uuid4(),
+                'client_secret': uuid.uuid4(),
+                'subscription_id': uuid.uuid4(),
+            },
+        }
+        response = self.create_offering('owner', add_payload=plans_request)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        offering = models.Offering.objects.get(uuid=response.data['uuid'])
+        self.assertFalse(offering.scope.shared)
+
     def test_create_offering_with_plans(self):
         plans_request = {
             'plans': [
-                {'name': 'small',
-                 'description': 'CPU 1',
-                 'unit': UnitPriceMixin.Units.QUANTITY,
-                 'unit_price': 100}
+                {
+                    'name': 'Small',
+                    'description': 'Basic plan',
+                }
             ]
         }
         response = self.create_offering('owner', add_payload=plans_request)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(len(response.data['plans']), 1)
 
-    def test_create_offering_with_plan_components(self):
+    def test_specify_max_amount_for_plan(self):
         plans_request = {
             'plans': [
                 {
-                    'name': 'small',
-                    'description': 'CPU 1',
-                    'unit': UnitPriceMixin.Units.QUANTITY,
-                    'unit_price': 100,
-                    'components': [
-                        {
-                            'type': 'cores',
-                            'amount': 10,
-                            'price': 10,
-                        }
-                    ]
+                    'name': 'Small',
+                    'description': 'Basic plan',
+                    'max_amount': 10,
                 }
             ]
         }
         response = self.create_offering('owner', add_payload=plans_request)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(response.data['plans'][0]['components'][0]['amount'], 10)
+        self.assertEqual(response.data['plans'][0]['max_amount'], 10)
+
+    def test_max_amount_should_be_at_least_one(self):
+        plans_request = {
+            'plans': [
+                {
+                    'name': 'Small',
+                    'description': 'Basic plan',
+                    'max_amount': -1,
+                }
+            ]
+        }
+        response = self.create_offering('owner', add_payload=plans_request)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_create_offering_with_custom_components(self):
+        plans_request = {
+            'components': [
+                {
+                    'type': 'cores',
+                    'name': 'Cores',
+                    'measured_unit': 'hours',
+                    'billing_type': 'fixed',
+                }
+            ],
+            'plans': [
+                {
+                    'name': 'small',
+                    'unit': UnitPriceMixin.Units.PER_MONTH,
+                    'prices': {'cores': 10},
+                    'quotas': {'cores': 10},
+                }
+            ]
+        }
+        response = self.create_offering('owner', add_payload=plans_request)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        offering = models.Offering.objects.get(uuid=response.data['uuid'])
+        plan = offering.plans.first()
+        component = plan.components.get(component__type='cores')
+
+        self.assertEqual(plan.unit_price, 100)
+        self.assertEqual(component.amount, 10)
+
+    def test_component_name_should_not_contain_spaces(self):
+        plans_request = {
+            'components': [
+                {
+                    'type': 'vCPU cores',
+                    'name': 'Cores',
+                    'measured_unit': 'hours',
+                    'billing_type': 'fixed',
+                }
+            ],
+            'plans': [
+                {
+                    'name': 'small',
+                    'unit': UnitPriceMixin.Units.PER_MONTH,
+                    'prices': {'cores': 10},
+                    'quotas': {'cores': 10},
+                }
+            ]
+        }
+        response = self.create_offering('owner', add_payload=plans_request)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_usage_based_components_are_ignored_for_unit_price_computing(self):
+        plans_request = {
+            'components': [
+                {
+                    'type': 'cores',
+                    'name': 'Cores',
+                    'measured_unit': 'hours',
+                    'billing_type': 'usage',
+                }
+            ],
+            'plans': [
+                {
+                    'name': 'Small',
+                    'unit': UnitPriceMixin.Units.PER_MONTH,
+                    'prices': {'cores': 10},
+                }
+            ]
+        }
+        response = self.create_offering('owner', add_payload=plans_request)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        offering = models.Offering.objects.get(uuid=response.data['uuid'])
+        plan = offering.plans.first()
+        self.assertEqual(plan.unit_price, 0)
+
+    def test_quotas_are_not_allowed_for_usage_based_components(self):
+        plans_request = {
+            'components': [
+                {
+                    'billing_type': 'usage',
+                    'name': 'Cores',
+                    'measured_unit': 'hours',
+                    'type': 'cores',
+                }
+            ],
+            'plans': [
+                {
+                    'name': 'Small',
+                    'unit': UnitPriceMixin.Units.PER_MONTH,
+                    'prices': {'cores': 10},
+                    'quotas': {'cores': 10},
+                }
+            ]
+        }
+        response = self.create_offering('owner', add_payload=plans_request)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_zero_quotas_are_allowed_for_fixed_components(self):
+        plans_request = {
+            'components': [
+                {
+                    'billing_type': 'fixed',
+                    'name': 'Cores',
+                    'measured_unit': 'hours',
+                    'type': 'cores',
+                }
+            ],
+            'plans': [
+                {
+                    'name': 'Small',
+                    'unit': UnitPriceMixin.Units.PER_MONTH,
+                    'prices': {'cores': 10},
+                    'quotas': {'cores': 0},
+                }
+            ]
+        }
+        response = self.create_offering('owner', add_payload=plans_request)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_zero_price_could_be_skipped_for_fixed_components(self):
+        plans_request = {
+            'components': [
+                {
+                    'billing_type': 'fixed',
+                    'name': 'Cores',
+                    'measured_unit': 'hours',
+                    'type': 'cores',
+                }
+            ],
+            'plans': [
+                {
+                    'name': 'Small',
+                    'unit': UnitPriceMixin.Units.PER_MONTH,
+                    'quotas': {'cores': 10},
+                }
+            ]
+        }
+        response = self.create_offering('owner', add_payload=plans_request)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_invalid_price_components_are_not_allowed(self):
+        plans_request = {
+            'components': [
+                {
+                    'billing_type': 'fixed',
+                    'name': 'Cores',
+                    'measured_unit': 'hours',
+                    'type': 'cores',
+                }
+            ],
+            'plans': [
+                {
+                    'name': 'Small',
+                    'unit': UnitPriceMixin.Units.PER_MONTH,
+                    'quotas': {
+                        'cores': 1,
+                        'invalid_component': 10,
+                    },
+                    'prices': {
+                        'cores': 1,
+                        'invalid_component': 10,
+                    },
+                }
+            ]
+        }
+        response = self.create_offering('owner', add_payload=plans_request)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue('Small' in response.data['plans'][0])
+        self.assertTrue('invalid_component' in response.data['plans'][0])
 
     def test_create_offering_with_options(self):
         response = self.create_offering('staff', attributes=True, add_payload={'options': OFFERING_OPTIONS})
@@ -273,6 +504,50 @@ class OfferingCreateTest(PostgreSQLTest):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertTrue('type' in response.data)
 
+    def test_validate_required_attribute(self):
+        user = getattr(self.fixture, 'staff')
+        self.client.force_authenticate(user)
+        url = factories.OfferingFactory.get_list_url()
+        factories.ServiceProviderFactory(customer=self.customer)
+        category = factories.CategoryFactory()
+        section = factories.SectionFactory(category=category)
+        factories.AttributeFactory(section=section, key='required_attribute', required=True)
+        payload = {
+            'name': 'offering',
+            'category': factories.CategoryFactory.get_url(category),
+            'customer': structure_factories.CustomerFactory.get_url(self.customer),
+            'type': 'Support.OfferingTemplate',
+            'attributes': {'vendorType': 'reseller'},
+        }
+
+        response = self.client.post(url, payload)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue('required_attribute' in response.content)
+
+    def test_default_attribute_value_is_used_if_user_did_not_override_it(self):
+        category = factories.CategoryFactory()
+        section = factories.SectionFactory(category=category)
+        factories.AttributeFactory(section=section, key='support_phone', default='support@example.com')
+
+        response = self.create_offering('staff', add_payload={
+            'category': factories.CategoryFactory.get_url(category),
+            'attributes': {},
+        })
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['attributes']['support_phone'], 'support@example.com')
+
+    def test_default_attribute_value_is_not_used_if_user_has_overriden_it(self):
+        category = factories.CategoryFactory()
+        section = factories.SectionFactory(category=category)
+        factories.AttributeFactory(section=section, key='support_phone', default='support@example.com')
+
+        response = self.create_offering('staff', add_payload={
+            'category': factories.CategoryFactory.get_url(category),
+            'attributes': {'support_phone': 'admin@example.com'}
+        })
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['attributes']['support_phone'], 'admin@example.com')
+
     def create_offering(self, user, attributes=False, add_payload=None):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
@@ -284,6 +559,12 @@ class OfferingCreateTest(PostgreSQLTest):
             'category': factories.CategoryFactory.get_url(),
             'customer': structure_factories.CustomerFactory.get_url(self.customer),
             'type': 'Support.OfferingTemplate',  # This is used only for testing
+            'plans': [
+                {
+                    'name': 'Small',
+                    'unit': UnitPriceMixin.Units.PER_MONTH,
+                }
+            ],
         }
 
         if attributes:
@@ -300,43 +581,343 @@ class OfferingCreateTest(PostgreSQLTest):
 
         return self.client.post(url, payload)
 
+    def test_offering_creating_is_not_available_for_blocked_organization(self):
+        self.customer.blocked = True
+        self.customer.save()
+        response = self.create_offering('owner')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
 
 @ddt
-class OfferingUpdateTest(PostgreSQLTest):
+class OfferingUpdateTest(test.APITransactionTestCase):
 
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.customer = self.fixture.customer
 
+        factories.ServiceProviderFactory(customer=self.customer)
+        self.offering = factories.OfferingFactory(customer=self.customer, shared=True)
+        self.url = factories.OfferingFactory.get_url(self.offering)
+
     @data('staff', 'owner')
-    def test_authorized_user_can_update_offering(self, user):
-        response, offering = self.update_offering(user)
+    def test_staff_and_owner_can_update_offering_in_draft_state(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.patch(self.url, {'name': 'new_offering'})
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        self.assertEqual(offering.name, 'new_offering')
-        self.assertTrue(models.Offering.objects.filter(name='new_offering').exists())
+
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.name, 'new_offering')
 
     @data('user', 'customer_support', 'admin', 'manager')
     def test_unauthorized_user_can_not_update_offering(self, user):
-        response, offering = self.update_offering(user)
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.patch(self.url, {'name': 'new_offering'})
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
-    def update_offering(self, user):
-        user = getattr(self.fixture, user)
-        self.client.force_authenticate(user)
-        factories.ServiceProviderFactory(customer=self.customer)
-        offering = factories.OfferingFactory(customer=self.customer, shared=True)
-        url = factories.OfferingFactory.get_url(offering)
+    @data(models.Offering.States.ACTIVE, models.Offering.States.PAUSED, models.Offering.States.ARCHIVED)
+    def test_owner_can_not_update_offering_in_active_or_paused_state(self, state):
+        # Arrange
+        self.offering.state = state
+        self.offering.save()
 
-        response = self.client.patch(url, {
-            'name': 'new_offering'
-        })
-        offering.refresh_from_db()
+        # Act
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.patch(self.url, {'name': 'new_offering'})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
-        return response, offering
+    @data(models.Offering.States.ACTIVE, models.Offering.States.PAUSED)
+    def test_staff_can_update_offering_in_active_or_paused_state(self, state):
+        # Arrange
+        self.offering.state = state
+        self.offering.save()
+
+        # Act
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.patch(self.url, {'name': 'new_offering'})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_staff_can_not_update_offering_in_archived_state(self):
+        # Arrange
+        self.offering.state = models.Offering.States.ARCHIVED
+        self.offering.save()
+
+        # Act
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.patch(self.url, {'name': 'new_offering'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_offering_updating_is_not_available_for_blocked_organization(self):
+        self.customer.blocked = True
+        self.customer.save()
+
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.patch(self.url, {'name': 'new_offering'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_if_category_is_updated_required_attributes_are_validated(self):
+        # Arrange
+        category = factories.CategoryFactory()
+        section = factories.SectionFactory(category=category)
+        factories.AttributeFactory(section=section, key='userSupportOptions', required=True)
+
+        # Act
+        self.client.force_authenticate(self.fixture.owner)
+        category_url = factories.CategoryFactory.get_url(category)
+        response = self.client.patch(self.url, {'category': category_url})
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_if_category_is_updated_attributes_are_validated(self):
+        # Arrange
+        category = factories.CategoryFactory()
+        section = factories.SectionFactory(category=category)
+        factories.AttributeFactory(section=section, key='userSupportOptions', required=True)
+
+        # Act
+        attributes = {'userSupportOptions': 'email'}
+        category_url = factories.CategoryFactory.get_url(category)
+        payload = {'category': category_url, 'attributes': attributes}
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.patch(self.url, payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.category, category)
+
+    def test_it_should_not_be_possible_to_delete_components_if_they_are_used(self):
+        # Arrange
+        factories.OfferingComponentFactory(offering=self.offering)
+        factories.ResourceFactory(offering=self.offering)
+
+        # Act
+        payload = {'components': []}
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.patch(self.url, payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_it_should_be_possible_to_delete_components_if_they_are_not_used(self):
+        # Arrange
+        factories.OfferingComponentFactory(offering=self.offering)
+
+        # Act
+        payload = {'components': []}
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.patch(self.url, payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.offering.refresh_from_db()
+        self.assertEqual(0, self.offering.components.count())
+
+    def test_it_should_be_possible_to_create_new_components(self):
+        # Act
+        components = [
+            {
+                'type': 'cores',
+                'name': 'Cores',
+                'measured_unit': 'hours',
+                'billing_type': 'fixed',
+            }
+        ]
+        payload = {'components': components}
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.patch(self.url, payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        component = self.offering.components.get()
+        self.assertEqual('cores', component.type)
+        self.assertEqual('hours', component.measured_unit)
+        self.assertEqual(models.OfferingComponent.BillingTypes.FIXED, component.billing_type)
+
+    def test_it_should_be_possible_to_update_existing_components(self):
+        factories.OfferingComponentFactory(
+            offering=self.offering,
+            type='cores',
+            name='CPU',
+            measured_unit='H',
+        )
+        # Act
+        components = [
+            {
+                'type': 'cores',
+                'name': 'Cores',
+                'measured_unit': 'hours',
+                'billing_type': 'fixed',
+            }
+        ]
+        payload = {'components': components}
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.patch(self.url, payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        component = self.offering.components.get()
+        self.assertEqual('Cores', component.name)
+        self.assertEqual('hours', component.measured_unit)
+        self.assertEqual(models.OfferingComponent.BillingTypes.FIXED, component.billing_type)
+
+    def test_it_should_be_possible_to_update_plan_name(self):
+        # Arrange
+        plan = factories.PlanFactory(offering=self.offering, name='Old name')
+
+        # Act
+        payload = {
+            'plans': [
+                {
+                    'uuid': plan.uuid.hex,
+                    'name': 'New name',
+                }
+            ]
+        }
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.patch(self.url, payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        plan.refresh_from_db()
+        self.assertEqual(plan.name, 'New name')
+
+    def test_it_should_be_possible_to_create_plan_components(self):
+        # Arrange
+        plan = factories.PlanFactory(offering=self.offering)
+        offering_component = factories.OfferingComponentFactory(offering=self.offering, type='ram')
+
+        # Act
+        payload = {
+            'plans': [
+                {
+                    'uuid': plan.uuid.hex,
+                    'quotas': {
+                        'ram': 20,
+                    },
+                    'prices': {
+                        'ram': 2,
+                    }
+                }
+            ]
+        }
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.patch(self.url, payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        plan_component = models.PlanComponent.objects.get(plan=plan, component=offering_component)
+        self.assertEqual(plan_component.amount, 20)
+        self.assertEqual(plan_component.price, 2)
+
+    def test_when_thumbnail_is_uploaded_plans_are_not_archived(self):
+        # Arrange
+        plan = factories.PlanFactory(offering=self.offering)
+
+        # Act
+        payload = {'thumbnail': dummy_image()}
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.patch(self.url, payload, format='multipart')
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        plan.refresh_from_db()
+        self.assertFalse(plan.archived)
+
+    def test_it_should_not_be_possible_to_remove_builtin_components(self):
+        # Arrange
+        self.offering.type = VIRTUAL_MACHINE_TYPE
+        self.offering.save()
+
+        cpu_component = factories.OfferingComponentFactory(offering=self.offering, type='cpu')
+
+        # Act
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.patch(self.url, {'components': []})
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        cpu_component.refresh_from_db()
+
+    def test_it_should_be_possible_to_update_plan_components(self):
+        # Arrange
+        plan = factories.PlanFactory(offering=self.offering)
+        offering_component = factories.OfferingComponentFactory(offering=self.offering, type='ram')
+        plan_component = factories.PlanComponentFactory(
+            plan=plan,
+            component=offering_component,
+            amount=10,
+            price=1,
+        )
+
+        # Act
+        payload = {
+            'plans': [
+                {
+                    'uuid': plan.uuid.hex,
+                    'quotas': {
+                        'ram': 20,
+                    },
+                    'prices': {
+                        'ram': 2,
+                    }
+                }
+            ]
+        }
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.patch(self.url, payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        plan_component.refresh_from_db()
+        self.assertEqual(plan_component.amount, 20)
+        self.assertEqual(plan_component.price, 2)
+
+    def test_it_should_be_possible_to_archive_plan(self):
+        # Arrange
+        plan = factories.PlanFactory(offering=self.offering)
+
+        # Act
+        payload = {
+            'plans': []
+        }
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.patch(self.url, payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        plan.refresh_from_db()
+        self.assertTrue(plan.archived)
+
+    def test_it_should_be_possible_to_add_new_plan(self):
+        payload = {
+            'components': [
+                {
+                    'type': 'cores',
+                    'name': 'Cores',
+                    'measured_unit': 'hours',
+                    'billing_type': 'fixed',
+                }
+            ],
+            'plans': [
+                {
+                    'name': 'small',
+                    'unit': UnitPriceMixin.Units.PER_MONTH,
+                    'prices': {'cores': 10},
+                    'quotas': {'cores': 10},
+                }
+            ]
+        }
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.patch(self.url, payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(1, self.offering.plans.count())
 
 
 @ddt
-class OfferingDeleteTest(PostgreSQLTest):
+class OfferingDeleteTest(test.APITransactionTestCase):
 
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
@@ -356,6 +937,12 @@ class OfferingDeleteTest(PostgreSQLTest):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         self.assertTrue(models.Offering.objects.filter(customer=self.customer).exists())
 
+    def test_offering_deleting_is_not_available_for_blocked_organization(self):
+        self.customer.blocked = True
+        self.customer.save()
+        response = self.delete_offering('owner')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
     def delete_offering(self, user):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
@@ -368,7 +955,7 @@ class OfferingDeleteTest(PostgreSQLTest):
 class OfferingAttributesTest(test.APITransactionTestCase):
 
     def setUp(self):
-        self.serializer = serializers.OfferingSerializer()
+        self.serializer = serializers.OfferingCreateSerializer()
         self.category = factories.CategoryFactory()
         self.section = factories.SectionFactory(category=self.category)
         self.attribute = factories.AttributeFactory(
@@ -413,7 +1000,7 @@ class OfferingAttributesTest(test.APITransactionTestCase):
     def test_integer_attribute_is_valid(self):
         self._valid('integer', 1)
 
-    @data(['web_chat'], 'web_chat', False)
+    @data(['web_chat'], 'web_chat', -1)
     def test_integer_attribute_is_not_valid(self, value):
         self._not_valid('integer', value)
 
@@ -428,48 +1015,98 @@ class OfferingAttributesTest(test.APITransactionTestCase):
         self.attribute.type = attribute_type
         self.attribute.save()
         attributes = {
-            'userSupportOptions': value,
+            'attributes': {
+                'userSupportOptions': value,
+            },
+            'category': self.category
         }
-        self.assertIsNone(self.serializer._validate_attributes(attributes, self.category))
+        self.assertIsNone(self.serializer._validate_attributes(attributes))
 
     def _not_valid(self, attribute_type, value):
         self.attribute.type = attribute_type
         self.attribute.save()
         attributes = {
-            'userSupportOptions': value,
+            'attributes': {
+                'userSupportOptions': value,
+            },
+            'category': self.category,
         }
         self.assertRaises(rest_exceptions.ValidationError, self.serializer._validate_attributes,
-                          attributes, self.category)
+                          attributes)
 
 
-class OfferingQuotaTest(PostgreSQLTest):
+class OfferingQuotaTest(test.APITransactionTestCase):
     def get_usage(self, category):
         return category.quotas.get(name='offering_count').usage
 
     def test_empty_category(self):
         self.assertEqual(0, self.get_usage(factories.CategoryFactory()))
 
-    def test_offering_count_quota_is_populated(self):
+    def test_active_offerings_are_counted(self):
         category = factories.CategoryFactory()
         provider = factories.ServiceProviderFactory()
-        factories.OfferingFactory.create_batch(3, category=category, customer=provider.customer)
+        factories.OfferingFactory.create_batch(
+            3, category=category, customer=provider.customer, state=models.Offering.States.ACTIVE)
         self.assertEqual(3, self.get_usage(category))
+
+    def test_draft_offerings_are_not_counted(self):
+        category = factories.CategoryFactory()
+        provider = factories.ServiceProviderFactory()
+        factories.OfferingFactory.create_batch(
+            2, category=category, customer=provider.customer, state=models.Offering.States.DRAFT)
+        self.assertEqual(0, self.get_usage(category))
 
 
 @ddt
-class OfferingStateTest(PostgreSQLTest):
+class OfferingCountTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.customer = self.fixture.customer
+        self.provider = factories.ServiceProviderFactory(customer=self.customer)
+        self.category = factories.CategoryFactory()
+        self.url = factories.CategoryFactory.get_url(self.category)
+
+    def assert_count(self, user, value, shared=False):
+        factories.OfferingFactory.create_batch(
+            2,
+            customer=self.customer,
+            category=self.category,
+            shared=shared,
+            state=models.Offering.States.ACTIVE
+        )
+        self.client.force_authenticate(user)
+        response = self.client.get(self.url)
+        self.assertEqual(value, response.data['offering_count'])
+
+    @data('staff', 'owner', 'admin', 'manager')
+    def test_authorized_user_can_see_private_offering(self, user):
+        self.assert_count(getattr(self.fixture, user), 2)
+
+    @data('owner', 'admin', 'manager')
+    def test_unauthorized_user_can_not_see_private_offering(self, user):
+        self.assert_count(getattr(fixtures.ProjectFixture(), user), 0)
+
+    @data('staff', 'owner', 'admin', 'manager')
+    def test_anyone_can_see_public_offering(self, user):
+        self.assert_count(getattr(fixtures.ProjectFixture(), user), 2, shared=True)
+
+
+@ddt
+class OfferingStateTest(test.APITransactionTestCase):
 
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.customer = self.fixture.customer
+        factories.ServiceProviderFactory(customer=self.customer)
+        self.offering = factories.OfferingFactory(customer=self.customer, shared=True)
 
-    @data('staff', 'owner')
+    @data('staff',)
     def test_authorized_user_can_update_state(self, user):
         response, offering = self.update_offering_state(user, 'activate')
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertEqual(offering.state, offering.States.ACTIVE)
 
-    @data('user', 'customer_support', 'admin', 'manager')
+    @data('owner', 'user', 'customer_support', 'admin', 'manager')
     def test_unauthorized_user_can_not_update_state(self, user):
         response, offering = self.update_offering_state(user, 'activate')
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
@@ -480,19 +1117,37 @@ class OfferingStateTest(PostgreSQLTest):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
         self.assertEqual(offering.state, offering.States.DRAFT)
 
-    def update_offering_state(self, user, state):
+    @data('activate', 'pause', 'archive')
+    def test_offering_state_changing_is_not_available_for_blocked_organization(self, state):
+        self.customer.blocked = True
+        self.customer.save()
+        response, offering = self.update_offering_state('staff', state)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_user_can_provide_paused_reason(self):
+        # Arrange
+        self.offering.state = models.Offering.States.ACTIVE
+        self.offering.save()
+
+        # Act
+        response, offering = self.update_offering_state('staff', 'pause', {
+            'paused_reason': 'Not available anymore.'})
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(offering.paused_reason, 'Not available anymore.')
+
+    def update_offering_state(self, user, state, payload=None):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
-        factories.ServiceProviderFactory(customer=self.customer)
-        offering = factories.OfferingFactory(customer=self.customer, shared=True)
-        url = factories.OfferingFactory.get_url(offering, state)
-        response = self.client.post(url)
-        offering.refresh_from_db()
+        url = factories.OfferingFactory.get_url(self.offering, state)
+        response = self.client.post(url, payload)
+        self.offering.refresh_from_db()
 
-        return response, offering
+        return response, self.offering
 
 
-class AllowedCustomersTest(PostgreSQLTest):
+class AllowedCustomersTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.customer = self.fixture.customer

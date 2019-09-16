@@ -1,3 +1,5 @@
+from django.conf.urls import url
+
 from . import views
 
 
@@ -11,6 +13,8 @@ def register_in(router):
     router.register(r'openstacktenant-security-groups', views.SecurityGroupViewSet, base_name='openstacktenant-sgp')
     router.register(r'openstacktenant-volumes', views.VolumeViewSet, base_name='openstacktenant-volume')
     router.register(r'openstacktenant-snapshots', views.SnapshotViewSet, base_name='openstacktenant-snapshot')
+    router.register(r'openstacktenant-instance-availability-zones', views.InstanceAvailabilityZoneViewSet,
+                    base_name='openstacktenant-instance-availability-zone')
     router.register(r'openstacktenant-instances', views.InstanceViewSet, base_name='openstacktenant-instance')
     router.register(r'openstacktenant-backups', views.BackupViewSet, base_name='openstacktenant-backup')
     router.register(r'openstacktenant-backup-schedules', views.BackupScheduleViewSet,
@@ -19,3 +23,12 @@ def register_in(router):
                     base_name='openstacktenant-snapshot-schedule')
     router.register(r'openstacktenant-subnets', views.SubNetViewSet, base_name='openstacktenant-subnet')
     router.register(r'openstacktenant-networks', views.NetworkViewSet, base_name='openstacktenant-network')
+    router.register(r'openstacktenant-volume-types', views.VolumeTypeViewSet, base_name='openstacktenant-volume-type')
+    router.register(r'openstacktenant-volume-availability-zones', views.VolumeAvailabilityZoneViewSet,
+                    base_name='openstacktenant-volume-availability-zone')
+
+
+urlpatterns = [
+    url(r'^api/openstack-shared-settings-instances/$', views.SharedSettingsInstances.as_view()),
+    url(r'^api/openstack-shared-settings-customers/$', views.SharedSettingsCustomers.as_view()),
+]

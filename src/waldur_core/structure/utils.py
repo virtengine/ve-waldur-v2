@@ -1,16 +1,19 @@
 import collections
 import logging
 
+from django.conf import settings
 from django.db import models
 from django.db.migrations.topological_sort import stable_topological_sort
 from django.utils.lru_cache import lru_cache
+from django.utils.translation import ugettext_lazy as _
+from rest_framework.exceptions import ValidationError
 import requests
 
 from . import SupportedServices
 
 logger = logging.getLogger(__name__)
 Coordinates = collections.namedtuple('Coordinates', ('latitude', 'longitude'))
-FieldInfo = collections.namedtuple('FieldInfo', 'fields fields_required extra_fields_required')
+FieldInfo = collections.namedtuple('FieldInfo', 'fields fields_required extra_fields_required extra_fields_default')
 
 
 class GeoIpException(Exception):
@@ -18,7 +21,12 @@ class GeoIpException(Exception):
 
 
 def get_coordinates_by_ip(ip_address):
-    url = 'http://freegeoip.net/json/{}'.format(ip_address)
+    if not settings.IPSTACK_ACCESS_KEY:
+        raise GeoIpException("IPSTACK_ACCESS_KEY is empty.")
+
+    url = 'http://api.ipstack.com/{}?access_key={}&output=json&legacy=1'.format(
+        ip_address,
+        settings.IPSTACK_ACCESS_KEY)
 
     try:
         response = requests.get(url)
@@ -62,6 +70,7 @@ def sort_dependencies(service_model, resources):
 @lru_cache(maxsize=1)
 def get_all_services_field_info():
     services_fields = dict()
+    services_fields_default_value = dict()
     services_fields_required = dict()
     services_extra_fields_required = dict()
     service_models = SupportedServices.get_service_models()
@@ -73,6 +82,11 @@ def get_all_services_field_info():
         fields = service_serializer.SERVICE_ACCOUNT_FIELDS.keys() \
             if service_serializer.SERVICE_ACCOUNT_FIELDS is not NotImplemented else []
 
+        extra_field_options = getattr(service_serializer.Meta, 'extra_field_options', {})
+        fields_default_value = {k: v.get('default_value')
+                                for k, v in extra_field_options.items()
+                                if v.get('default_value')}
+
         fields_extra = service_serializer.SERVICE_ACCOUNT_EXTRA_FIELDS.keys() \
             if service_serializer.SERVICE_ACCOUNT_EXTRA_FIELDS is not NotImplemented else []
 
@@ -82,10 +96,12 @@ def get_all_services_field_info():
         services_fields[service_name] = list(fields)
         services_fields_required[service_name] = list(set(fields) & set(fields_required))
         services_extra_fields_required[service_name] = list(set(fields_extra) & set(fields_required))
+        services_fields_default_value[service_name] = fields_default_value
 
     return FieldInfo(fields=services_fields,
                      fields_required=services_fields_required,
-                     extra_fields_required=services_extra_fields_required)
+                     extra_fields_required=services_extra_fields_required,
+                     extra_fields_default=services_fields_default_value)
 
 
 def update_pulled_fields(instance, imported_instance, fields):
@@ -146,5 +162,13 @@ def handle_resource_update_success(resource):
 
     if update_fields:
         resource.save(update_fields=update_fields)
-    logger.warning('%s %s (PK: %s) was successfully updated.' % (
+    logger.info('%s %s (PK: %s) was successfully updated.' % (
         resource.__class__.__name__, resource, resource.pk))
+
+
+def check_customer_blocked(obj):
+    from waldur_core.structure import permissions
+
+    customer = permissions._get_customer(obj)
+    if customer and customer.blocked:
+        raise ValidationError(_('Blocked organization is not available.'))

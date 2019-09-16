@@ -1,5 +1,6 @@
 import uuid
 
+from celery import Signature
 from cinderclient import exceptions as cinder_exceptions
 from ddt import ddt, data
 from django.conf import settings
@@ -9,11 +10,54 @@ from rest_framework import status, test
 import mock
 from six.moves import urllib
 
-from waldur_openstack.openstack.tests.unittests import test_backend
+from waldur_core.core.utils import serialize_instance
 from waldur_core.structure.tests import factories as structure_factories
+from waldur_openstack.openstack.tests.unittests import test_backend
+from waldur_openstack.openstack_tenant.tests.helpers import override_openstack_tenant_settings
 
-from . import factories, fixtures
-from .. import models, views
+from . import factories, fixtures, helpers
+from .. import executors, models, views
+
+
+class InstanceFilterTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.OpenStackTenantFixture()
+        self.client.force_authenticate(user=self.fixture.owner)
+        self.url = factories.InstanceFactory.get_list_url()
+
+    def test_filter_instance_by_valid_volume_uuid(self):
+        self.fixture.instance
+        response = self.client.get(self.url, {'attach_volume_uuid': self.fixture.volume.uuid})
+        self.assertEqual(len(response.data), 1)
+
+    def test_filter_instance_by_invalid_volume_uuid(self):
+        self.fixture.instance
+        response = self.client.get(self.url, {'attach_volume_uuid': 'invalid'})
+        self.assertEqual(len(response.data), 0)
+
+    def test_filter_instance_by_availability_zone(self):
+        vm_az = self.fixture.instance_availability_zone
+        vm = self.fixture.instance
+        vm.availability_zone = vm_az
+        vm.save()
+
+        volume_az = self.fixture.volume_availability_zone
+        volume = self.fixture.volume
+        volume.availability_zone = volume_az
+        volume.save()
+
+        private_settings = self.fixture.openstack_tenant_service_settings
+        shared_settings = private_settings.scope.service_settings
+
+        shared_settings.options = {
+            'valid_availability_zones': {
+                vm_az.name: volume_az.name
+            }
+        }
+        shared_settings.save()
+
+        response = self.client.get(self.url, {'attach_volume_uuid': volume.uuid})
+        self.assertEqual(len(response.data), 1)
 
 
 @ddt
@@ -57,9 +101,14 @@ class InstanceCreateTest(test.APITransactionTestCase):
         self.assertEqual(self.openstack_settings.quotas.get(name=Quotas.vcpu).usage, instance.cores)
         self.assertEqual(self.openstack_settings.quotas.get(name=Quotas.instances).usage, 1)
 
-        self.assertEqual(self.openstack_spl.quotas.get(name=self.openstack_spl.Quotas.ram).usage, instance.ram)
-        self.assertEqual(self.openstack_spl.quotas.get(name=self.openstack_spl.Quotas.storage).usage, instance.disk)
-        self.assertEqual(self.openstack_spl.quotas.get(name=self.openstack_spl.Quotas.vcpu).usage, instance.cores)
+        self.assertEqual(self.openstack_spl.quotas.get(name=Quotas.ram).usage, instance.ram)
+        self.assertEqual(self.openstack_spl.quotas.get(name=Quotas.storage).usage, instance.disk)
+        self.assertEqual(self.openstack_spl.quotas.get(name=Quotas.vcpu).usage, instance.cores)
+
+        self.assertEqual(self.openstack_settings.scope.quotas.get(name=Quotas.ram).usage, instance.ram)
+        self.assertEqual(self.openstack_settings.scope.quotas.get(name=Quotas.storage).usage, instance.disk)
+        self.assertEqual(self.openstack_settings.scope.quotas.get(name=Quotas.vcpu).usage, instance.cores)
+        self.assertEqual(self.openstack_settings.scope.quotas.get(name=Quotas.instances).usage, 1)
 
     def test_project_quotas_updated_when_instance_is_created(self):
         response = self.client.post(self.url, self.get_valid_data())
@@ -150,6 +199,17 @@ class InstanceCreateTest(test.APITransactionTestCase):
         instance = models.Instance.objects.get(uuid=response.data['uuid'])
         self.assertIn(floating_ip, instance.floating_ips)
 
+    def test_service_settings_should_have_external_network_id(self):
+        ss = self.openstack_spl.service.settings
+        ss.options = {'external_network_id': 'invalid'}
+        ss.save()
+
+        subnet_url = factories.SubNetFactory.get_url(self.subnet)
+        data = self.get_valid_data(floating_ips=[{'subnet': subnet_url}])
+
+        response = self.client.post(self.url, data)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
     def test_user_cannot_assign_floating_ip_from_other_settings_to_instance(self):
         subnet_url = factories.SubNetFactory.get_url(self.subnet)
         floating_ip = factories.FloatingIPFactory()
@@ -238,6 +298,97 @@ class InstanceCreateTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn('internal_ips_set', response.data)
 
+    def test_show_volume_type_in_instance_serializer(self):
+        instance = factories.InstanceFactory()
+        settings = instance.service_project_link.service.settings
+        volume_type = factories.VolumeTypeFactory(settings=settings)
+        factories.VolumeFactory(service_project_link=instance.service_project_link,
+                                instance=instance,
+                                type=volume_type)
+        url = factories.InstanceFactory.get_url(instance)
+        staff = structure_factories.UserFactory(is_staff=True)
+        self.client.force_authenticate(user=staff)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['volumes'][0]['type_name'], volume_type.name)
+
+    def test_user_can_define_instance_availability_zone(self):
+        zone = self.openstack_tenant_fixture.instance_availability_zone
+        data = self.get_valid_data(
+            availability_zone=factories.InstanceAvailabilityZoneFactory.get_url(zone))
+
+        response = self.client.post(self.url, data)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        instance = models.Instance.objects.get(uuid=response.data['uuid'])
+        self.assertEqual(instance.availability_zone, zone)
+
+    def test_availability_zone_should_be_available(self):
+        zone = self.openstack_tenant_fixture.instance_availability_zone
+        zone.available = False
+        zone.save()
+        data = self.get_valid_data(
+            availability_zone=factories.InstanceAvailabilityZoneFactory.get_url(zone))
+
+        response = self.client.post(self.url, data)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_availability_zone_should_be_related_to_the_same_service_settings(self):
+        zone = factories.InstanceAvailabilityZoneFactory()
+        data = self.get_valid_data(
+            availability_zone=factories.InstanceAvailabilityZoneFactory.get_url(zone))
+
+        response = self.client.post(self.url, data)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_volume_AZ_should_be_matched_with_instance_AZ(self):
+        # Arrange
+        vm_az = self.openstack_tenant_fixture.instance_availability_zone
+        volume_az = self.openstack_tenant_fixture.volume_availability_zone
+
+        private_ss = self.openstack_tenant_fixture.openstack_tenant_service_settings
+        shared_ss = private_ss.scope.service_settings
+
+        shared_ss.options = {
+            'valid_availability_zones': {
+                vm_az.name: volume_az.name
+            }
+        }
+        shared_ss.save()
+
+        vm_az_url = factories.InstanceAvailabilityZoneFactory.get_url(vm_az)
+        data = self.get_valid_data(availability_zone=vm_az_url)
+
+        # Act
+        response = self.client.post(self.url, data)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        instance = models.Instance.objects.get(uuid=response.data['uuid'])
+
+        self.assertEqual(instance.availability_zone, vm_az)
+        self.assertEqual(instance.volumes.first().availability_zone, volume_az)
+        self.assertEqual(instance.volumes.last().availability_zone, volume_az)
+
+    @override_openstack_tenant_settings(REQUIRE_AVAILABILITY_ZONE=True)
+    def test_when_availability_zone_is_mandatory_and_exists_validation_fails(self):
+        self.openstack_tenant_fixture.instance_availability_zone
+        data = self.get_valid_data()
+
+        response = self.client.post(self.url, data)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @override_openstack_tenant_settings(REQUIRE_AVAILABILITY_ZONE=True)
+    def test_when_availability_zone_is_mandatory_and_does_not_exist_validation_succeeds(self):
+        data = self.get_valid_data()
+
+        response = self.client.post(self.url, data)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
 
 class InstanceDeleteTest(test_backend.BaseBackendTestCase):
     def setUp(self):
@@ -300,8 +451,6 @@ class InstanceDeleteTest(test_backend.BaseBackendTestCase):
         nova.servers.delete.assert_called_once_with(self.instance.backend_id)
         nova.servers.get.assert_called_once_with(self.instance.backend_id)
 
-        self.assertFalse(nova.volumes.delete_server_volume.called)
-
     def test_database_models_deleted(self):
         self.mock_volumes(True)
         self.delete_instance()
@@ -316,13 +465,15 @@ class InstanceDeleteTest(test_backend.BaseBackendTestCase):
 
         self.instance.service_project_link.service.settings.refresh_from_db()
         quotas = self.instance.service_project_link.service.settings.quotas
+        tenant_quotas = self.instance.service_project_link.service.settings.scope.quotas
 
-        self.assert_quota_usage(quotas, 'instances', 0)
-        self.assert_quota_usage(quotas, 'vcpu', 0)
-        self.assert_quota_usage(quotas, 'ram', 0)
+        for scope in (quotas, tenant_quotas):
+            self.assert_quota_usage(scope, 'instances', 0)
+            self.assert_quota_usage(scope, 'vcpu', 0)
+            self.assert_quota_usage(scope, 'ram', 0)
 
-        self.assert_quota_usage(quotas, 'volumes', 0)
-        self.assert_quota_usage(quotas, 'storage', 0)
+            self.assert_quota_usage(scope, 'volumes', 0)
+            self.assert_quota_usage(scope, 'storage', 0)
 
     def test_backend_methods_are_called_if_instance_is_deleted_without_volumes(self):
         self.mock_volumes(False)
@@ -380,25 +531,49 @@ class InstanceDeleteTest(test_backend.BaseBackendTestCase):
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT, response.data)
 
     def test_neutron_methods_are_called_if_instance_is_deleted_with_floating_ips(self):
+        self.mock_volumes(False)
         fixture = fixtures.OpenStackTenantFixture()
         internal_ip = factories.InternalIPFactory.create(instance=self.instance, subnet=fixture.subnet)
         settings = self.instance.service_project_link.service.settings
         floating_ip = factories.FloatingIPFactory.create(internal_ip=internal_ip, settings=settings)
-        self.delete_instance({'release_floating_ips': True})
+        self.delete_instance({
+            'release_floating_ips': True,
+            'delete_volumes': False,
+        })
         self.mocked_neutron().delete_floatingip.assert_called_once_with(floating_ip.backend_id)
 
     def test_neutron_methods_are_not_called_if_instance_does_not_have_any_floating_ips_yet(self):
-        self.delete_instance({'release_floating_ips': True})
+        self.mock_volumes(False)
+        self.delete_instance({
+            'release_floating_ips': True,
+            'delete_volumes': False,
+        })
         self.assertEqual(self.mocked_neutron().delete_floatingip.call_count, 0)
 
     def test_neutron_methods_are_not_called_if_user_did_not_ask_for_floating_ip_removal_explicitly(self):
+        self.mock_volumes(False)
         self.mocked_neutron().show_floatingip.return_value = {'floatingip': {'status': 'DOWN'}}
         fixture = fixtures.OpenStackTenantFixture()
         internal_ip = factories.InternalIPFactory.create(instance=self.instance, subnet=fixture.subnet)
         settings = self.instance.service_project_link.service.settings
         factories.FloatingIPFactory.create(internal_ip=internal_ip, settings=settings)
-        self.delete_instance({'release_floating_ips': False})
+        self.delete_instance({
+            'release_floating_ips': False,
+            'delete_volumes': False
+        })
         self.assertEqual(self.mocked_neutron().delete_floatingip.call_count, 0)
+
+    def test_incomplete_instance_deletion_executor_produces_celery_signature(self):
+        # Arrange
+        self.instance.backend_id = None
+        self.instance.save()
+
+        # Act
+        serialized_instance = serialize_instance(self.instance)
+        signature = executors.InstanceDeleteExecutor.get_task_signature(self.instance, serialized_instance)
+
+        # Assert
+        self.assertIsInstance(signature, Signature)
 
 
 class InstanceCreateBackupSchedule(test.APITransactionTestCase):
@@ -771,3 +946,78 @@ class InstanceImportTest(BaseInstanceImportTest):
         response = self.client.post(self.url, payload)
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+
+
+@ddt
+class InstanceActionsTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.OpenStackTenantFixture()
+        self.fixture.openstack_tenant_service_settings.options = {
+            'external_network_id': uuid.uuid4().hex,
+            'tenant_id': self.fixture.tenant.id}
+        self.fixture.openstack_tenant_service_settings.save()
+        self.instance = self.fixture.instance
+
+        self.url = factories.InstanceFactory.get_url(self.instance, action=self.action)
+        self.mock_path = \
+            mock.patch('waldur_openstack.openstack_tenant.backend.OpenStackTenantBackend.%s' % self.backend_method)
+        self.mock_console = self.mock_path.start()
+        self.mock_console.return_value = self.backend_return_value
+
+    def tearDown(self):
+        super(InstanceActionsTest, self).tearDown()
+        mock.patch.stopall()
+
+
+@ddt
+class InstanceConsoleTest(InstanceActionsTest):
+    action = 'console'
+    backend_method = 'get_console_url'
+    backend_return_value = 'url'
+
+    @data('staff')
+    def test_action_available_to_staff(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.mock_console.assert_called_once_with(self.instance)
+
+    @data('admin', 'manager', 'owner')
+    def test_action_not_available_for_users(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @data('staff', 'admin', 'manager', 'owner')
+    @helpers.override_openstack_tenant_settings(ALLOW_CUSTOMER_USERS_OPENSTACK_CONSOLE_ACCESS=True)
+    def test_action_available_for_users_if_this_allowed_in_settings(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    @data('user')
+    @helpers.override_openstack_tenant_settings(ALLOW_CUSTOMER_USERS_OPENSTACK_CONSOLE_ACCESS=True)
+    def test_action_not_available_for_other_users(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+@ddt
+class InstanceConsoleLogTest(InstanceActionsTest):
+    action = 'console_log'
+    backend_method = 'get_console_output'
+    backend_return_value = 'openstack-vm login: '
+
+    @data('staff', 'admin', 'manager', 'owner')
+    def test_action_available_for_staff_and_users_associated_with_project(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.mock_console.assert_called_once_with(self.instance, None)
+
+    @data('user')
+    def test_action_not_available_for_users_unassociated_with_project(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)

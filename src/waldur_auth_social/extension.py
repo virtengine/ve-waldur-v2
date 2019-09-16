@@ -8,21 +8,33 @@ class AuthSocialExtension(WaldurExtension):
     class Settings:
         # wiki: https://opennode.atlassian.net/wiki/display/WD/AuthSocial+plugin+configuration
         WALDUR_AUTH_SOCIAL = {
-            'GOOGLE_SECRET': 'PLACEHOLDER',
-            'GOOGLE_CLIENT_ID': 'PLACEHOLDER',
+            'GOOGLE_SECRET': '',
+            'GOOGLE_CLIENT_ID': '',
 
-            'FACEBOOK_SECRET': 'PLACEHOLDER',
-            'FACEBOOK_CLIENT_ID': 'PLACEHOLDER',
+            'FACEBOOK_SECRET': '',
+            'FACEBOOK_CLIENT_ID': '',
 
-            'SMARTIDEE_SECRET': 'PLACEHOLDER',
-            'SMARTIDEE_CLIENT_ID': 'PLACEHOLDER',
+            'SMARTIDEE_SECRET': '',
+            'SMARTIDEE_CLIENT_ID': '',
+
+            'TARA_SECRET': '',
+            'TARA_CLIENT_ID': '',
+            'TARA_SANDBOX': True,
+            'TARA_LABEL': 'Riigi Autentimisteenus',
 
             'USER_ACTIVATION_URL_TEMPLATE': 'http://example.com/#/activate/{user_uuid}/{token}/',
         }
 
     @staticmethod
     def get_public_settings():
-        return ['GOOGLE_CLIENT_ID', 'FACEBOOK_CLIENT_ID', 'SMARTIDEE_CLIENT_ID']
+        return [
+            'GOOGLE_CLIENT_ID',
+            'FACEBOOK_CLIENT_ID',
+            'SMARTIDEE_CLIENT_ID',
+            'TARA_CLIENT_ID',
+            'TARA_SANDBOX',
+            'TARA_LABEL',
+        ]
 
     @staticmethod
     def django_app():

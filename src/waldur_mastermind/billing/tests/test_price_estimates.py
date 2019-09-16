@@ -1,3 +1,5 @@
+import decimal
+
 from ddt import ddt, data
 from freezegun import freeze_time
 from rest_framework import status, test
@@ -5,8 +7,9 @@ from rest_framework import status, test
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.invoices.tests import factories as invoice_factories
-from waldur_mastermind.packages.tests import fixtures as packages_fixtures
 from waldur_mastermind.packages.tests import factories as packages_factories
+from waldur_mastermind.packages.tests import fixtures as packages_fixtures
+from waldur_mastermind.packages.tests import utils as packages_utils
 from waldur_mastermind.support import models as support_models
 from waldur_mastermind.support.tests import fixtures as support_fixtures
 
@@ -56,7 +59,7 @@ class PriceEstimateAPITest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
 
-    @freeze_time('2017-11-01 00:00:00')
+    @freeze_time('2017-11-01')
     def test_get_archive_price_estimate_for_customer(self):
         self.client.force_authenticate(getattr(self.fixture, 'staff'))
         models.PriceEstimate.objects.filter(scope=self.fixture.customer).update(total=100)
@@ -102,14 +105,14 @@ class PriceEstimateAPITest(test.APITransactionTestCase):
 
 
 @ddt
-@freeze_time('2017-01-01 00:00:00')
+@freeze_time('2017-01-01')
 class PriceEstimateInvoiceItemTest(test.APITransactionTestCase):
     @data('project', 'customer')
     def test_when_openstack_package_is_created_total_is_updated(self, scope):
         fixture = packages_fixtures.PackageFixture()
         package = fixture.openstack_package
         estimate = models.PriceEstimate.objects.get(scope=getattr(fixture, scope))
-        self.assertEqual(estimate.total, package.template.price * 31)
+        self.assertAlmostEqual(decimal.Decimal(estimate.total), decimal.Decimal(package.template.price * 31))
 
     def test_when_openstack_package_is_extended_project_total_is_updated(self):
         fixture = packages_fixtures.PackageFixture()
@@ -134,7 +137,7 @@ class PriceEstimateInvoiceItemTest(test.APITransactionTestCase):
 
 
 @ddt
-@freeze_time('2017-01-01 00:00:00')
+@freeze_time('2017-01-01')
 class OfferingPriceEstimateLimitValidationTest(test.APITransactionTestCase):
     """
     If total cost of project and resource exceeds cost limit provision is disabled.
@@ -162,7 +165,7 @@ class OfferingPriceEstimateLimitValidationTest(test.APITransactionTestCase):
 
 
 @ddt
-@freeze_time('2017-01-01 00:00:00')
+@freeze_time('2017-01-01')
 class PackagePriceEstimateLimitValidationTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = packages_fixtures.PackageFixture()
@@ -176,7 +179,7 @@ class PackagePriceEstimateLimitValidationTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
 
         estimate = models.PriceEstimate.objects.get(scope=self.fixture.project)
-        self.assertEqual(estimate.total, float(self.new_template.price * 30))
+        self.assertAlmostEqual(decimal.Decimal(estimate.total), decimal.Decimal(self.new_template.price * 31))
 
     @data('project', 'customer')
     def test_if_extended_package_cost_exceeds_limit_provision_is_disabled(self, scope):
@@ -186,7 +189,7 @@ class PackagePriceEstimateLimitValidationTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
 
         estimate = models.PriceEstimate.objects.get(scope=self.fixture.project)
-        self.assertEqual(estimate.total, self.package.template.price * 31)
+        self.assertAlmostEqual(decimal.Decimal(estimate.total), decimal.Decimal(self.package.template.price * 31))
 
     def extend_package(self, total_price):
         self.new_template = packages_factories.PackageTemplateFactory(
@@ -197,10 +200,15 @@ class PackagePriceEstimateLimitValidationTest(test.APITransactionTestCase):
             self.new_template.components.filter(type=component_type).update(price=component_price, amount=1)
 
         self.client.force_authenticate(user=self.fixture.owner)
-        return self.client.post(packages_factories.OpenStackPackageFactory.get_list_url(action='change'), data={
+        response = self.client.post(packages_factories.OpenStackPackageFactory.get_list_url(action='change'), data={
             'template': packages_factories.PackageTemplateFactory.get_url(self.new_template),
             'package': packages_factories.OpenStackPackageFactory.get_url(self.package),
         })
+
+        if response.status_code == status.HTTP_202_ACCEPTED:
+            packages_utils.run_openstack_package_change_executor(self.package, self.new_template)
+
+        return response
 
 
 class PriceEstimateLimitTest(test.APITransactionTestCase):

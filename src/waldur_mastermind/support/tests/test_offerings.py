@@ -8,13 +8,12 @@ from django.conf import settings
 from django.utils import timezone
 from freezegun import freeze_time
 import mock
-from rest_framework import status
+from rest_framework import status, test
 
-from waldur_core.core.tests.utils import PostgreSQLTest
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
-from waldur_mastermind.support.backend import SupportBackendError
 from waldur_mastermind.support.tests.base import override_support_settings, BaseTest
+
 from . import factories, fixtures
 from .. import models, tasks
 
@@ -93,6 +92,24 @@ class OfferingCreateTest(BaseTest):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
         self.assertEqual(models.Issue.objects.count(), 1)
 
+    def test_issue_is_created_without_attributes_if_all_custom_attributes_are_optional(self):
+        # Arrange
+        conf = self.offering_template.config['options']
+        conf['storage']['required'] = False
+        conf['ram']['required'] = False
+        conf['cpu_count']['required'] = False
+        self.offering_template.save()
+
+        request_data = self._get_valid_request()
+        del request_data['attributes']
+
+        # Act
+        response = self.client.post(self.url, data=request_data)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(models.Issue.objects.count(), 1)
+
     def test_issue_is_created_with_explicit_plan(self):
         payload = self._get_valid_request()
         plan = factories.OfferingPlanFactory(template=self.offering_template)
@@ -147,6 +164,21 @@ class OfferingCreateTest(BaseTest):
         self.assertEqual(offering.template, self.offering_template)
         self.assertEqual(offering.type_label, offering.config['label'])
 
+    def test_article_code_and_product_code_is_copied_from_template(self):
+        # Arrange
+        self.offering_template.config['product_code'] = 'OS-VM'
+        self.offering_template.config['article_code'] = 'AA201901'
+        self.offering_template.save()
+
+        # Act
+        request_data = self._get_valid_request()
+        self.client.post(self.url, data=request_data)
+
+        # Assert
+        offering = models.Offering.objects.first()
+        self.assertEqual(offering.product_code, 'OS-VM')
+        self.assertEqual(offering.article_code, 'AA201901')
+
     def test_user_cannot_create_offering_if_he_has_no_permissions_to_the_project(self):
         request_data = self._get_valid_request()
         request_data['project'] = structure_factories.ProjectFactory.get_url()
@@ -166,19 +198,6 @@ class OfferingCreateTest(BaseTest):
         self.assertEqual(models.Offering.objects.count(), 1)
         offering = models.Offering.objects.first()
         self.assertEqual(issue.project.uuid, offering.project.uuid)
-
-    def test_offering_is_not_created_if_backend_raises_error(self):
-        self.mock_get_active_backend.side_effect = SupportBackendError()
-
-        request_data = self._get_valid_request()
-        self.assertEqual(models.Offering.objects.count(), 0)
-        self.assertEqual(models.Issue.objects.count(), 0)
-
-        with self.assertRaises(SupportBackendError):
-            self.client.post(self.url, data=request_data)
-
-        self.assertEqual(models.Offering.objects.count(), 0)
-        self.assertEqual(models.Issue.objects.count(), 0)
 
     @data('user')
     def test_user_cannot_associate_new_offering_with_project_if_he_has_no_project_level_permissions(self, user):
@@ -268,7 +287,7 @@ class OfferingCreateProductTest(BaseOfferingTest):
         valid_request = self._get_valid_request()
         response = self.client.post(self.url, valid_request)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertIn('Virtual machines count: &#39;1000&#39;', response.data['issue_description'])
+        self.assertIn("Virtual machines count: '1000'", response.data['issue_description'])
 
 
 class OfferingUpdateTest(BaseOfferingTest):
@@ -440,12 +459,12 @@ class OfferingDeleteTest(BaseOfferingTest):
 
 
 @ddt
-class CountersTest(PostgreSQLTest):
+class CountersTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
 
     @data((True, 1), (False, 0))
-    def test_project_counter_has_experts(self, pair):
+    def test_project_counter_has_offerings(self, pair):
         (has_request, expected_value) = pair
         if has_request:
             factories.OfferingFactory(project=self.fixture.project)
@@ -459,7 +478,7 @@ class CountersTest(PostgreSQLTest):
         self.assertEqual(response.data, {'offerings': expected_value})
 
     @data((True, 1), (False, 0))
-    def test_customer_counter_has_experts(self, pair):
+    def test_customer_counter_has_offerings(self, pair):
         (has_request, expected_value) = pair
         if has_request:
             factories.OfferingFactory(project=self.fixture.project)

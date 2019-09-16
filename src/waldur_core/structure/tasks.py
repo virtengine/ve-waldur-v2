@@ -11,6 +11,7 @@ from django.utils import timezone
 import six
 
 from waldur_core.core import utils as core_utils, tasks as core_tasks, models as core_models
+from waldur_core.quotas.exceptions import QuotaValidationError
 from waldur_core.structure import SupportedServices, models, utils, ServiceBackendError, models as structure_models
 
 logger = logging.getLogger(__name__)
@@ -50,23 +51,40 @@ def check_expired_permissions():
             permission.revoke()
 
 
+def connect_shared_settings(service_settings):
+    logger.debug('About to connect service settings "%s" to all available customers' % service_settings.name)
+    if not service_settings.shared:
+        raise ValueError('It is impossible to connect non-shared settings')
+    service_model = SupportedServices.get_service_models()[service_settings.type]['service']
+
+    with transaction.atomic():
+        for customer in models.Customer.objects.all():
+            defaults = {'available_for_all': True}
+            try:
+                service, _ = service_model.objects.get_or_create(
+                    customer=customer, settings=service_settings, defaults=defaults)
+            except QuotaValidationError:
+                logger.warning('Unable to connect shared service '
+                               'settings to customer because quota is exceeded. '
+                               'Service settings ID: %s, customer ID: %s',
+                               service_settings.id, customer.id)
+                continue
+
+            service_project_link_model = service.projects.through
+            for project in service.customer.projects.all():
+                try:
+                    service_project_link_model.objects.get_or_create(project=project, service=service)
+                except QuotaValidationError:
+                    logger.warning('Unable to connect shared service to project because '
+                                   'quota is exceeded. Service ID: %s, project ID: %s',
+                                   service.id, project.id)
+                    continue
+
+
 class ConnectSharedSettingsTask(core_tasks.Task):
 
     def execute(self, service_settings):
-        logger.debug('About to connect service settings "%s" to all available customers' % service_settings.name)
-        if not service_settings.shared:
-            raise ValueError('It is impossible to connect non-shared settings')
-        service_model = SupportedServices.get_service_models()[service_settings.type]['service']
-
-        with transaction.atomic():
-            for customer in models.Customer.objects.all():
-                defaults = {'available_for_all': True}
-                service, _ = service_model.objects.get_or_create(
-                    customer=customer, settings=service_settings, defaults=defaults)
-
-                service_project_link_model = service.projects.through
-                for project in service.customer.projects.all():
-                    service_project_link_model.objects.get_or_create(project=project, service=service)
+        connect_shared_settings(service_settings)
         logger.info('Successfully connected service settings "%s" to all available customers' % service_settings.name)
 
 
@@ -142,21 +160,48 @@ class BackgroundListPullTask(core_tasks.BackgroundTask):
             self.pull_task().apply_async(args=(serialized,), kwargs={})
 
 
-class ServiceSettingsBackgroundPullTask(BackgroundPullTask):
-
-    def pull(self, service_settings):
-        backend = service_settings.get_backend()
-        backend.sync()
-
-
-class ServiceSettingsListPullTask(BackgroundListPullTask):
-    name = 'waldur_core.structure.ServiceSettingsListPullTask'
+class ServiceListPullTask(BackgroundListPullTask):
     model = models.ServiceSettings
-    pull_task = ServiceSettingsBackgroundPullTask
 
     def get_pulled_objects(self):
         States = self.model.States
         return self.model.objects.filter(state__in=[States.ERRED, States.OK])
+
+
+class ServicePropertiesPullTask(BackgroundPullTask):
+
+    def pull(self, service_settings):
+        backend = service_settings.get_backend()
+        backend.pull_service_properties()
+
+
+class ServiceResourcesPullTask(BackgroundPullTask):
+
+    def pull(self, service_settings):
+        backend = service_settings.get_backend()
+        backend.pull_resources()
+
+
+class ServiceSubResourcesPullTask(BackgroundPullTask):
+
+    def pull(self, service_settings):
+        backend = service_settings.get_backend()
+        backend.pull_subresources()
+
+
+class ServicePropertiesListPullTask(ServiceListPullTask):
+    name = 'waldur_core.structure.ServicePropertiesListPullTask'
+    pull_task = ServicePropertiesPullTask
+
+
+class ServiceResourcesListPullTask(ServiceListPullTask):
+    name = 'waldur_core.structure.ServiceResourcesListPullTask'
+    pull_task = ServiceResourcesPullTask
+
+
+class ServiceSubResourcesListPullTask(ServiceListPullTask):
+    name = 'waldur_core.structure.ServiceSubResourcesListPullTask'
+    pull_task = ServiceSubResourcesPullTask
 
 
 class RetryUntilAvailableTask(core_tasks.Task):
@@ -216,7 +261,9 @@ class SetErredStuckResources(core_tasks.BackgroundTask):
         cutoff = timezone.now() - timedelta(hours=3)
         states = (structure_models.NewResource.States.CREATING,
                   structure_models.NewResource.States.CREATION_SCHEDULED)
-        for model in structure_models.NewResource.get_all_models():
+        resource_models = (structure_models.NewResource.get_all_models() +
+                           structure_models.SubResource.get_all_models())
+        for model in resource_models:
             for resource in model.objects.filter(modified__lt=cutoff, state__in=states):
                 resource.set_erred()
                 resource.error_message = 'Provisioning has timed out.'

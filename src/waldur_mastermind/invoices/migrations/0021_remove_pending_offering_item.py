@@ -8,10 +8,14 @@ logger = logging.getLogger(__name__)
 
 
 def migrate_data(apps, schema_editor):
-    from waldur_mastermind.invoices.models import OfferingItem
-    from waldur_mastermind.support.models import Offering
+    OfferingItem = apps.get_model('invoices', 'OfferingItem')
 
-    OfferingItem.objects.filter(offering__state=Offering.States.REQUESTED).delete()
+    class States(object):
+        REQUESTED = 'requested'
+        OK = 'ok'
+        TERMINATED = 'terminated'
+
+    OfferingItem.objects.filter(offering__state=States.REQUESTED).delete()
 
 
 class Migration(migrations.Migration):
@@ -20,5 +24,5 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.RunPython(migrate_data, reverse_code=migrations.RunPython.noop),
+        migrations.RunPython(migrate_data, reverse_code=migrations.RunPython.noop, elidable=True),
     ]

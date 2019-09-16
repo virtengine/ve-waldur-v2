@@ -1,7 +1,6 @@
 from __future__ import unicode_literals
 
 import logging
-import uuid
 
 import requests
 from django.apps import apps
@@ -16,11 +15,11 @@ from django.template.loader import render_to_string
 from django.utils import timezone
 from django.utils.lru_cache import lru_cache
 from django.utils.translation import ugettext_lazy as _
+from model_utils.fields import AutoCreatedField
 from model_utils.models import TimeStampedModel
 
 from waldur_core.core.fields import JSONField, UUIDField
-from waldur_core.core.utils import timestamp_to_datetime
-from waldur_core.logging import managers
+from waldur_core.core.managers import GenericKeyMixin
 
 logger = logging.getLogger(__name__)
 
@@ -33,47 +32,6 @@ class UuidMixin(models.Model):
         abstract = True
 
     uuid = UUIDField()
-
-
-class Alert(UuidMixin, TimeStampedModel):
-    class Meta:
-        unique_together = ("content_type", "object_id", "alert_type", "is_closed")
-
-    class SeverityChoices(object):
-        DEBUG = 10
-        INFO = 20
-        WARNING = 30
-        ERROR = 40
-        CHOICES = ((DEBUG, 'Debug'), (INFO, 'Info'), (WARNING, 'Warning'), (ERROR, 'Error'))
-
-    alert_type = models.CharField(max_length=50, db_index=True)
-    message = models.CharField(max_length=255)
-    severity = models.SmallIntegerField(choices=SeverityChoices.CHOICES)
-    closed = models.DateTimeField(null=True, blank=True)
-    # Hack: This field stays blank until alert closing.
-    #       After closing it gets unique value to avoid unique together constraint break.
-    is_closed = models.CharField(blank=True, max_length=32)
-    acknowledged = models.BooleanField(default=False)
-    context = JSONField(blank=True)
-
-    content_type = models.ForeignKey(ct_models.ContentType, null=True, on_delete=models.SET_NULL)
-    object_id = models.PositiveIntegerField(null=True)
-    scope = ct_fields.GenericForeignKey('content_type', 'object_id')
-
-    objects = managers.AlertManager()
-
-    def close(self):
-        self.closed = timezone.now()
-        self.is_closed = uuid.uuid4().hex
-        self.save()
-
-    def acknowledge(self):
-        self.acknowledged = True
-        self.save()
-
-    def cancel_acknowledgment(self):
-        self.acknowledged = False
-        self.save()
 
 
 class AlertThresholdMixin(models.Model):
@@ -176,14 +134,20 @@ class WebHook(BaseHook):
 
     def process(self, event):
         logger.debug('Submitting web hook to URL %s, payload: %s', self.destination_url, event)
+        payload = dict(
+            created=event.created,
+            message=event.message,
+            context=event.context,
+            event_type=event.event_type,
+        )
 
         # encode event as JSON
         if self.content_type == WebHook.ContentTypeChoices.JSON:
-            requests.post(self.destination_url, json=event, verify=settings.VERIFY_WEBHOOK_REQUESTS)
+            requests.post(self.destination_url, json=payload, verify=settings.VERIFY_WEBHOOK_REQUESTS)
 
         # encode event as form
         elif self.content_type == WebHook.ContentTypeChoices.FORM:
-            requests.post(self.destination_url, data=event, verify=settings.VERIFY_WEBHOOK_REQUESTS)
+            requests.post(self.destination_url, data=payload, verify=settings.VERIFY_WEBHOOK_REQUESTS)
 
 
 class PushHook(BaseHook):
@@ -231,12 +195,12 @@ class PushHook(BaseHook):
         payload = {
             'to': self.token,
             'notification': {
-                'body': event.get('message', 'New event'),
+                'body': event.message or 'New event',
                 'title': conf.get('NOTIFICATION_TITLE', 'Waldur notification'),
                 'image': 'icon',
             },
             'data': {
-                'event': event
+                'event': event.context
             },
         }
         if self.type == self.Type.IOS:
@@ -252,13 +216,10 @@ class EmailHook(BaseHook):
         if not self.email:
             logger.debug('Skipping processing of email hook (PK=%s) because email is not defined' % self.pk)
             return
-        # Prevent mutations of event because otherwise subsequent hook processors would fail
-        context = event.copy()
-        subject = 'Notifications from Waldur'
-        context['timestamp'] = timestamp_to_datetime(event['timestamp'])
-        text_message = context['message']
-        html_message = render_to_string('logging/email.html', {'events': [context]})
-        logger.debug('Submitting email hook to %s, payload: %s', self.email, context)
+        subject = settings.WALDUR_CORE.get('NOTIFICATION_SUBJECT', 'Notifications from Waldur')
+        text_message = event.message
+        html_message = render_to_string('logging/email.html', {'events': [event]})
+        logger.debug('Submitting email hook to %s, payload: %s', self.email, text_message)
         send_mail(subject, text_message, settings.DEFAULT_FROM_EMAIL, [self.email], html_message=html_message)
 
 
@@ -313,3 +274,43 @@ class SystemNotification(EventTypesMixin, models.Model):
 
     def __str__(self):
         return '%s | %s' % (self.hook_content_type, self.name)
+
+
+class Report(UuidMixin, TimeStampedModel):
+    class States(object):
+        PENDING = 'pending'
+        DONE = 'done'
+        ERRED = 'erred'
+
+        CHOICES = (
+            (PENDING, 'Pending'),
+            (DONE, 'Done'),
+            (ERRED, 'Erred'),
+        )
+
+    file = models.FileField(upload_to='logging_reports')
+    file_size = models.PositiveIntegerField(null=True)
+    state = models.CharField(choices=States.CHOICES, default=States.PENDING, max_length=10)
+    error_message = models.TextField(blank=True)
+
+
+class Event(UuidMixin):
+    created = AutoCreatedField()
+    event_type = models.CharField(max_length=100, db_index=True)
+    message = models.TextField()
+    context = BetterJSONField(blank=True)
+
+    class Meta(object):
+        ordering = ('-created',)
+
+
+class FeedManager(GenericKeyMixin, models.Manager):
+    pass
+
+
+class Feed(models.Model):
+    event = models.ForeignKey(Event)
+    content_type = models.ForeignKey(ct_models.ContentType, db_index=True)
+    object_id = models.PositiveIntegerField(db_index=True)
+    scope = ct_fields.GenericForeignKey('content_type', 'object_id')
+    objects = FeedManager()

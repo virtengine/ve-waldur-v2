@@ -3,8 +3,9 @@ import random
 
 from rest_framework.reverse import reverse
 
-from waldur_openstack.openstack import models as openstack_models
 from waldur_core.structure.tests import factories as structure_factories
+from waldur_openstack.openstack import models as openstack_models
+from waldur_openstack.openstack.tests.factories import TenantFactory
 
 from .. import models
 
@@ -39,7 +40,7 @@ class PackageTemplateFactory(factory.DjangoModelFactory):
                 component.save()
         else:
             for component_type in self.get_required_component_types():
-                self.components.get_or_create(type=component_type, price=random.randint(10, 20), amount=1)
+                self.components.get_or_create(type=component_type, price=random.randint(1, 2), amount=1)
 
 
 # XXX: this factory is useless. On template creation its components are already
@@ -75,13 +76,6 @@ class OpenStackServiceProjectLinkFactory(factory.DjangoModelFactory):
             service_project_link = OpenStackServiceProjectLinkFactory()
         url = 'http://testserver' + reverse('openstack-spl-detail', kwargs={'pk': service_project_link.pk})
         return url if action is None else url + action + '/'
-
-
-class TenantFactory(factory.DjangoModelFactory):
-    class Meta(object):
-        model = openstack_models.Tenant
-
-    service_project_link = factory.SubFactory(OpenStackServiceProjectLinkFactory)
 
 
 class OpenStackPackageFactory(factory.DjangoModelFactory):

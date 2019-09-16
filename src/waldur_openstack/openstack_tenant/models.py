@@ -1,5 +1,6 @@
 from __future__ import unicode_literals
 
+import logging
 
 from django.core.validators import RegexValidator
 from django.db import models
@@ -15,6 +16,12 @@ from waldur_core.logging.loggers import LoggableMixin
 from waldur_core.quotas import models as quotas_models, fields as quotas_fields
 from waldur_core.structure import models as structure_models, utils as structure_utils
 from waldur_openstack.openstack_base import models as openstack_base_models
+from waldur_openstack.openstack import models as openstack_models
+
+logger = logging.getLogger(__name__)
+
+
+TenantQuotas = openstack_models.Tenant.Quotas
 
 
 class OpenStackTenantService(structure_models.Service):
@@ -97,6 +104,16 @@ class SecurityGroupRule(openstack_base_models.BaseSecurityGroupRule):
     security_group = models.ForeignKey(SecurityGroup, related_name='rules')
 
 
+class TenantQuotaMixin(quotas_models.SharedQuotaMixin):
+    """
+    It allows to update both service settings and shared tenant quotas.
+    """
+
+    def get_quota_scopes(self):
+        service_settings = self.service_project_link.service.settings
+        return service_settings, service_settings.scope
+
+
 @python_2_unicode_compatible
 class FloatingIP(structure_models.ServiceProperty):
     address = models.GenericIPAddressField(protocol='IPv4', null=True, default=None)
@@ -105,6 +122,7 @@ class FloatingIP(structure_models.ServiceProperty):
     is_booked = models.BooleanField(default=False,
                                     help_text=_('Marks if floating IP has been booked for provisioning.'))
     internal_ip = models.ForeignKey('InternalIP', related_name='floating_ips', null=True, on_delete=models.SET_NULL)
+    tracker = FieldTracker()
 
     class Meta:
         unique_together = ('settings', 'address')
@@ -132,7 +150,7 @@ class FloatingIP(structure_models.ServiceProperty):
         return super(FloatingIP, cls).get_backend_fields() + ('address', 'runtime_state', 'backend_network_id')
 
 
-class Volume(structure_models.Volume):
+class Volume(TenantQuotaMixin, structure_models.Volume):
     # backend_id is nullable on purpose, otherwise
     # it wouldn't be possible to put a unique constraint on it
     backend_id = models.CharField(max_length=255, blank=True, null=True)
@@ -150,7 +168,8 @@ class Volume(structure_models.Volume):
     image = models.ForeignKey(Image, blank=True, null=True, on_delete=models.SET_NULL)
     image_name = models.CharField(max_length=150, blank=True)
     image_metadata = JSONField(blank=True)
-    type = models.CharField(max_length=100, blank=True)
+    type = models.ForeignKey('VolumeType', blank=True, null=True, on_delete=models.SET_NULL)
+    availability_zone = models.ForeignKey('VolumeAvailabilityZone', blank=True, null=True, on_delete=models.SET_NULL)
     source_snapshot = models.ForeignKey('Snapshot', related_name='volumes', blank=True, null=True,
                                         on_delete=models.SET_NULL)
     # TODO: Move this fields to resource model.
@@ -162,15 +181,12 @@ class Volume(structure_models.Volume):
     class Meta(object):
         unique_together = ('service_project_link', 'backend_id')
 
-    def increase_backend_quotas_usage(self, validate=True):
-        settings = self.service_project_link.service.settings
-        settings.add_quota_usage(settings.Quotas.volumes, 1, validate=validate)
-        settings.add_quota_usage(settings.Quotas.storage, self.size, validate=validate)
-
-    def decrease_backend_quotas_usage(self):
-        settings = self.service_project_link.service.settings
-        settings.add_quota_usage(settings.Quotas.volumes, -1)
-        settings.add_quota_usage(settings.Quotas.storage, -self.size)
+    def get_quota_deltas(self):
+        return {
+            TenantQuotas.volumes: 1,
+            TenantQuotas.volumes_size: self.size,
+            TenantQuotas.storage: self.size,
+        }
 
     @classmethod
     def get_url_name(cls):
@@ -179,10 +195,11 @@ class Volume(structure_models.Volume):
     @classmethod
     def get_backend_fields(cls):
         return super(Volume, cls).get_backend_fields() + ('name', 'description', 'size', 'metadata', 'type', 'bootable',
-                                                          'runtime_state', 'device')
+                                                          'runtime_state', 'device', 'instance', 'availability_zone',
+                                                          'image')
 
 
-class Snapshot(structure_models.Snapshot):
+class Snapshot(TenantQuotaMixin, structure_models.Snapshot):
     # backend_id is nullable on purpose, otherwise
     # it wouldn't be possible to put a unique constraint on it
     backend_id = models.CharField(max_length=255, blank=True, null=True)
@@ -214,15 +231,12 @@ class Snapshot(structure_models.Snapshot):
     def get_url_name(cls):
         return 'openstacktenant-snapshot'
 
-    def increase_backend_quotas_usage(self, validate=True):
-        settings = self.service_project_link.service.settings
-        settings.add_quota_usage(settings.Quotas.snapshots, 1, validate=validate)
-        settings.add_quota_usage(settings.Quotas.storage, self.size, validate=validate)
-
-    def decrease_backend_quotas_usage(self):
-        settings = self.service_project_link.service.settings
-        settings.add_quota_usage(settings.Quotas.snapshots, -1)
-        settings.add_quota_usage(settings.Quotas.storage, -self.size)
+    def get_quota_deltas(self):
+        return {
+            TenantQuotas.snapshots: 1,
+            TenantQuotas.snapshots_size: self.size,
+            TenantQuotas.storage: self.size,
+        }
 
     @classmethod
     def get_backend_fields(cls):
@@ -239,7 +253,23 @@ class SnapshotRestoration(core_models.UuidMixin, TimeStampedModel):
         project_path = 'snapshot__service_project_link__project'
 
 
-class Instance(structure_models.VirtualMachine):
+@python_2_unicode_compatible
+class InstanceAvailabilityZone(structure_models.BaseServiceProperty):
+    settings = models.ForeignKey(structure_models.ServiceSettings, related_name='+')
+    available = models.BooleanField(default=True)
+
+    class Meta(object):
+        unique_together = ('settings', 'name')
+
+    def __str__(self):
+        return self.name
+
+    @classmethod
+    def get_url_name(cls):
+        return 'openstacktenant-instance-availability-zone'
+
+
+class Instance(TenantQuotaMixin, structure_models.VirtualMachine):
 
     class RuntimeStates(object):
         # All possible OpenStack Instance states on backend.
@@ -269,6 +299,7 @@ class Instance(structure_models.VirtualMachine):
     service_project_link = models.ForeignKey(
         OpenStackTenantServiceProjectLink, related_name='instances', on_delete=models.PROTECT)
 
+    availability_zone = models.ForeignKey(InstanceAvailabilityZone, blank=True, null=True, on_delete=models.SET_NULL)
     flavor_name = models.CharField(max_length=255, blank=True)
     flavor_disk = models.PositiveIntegerField(default=0, help_text=_('Flavor disk size in MiB'))
     security_groups = models.ManyToManyField(SecurityGroup, related_name='instances')
@@ -311,17 +342,12 @@ class Instance(structure_models.VirtualMachine):
             if hostname:
                 return structure_utils.get_coordinates_by_ip(hostname)
 
-    def increase_backend_quotas_usage(self, validate=True):
-        settings = self.service_project_link.service.settings
-        settings.add_quota_usage(settings.Quotas.instances, 1, validate=validate)
-        settings.add_quota_usage(settings.Quotas.ram, self.ram, validate=validate)
-        settings.add_quota_usage(settings.Quotas.vcpu, self.cores, validate=validate)
-
-    def decrease_backend_quotas_usage(self):
-        settings = self.service_project_link.service.settings
-        settings.add_quota_usage(settings.Quotas.instances, -1)
-        settings.add_quota_usage(settings.Quotas.ram, -self.ram)
-        settings.add_quota_usage(settings.Quotas.vcpu, -self.cores)
+    def get_quota_deltas(self):
+        return {
+            TenantQuotas.instances: 1,
+            TenantQuotas.ram: self.ram,
+            TenantQuotas.vcpu: self.cores,
+        }
 
     @property
     def floating_ips(self):
@@ -330,7 +356,7 @@ class Instance(structure_models.VirtualMachine):
     @classmethod
     def get_backend_fields(cls):
         return super(Instance, cls).get_backend_fields() + ('flavor_name', 'flavor_disk', 'ram', 'cores', 'disk',
-                                                            'runtime_state')
+                                                            'runtime_state', 'availability_zone')
 
     @classmethod
     def get_online_state(cls):
@@ -464,3 +490,42 @@ class InternalIP(openstack_base_models.Port):
     # So another related name should be used.
     instance = models.ForeignKey(Instance, related_name='internal_ips_set', null=True)
     subnet = models.ForeignKey(SubNet, related_name='internal_ips')
+
+    # backend_id is nullable on purpose, otherwise
+    # it wouldn't be possible to put a unique constraint on it
+    backend_id = models.CharField(max_length=255, null=True)
+    settings = models.ForeignKey(structure_models.ServiceSettings, related_name='+')
+    tracker = FieldTracker()
+
+    class Meta:
+        unique_together = ('backend_id', 'settings')
+
+
+@python_2_unicode_compatible
+class VolumeType(core_models.DescribableMixin, structure_models.ServiceProperty):
+    class Meta(object):
+        unique_together = ('settings', 'backend_id')
+        # TODO: validate behaviour in different OpenStack versions and add unique_together = ('settings', 'name')
+
+    def __str__(self):
+        return self.name
+
+    @classmethod
+    def get_url_name(cls):
+        return 'openstacktenant-volume-type'
+
+
+@python_2_unicode_compatible
+class VolumeAvailabilityZone(structure_models.BaseServiceProperty):
+    settings = models.ForeignKey(structure_models.ServiceSettings, related_name='+')
+    available = models.BooleanField(default=True)
+
+    class Meta(object):
+        unique_together = ('settings', 'name')
+
+    def __str__(self):
+        return self.name
+
+    @classmethod
+    def get_url_name(cls):
+        return 'openstacktenant-volume-availability-zone'

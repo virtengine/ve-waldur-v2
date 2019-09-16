@@ -1,5 +1,7 @@
 from __future__ import unicode_literals
 
+import uuid
+
 from ddt import ddt, data
 from mock import patch
 from rest_framework import status
@@ -122,13 +124,16 @@ class BackupRestorationTest(test.APITransactionTestCase):
         self.client.force_authenticate(user=user)
 
         self.backup = factories.BackupFactory(state=models.Backup.States.OK)
+        ss = self.backup.service_project_link.service.settings
+        ss.options = {'external_network_id': uuid.uuid4().hex}
+        ss.save()
         self.url = factories.BackupFactory.get_url(self.backup, 'restore')
 
         system_volume = self.backup.instance.volumes.get(bootable=True)
         self.disk_size = system_volume.size
 
         self.service_settings = self.backup.instance.service_project_link.service.settings
-        self.service_settings.options = {'external_network_id': 'id'}
+        self.service_settings.options = {'external_network_id': uuid.uuid4().hex}
         self.service_settings.save()
         self.valid_flavor = factories.FlavorFactory(disk=self.disk_size + 10, settings=self.service_settings)
         self.subnet = factories.SubNetFactory(settings=self.service_settings)
@@ -143,15 +148,6 @@ class BackupRestorationTest(test.APITransactionTestCase):
         response = self.client.post(self.url, self._get_valid_payload())
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-
-    def test_if_flavor_disk_size_lesser_then_system_volume_size_validation_fails(self):
-        invalid_flavor = factories.FlavorFactory(disk=self.disk_size - 10, settings=self.service_settings)
-        response = self.client.post(self.url, self._get_valid_payload(
-            flavor=factories.FlavorFactory.get_url(invalid_flavor))
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
-        self.assertEqual(response.data['flavor'], ['Flavor disk size should match system volume size.'])
 
     def test_security_groups_cannot_be_associated_if_they_belong_to_another_settings(self):
         security_group = factories.SecurityGroupFactory()
@@ -215,7 +211,7 @@ class BackupRestorationTest(test.APITransactionTestCase):
 
         response = self.client.post(self.url, payload)
 
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
         self.assertIn('floating_ips', response.data)
 
     def test_floating_ip_is_not_valid_if_it_is_already_assigned(self):

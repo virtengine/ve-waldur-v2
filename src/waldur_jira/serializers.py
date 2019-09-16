@@ -10,6 +10,7 @@ from django.utils.translation import ugettext_lazy as _
 from rest_framework import serializers
 
 from waldur_core.core import serializers as core_serializers
+from waldur_core.media.serializers import ProtectedMediaSerializerMixin
 from waldur_core.structure import serializers as structure_serializers, models as structure_models, SupportedServices
 
 from . import models, executors
@@ -23,6 +24,7 @@ class ServiceSerializer(structure_serializers.BaseServiceSerializer):
         'backend_url': 'JIRA host (e.g. https://jira.example.com/)',
         'username': 'JIRA user with excessive privileges',
         'password': '',
+        'token': '',
     }
 
     class Meta(structure_serializers.BaseServiceSerializer.Meta):
@@ -219,7 +221,7 @@ class CommentSerializer(JiraPropertySerializer):
         )
 
 
-class AttachmentSerializer(JiraPropertySerializer):
+class AttachmentSerializer(ProtectedMediaSerializerMixin, JiraPropertySerializer):
 
     class Meta(JiraPropertySerializer.Meta):
         model = models.Attachment
@@ -491,7 +493,7 @@ class WebHookReceiverSerializer(serializers.Serializer):
                     if old_jira == 'issue_comment_deleted':
                         backend.delete_old_comments(issue)
 
-                    if old_jira == 'issue_updated':
+                    if old_jira in ('issue_updated', 'issue_generic'):
                         new_attachment = filter(lambda x: x['field'] == 'Attachment',
                                                 validated_data['changelog']['items'])
                         if new_attachment:

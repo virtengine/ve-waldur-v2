@@ -1,14 +1,21 @@
+from decimal import Decimal
+
+from django.test import override_settings
+import mock
 from ddt import ddt, data
+from django.core import mail
+from freezegun import freeze_time
 from rest_framework import test, status
 
 from waldur_core.core.tests.helpers import override_waldur_core_settings
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.packages.tests import fixtures as packages_fixtures
 from waldur_mastermind.slurm_invoices.tests import factories as slurm_factories
+from waldur_mastermind.support.tests import fixtures as support_fixtures
 from waldur_slurm.tests import fixtures as slurm_fixtures
 
-from . import factories, fixtures
-from .. import models
+from . import factories, fixtures, utils as test_utils
+from .. import models, utils
 
 
 @ddt
@@ -37,42 +44,62 @@ class InvoiceSendNotificationTest(test.APITransactionTestCase):
         self.fixture.invoice.state = models.Invoice.States.CREATED
         self.fixture.invoice.save(update_fields=['state'])
 
+        self.patcher = mock.patch('waldur_mastermind.invoices.utils.pdfkit')
+        mock_pdfkit = self.patcher.start()
+        mock_pdfkit.from_string.return_value = ''
+
+    def tearDown(self):
+        super(InvoiceSendNotificationTest, self).tearDown()
+        mock.patch.stopall()
+
     @data('staff')
     def test_user_can_send_invoice_notification(self, user):
         self.client.force_authenticate(getattr(self.fixture, user))
-        response = self.client.post(self.url, self._get_payload())
+        response = self.client.post(self.url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
     @data('manager', 'admin', 'user')
     def test_user_cannot_send_invoice_notification(self, user):
         self.client.force_authenticate(getattr(self.fixture, user))
-        response = self.client.post(self.url, self._get_payload())
+        response = self.client.post(self.url)
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_user_cannot_send_invoice_notification_with_invalid_link_template(self):
-        self.client.force_authenticate(self.fixture.staff)
-        payload = self._get_payload()
-        payload['link_template'] = 'http://example.com/invoice/'
+    @override_settings(task_always_eager=True)
+    @test_utils.override_invoices_settings(INVOICE_LINK_TEMPLATE='http://example.com/invoice/{uuid}')
+    def test_notification_email_is_rendered(self):
+        # Arrange
+        self.fixture.owner
 
-        response = self.client.post(self.url, payload)
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertEqual(response.data['link_template'], ["Link template must include '{uuid}' parameter."])
+        # Act
+        self.client.force_authenticate(self.fixture.staff)
+        self.client.post(self.url)
+
+        # Assert
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertTrue('invoice' in mail.outbox[0].subject)
+        self.assertEqual(self.fixture.owner.email, mail.outbox[0].to[0])
+
+    @override_settings(task_always_eager=True)
+    @test_utils.override_invoices_settings(INVOICE_LINK_TEMPLATE='http://example.com/invoice/')
+    def test_user_cannot_send_invoice_notification_with_invalid_link_template(self):
+        # Arrange
+        self.fixture.owner
+
+        # Act
+        self.client.force_authenticate(self.fixture.staff)
+        self.client.post(self.url)
+
+        # Assert
+        self.assertEqual(len(mail.outbox), 0)
 
     def test_user_cannot_send_invoice_notification_in_invalid_state(self):
         self.fixture.invoice.state = models.Invoice.States.PENDING
         self.fixture.invoice.save(update_fields=['state'])
         self.client.force_authenticate(self.fixture.staff)
-        payload = self._get_payload()
 
-        response = self.client.post(self.url, payload)
+        response = self.client.post(self.url)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(response.data, ["Notification only for the created invoice can be sent."])
-
-    # Helper methods
-    def _get_payload(self):
-        return {
-            'link_template': 'http://example.com/invoice/{uuid}',
-        }
 
 
 class UpdateInvoiceItemProjectTest(test.APITransactionTestCase):
@@ -112,7 +139,7 @@ class UpdateInvoiceItemProjectTest(test.APITransactionTestCase):
         response = self.client.get(factories.InvoiceFactory.get_url(self.invoice))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        item = response.data['openstack_items'][0]
+        item = response.data['items'][0]
         self.assertEqual(item['project_name'], project_name)
         self.assertEqual(item['project_uuid'], self.fixture.project.uuid.hex)
 
@@ -121,17 +148,17 @@ class OpenStackInvoiceItemTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = packages_fixtures.PackageFixture()
         self.package = self.fixture.openstack_package
-        self.item = models.OpenStackItem.objects.get(package=self.package)
+        self.item = models.InvoiceItem.objects.get(scope=self.package)
 
     def check_output(self):
         self.client.force_authenticate(self.fixture.owner)
         response = self.client.get(factories.InvoiceFactory.get_url(self.item.invoice))
-        item = response.data['openstack_items'][0]
-        self.assertEqual(item['tenant_name'], self.package.tenant.name)
-        self.assertEqual(item['tenant_uuid'], self.package.tenant.uuid.hex)
-        self.assertEqual(item['template_name'], self.package.template.name)
-        self.assertEqual(item['template_uuid'], self.package.template.uuid.hex)
-        self.assertEqual(item['template_category'], self.package.template.get_category_display())
+        item = response.data['items'][0]
+        self.assertEqual(item['details']['tenant_name'], self.package.tenant.name)
+        self.assertEqual(item['details']['tenant_uuid'], self.package.tenant.uuid.hex)
+        self.assertEqual(item['details']['template_name'], self.package.template.name)
+        self.assertEqual(item['details']['template_uuid'], self.package.template.uuid.hex)
+        self.assertEqual(item['details']['template_category'], self.package.template.get_category_display())
 
     def test_details_are_rendered_if_package_exists(self):
         self.check_output()
@@ -142,19 +169,23 @@ class OpenStackInvoiceItemTest(test.APITransactionTestCase):
         self.check_output()
 
 
-class GenericInvoiceItemTest(test.APITransactionTestCase):
+class InvoiceItemTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = slurm_fixtures.SlurmFixture()
         self.package = slurm_factories.SlurmPackageFactory(service_settings=self.fixture.service.settings)
         self.invoice = factories.InvoiceFactory(customer=self.fixture.customer)
         self.scope = self.fixture.allocation
-        self.item = models.GenericInvoiceItem.objects.filter(scope=self.scope).get()
+        self.item = models.InvoiceItem.objects.filter(scope=self.scope).get()
+        self.item.unit = models.InvoiceItem.Units.QUANTITY
+        self.item.quantity = 10
+        self.item.unit_price = 10
+        self.item.save()
 
     def check_output(self):
         self.client.force_authenticate(self.fixture.owner)
         response = self.client.get(factories.InvoiceFactory.get_url(self.item.invoice))
 
-        item = response.data['generic_items'][0]
+        item = response.data['items'][0]
         self.assertEqual(item['scope_type'], 'SLURM.Allocation')
         self.assertEqual(item['scope_uuid'], self.scope.uuid.hex)
         self.assertEqual(item['name'], self.scope.name)
@@ -166,6 +197,23 @@ class GenericInvoiceItemTest(test.APITransactionTestCase):
         self.scope.delete()
         self.item.refresh_from_db()
         self.check_output()
+
+    def test_scope_type_is_rendered_for_support_request(self):
+        fixture = support_fixtures.SupportFixture()
+        invoice = factories.InvoiceFactory(customer=fixture.customer)
+        models.InvoiceItem.objects.create(
+            scope=fixture.offering,
+            invoice=invoice,
+            unit=models.InvoiceItem.Units.QUANTITY,
+            quantity=10,
+            unit_price=10
+        )
+        url = factories.InvoiceFactory.get_url(invoice)
+
+        self.client.force_authenticate(fixture.owner)
+        response = self.client.get(url)
+        item = response.data['items'][0]
+        self.assertEqual(item['scope_type'], 'Support.Offering')
 
 
 class DeleteCustomerWithInvoiceTest(test.APITransactionTestCase):
@@ -182,7 +230,7 @@ class DeleteCustomerWithInvoiceTest(test.APITransactionTestCase):
 
     @override_waldur_core_settings(OWNER_CAN_MANAGE_CUSTOMER=True)
     def test_owner_can_not_delete_customer_with_non_empty_invoice(self):
-        factories.GenericInvoiceItemFactory(invoice=self.invoice, unit_price=100)
+        factories.InvoiceItemFactory(invoice=self.invoice, unit_price=100)
 
         self.client.force_authenticate(self.fixture.owner)
         response = self.client.delete(self.url)
@@ -205,7 +253,7 @@ class DeleteCustomerWithInvoiceTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
 
     def test_staff_can_delete_customer_with_non_empty_invoice(self):
-        factories.GenericInvoiceItemFactory(invoice=self.invoice, unit_price=100)
+        factories.InvoiceItemFactory(invoice=self.invoice, unit_price=100)
 
         self.client.force_authenticate(self.fixture.staff)
         response = self.client.delete(self.url)
@@ -220,3 +268,34 @@ class DeleteCustomerWithInvoiceTest(test.APITransactionTestCase):
         response = self.client.delete(self.url)
 
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+
+@ddt
+class InvoicePDFTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.invoice = factories.InvoiceFactory()
+
+    @mock.patch('waldur_mastermind.invoices.utils.pdfkit')
+    def test_create_invoice_pdf(self, mock_pdfkit):
+        mock_pdfkit.from_string.return_value = 'pdf_content'
+        utils.create_invoice_pdf(self.invoice)
+        self.assertTrue(self.invoice.has_file())
+
+    @mock.patch('waldur_mastermind.invoices.handlers.tasks')
+    def test_create_invoice_pdf_is_not_called_if_invoice_cost_has_not_been_changed(self, mock_tasks):
+        with freeze_time('2019-01-02'):
+            invoice = factories.InvoiceFactory()
+            factories.InvoiceItemFactory(invoice=invoice, unit_price=Decimal(10))
+            self.assertEqual(mock_tasks.create_invoice_pdf.delay.call_count, 1)
+            invoice.update_current_cost()
+            self.assertEqual(mock_tasks.create_invoice_pdf.delay.call_count, 1)
+
+    @mock.patch('waldur_mastermind.invoices.handlers.tasks')
+    def test_create_invoice_pdf_is_called_if_invoice_cost_has_been_changed(self, mock_tasks):
+        with freeze_time('2019-01-02'):
+            invoice = factories.InvoiceFactory()
+            factories.InvoiceItemFactory(invoice=invoice, unit_price=Decimal(10))
+            self.assertEqual(mock_tasks.create_invoice_pdf.delay.call_count, 1)
+            factories.InvoiceItemFactory(invoice=invoice, unit_price=Decimal(10))
+            invoice.update_current_cost()
+            self.assertEqual(mock_tasks.create_invoice_pdf.delay.call_count, 2)

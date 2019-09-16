@@ -1,6 +1,23 @@
 import logging
 
-from rest_framework import exceptions
+
+class Component(object):
+    def __init__(self, type, name, measured_unit, billing_type, factor=1):
+        self.type = type
+        self.name = name
+        self.measured_unit = measured_unit
+        self.billing_type = billing_type
+        self.factor = factor
+
+    def _asdict(self):
+        # Note that factor is not serialized to dict because it is not stored in the database.
+        # Currently it is used only for cost estimation when order item is created.
+        return {
+            'type': self.type,
+            'name': self.name,
+            'measured_unit': self.measured_unit,
+            'billing_type': self.billing_type,
+        }
 
 
 logger = logging.getLogger(__name__)
@@ -10,70 +27,98 @@ class PluginManager(object):
     def __init__(self):
         self.backends = {}
 
-    def register(self, offering_type, processor, validator=None, components=None):
+    def register(self, offering_type,
+                 create_resource_processor,
+                 update_resource_processor=None,
+                 delete_resource_processor=None,
+                 components=None,
+                 service_type=None,
+                 can_terminate_order_item=False,
+                 secret_attributes=None,
+                 available_limits=None):
         """
 
         :param offering_type: string which consists of application name and model name,
                               for example Support.OfferingTemplate
-        :param processor: function which receives order item and request object,
-                          and creates plugin's resource corresponding to provided order item.
-                          It is called after order has been approved.
-        :param validator: optional function which receives order item and request object,
-                          and raises validation error if order item is invalid.
-                          It is called after order has been created but before it is submitted.
-        :param components: optional dictionary of available plan components, for example
-        :return:
+        :param create_resource_processor: class which receives order item
+        :param update_resource_processor: class which receives order item
+        :param delete_resource_processor: class which receives order item
+        :param components: tuple available plan components, for example
+                           Component(type='storage', name='Storage', measured_unit='GB')
+        :param service_type: optional string indicates service type to be used
+        :param can_terminate_order_item: optional boolean indicates whether order item can be terminated
+        :param secret_attributes: optional list of strings each of which corresponds to secret attribute key,
+        for example, VPC username and password.
+        :param available_limits: optional list of strings each of which corresponds to offering component type,
+        which supports user-defined limits, such as VPC RAM and vCPU.
         """
         self.backends[offering_type] = {
-            'processor': processor,
-            'validator': validator,
+            'create_resource_processor': create_resource_processor,
+            'update_resource_processor': update_resource_processor,
+            'delete_resource_processor': delete_resource_processor,
             'components': components,
+            'service_type': service_type,
+            'can_terminate_order_item': can_terminate_order_item,
+            'secret_attributes': secret_attributes,
+            'available_limits': available_limits,
         }
 
-    def get_processor(self, offering_type):
+    def get_offering_types(self):
         """
-        Return a processor function for given offering_type.
-        :param offering_type: offering type name
-        :return: processor function
+        Return list of offering types.
         """
-        return self.backends.get(offering_type, {}).get('processor')
+        return self.backends.keys()
 
-    def get_validator(self, offering_type):
+    def get_service_type(self, offering_type):
         """
-        Return a validator function for given offering_type.
+        Return a service type for given offering_type.
         :param offering_type: offering type name
-        :return: validator function
+        :return: string or None
         """
-        return self.backends.get(offering_type, {}).get('validator')
+        return self.backends.get(offering_type, {}).get('service_type')
 
     def get_components(self, offering_type):
         """
-        Return a components dict for given offering_type.
+        Return a list of components for given offering_type.
         :param offering_type: offering type name
-        :return: components dict
+        :return: list of components
         """
-        return self.backends.get(offering_type, {}).get('components')
+        return self.backends.get(offering_type, {}).get('components') or []
 
-    def process(self, order_item, request):
-        processor = self.get_processor(order_item.offering.type)
+    def get_component_types(self, offering_type):
+        """
+        Return a components types for given offering_type.
+        :param offering_type: offering type name
+        :return: set of component types
+        """
+        return {component.type for component in self.get_components(offering_type)}
 
-        if not processor:
-            order_item.error_message = 'Skipping order item processing because processor is not found.'
-            order_item.set_state('erred')
-            return
+    def can_terminate_order_item(self, offering_type):
+        """
+        Returns true if order item can be terminated.
+        """
+        return self.backends.get(offering_type, {}).get('can_terminate_order_item')
 
-        try:
-            processor(order_item, request)
-        except exceptions.APIException as e:
-            order_item.error_message = e
-            order_item.set_state('erred')
-        else:
-            order_item.set_state('executing')
+    def get_secret_attributes(self, offering_type):
+        """
+        Returns list of secret attributes for given offering type.
+        """
+        secret_attributes = self.backends.get(offering_type, {}).get('secret_attributes')
+        if callable(secret_attributes):
+            secret_attributes = secret_attributes()
+        return secret_attributes or []
 
-    def validate(self, order_item, request):
-        validator = self.get_validator(order_item.offering.type)
-        if validator:
-            validator(order_item, request)
+    def get_available_limits(self, offering_type):
+        """
+        Returns list of offering component types which supports user-defined limits.
+        """
+        return self.backends.get(offering_type, {}).get('available_limits') or []
+
+    def get_processor(self, offering_type, processor_type):
+        """
+        Return a processor class for given offering type and order item type.
+        """
+        return self.backends.get(offering_type, {}).get(processor_type)
 
 
 manager = PluginManager()

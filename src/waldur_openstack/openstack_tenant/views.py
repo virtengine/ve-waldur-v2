@@ -1,9 +1,17 @@
-from django.db.models import Count
+from django.db.models import Count, OuterRef, Subquery, IntegerField
+from django.conf import settings
 from django.utils.translation import ugettext_lazy as _
-from rest_framework import decorators, response, status, exceptions, serializers as rf_serializers
+from rest_framework import decorators, response, status, exceptions, serializers as rf_serializers, generics
 
 from waldur_core.core import exceptions as core_exceptions, validators as core_validators
+from waldur_core.core import utils as core_utils
+from waldur_core.structure import models as structure_models
+from waldur_core.structure import signals as structure_signals
 from waldur_core.structure import views as structure_views, filters as structure_filters
+from waldur_core.structure import permissions as structure_permissions
+from waldur_openstack.openstack import models as openstack_models
+from waldur_openstack.openstack.apps import OpenStackConfig
+from waldur_openstack.openstack_base.backend import OpenStackBackendError
 
 from . import models, serializers, filters, executors
 
@@ -97,6 +105,13 @@ class OpenStackServiceProjectLinkViewSet(structure_views.BaseServiceProjectLinkV
 
 
 class UsageReporter(object):
+    """
+    This class implements service for counting number of instances grouped
+    by image and flavor name and by instance runtime status.
+    Please note that even when flavors have different UUIDs they are treated
+    as the same as long as they have the same name.
+    This is needed because in OpenStack UUID is not stable for images and flavors.
+    """
     def __init__(self, view, request):
         self.view = view
         self.request = request
@@ -106,22 +121,21 @@ class UsageReporter(object):
         if self.request.query_params:
             self.query = self.parse_query(self.request)
 
-        active_stats = self.get_stats(models.Instance.RuntimeStates.ACTIVE)
-        shutoff_stats = self.get_stats(models.Instance.RuntimeStates.SHUTOFF)
-        qs = self.get_initial_queryset().values_list('name', 'uuid')
+        running_stats = self.get_stats(models.Instance.RuntimeStates.ACTIVE)
+        created_stats = self.get_stats()
+        qs = self.get_initial_queryset().values_list('name', flat=True).distinct()
 
         page = self.view.paginate_queryset(qs)
-        result = self.serialize_result(page, active_stats, shutoff_stats)
+        result = self.serialize_result(page, running_stats, created_stats)
         return self.view.get_paginated_response(result)
 
-    def serialize_result(self, queryset, active_stats, shutoff_stats):
+    def serialize_result(self, queryset, running_stats, created_stats):
         result = []
-        for (name, uuid) in queryset:
+        for name in queryset:
             result.append({
                 'name': name,
-                'uuid': uuid,
-                'running_instances_count': active_stats.get(name, 0),
-                'created_instances_count': shutoff_stats.get(name, 0),
+                'running_instances_count': running_stats.get(name, 0),
+                'created_instances_count': created_stats.get(name, 0),
             })
         return result
 
@@ -146,7 +160,7 @@ class UsageReporter(object):
     def get_initial_queryset(self):
         raise NotImplementedError
 
-    def get_stats(self, runtime_state):
+    def get_stats(self, runtime_state=None):
         raise NotImplementedError
 
 
@@ -155,8 +169,10 @@ class ImageUsageReporter(UsageReporter):
     def get_initial_queryset(self):
         return models.Image.objects.all()
 
-    def get_stats(self, runtime_state):
-        volumes = models.Volume.objects.filter(bootable=True, instance__runtime_state=runtime_state)
+    def get_stats(self, runtime_state=None):
+        volumes = models.Volume.objects.filter(bootable=True)
+        if runtime_state:
+            volumes = volumes.filter(instance__runtime_state=runtime_state)
         rows = self.apply_filters(volumes).values('image_name').annotate(count=Count('image_name'))
         return {row['image_name']: row['count'] for row in rows}
 
@@ -166,8 +182,10 @@ class FlavorUsageReporter(UsageReporter):
     def get_initial_queryset(self):
         return models.Flavor.objects.all()
 
-    def get_stats(self, runtime_state):
-        instances = models.Instance.objects.filter(runtime_state=runtime_state)
+    def get_stats(self, runtime_state=None):
+        instances = models.Instance.objects.all()
+        if runtime_state:
+            instances = instances.filter(runtime_state=runtime_state)
         rows = self.apply_filters(instances)\
             .values('flavor_name').annotate(count=Count('flavor_name'))
         return {row['flavor_name']: row['count'] for row in rows}
@@ -256,6 +274,10 @@ class VolumeViewSet(structure_views.ImportableResourceViewSet):
         if volume.instance and volume.instance.runtime_state != models.Instance.RuntimeStates.SHUTOFF:
             raise core_exceptions.IncorrectStateException(_('Volume instance should be in shutoff state.'))
 
+    def _is_volume_instance_ok(volume):
+        if volume.instance and volume.instance.state != models.Instance.States.OK:
+            raise core_exceptions.IncorrectStateException(_('Volume instance should be in OK state.'))
+
     @decorators.detail_route(methods=['post'])
     def extend(self, request, uuid=None):
         """ Increase volume size """
@@ -271,6 +293,7 @@ class VolumeViewSet(structure_views.ImportableResourceViewSet):
         return response.Response({'status': _('extend was scheduled')}, status=status.HTTP_202_ACCEPTED)
 
     extend_validators = [_is_volume_bootable,
+                         _is_volume_instance_ok,
                          _is_volume_instance_shutoff,
                          core_validators.StateValidator(models.Volume.States.OK)]
     extend_serializer_class = serializers.VolumeExtendSerializer
@@ -361,6 +384,13 @@ class SnapshotViewSet(structure_views.ImportableResourceViewSet):
     importable_resources_backend_method = 'get_snapshots_for_import'
     importable_resources_serializer_class = serializers.SnapshotImportableSerializer
     import_resource_serializer_class = serializers.SnapshotImportSerializer
+
+
+class InstanceAvailabilityZoneViewSet(structure_views.BaseServicePropertyViewSet):
+    queryset = models.InstanceAvailabilityZone.objects.all().order_by('settings', 'name')
+    serializer_class = serializers.InstanceAvailabilityZoneSerializer
+    lookup_field = 'uuid'
+    filter_class = filters.InstanceAvailabilityZoneFilter
 
 
 class InstanceViewSet(structure_views.ImportableResourceViewSet):
@@ -612,6 +642,51 @@ class InstanceViewSet(structure_views.ImportableResourceViewSet):
     import_resource_serializer_class = serializers.InstanceImportSerializer
     import_resource_executor = executors.InstancePullExecutor
 
+    @decorators.detail_route(methods=['get'])
+    def console(self, request, uuid=None):
+        instance = self.get_object()
+        backend = instance.get_backend()
+        try:
+            url = backend.get_console_url(instance)
+        except OpenStackBackendError as e:
+            raise exceptions.ValidationError(e.message)
+
+        return response.Response({'url': url}, status=status.HTTP_200_OK)
+
+    console_validators = [core_validators.StateValidator(models.Instance.States.OK)]
+
+    def check_permissions_for_console(request, view, instance=None):
+        if not instance:
+            return
+
+        if request.user.is_staff:
+            return
+
+        if settings.WALDUR_OPENSTACK_TENANT['ALLOW_CUSTOMER_USERS_OPENSTACK_CONSOLE_ACCESS']:
+            structure_permissions.is_administrator(request, view, instance)
+        else:
+            raise exceptions.PermissionDenied()
+
+    console_permissions = [check_permissions_for_console]
+
+    @decorators.detail_route(methods=['get'])
+    def console_log(self, request, uuid=None):
+        instance = self.get_object()
+        backend = instance.get_backend()
+        serializer = self.get_serializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        length = serializer.validated_data.get('length')
+
+        try:
+            log = backend.get_console_output(instance, length)
+        except OpenStackBackendError as e:
+            raise exceptions.ValidationError(e.message)
+
+        return response.Response(log, status=status.HTTP_200_OK)
+
+    console_log_serializer_class = serializers.ConsoleLogSerializer
+    console_log_permissions = [structure_permissions.is_administrator]
+
 
 class BackupViewSet(structure_views.BaseResourceViewSet):
     queryset = models.Backup.objects.all().order_by('name')
@@ -633,6 +708,12 @@ class BackupViewSet(structure_views.BaseResourceViewSet):
         serializer.is_valid(raise_exception=True)
         backup_restoration = serializer.save()
 
+        # Note that connected volumes will be linked with new marketplace.Resources by handler in openstack_marketplace
+        structure_signals.resource_imported.send(
+            sender=models.Instance,
+            instance=backup_restoration.instance,
+        )
+
         # It is assumed that SSH public key is already stored in OpenStack system volume.
         # Therefore we don't need to specify it explicitly for cloud init service.
         executors.InstanceCreateExecutor.execute(
@@ -641,9 +722,9 @@ class BackupViewSet(structure_views.BaseResourceViewSet):
             is_heavy_task=True,
         )
 
-        instance_serialiser = serializers.InstanceSerializer(
+        instance_serializer = serializers.InstanceSerializer(
             backup_restoration.instance, context={'request': self.request})
-        return response.Response(instance_serialiser.data, status=status.HTTP_201_CREATED)
+        return response.Response(instance_serializer.data, status=status.HTTP_201_CREATED)
 
     restore_validators = [core_validators.StateValidator(models.Backup.States.OK)]
     restore_serializer_class = serializers.BackupRestorationSerializer
@@ -725,3 +806,74 @@ class SnapshotScheduleViewSet(BaseScheduleViewSet):
     queryset = models.SnapshotSchedule.objects.all().order_by('name')
     serializer_class = serializers.SnapshotScheduleSerializer
     filter_class = filters.SnapshotScheduleFilter
+
+
+class SharedSettingsBaseView(generics.GenericAPIView):
+    def get_private_settings(self):
+        service_settings_uuid = self.request.query_params.get('service_settings_uuid')
+        if not service_settings_uuid or not core_utils.is_uuid_like(service_settings_uuid):
+            return structure_models.ServiceSettings.objects.none()
+
+        queryset = structure_models.ServiceSettings.objects.filter(type=OpenStackConfig.service_name)
+        try:
+            shared_settings = queryset.get(uuid=service_settings_uuid)
+        except structure_models.ServiceSettings.DoesNotExist:
+            return structure_models.ServiceSettings.objects.none()
+
+        tenants = openstack_models.Tenant.objects.filter(service_project_link__service__settings=shared_settings)
+        if tenants:
+            return structure_models.ServiceSettings.objects.filter(scope__in=tenants)
+        else:
+            return structure_models.ServiceSettings.objects.none()
+
+    def get(self, request, *args, **kwargs):
+        page = self.paginate_queryset(self.get_queryset())
+        serializer = self.get_serializer(page, many=True)
+        return self.get_paginated_response(serializer.data)
+
+
+class SharedSettingsInstances(SharedSettingsBaseView):
+
+    serializer_class = serializers.InstanceSerializer
+
+    def get_queryset(self):
+        private_settings = self.get_private_settings()
+        return models.Instance.objects\
+            .order_by('service_project_link__project__customer__name')\
+            .filter(service_project_link__service__settings__in=private_settings)
+
+
+class SharedSettingsCustomers(SharedSettingsBaseView):
+
+    serializer_class = serializers.SharedSettingsCustomerSerializer
+
+    def get_queryset(self):
+        private_settings = self.get_private_settings()
+        vms = models.Instance.objects.filter(
+            service_project_link__service__settings__in=private_settings,
+            project__customer=OuterRef('pk')
+        ).annotate(count=Count('*')).values('count')
+
+        # Workaround for Django bug:
+        # https://code.djangoproject.com/ticket/28296
+        # It allows to remove extra GROUP BY clause from the subquery.
+        vms.query.group_by = []
+
+        vm_count = Subquery(vms[:1], output_field=IntegerField())
+        return structure_models.Customer.objects.filter(
+            pk__in=private_settings.values('customer')
+        ).annotate(vm_count=vm_count)
+
+
+class VolumeTypeViewSet(structure_views.BaseServicePropertyViewSet):
+    queryset = models.VolumeType.objects.all().order_by('settings', 'name')
+    serializer_class = serializers.VolumeTypeSerializer
+    lookup_field = 'uuid'
+    filter_class = filters.VolumeTypeFilter
+
+
+class VolumeAvailabilityZoneViewSet(structure_views.BaseServicePropertyViewSet):
+    queryset = models.VolumeAvailabilityZone.objects.all().order_by('settings', 'name')
+    serializer_class = serializers.VolumeAvailabilityZoneSerializer
+    lookup_field = 'uuid'
+    filter_class = filters.VolumeAvailabilityZoneFilter

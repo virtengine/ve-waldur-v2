@@ -9,46 +9,8 @@ class InvoiceConfig(AppConfig):
     def ready(self):
         from waldur_core.core import signals as core_signals
         from waldur_core.structure import models as structure_models
-        from waldur_mastermind.invoices.plugins import offering_registrator
-        from waldur_mastermind.invoices.plugins import openstack_registrator
-        from waldur_mastermind.packages import models as packages_models
-        from waldur_mastermind.support import models as support_models
 
-        from . import handlers, models, registrators
-
-        registrators.RegistrationManager.add_registrator(
-            support_models.Offering,
-            offering_registrator.OfferingItemRegistrator
-        )
-
-        registrators.RegistrationManager.add_registrator(
-            packages_models.OpenStackPackage,
-            openstack_registrator.OpenStackItemRegistrator
-        )
-
-        signals.post_save.connect(
-            handlers.add_new_openstack_package_details_to_invoice,
-            sender=packages_models.OpenStackPackage,
-            dispatch_uid='waldur_mastermind.invoices.add_new_openstack_package_details_to_invoice',
-        )
-
-        signals.pre_delete.connect(
-            handlers.update_invoice_on_openstack_package_deletion,
-            sender=packages_models.OpenStackPackage,
-            dispatch_uid='waldur_mastermind.invoices.update_invoice_on_openstack_package_deletion',
-        )
-
-        signals.post_save.connect(
-            handlers.add_new_offering_details_to_invoice,
-            sender=support_models.Offering,
-            dispatch_uid='waldur_mastermind.invoices.add_new_offering_details_to_invoice',
-        )
-
-        signals.pre_delete.connect(
-            handlers.update_invoice_on_offering_deletion,
-            sender=support_models.Offering,
-            dispatch_uid='waldur_mastermind.invoices.update_invoice_on_offering_deletion',
-        )
+        from . import handlers, models
 
         signals.pre_save.connect(
             handlers.set_tax_percent_on_invoice_creation,
@@ -68,29 +30,29 @@ class InvoiceConfig(AppConfig):
             dispatch_uid='waldur_mastermind.invoices.emit_invoice_created_event',
         )
 
-        for index, model in enumerate(models.InvoiceItem.get_all_models()):
-            signals.post_save.connect(
-                handlers.set_project_name_on_invoice_item_creation,
-                sender=model,
-                dispatch_uid='waldur_mastermind.invoices.'
-                             'set_project_name_on_invoice_item_creation_%s_%s' % (index, model.__class__),
-            )
+        signals.post_save.connect(
+            handlers.update_invoice_pdf,
+            sender=models.Invoice,
+            dispatch_uid='waldur_mastermind.invoices.update_invoice_pdf',
+        )
 
-            signals.post_save.connect(
-                handlers.update_current_cost_when_invoice_item_is_updated,
-                sender=model,
-                dispatch_uid='waldur_mastermind.invoices.'
-                             'update_current_cost_when_invoice_item_is_updated_%s_%s' %
-                             (index, model.__class__),
-            )
+        signals.post_save.connect(
+            handlers.set_project_name_on_invoice_item_creation,
+            sender=models.InvoiceItem,
+            dispatch_uid='waldur_mastermind.invoices.set_project_name_on_invoice_item_creation',
+        )
 
-            signals.post_delete.connect(
-                handlers.update_current_cost_when_invoice_item_is_deleted,
-                sender=model,
-                dispatch_uid='waldur_mastermind.invoices.'
-                             'update_current_cost_when_invoice_item_is_deleted_%s_%s' %
-                             (index, model.__class__),
-            )
+        signals.post_save.connect(
+            handlers.update_current_cost_when_invoice_item_is_updated,
+            sender=models.InvoiceItem,
+            dispatch_uid='waldur_mastermind.invoices.update_current_cost_when_invoice_item_is_updated_%s',
+        )
+
+        signals.post_delete.connect(
+            handlers.update_current_cost_when_invoice_item_is_deleted,
+            sender=models.InvoiceItem,
+            dispatch_uid='waldur_mastermind.invoices.update_current_cost_when_invoice_item_is_deleted',
+        )
 
         signals.post_save.connect(
             handlers.update_invoice_item_on_project_name_update,
@@ -102,4 +64,10 @@ class InvoiceConfig(AppConfig):
             handlers.prevent_deletion_of_customer_with_invoice,
             sender=structure_models.Customer,
             dispatch_uid='waldur_mastermind.invoices.prevent_deletion_of_customer_with_invoice',
+        )
+
+        signals.post_save.connect(
+            handlers.adjust_invoice_items_for_downtime,
+            sender=models.ServiceDowntime,
+            dispatch_uid='waldur_mastermind.invoices.adjust_invoice_items_for_downtime',
         )

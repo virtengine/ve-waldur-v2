@@ -42,6 +42,7 @@ INSTALLED_APPS = (
     'waldur_core.structure',
     'waldur_core.cost_tracking',
     'waldur_core.users',
+    'waldur_core.media',
 
     'rest_framework',
     'rest_framework.authtoken',
@@ -204,9 +205,19 @@ CACHES = {
 
 # Regular tasks
 CELERY_BEAT_SCHEDULE = {
-    'pull-service-settings': {
-        'task': 'waldur_core.structure.ServiceSettingsListPullTask',
-        'schedule': timedelta(minutes=30),
+    'pull-service-properties': {
+        'task': 'waldur_core.structure.ServicePropertiesListPullTask',
+        'schedule': timedelta(hours=24),
+        'args': (),
+    },
+    'pull-service-resources': {
+        'task': 'waldur_core.structure.ServiceResourcesListPullTask',
+        'schedule': timedelta(hours=1),
+        'args': (),
+    },
+    'pull-service-subresources': {
+        'task': 'waldur_core.structure.ServiceSubResourcesListPullTask',
+        'schedule': timedelta(hours=2),
         'args': (),
     },
     'check-expired-permissions': {
@@ -219,21 +230,6 @@ CELERY_BEAT_SCHEDULE = {
         # To avoid bugs and unexpected behavior - do not re-calculate estimates
         # right in the end of the month.
         'schedule': crontab(minute=10),
-        'args': (),
-    },
-    'close-alerts-without-scope': {
-        'task': 'waldur_core.logging.close_alerts_without_scope',
-        'schedule': timedelta(minutes=30),
-        'args': (),
-    },
-    'cleanup-alerts': {
-        'task': 'waldur_core.logging.alerts_cleanup',
-        'schedule': timedelta(minutes=30),
-        'args': (),
-    },
-    'check-threshold': {
-        'task': 'waldur_core.logging.check_threshold',
-        'schedule': timedelta(minutes=30),
         'args': (),
     },
     'cancel-expired-invitations': {
@@ -266,7 +262,6 @@ WALDUR_CORE = {
     'ALLOW_SIGNUP_WITHOUT_INVITATION': True,
     'VALIDATE_INVITATION_EMAIL': False,
     'TOKEN_LIFETIME': timedelta(hours=1),
-    'CLOSED_ALERTS_LIFETIME': timedelta(weeks=1),
     'INVITATION_LIFETIME': timedelta(weeks=1),
     'OWNERS_CAN_MANAGE_OWNERS': False,
     'OWNER_CAN_MANAGE_CUSTOMER': False,
@@ -282,6 +277,11 @@ WALDUR_CORE = {
     ),
     'NATIVE_NAME_ENABLED': False,
     'SITE_NAME': 'Waldur MasterMind',
+    'SITE_ADDRESS': 'Default address',
+    'SITE_EMAIL': 'Default email',
+    'SITE_PHONE': 'Default phone',
+    'SITE_LOGO': None,
+    'CURRENCY_NAME': 'EUR',
     'LOGIN_COMPLETED_URL': 'https://example.com/#/login_completed/{token}/{method}/',
     'LOGIN_FAILED_URL': 'https://example.com/#/login_failed/',
     'LOGOUT_COMPLETED_URL': 'https://example.com/#/logout_completed/',
@@ -290,6 +290,18 @@ WALDUR_CORE = {
     # 'COUNTRIES': ['EE', 'LV', 'LT'],
     'ENABLE_ACCOUNTING_START_DATE': False,
     'USE_ATOMIC_TRANSACTION': True,
+    'NOTIFICATION_SUBJECT': 'Notifications from Waldur',
+    'LOGGING_REPORT_DIRECTORY': '/var/log/waldur',
+    'LOGGING_REPORT_INTERVAL': timedelta(days=7),
+    'HTTP_CHUNK_SIZE': 50,
+    'ONLY_STAFF_CAN_INVITE_USERS': False,
+    'INVITATION_APPROVE_URL': 'https://example.com/#/invitation_approve/{token}/',
+    'INVITATION_REJECT_URL': 'https://example.com/#/invitation_reject/{token}/',
+    'INVITATION_MAX_AGE': None,
+    'INVITATION_CREATE_MISSING_USER': False,
+    'INVITATION_DISABLE_MULTIPLE_ROLES': False,
+    'PROTECT_USER_DETAILS_FOR_REGISTRATION_METHODS': [],
+    'ATTACHMENT_LINK_MAX_AGE': timedelta(hours=1),
 }
 
 WALDUR_CORE_PUBLIC_SETTINGS = [
@@ -302,6 +314,7 @@ WALDUR_CORE_PUBLIC_SETTINGS = [
     'COMPANY_TYPES',
     'NATIVE_NAME_ENABLED',
     'ONLY_STAFF_MANAGES_SERVICES',
+    'PROTECT_USER_DETAILS_FOR_REGISTRATION_METHODS',
 ]
 
 for ext in WaldurExtension.get_extensions():
@@ -337,3 +350,5 @@ SWAGGER_SETTINGS = {
         },
     },
 }
+
+IPSTACK_ACCESS_KEY = ''

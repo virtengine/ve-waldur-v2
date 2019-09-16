@@ -20,8 +20,8 @@ from rest_framework.filters import BaseFilterBackend
 
 from waldur_core.core import filters as core_filters
 from waldur_core.core import models as core_models
-from waldur_core.core.filters import BaseExternalFilter, ExternalFilterBackend
-from waldur_core.logging.filters import ExternalAlertFilterBackend
+from waldur_core.core.filters import ExternalFilterBackend
+from waldur_core.core.utils import order_with_nulls, get_ordering, is_uuid_like
 from waldur_core.structure import SupportedServices
 from waldur_core.structure import models
 from waldur_core.structure.managers import filter_queryset_for_user
@@ -103,9 +103,12 @@ class GenericUserFilter(BaseFilterBackend):
 
 
 class CustomerFilter(NameFilterSet):
+    query = django_filters.CharFilter(method='filter_query')
     native_name = django_filters.CharFilter(lookup_expr='icontains')
     abbreviation = django_filters.CharFilter(lookup_expr='icontains')
     contact_details = django_filters.CharFilter(lookup_expr='icontains')
+    division_uuid = django_filters.UUIDFilter(name='division__uuid')
+    division_name = django_filters.CharFilter(name='division__name', lookup_expr='icontains')
 
     class Meta(object):
         model = models.Customer
@@ -115,7 +118,22 @@ class CustomerFilter(NameFilterSet):
             'contact_details',
             'native_name',
             'registration_code',
+            'agreement_number',
+            'backend_id',
         ]
+
+    def filter_query(self, queryset, name, value):
+        if value:
+            return queryset.filter(
+                Q(name__icontains=value) |
+                Q(native_name__icontains=value) |
+                Q(abbreviation__icontains=value) |
+                Q(domain__icontains=value) |
+                Q(uuid__icontains=value) |
+                Q(registration_code__icontains=value) |
+                Q(agreement_number__contains=value)
+            )
+        return queryset
 
 
 class ExternalCustomerFilterBackend(ExternalFilterBackend):
@@ -124,27 +142,35 @@ class ExternalCustomerFilterBackend(ExternalFilterBackend):
 
 class AccountingStartDateFilter(BaseFilterBackend):
     def filter_queryset(self, request, queryset, view):
-
-        if not django_settings.WALDUR_CORE['ENABLE_ACCOUNTING_START_DATE']:
-            return queryset
-
-        value = request.query_params.get('accounting_is_running')
-        boolean_field = forms.NullBooleanField()
-
-        try:
-            value = boolean_field.to_python(value)
-        except exceptions.ValidationError:
-            value = None
-
-        if value is None:
-            return queryset
-
         query = Q(accounting_start_date__gt=timezone.now())
+        return filter_by_accounting_is_running(request, queryset, query)
 
-        if value:
-            return queryset.exclude(query)
-        else:
-            return queryset.filter(query)
+
+class CustomerAccountingStartDateFilter(BaseFilterBackend):
+    def filter_queryset(self, request, queryset, view):
+        query = Q(customer__accounting_start_date__gt=timezone.now())
+        return filter_by_accounting_is_running(request, queryset, query)
+
+
+def filter_by_accounting_is_running(request, queryset, query):
+    if not django_settings.WALDUR_CORE['ENABLE_ACCOUNTING_START_DATE']:
+        return queryset
+
+    value = request.query_params.get('accounting_is_running')
+    boolean_field = forms.NullBooleanField()
+
+    try:
+        value = boolean_field.to_python(value)
+    except exceptions.ValidationError:
+        value = None
+
+    if value is None:
+        return queryset
+
+    if value:
+        return queryset.exclude(query)
+    else:
+        return queryset.filter(query)
 
 
 class ProjectTypeFilter(NameFilterSet):
@@ -180,6 +206,8 @@ class ProjectFilter(NameFilterSet):
 
     description = django_filters.CharFilter(lookup_expr='icontains')
 
+    query = django_filters.CharFilter(method='filter_query')
+
     o = django_filters.OrderingFilter(
         fields=(
             ('name', 'name'),
@@ -197,7 +225,14 @@ class ProjectFilter(NameFilterSet):
             'customer', 'customer_name', 'customer_native_name', 'customer_abbreviation',
             'description',
             'created',
+            'query',
         ]
+
+    def filter_query(self, queryset, name, value):
+        if is_uuid_like(value):
+            return queryset.filter(uuid=value)
+        else:
+            return queryset.filter(name__icontains=value)
 
 
 class CustomerUserFilter(DjangoFilterBackend):
@@ -236,44 +271,44 @@ class ProjectUserFilter(DjangoFilterBackend):
         ).distinct()
 
 
+def filter_visible_users(queryset, user, extra=None):
+    connected_customers_query = models.Customer.objects.all()
+    if not (user.is_staff or user.is_support):
+        connected_customers_query = connected_customers_query.filter(
+            Q(permissions__user=user, permissions__is_active=True) |
+            Q(projects__permissions__user=user, projects__permissions__is_active=True)
+        ).distinct()
+
+    connected_customers = list(connected_customers_query.all())
+
+    subquery = (
+        Q(customerpermission__customer__in=connected_customers,
+          customerpermission__is_active=True) |
+        Q(projectpermission__project__customer__in=connected_customers,
+          projectpermission__is_active=True)
+    )
+
+    queryset = queryset.filter(is_staff=False).filter(
+        subquery | Q(uuid=user.uuid) | (extra or Q())
+    ).distinct()
+
+    if not (user.is_staff or user.is_support):
+        queryset = queryset.filter(is_active=True, is_staff=False)
+
+    return queryset
+
+
 class UserFilterBackend(DjangoFilterBackend):
     def filter_queryset(self, request, queryset, view):
         user = request.user
 
-        # ?current
         current_user = request.query_params.get('current')
         if current_user is not None and not user.is_anonymous:
             queryset = User.objects.filter(uuid=user.uuid)
 
-        # TODO: refactor to a separate endpoint or structure
-        # a special query for all users with assigned privileges that the current user can remove privileges from
         if (not django_settings.WALDUR_CORE.get('SHOW_ALL_USERS', False) and
                 not (user.is_staff or user.is_support)):
-            connected_customers_query = models.Customer.objects.all()
-            # is user is not staff, allow only connected customers
-            if not (user.is_staff or user.is_support):
-                # XXX: Let the DB cry...
-                connected_customers_query = connected_customers_query.filter(
-                    Q(permissions__user=user, permissions__is_active=True) |
-                    Q(projects__permissions__user=user, projects__permissions__is_active=True)
-                ).distinct()
-
-            connected_customers = list(connected_customers_query.all())
-
-            queryset = queryset.filter(is_staff=False).filter(
-                # customer users
-                Q(customerpermission__customer__in=connected_customers,
-                  customerpermission__is_active=True) |
-                Q(projectpermission__project__customer__in=connected_customers,
-                  projectpermission__is_active=True) |
-                Q(uuid=user.uuid) |
-                self.get_extra_q(user)
-            ).distinct()
-
-        if not (user.is_staff or user.is_support):
-            queryset = queryset.filter(is_active=True)
-            # non-staff users cannot see staff through rest
-            queryset = queryset.filter(is_staff=False)
+            queryset = filter_visible_users(queryset, user, self.get_extra_q(user))
 
         return queryset.order_by('username')
 
@@ -511,6 +546,7 @@ class BaseServiceFilter(six.with_metaclass(ServiceFilterMetaclass, django_filter
 
 class BaseServiceProjectLinkFilter(django_filters.FilterSet):
     service_uuid = django_filters.UUIDFilter(name='service__uuid')
+    settings_uuid = django_filters.UUIDFilter(name='service__settings__uuid')
     customer_uuid = django_filters.UUIDFilter(name='service__customer__uuid')
     project_uuid = django_filters.UUIDFilter(name='project__uuid')
     project = core_filters.URLFilter(view_name='project-detail', name='project__uuid')
@@ -527,7 +563,8 @@ class ResourceFilterMetaclass(FilterSetMetaclass):
 
     def __new__(cls, name, bases, args):
         resource_filter = super(ResourceFilterMetaclass, cls).__new__(cls, name, bases, args)
-        SupportedServices.register_resource_filter(args['Meta'].model, resource_filter)
+        if 'Meta' in args:
+            SupportedServices.register_resource_filter(args['Meta'].model, resource_filter)
         return resource_filter
 
 
@@ -582,6 +619,7 @@ class BaseResourceFilter(six.with_metaclass(ResourceFilterMetaclass,
         queryset=taggit.models.Tag.objects.all(),
         conjoined=True,
     )
+    external_ip = core_filters.EmptyFilter()
 
     ORDERING_FIELDS = (
         ('name', 'name'),
@@ -643,7 +681,7 @@ class TagsFilter(BaseFilterBackend):
         return queryset
 
     def _order(self, request, queryset):
-        order_by = request.query_params.get('o')
+        order_by = get_ordering(request)
         item_name = self._get_item_name(order_by)
         if item_name:
             filter_kwargs = {self.db_field + '__name__startswith': item_name}
@@ -657,24 +695,12 @@ class TagsFilter(BaseFilterBackend):
 
 
 class StartTimeFilter(BaseFilterBackend):
-    """
-    In PostgreSQL NULL values come *last* with ascending sort order.
-    In MySQL NULL values come *first* with ascending sort order.
-    This filter provides unified sorting for both databases.
-    """
 
     def filter_queryset(self, request, queryset, view):
-        order = request.query_params.get('o', None)
-        if order == 'start_time':
-            queryset = queryset.extra(select={
-                'is_null': 'CASE WHEN start_time IS NULL THEN 0 ELSE 1 END'}) \
-                .order_by('is_null', 'start_time')
-        elif order == '-start_time':
-            queryset = queryset.extra(select={
-                'is_null': 'CASE WHEN start_time IS NULL THEN 0 ELSE 1 END'}) \
-                .order_by('-is_null', '-start_time')
-
-        return queryset
+        order_by = get_ordering(request)
+        if order_by not in ('start_time', '-start_time'):
+            return queryset
+        return order_with_nulls(queryset, order_by)
 
 
 class BaseServicePropertyFilter(NameFilterSet):
@@ -689,61 +715,6 @@ class ServicePropertySettingsFilter(BaseServicePropertyFilter):
 
     class Meta(BaseServicePropertyFilter.Meta):
         fields = BaseServicePropertyFilter.Meta.fields + ('settings_uuid', 'settings')
-
-
-class AggregateFilter(BaseExternalFilter):
-    """
-    Filter by aggregate
-    """
-
-    def filter(self, request, queryset, view):
-        # Don't apply filter if aggregate is not specified
-        if 'aggregate' not in request.query_params:
-            return queryset
-
-        aggregate = request.query_params['aggregate']
-        uuid = request.query_params.get('uuid')
-
-        return filter_alerts_by_aggregate(queryset, aggregate, request.user, uuid)
-
-
-def filter_alerts_by_aggregate(queryset, aggregate, user, uuid=None):
-    valid_model_choices = {
-        'project': models.Project,
-        'customer': models.Customer,
-    }
-
-    error = '"%s" parameter is not found. Valid choices are: %s.' % (aggregate, ', '.join(valid_model_choices.keys()))
-    assert (aggregate in valid_model_choices), error
-
-    aggregate_query = filter_queryset_for_user(valid_model_choices[aggregate].objects, user)
-
-    if uuid:
-        aggregate_query = aggregate_query.filter(uuid=uuid)
-
-    aggregates_ids = aggregate_query.values_list('id', flat=True)
-    query = {'%s__in' % aggregate: aggregates_ids}
-
-    all_models = models.ResourceMixin.get_all_models() + models.ServiceProjectLink.get_all_models()
-    if aggregate == 'customer':
-        all_models += models.Service.get_all_models()
-        all_models.append(models.Project)
-
-    querysets = [aggregate_query]
-    for model in all_models:
-        qs = model.objects.filter(**query).all()
-        querysets.append(filter_queryset_for_user(qs, user))
-
-    aggregate_query = Q()
-    for qs in querysets:
-        content_type = ContentType.objects.get_for_model(qs.model)
-        ids = qs.values_list('id', flat=True)
-        aggregate_query |= Q(content_type=content_type, object_id__in=ids)
-
-    return queryset.filter(aggregate_query)
-
-
-ExternalAlertFilterBackend.register(AggregateFilter())
 
 
 class ResourceSummaryFilterBackend(core_filters.SummaryFilter):
@@ -768,3 +739,14 @@ class ServiceSummaryFilterBackend(core_filters.SummaryFilter):
 
     def get_base_filter(self):
         return BaseServiceFilter
+
+
+class DivisionFilter(NameFilterSet):
+    type = django_filters.CharFilter(name='type__name', lookup_expr='iexact')
+    parent = django_filters.UUIDFilter(name='parent__uuid')
+
+    class Meta(object):
+        model = models.Division
+        fields = [
+            'name',
+        ]

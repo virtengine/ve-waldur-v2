@@ -26,7 +26,7 @@
 Name: waldur-mastermind
 Summary: Waldur MasterMind
 Group: Development/Libraries
-Version: 3.0.7
+Version: 3.9.7
 Release: 1.el7
 License: MIT
 Url: https://waldur.com
@@ -37,7 +37,7 @@ Source0: %{name}-%{version}.tar.gz
 # python-cryptography is needed for Azure plugin
 # python-django-cors-headers is packaging-specific dependency; it is not required in upstream code
 # python-jira is needed for JIRA plugin
-# python-libcloud is needed for AWS and Azure plugin
+# python-libcloud is needed for AWS plugin
 # python-lxml is needed for Valimo auth to work
 # xmlsec1-openssl package is needed for SAML2 features to work
 
@@ -45,14 +45,15 @@ Requires: ansible-waldur-module >= 0.8.2
 Requires: logrotate
 Requires: mailcap
 Requires: openssl
+Requires: python-azure-sdk >= 4.0.0
 Requires: python-ceilometerclient >= 2.9.0
-Requires: python-celery = 4.1.0
+Requires: python2-celery >= 4.2.0
 Requires: python-cinderclient >= 3.1.0
 Requires: python-country >= 1.20, python-country < 2.0
 Requires: python-croniter >= 0.3.4, python-croniter < 0.3.6
 Requires: python2-cryptography >= 1.7.2
 Requires: python-digitalocean >= 1.5
-Requires: python-django >= 1.11, python-django < 2.0
+Requires: python2-django >= 1.11.23, python2-django < 2.0.0
 Requires: python-django-admin-tools = 0.8.0
 Requires: python-django-auth-ldap >= 1.3.0
 Requires: python-django-cors-headers = 2.1.0
@@ -67,17 +68,17 @@ Requires: python-django-redis-cache >= 1.6.5
 Requires: python-django-rest-framework >= 3.6.3, python-django-rest-framework < 3.7.0
 Requires: python-django-rest-swagger = 2.1.2
 Requires: python-django-reversion = 2.0.8
-Requires: python-django-saml2 = 0.17.1
+Requires: python-django-saml2 = 0.17.1-2
 Requires: python-django-taggit >= 0.20.2
-Requires: python-elasticsearch = 5.4.0
-Requires: python-freeipa >= 0.1.2
+Requires: python-freeipa >= 0.2.2
 Requires: python-glanceclient >= 1:2.8.0
 Requires: python-hiredis >= 0.2.0
 Requires: python-influxdb >= 4.1.0
 Requires: python-iptools >= 0.6.1
-Requires: python-jira >= 1.0.7
+Requires: python-jira >= 1.0.15-2
+Requires: python-jwt >= 1.5.3
 Requires: python-keystoneclient >= 1:3.13.0
-Requires: python-libcloud >= 1.1.0, python-libcloud < 2.2.0
+Requires: python-libcloud >= 1.1.0, python-libcloud < 2.3.0
 Requires: python-lxml >= 3.2.0
 Requires: python-neutronclient >= 6.5.0
 Requires: python-novaclient >= 1:9.1.0
@@ -87,7 +88,7 @@ Requires: python-pillow >= 2.0.0
 Requires: python-prettytable >= 0.7.1, python-prettytable < 0.8
 Requires: python-psycopg2 >= 2.5.4
 Requires: python-redis = 2.10.6
-Requires: python-requests >= 2.6.0
+Requires: python-requests >= 2.14.2
 Requires: python-sqlparse >= 0.1.11
 Requires: python-tlslite = 0.4.8
 Requires: python-urllib3 >= 1.10.1
@@ -95,27 +96,10 @@ Requires: python-vat >= 1.3.1, python-vat < 2.0
 Requires: python-zabbix >= 0.7.2
 Requires: python2-defusedxml >= 0.4.1
 Requires: python2-pdfkit >= 0.6.1
+Requires: python2-pyvmomi >= 6.7.1
 Requires: PyYAML
-Requires: uwsgi-plugin-python
+Requires: uwsgi-plugin-python2
 Requires: xmlsec1-openssl
-
-Obsoletes: waldur-ansible
-Obsoletes: waldur-auth-openid
-Obsoletes: waldur-auth-saml2
-Obsoletes: waldur-auth-social
-Obsoletes: waldur-auth-valimo
-Obsoletes: waldur-aws
-Obsoletes: waldur-azure
-Obsoletes: waldur-core
-Obsoletes: waldur-cost-planning
-Obsoletes: waldur-digitalocean
-Obsoletes: waldur-freeipa
-Obsoletes: waldur-jira
-Obsoletes: waldur-openstack
-Obsoletes: waldur-paypal
-Obsoletes: waldur-rijkscloud
-Obsoletes: waldur-slurm
-Obsoletes: waldur-zabbix
 
 BuildArch: noarch
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-buildroot
@@ -125,7 +109,7 @@ BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-buildroot
 # python-setuptools package is needed to run 'python setup.py <cmd>'
 # systemd package provides _unitdir RPM macro
 BuildRequires: gettext
-BuildRequires: python-django >= 1.11, python-django < 2.0
+BuildRequires: python2-django >= 1.11.23
 BuildRequires: python-django-filter = 1.0.2
 BuildRequires: python-django-fluent-dashboard
 BuildRequires: python-django-jsoneditor >= 0.0.7
@@ -318,6 +302,276 @@ fi
 %systemd_postun_with_restart %{__uwsgi_service_name}.service
 
 %changelog
+* Fri Sep 13 2019 Jenkins <jenkins@opennodecloud.com> - 3.9.7-1.el7
+- New upstream release
+
+* Thu Sep 12 2019 Jenkins <jenkins@opennodecloud.com> - 3.9.6-1.el7
+- New upstream release
+
+* Sat Aug 31 2019 Jenkins <jenkins@opennodecloud.com> - 3.9.5-1.el7
+- New upstream release
+
+* Mon Aug 26 2019 Jenkins <jenkins@opennodecloud.com> - 3.9.4-1.el7
+- New upstream release
+
+* Fri Aug 23 2019 Jenkins <jenkins@opennodecloud.com> - 3.9.3-1.el7
+- New upstream release
+
+* Wed Aug 21 2019 Jenkins <jenkins@opennodecloud.com> - 3.9.2-1.el7
+- New upstream release
+
+* Wed Aug 21 2019 Jenkins <jenkins@opennodecloud.com> - 3.9.1-1.el7
+- New upstream release
+
+* Mon Aug 19 2019 Jenkins <jenkins@opennodecloud.com> - 3.9.0-1.el7
+- New upstream release
+
+* Tue Aug 13 2019 Jenkins <jenkins@opennodecloud.com> - 3.8.9-1.el7
+- New upstream release
+
+* Tue Aug 13 2019 Jenkins <jenkins@opennodecloud.com> - 3.8.8-1.el7
+- New upstream release
+
+* Fri Aug 2 2019 Jenkins <jenkins@opennodecloud.com> - 3.8.7-1.el7
+- New upstream release
+
+* Thu Jul 25 2019 Jenkins <jenkins@opennodecloud.com> - 3.8.6-1.el7
+- New upstream release
+
+* Fri Jul 19 2019 Jenkins <jenkins@opennodecloud.com> - 3.8.5-1.el7
+- New upstream release
+
+* Tue Jul 16 2019 Jenkins <jenkins@opennodecloud.com> - 3.8.4-1.el7
+- New upstream release
+
+* Tue Jul 16 2019 Jenkins <jenkins@opennodecloud.com> - 3.8.3-1.el7
+- New upstream release
+
+* Sat Jul 13 2019 Jenkins <jenkins@opennodecloud.com> - 3.8.2-1.el7
+- New upstream release
+
+* Tue Jul 9 2019 Jenkins <jenkins@opennodecloud.com> - 3.8.1-1.el7
+- New upstream release
+
+* Mon Jul 8 2019 Jenkins <jenkins@opennodecloud.com> - 3.8.0-1.el7
+- New upstream release
+
+* Mon Jun 24 2019 Jenkins <jenkins@opennodecloud.com> - 3.7.9-1.el7
+- New upstream release
+
+* Fri Jun 21 2019 Jenkins <jenkins@opennodecloud.com> - 3.7.8-1.el7
+- New upstream release
+
+* Wed Jun 12 2019 Jenkins <jenkins@opennodecloud.com> - 3.7.7-1.el7
+- New upstream release
+
+* Wed Jun 12 2019 Jenkins <jenkins@opennodecloud.com> - 3.7.6-1.el7
+- New upstream release
+
+* Mon Jun 10 2019 Jenkins <jenkins@opennodecloud.com> - 3.7.5-1.el7
+- New upstream release
+
+* Wed Jun 5 2019 Jenkins <jenkins@opennodecloud.com> - 3.7.4-1.el7
+- New upstream release
+
+* Sat Jun 1 2019 Jenkins <jenkins@opennodecloud.com> - 3.7.3-1.el7
+- New upstream release
+
+* Wed May 29 2019 Jenkins <jenkins@opennodecloud.com> - 3.7.2-1.el7
+- New upstream release
+
+* Tue May 28 2019 Jenkins <jenkins@opennodecloud.com> - 3.7.1-1.el7
+- New upstream release
+
+* Tue May 28 2019 Jenkins <jenkins@opennodecloud.com> - 3.7.0-1.el7
+- New upstream release
+
+* Mon May 27 2019 Jenkins <jenkins@opennodecloud.com> - 3.6.9-1.el7
+- New upstream release
+
+* Sun May 26 2019 Jenkins <jenkins@opennodecloud.com> - 3.6.8-1.el7
+- New upstream release
+
+* Sat May 25 2019 Jenkins <jenkins@opennodecloud.com> - 3.6.7-1.el7
+- New upstream release
+
+* Thu May 23 2019 Jenkins <jenkins@opennodecloud.com> - 3.6.6-1.el7
+- New upstream release
+
+* Wed May 22 2019 Jenkins <jenkins@opennodecloud.com> - 3.6.5-1.el7
+- New upstream release
+
+* Sat May 18 2019 Jenkins <jenkins@opennodecloud.com> - 3.6.4-1.el7
+- New upstream release
+
+* Wed May 15 2019 Jenkins <jenkins@opennodecloud.com> - 3.6.3-1.el7
+- New upstream release
+
+* Sun May 12 2019 Jenkins <jenkins@opennodecloud.com> - 3.6.2-1.el7
+- New upstream release
+
+* Thu May 9 2019 Jenkins <jenkins@opennodecloud.com> - 3.6.1-1.el7
+- New upstream release
+
+* Thu May 9 2019 Jenkins <jenkins@opennodecloud.com> - 3.6.0-1.el7
+- New upstream release
+
+* Wed May 8 2019 Jenkins <jenkins@opennodecloud.com> - 3.5.9-1.el7
+- New upstream release
+
+* Wed May 8 2019 Jenkins <jenkins@opennodecloud.com> - 3.5.8-1.el7
+- New upstream release
+
+* Tue May 7 2019 Jenkins <jenkins@opennodecloud.com> - 3.5.7-1.el7
+- New upstream release
+
+* Mon May 6 2019 Jenkins <jenkins@opennodecloud.com> - 3.5.6-1.el7
+- New upstream release
+
+* Fri May 3 2019 Jenkins <jenkins@opennodecloud.com> - 3.5.5-1.el7
+- New upstream release
+
+* Thu May 2 2019 Jenkins <jenkins@opennodecloud.com> - 3.5.4-1.el7
+- New upstream release
+
+* Mon Apr 29 2019 Jenkins <jenkins@opennodecloud.com> - 3.5.3-1.el7
+- New upstream release
+
+* Sat Apr 27 2019 Jenkins <jenkins@opennodecloud.com> - 3.5.2-1.el7
+- New upstream release
+
+* Mon Apr 22 2019 Jenkins <jenkins@opennodecloud.com> - 3.5.1-1.el7
+- New upstream release
+
+* Wed Apr 17 2019 Jenkins <jenkins@opennodecloud.com> - 3.5.0-1.el7
+- New upstream release
+
+* Tue Apr 16 2019 Jenkins <jenkins@opennodecloud.com> - 3.4.9-1.el7
+- New upstream release
+
+* Fri Apr 12 2019 Jenkins <jenkins@opennodecloud.com> - 3.4.8-1.el7
+- New upstream release
+
+* Wed Apr 10 2019 Jenkins <jenkins@opennodecloud.com> - 3.4.7-1.el7
+- New upstream release
+
+* Tue Apr 9 2019 Jenkins <jenkins@opennodecloud.com> - 3.4.6-1.el7
+- New upstream release
+
+* Mon Apr 8 2019 Jenkins <jenkins@opennodecloud.com> - 3.4.5-1.el7
+- New upstream release
+
+* Fri Apr 5 2019 Jenkins <jenkins@opennodecloud.com> - 3.4.4-1.el7
+- New upstream release
+
+* Thu Apr 4 2019 Jenkins <jenkins@opennodecloud.com> - 3.4.3-1.el7
+- New upstream release
+
+* Thu Apr 4 2019 Jenkins <jenkins@opennodecloud.com> - 3.4.2-1.el7
+- New upstream release
+
+* Tue Mar 26 2019 Jenkins <jenkins@opennodecloud.com> - 3.4.1-1.el7
+- New upstream release
+
+* Tue Mar 19 2019 Jenkins <jenkins@opennodecloud.com> - 3.4.0-1.el7
+- New upstream release
+
+* Tue Mar 19 2019 Jenkins <jenkins@opennodecloud.com> - 3.3.9-1.el7
+- New upstream release
+
+* Mon Mar 11 2019 Jenkins <jenkins@opennodecloud.com> - 3.3.8-1.el7
+- New upstream release
+
+* Sun Mar 10 2019 Jenkins <jenkins@opennodecloud.com> - 3.3.7-1.el7
+- New upstream release
+
+* Thu Mar 7 2019 Jenkins <jenkins@opennodecloud.com> - 3.3.6-1.el7
+- New upstream release
+
+* Sat Mar 2 2019 Jenkins <jenkins@opennodecloud.com> - 3.3.5-1.el7
+- New upstream release
+
+* Thu Feb 28 2019 Jenkins <jenkins@opennodecloud.com> - 3.3.4-1.el7
+- New upstream release
+
+* Tue Feb 26 2019 Jenkins <jenkins@opennodecloud.com> - 3.3.3-1.el7
+- New upstream release
+
+* Tue Feb 19 2019 Jenkins <jenkins@opennodecloud.com> - 3.3.2-1.el7
+- New upstream release
+
+* Wed Feb 13 2019 Jenkins <jenkins@opennodecloud.com> - 3.3.1-1.el7
+- New upstream release
+
+* Mon Feb 11 2019 Jenkins <jenkins@opennodecloud.com> - 3.3.0-1.el7
+- New upstream release
+
+* Sat Feb 9 2019 Jenkins <jenkins@opennodecloud.com> - 3.2.9-1.el7
+- New upstream release
+
+* Sat Feb 9 2019 Jenkins <jenkins@opennodecloud.com> - 3.2.8-1.el7
+- New upstream release
+
+* Fri Feb 8 2019 Jenkins <jenkins@opennodecloud.com> - 3.2.7-1.el7
+- New upstream release
+
+* Tue Feb 5 2019 Jenkins <jenkins@opennodecloud.com> - 3.2.6-1.el7
+- New upstream release
+
+* Sun Jan 20 2019 Jenkins <jenkins@opennodecloud.com> - 3.2.5-1.el7
+- New upstream release
+
+* Sun Jan 6 2019 Jenkins <jenkins@opennodecloud.com> - 3.2.4-1.el7
+- New upstream release
+
+* Sat Dec 29 2018 Jenkins <jenkins@opennodecloud.com> - 3.2.3-1.el7
+- New upstream release
+
+* Wed Dec 26 2018 Jenkins <jenkins@opennodecloud.com> - 3.2.2-1.el7
+- New upstream release
+
+* Tue Dec 18 2018 Jenkins <jenkins@opennodecloud.com> - 3.2.1-1.el7
+- New upstream release
+
+* Fri Dec 14 2018 Jenkins <jenkins@opennodecloud.com> - 3.2.0-1.el7
+- New upstream release
+
+* Mon Dec 10 2018 Jenkins <jenkins@opennodecloud.com> - 3.1.9-1.el7
+- New upstream release
+
+* Fri Nov 30 2018 Jenkins <jenkins@opennodecloud.com> - 3.1.8-1.el7
+- New upstream release
+
+* Wed Nov 14 2018 Jenkins <jenkins@opennodecloud.com> - 3.1.7-1.el7
+- New upstream release
+
+* Sat Nov 10 2018 Jenkins <jenkins@opennodecloud.com> - 3.1.6-1.el7
+- New upstream release
+
+* Sat Nov 10 2018 Jenkins <jenkins@opennodecloud.com> - 3.1.5-1.el7
+- New upstream release
+
+* Fri Nov 2 2018 Jenkins <jenkins@opennodecloud.com> - 3.1.4-1.el7
+- New upstream release
+
+* Wed Oct 31 2018 Jenkins <jenkins@opennodecloud.com> - 3.1.3-1.el7
+- New upstream release
+
+* Tue Oct 30 2018 Jenkins <jenkins@opennodecloud.com> - 3.1.2-1.el7
+- New upstream release
+
+* Sun Oct 28 2018 Jenkins <jenkins@opennodecloud.com> - 3.1.1-1.el7
+- New upstream release
+
+* Tue Oct 23 2018 Jenkins <jenkins@opennodecloud.com> - 3.1.0-1.el7
+- New upstream release
+
+* Mon Oct 8 2018 Jenkins <jenkins@opennodecloud.com> - 3.0.9-1.el7
+- New upstream release
+
+* Mon Oct 1 2018 Jenkins <jenkins@opennodecloud.com> - 3.0.8-1.el7
+- New upstream release
+
 * Tue Aug 14 2018 Jenkins <jenkins@opennodecloud.com> - 3.0.7-1.el7
 - New upstream release
 

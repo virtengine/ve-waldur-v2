@@ -1,24 +1,34 @@
 import calendar
 from collections import OrderedDict
 import datetime
+import functools
 import importlib
 from itertools import chain
 from operator import itemgetter
 import os
 import re
 import time
+import unicodedata
+import uuid
 
 from django.apps import apps
 from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.core.mail import send_mail
+from django.core.mail import EmailMultiAlternatives
 from django.core.management import call_command
+from django.core.management.base import BaseCommand
+from django.core.serializers.json import DjangoJSONEncoder
+from django.db.models import F
+from django.db.models.sql.query import get_order_dir
 from django.http import QueryDict
-from django.template.loader import render_to_string
+from django.template import Context
+from django.template.loader import get_template, render_to_string
 from django.urls import resolve
 from django.utils import timezone
 from django.utils.crypto import get_random_string
 from django.utils.encoding import force_text
+import jwt
+from rest_framework.settings import api_settings
 
 
 def flatten(*xs):
@@ -211,16 +221,40 @@ def silent_call(name, *args, **options):
     call_command(name, stdout=open(os.devnull, 'w'), *args, **options)
 
 
-def broadcast_mail(app, event_type, context, recipient_list):
+def format_text(template_name, context):
+    template = get_template(template_name).template
+    return template.render(Context(context, autoescape=False)).strip()
+
+
+def send_mail_with_attachment(subject, body, to, from_email=None, html_message=None,
+                              filename=None, attachment=None, content_type='text/plain'):
+    from_email = from_email or settings.DEFAULT_FROM_EMAIL
+    email = EmailMultiAlternatives(
+        subject=subject,
+        body=body,
+        to=to,
+        from_email=from_email
+    )
+
+    if html_message:
+        email.attach_alternative(html_message, 'text/html')
+
+    if filename:
+        email.attach(filename, attachment, content_type)
+    return email.send()
+
+
+def broadcast_mail(app, event_type, context, recipient_list,
+                   filename=None, attachment=None, content_type='text/plain'):
     """
     Shorthand to format email message from template file and sent it to all recipients.
 
     It is assumed that there are there are 3 templates available for event type in application.
-    For example, if app is 'experts' and event_type is 'new_request', then there should be 3 files:
+    For example, if app is 'users' and event_type is 'invitation_rejected', then there should be 3 files:
 
-    1) experts/new_request_subject.txt is template for email subject
-    2) experts/new_request_message.txt is template for email body as text
-    3) experts/new_request_message.html is template for email body as HTML
+    1) users/invitation_rejected_subject.txt is template for email subject
+    2) users/invitation_rejected_message.txt is template for email body as text
+    3) users/invitation_rejected_message.html is template for email body as HTML
 
     By default, built-in Django send_mail is used, all members
     of the recipient list will see the other recipients in the 'To' field.
@@ -231,15 +265,124 @@ def broadcast_mail(app, event_type, context, recipient_list):
     :param event_type: postfix for template filename.
     :param context: dictionary passed to the template for rendering.
     :param recipient_list: list of strings, each an email address.
+    :param filename: name of the attached file
+    :param attachment: content of attachment
+    :param content_type: the content type of attachment
     """
+    subject_template_name = '%s/%s_subject.txt' % (app, event_type)
+    subject = format_text(subject_template_name, context)
 
-    subject_template = '%s/%s_subject.txt' % (app, event_type)
-    text_template = '%s/%s_message.txt' % (app, event_type)
-    html_template = '%s/%s_message.html' % (app, event_type)
+    text_template_name = '%s/%s_message.txt' % (app, event_type)
+    text_message = format_text(text_template_name, context)
 
-    subject = render_to_string(subject_template, context).strip()
-    text_message = render_to_string(text_template, context)
-    html_message = render_to_string(html_template, context)
+    html_template_name = '%s/%s_message.html' % (app, event_type)
+    html_message = render_to_string(html_template_name, context)
 
     for recipient in recipient_list:
-        send_mail(subject, text_message, settings.DEFAULT_FROM_EMAIL, [recipient], html_message=html_message)
+        send_mail_with_attachment(subject, text_message, to=[recipient], html_message=html_message,
+                                  filename=filename, attachment=attachment, content_type=content_type)
+
+
+def get_ordering(request):
+    """
+    Extract ordering from HTTP request.
+    """
+    return request.query_params.get(api_settings.ORDERING_PARAM)
+
+
+def order_with_nulls(queryset, field):
+    """
+    If sorting order is ascending, then NULL values come first,
+    if sorting order is descending, then NULL values come last.
+    """
+    col, order = get_order_dir(field)
+    descending = True if order == 'DESC' else False
+
+    if descending:
+        return queryset.order_by(F(col).desc(nulls_last=True))
+    else:
+        return queryset.order_by(F(col).asc(nulls_first=True))
+
+
+def is_uuid_like(val):
+    """
+    Check if value looks like a valid UUID.
+    """
+    try:
+        uuid.UUID(val)
+    except (TypeError, ValueError, AttributeError):
+        return False
+    else:
+        return True
+
+
+def chunks(xs, n):
+    """
+    Split list to evenly sized chunks
+
+    >> chunks(range(10), 4)
+    [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9]]
+
+    :param xs: arbitrary list
+    :param n: chunk size
+    :return: list of lists
+    """
+    return [xs[i:i + n] for i in xrange(0, len(xs), n)]
+
+
+def create_batch_fetcher(fetcher):
+    """
+    Decorator to simplify code for chunked fetching.
+    It fetches resources from backend API in evenly sized chunks.
+    It is needed in order to avoid too long HTTP request error.
+    Essentially, it gives the same result as fetcher(items) but does not throw an error.
+
+    :param fetcher: fetcher: function which accepts list of items and returns list of results,
+    for example, list of UUIDs and returns list of projects with given UUIDs
+    :return: function with the same signature as fetcher
+    """
+    @functools.wraps(fetcher)
+    def wrapped(items):
+        """
+        :param items: list of items for request, for example, list of UUIDs
+        :return: merged list of results
+        """
+        result = []
+        for chunk in chunks(items, settings.WALDUR_CORE['HTTP_CHUNK_SIZE']):
+            result.extend(fetcher(chunk))
+        return result
+    return wrapped
+
+
+class DryRunCommand(BaseCommand):
+    def add_arguments(self, parser):
+        parser.add_argument('--dry-run', action='store_true',
+                            help='Don\'t make any changes, instead show what objects would be created.')
+
+
+def encode_jwt_token(data, api_secret_code=None):
+    """
+    Encode Python dictionary as JWT token.
+    :param data: Dictionary with payload.
+    :param api_secret_code: optional string, application secret key is used by default.
+    :return: JWT token string with encoded and signed data.
+    """
+    if api_secret_code is None:
+        api_secret_code = settings.SECRET_KEY
+    return jwt.encode(data, api_secret_code, algorithm='HS256', json_encoder=DjangoJSONEncoder)
+
+
+def decode_jwt_token(encoded_data, api_secret_code=None):
+    """
+    Decode JWT token string to Python dictionary.
+    :param encoded_data: JWT token string with encoded and signed data.
+    :param api_secret_code: optional string, application secret key is used by default.
+    :return: Dictionary with payload.
+    """
+    if api_secret_code is None:
+        api_secret_code = settings.SECRET_KEY
+    return jwt.decode(encoded_data, api_secret_code, algorithms=['HS256'])
+
+
+def normalize_unicode(data):
+    return unicodedata.normalize(u'NFKD', data).encode('ascii', 'ignore').decode('utf8')

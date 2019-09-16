@@ -1,7 +1,7 @@
 from functools import reduce
 
 from django.db import models
-from django.db.models import Sum
+from django.db.models import F, Sum
 import six
 
 from . import exceptions
@@ -52,7 +52,7 @@ class QuotaLimitField(models.IntegerField):
         def func(instance, value, quota_field=self._quota_field):
             # a hook to properly init quota after object saved to DB
             quota_field.scope_default_limit(instance, value)
-            instance.set_quota_limit(quota_field, value, fail_silently=True)
+            instance.set_quota_limit(quota_field, value)
 
         return func
 
@@ -193,11 +193,11 @@ class CounterQuotaField(QuotaField):
         current_usage = self.get_current_usage(self.target_models, scope)
         scope.set_quota_usage(self.name, current_usage)
 
-    def add_usage(self, target_instance, delta, fail_silently=False):
+    def add_usage(self, target_instance, delta):
         scope = self._get_scope(target_instance)
         delta *= self.get_delta(target_instance)
         if self.is_connected_to_scope(scope):
-            scope.add_quota_usage(self.name, delta, fail_silently=fail_silently, validate=True)
+            scope.add_quota_usage(self.name, delta, validate=True)
 
     def _get_scope(self, target_instance):
         return reduce(getattr, self.path_to_scope.split('.'), target_instance)
@@ -267,22 +267,18 @@ class AggregatorQuotaField(QuotaField):
         scope.set_quota_usage(self.name, current_usage)
 
     def post_child_quota_save(self, scope, child_quota, created=False):
-        quota = scope.quotas.get(name=self.name)
         current_value = getattr(child_quota, self.aggregation_field)
         if created:
             diff = current_value
         else:
             diff = current_value - child_quota.tracker.previous(self.aggregation_field)
         if diff:
-            quota.usage += diff
-            quota.save()
+            scope.quotas.filter(name=self.name).update(usage=F('usage') + diff)
 
     def pre_child_quota_delete(self, scope, child_quota):
-        quota = scope.quotas.get(name=self.name)
         diff = getattr(child_quota, self.aggregation_field)
         if diff:
-            quota.usage -= diff
-            quota.save()
+            scope.quotas.filter(name=self.name).update(usage=F('usage') - diff)
 
 
 class UsageAggregatorQuotaField(AggregatorQuotaField):

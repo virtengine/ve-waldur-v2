@@ -5,17 +5,18 @@ from django.db.models import Q
 from django.utils import timezone
 from django.utils.translation import ugettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
-from rest_framework import viewsets, views, permissions, decorators, response, status, exceptions
+from rest_framework import viewsets, views, permissions, decorators, response, status, exceptions as rf_exceptions
 
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
+from waldur_core.core import utils as core_utils
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import metadata as structure_metadata
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure import views as structure_views
 
-from . import filters, models, serializers, backend
+from . import filters, models, serializers, backend, exceptions, tasks
 
 
 class CheckExtensionMixin(core_views.CheckExtensionMixin):
@@ -35,16 +36,30 @@ class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
 
     def is_staff_or_support(request, view, obj=None):
         if not request.user.is_staff and not request.user.is_support:
-            raise exceptions.PermissionDenied()
+            raise rf_exceptions.PermissionDenied()
 
     def check_related_resources(request, view, obj=None):
         if obj and obj.offering_set.exists():
-            raise exceptions.ValidationError(_('Issue has offering. Please remove it first.'))
+            raise rf_exceptions.ValidationError(_('Issue has offering. Please remove it first.'))
+
+    def can_create_user(request, view, obj=None):
+        if not request.user.email:
+            raise rf_exceptions.ValidationError(_('Current user does not have email, '
+                                                  'therefore he is not allowed to create issues.'))
+
+        if not request.user.full_name:
+            raise rf_exceptions.ValidationError(_('Current user does not have full_name, '
+                                                  'therefore he is not allowed to create issues.'))
 
     @transaction.atomic()
     def perform_create(self, serializer):
         issue = serializer.save()
-        backend.get_active_backend().create_issue(issue)
+        try:
+            backend.get_active_backend().create_issue(issue)
+        except exceptions.SupportUserInactive:
+            raise rf_exceptions.ValidationError({'caller': _('Caller is inactive.')})
+
+    create_permissions = [can_create_user]
 
     @transaction.atomic()
     def perform_update(self, serializer):
@@ -65,12 +80,15 @@ class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
         if user.is_staff or user.is_support or not obj:
             return
         issue = obj
+        # if it's a personal issue
+        if not issue.customer and not issue.project and issue.caller == user:
+            return
         if issue.customer and issue.customer.has_user(user, structure_models.CustomerRole.OWNER):
             return
         if (issue.project and (issue.project.has_user(user, structure_models.ProjectRole.ADMINISTRATOR) or
                                issue.project.has_user(user, structure_models.ProjectRole.MANAGER))):
             return
-        raise exceptions.PermissionDenied()
+        raise rf_exceptions.PermissionDenied()
 
     @decorators.detail_route(methods=['post'])
     def comment(self, request, uuid=None):
@@ -83,6 +101,13 @@ class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
 
     comment_serializer_class = serializers.CommentSerializer
     comment_permissions = [_comment_permission]
+
+
+class PriorityViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = models.Priority.objects.all()
+    serializer_class = serializers.PrioritySerializer
+    filter_class = filters.PriorityFilter
+    lookup_field = 'uuid'
 
 
 class CommentViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
@@ -173,7 +198,9 @@ class OfferingViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         offering = serializer.save()
-        backend.get_active_backend().create_issue(offering.issue)
+        serialized_issue = core_utils.serialize_instance(offering.issue)
+        task = tasks.create_issue.s(serialized_issue)
+        transaction.on_commit(lambda: task.apply_async(countdown=2))
         return response.Response(serializer.data, status=status.HTTP_201_CREATED)
 
     create_serializer_class = serializers.OfferingCreateSerializer
@@ -183,7 +210,7 @@ class OfferingViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
 
     def offering_is_in_requested_state(offering):
         if offering.state != models.Offering.States.REQUESTED:
-            raise exceptions.ValidationError(_('Offering must be in requested state.'))
+            raise rf_exceptions.ValidationError(_('Offering must be in requested state.'))
 
     @decorators.detail_route(methods=['post'])
     def complete(self, request, uuid=None):
@@ -233,16 +260,7 @@ class AttachmentViewSet(CheckExtensionMixin,
 
     def get_queryset(self):
         queryset = super(AttachmentViewSet, self).get_queryset()
-
-        if not self.request.user.is_staff:
-            user_customers = structure_models.Customer.objects.filter(
-                permissions__role=structure_models.CustomerRole.OWNER,
-                permissions__user=self.request.user,
-                permissions__is_active=True)
-            subquery = Q(issue__customer__in=user_customers) | Q(issue__caller=self.request.user)
-            queryset = queryset.filter(subquery)
-
-        return queryset
+        return queryset.filter_for_user(self.request.user)
 
 
 class TemplateViewSet(CheckExtensionMixin, viewsets.ReadOnlyModelViewSet):

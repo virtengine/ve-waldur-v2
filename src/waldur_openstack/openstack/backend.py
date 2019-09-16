@@ -5,10 +5,13 @@ import re
 from cinderclient import exceptions as cinder_exceptions
 from django.db import transaction
 from django.utils import timezone
+from django.utils.crypto import get_random_string
+from django.utils.decorators import method_decorator
 from keystoneclient import exceptions as keystone_exceptions
 from neutronclient.client import exceptions as neutron_exceptions
 from novaclient import exceptions as nova_exceptions
 
+from waldur_core.core.utils import create_batch_fetcher
 from waldur_core.structure import log_backend_action, SupportedServices
 from waldur_core.structure.utils import (
     update_pulled_fields, handle_resource_not_found, handle_resource_update_success)
@@ -34,14 +37,15 @@ class OpenStackBackend(BaseOpenStackBackend):
         else:
             return True
 
-    def sync(self):
-        # pull service properties
+    def pull_service_properties(self):
         self.pull_flavors()
         self.pull_images()
         self.pull_service_settings_quotas()
 
-        # pull resources
+    def pull_resources(self):
         self.pull_tenants()
+
+    def pull_subresources(self):
         self.pull_security_groups()
         self.pull_floating_ips()
         self.pull_networks()
@@ -174,8 +178,6 @@ class OpenStackBackend(BaseOpenStackBackend):
         self._pull_tenant_quotas(tenant.backend_id, tenant)
 
     def pull_floating_ips(self, tenants=None):
-        neutron = self.neutron_admin_client
-
         if tenants is None:
             tenants = models.Tenant.objects.filter(
                 state=models.Tenant.States.OK,
@@ -184,11 +186,7 @@ class OpenStackBackend(BaseOpenStackBackend):
         if not tenant_mappings:
             return
 
-        try:
-            backend_floating_ips = neutron.list_floatingips(
-                tenant_id=tenant_mappings.keys())['floatingips']
-        except neutron_exceptions.NeutronClientException as e:
-            reraise(e)
+        backend_floating_ips = self.list_floatingips(tenant_mappings.keys())
 
         tenant_floating_ips = dict()
         for tenant_id, floating_ips in groupby(backend_floating_ips, lambda x: x['tenant_id']):
@@ -199,6 +197,15 @@ class OpenStackBackend(BaseOpenStackBackend):
                 self._update_tenant_floating_ips(tenant, floating_ips)
 
             self._remove_stale_floating_ips(tenants, backend_floating_ips)
+
+    @method_decorator(create_batch_fetcher)
+    def list_floatingips(self, tenants):
+        neutron = self.neutron_admin_client
+
+        try:
+            return neutron.list_floatingips(tenant_id=tenants)['floatingips']
+        except neutron_exceptions.NeutronClientException as e:
+            reraise(e)
 
     @log_backend_action('pull floating IPs for tenant')
     def pull_tenant_floating_ips(self, tenant):
@@ -258,7 +265,6 @@ class OpenStackBackend(BaseOpenStackBackend):
         return floating_ip
 
     def pull_security_groups(self, tenants=None):
-        neutron = self.neutron_admin_client
 
         if tenants is None:
             tenants = models.Tenant.objects.filter(
@@ -269,11 +275,7 @@ class OpenStackBackend(BaseOpenStackBackend):
         if not tenant_mappings:
             return
 
-        try:
-            backend_security_groups = neutron.list_security_groups(
-                tenant_id=tenant_mappings.keys())['security_groups']
-        except neutron_exceptions.NeutronClientException as e:
-            reraise(e)
+        backend_security_groups = self.list_security_groups(tenant_mappings.keys())
 
         tenant_security_groups = dict()
         for tenant_id, security_groups in groupby(backend_security_groups, lambda x: x['tenant_id']):
@@ -283,6 +285,15 @@ class OpenStackBackend(BaseOpenStackBackend):
             for tenant, security_groups in tenant_security_groups.items():
                 self._update_tenant_security_groups(tenant, security_groups)
             self._remove_stale_security_groups(tenants, backend_security_groups)
+
+    @method_decorator(create_batch_fetcher)
+    def list_security_groups(self, tenants):
+        neutron = self.neutron_admin_client
+
+        try:
+            return neutron.list_security_groups(tenant_id=tenants)['security_groups']
+        except neutron_exceptions.NeutronClientException as e:
+            reraise(e)
 
     @log_backend_action('pull security groups for tenant')
     def pull_tenant_security_groups(self, tenant):
@@ -348,13 +359,8 @@ class OpenStackBackend(BaseOpenStackBackend):
         return self._pull_networks([tenant])
 
     def _pull_networks(self, tenants):
-        neutron = self.neutron_client
         tenant_mappings = {tenant.backend_id: tenant for tenant in tenants}
-
-        try:
-            backend_networks = neutron.list_networks(tenant_id=tenant_mappings.keys())['networks']
-        except neutron_exceptions.NeutronClientException as e:
-            reraise(e)
+        backend_networks = self.list_networks(tenant_mappings.keys())
 
         networks = []
         with transaction.atomic():
@@ -387,6 +393,14 @@ class OpenStackBackend(BaseOpenStackBackend):
 
         return networks
 
+    @method_decorator(create_batch_fetcher)
+    def list_networks(self, tenants):
+        neutron = self.neutron_client
+        try:
+            return neutron.list_networks(tenant_id=tenants)['networks']
+        except neutron_exceptions.NeutronClientException as e:
+            reraise(e)
+
     def _backend_network_to_network(self, backend_network, **kwargs):
         network = models.Network(
             name=backend_network['name'],
@@ -406,27 +420,38 @@ class OpenStackBackend(BaseOpenStackBackend):
 
         return network
 
-    def pull_subnets(self, networks=None):
+    def pull_subnets(self, tenant=None):
         neutron = self.neutron_client
 
-        if networks is None:
+        if tenant:
+            networks = tenant.networks.all()
+        else:
             networks = models.Network.objects.filter(
                 state=models.Network.States.OK,
                 service_project_link__service__settings=self.settings,
-            ).prefetch_related('subnets')
+            )
         network_mappings = {network.backend_id: network for network in networks}
         if not network_mappings:
             return
 
         try:
-            backend_subnets = neutron.list_subnets(network_id=network_mappings.keys())['subnets']
+            if tenant:
+                backend_subnets = neutron.list_subnets(tenant_id=tenant.backend_id)['subnets']
+            else:
+                # We can't filter subnets by network IDs because it exceeds maximum request length
+                backend_subnets = neutron.list_subnets()['subnets']
         except neutron_exceptions.NeutronClientException as e:
             reraise(e)
 
         subnet_uuids = []
         with transaction.atomic():
             for backend_subnet in backend_subnets:
-                network = network_mappings[backend_subnet['network_id']]
+                network = network_mappings.get(backend_subnet['network_id'])
+
+                if not network:
+                    logger.debug('OpenStack network is not imported yet. Network ID: %s',
+                                 backend_subnet['network_id'])
+                    continue
 
                 imported_subnet = self._backend_subnet_to_subnet(
                     backend_subnet, network=network, service_project_link=network.service_project_link)
@@ -449,7 +474,7 @@ class OpenStackBackend(BaseOpenStackBackend):
 
     @log_backend_action()
     def import_tenant_subnets(self, tenant):
-        self.pull_subnets(tenant.networks.iterator())
+        self.pull_subnets(tenant)
 
     def _backend_subnet_to_subnet(self, backend_subnet, **kwargs):
         subnet = models.SubNet(
@@ -480,6 +505,41 @@ class OpenStackBackend(BaseOpenStackBackend):
             tenant.save(update_fields=['backend_id'])
         except keystone_exceptions.ClientException as e:
             reraise(e)
+
+    @log_backend_action()
+    def create_tenant_safe(self, tenant):
+        """
+        Check available tenant name before creating tenant.
+        It allows to avoid failure when name is already taken.
+        """
+        new_name = self.get_available_tenant_name(tenant.name)
+        if new_name != tenant.name:
+            tenant.name = new_name
+            tenant.save(update_fields=['name'])
+        self.create_tenant(tenant)
+
+    def get_available_tenant_name(self, name, max_length=64):
+        """
+        Returns a tenant name that's free on the target deployment.
+        """
+        keystone = self.keystone_admin_client
+        try:
+            tenants = keystone.projects.list(domain=self._get_domain())
+        except keystone_exceptions.ClientException as e:
+            reraise(e)
+
+        names = [tenant.name for tenant in tenants]
+        new_name = name
+
+        # If the tenant name already exists, add an underscore and a random 3
+        # character alphanumeric string to the tenant name until the generated name doesn't exist.
+        # Truncate original name if required, so the new name does not exceed the max_length.
+        while new_name in names:
+            new_name = "%s_%s" % (name, get_random_string(3))
+            truncation = len(new_name) - max_length
+            if truncation > 0:
+                new_name = "%s_%s" % (name[:-truncation], get_random_string(3))
+        return new_name
 
     def import_tenant(self, tenant_backend_id, service_project_link=None, save=True):
         keystone = self.keystone_admin_client
@@ -624,14 +684,18 @@ class OpenStackBackend(BaseOpenStackBackend):
             reraise(e)
 
         for port in ports.get('ports', []):
-            logger.info("Deleting port %s interface_router from tenant %s", port['id'], tenant.backend_id)
-            try:
-                neutron.remove_interface_router(port['device_id'], {'port_id': port['id']})
-            except neutron_exceptions.NotFound:
-                logger.debug("Port %s interface_router is already gone from tenant %s", port['id'],
-                             tenant.backend_id)
-            except neutron_exceptions.NeutronClientException as e:
-                reraise(e)
+            if 'device_id' in port and \
+                    port['device_owner'] in ['network:router_interface',
+                                             'network:router_interface_distributed',
+                                             'network:ha_router_replicated_interface']:
+                logger.info("Deleting port %s interface_router from tenant %s", port['id'], tenant.backend_id)
+                try:
+                    neutron.remove_interface_router(port['device_id'], {'port_id': port['id']})
+                except neutron_exceptions.NotFound:
+                    logger.debug("Port %s interface_router is already gone from tenant %s", port['id'],
+                                 tenant.backend_id)
+                except neutron_exceptions.NeutronClientException as e:
+                    reraise(e)
 
             logger.info("Deleting port %s from tenant %s", port['id'], tenant.backend_id)
             try:
@@ -843,6 +907,9 @@ class OpenStackBackend(BaseOpenStackBackend):
         backend_rules = {
             rule['id']: self._normalize_security_group_rule(rule)
             for rule in backend_security_group['security_group_rules']
+            # TODO: Currently only security group rules for incoming traffic can be created
+            # Therefore we should not modify security group rules for outgoing traffic
+            if rule['direction'] == 'ingress'
         }
 
         # list of nc rules, that do not exist in openstack
@@ -1051,6 +1118,7 @@ class OpenStackBackend(BaseOpenStackBackend):
         }
         if subnet.dns_nameservers:
             data['dns_nameservers'] = subnet.dns_nameservers
+        data.update(self._serialize_subnet_gateway(subnet))
         try:
             response = neutron.create_subnet({'subnets': [data]})
             # Automatically create router for subnet
@@ -1071,10 +1139,19 @@ class OpenStackBackend(BaseOpenStackBackend):
         neutron = self.neutron_admin_client
 
         data = {'name': subnet.name}
+        data.update(self._serialize_subnet_gateway(subnet))
         try:
             neutron.update_subnet(subnet.backend_id, {'subnet': data})
         except neutron_exceptions.NeutronException as e:
             reraise(e)
+
+    def _serialize_subnet_gateway(self, subnet):
+        data = {}
+        if subnet.disable_gateway:
+            data['gateway_ip'] = None
+        elif subnet.gateway_ip:
+            data['gateway_ip'] = subnet.gateway_ip
+        return data
 
     @log_backend_action()
     def delete_subnet(self, subnet):

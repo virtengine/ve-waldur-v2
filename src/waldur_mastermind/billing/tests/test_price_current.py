@@ -7,19 +7,19 @@ from waldur_mastermind.invoices.tests import factories as invoice_factories
 from waldur_mastermind.invoices.tests import fixtures as invoice_fixtures
 
 
-@freeze_time('2017-01-10 00:00:00')
+@freeze_time('2017-01-10')
 class PriceCurrentTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = invoice_fixtures.InvoiceFixture()
 
-        invoice_factories.GenericInvoiceItemFactory(
+        invoice_factories.InvoiceItemFactory(
             invoice=self.fixture.invoice,
             project=self.fixture.project,
             unit=invoice_models.InvoiceItem.Units.PER_MONTH,
             unit_price=100,
             quantity=1,
         )
-        invoice_factories.GenericInvoiceItemFactory(
+        invoice_factories.InvoiceItemFactory(
             invoice=self.fixture.invoice,
             project=self.fixture.project,
             unit=invoice_models.InvoiceItem.Units.PER_DAY,

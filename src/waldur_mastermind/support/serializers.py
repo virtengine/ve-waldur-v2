@@ -11,8 +11,9 @@ from django.utils.translation import ugettext_lazy as _
 from rest_framework import serializers, exceptions
 
 from waldur_core.core import serializers as core_serializers
+from waldur_core.media.serializers import ProtectedMediaSerializerMixin
 from waldur_core.structure import models as structure_models, SupportedServices, serializers as structure_serializers
-from waldur_jira.serializers import WebHookReceiverSerializer as JiraWebHookReceiverSerializer
+from waldur_jira import serializers as jira_serializers
 from waldur_mastermind.common.serializers import validate_options
 from waldur_mastermind.support.backend.atlassian import ServiceDeskBackend
 
@@ -29,7 +30,7 @@ def render_issue_template(config_name, issue):
 
     raw = issue_settings[config_name]
     template = Template(raw)
-    return template.render(Context({'issue': issue}))
+    return template.render(Context({'issue': issue}, autoescape=False))
 
 
 class IssueSerializer(core_serializers.AugmentedSerializerMixin,
@@ -55,6 +56,13 @@ class IssueSerializer(core_serializers.AugmentedSerializerMixin,
         required=False,
         allow_null=True,
     )
+    template = serializers.HyperlinkedRelatedField(
+        view_name='support-template-detail',
+        lookup_field='uuid',
+        queryset=models.Template.objects.all(),
+        required=False,
+        allow_null=True,
+    )
     resource_type = serializers.SerializerMethodField()
     resource_name = serializers.ReadOnlyField(source='resource.name')
     type = serializers.ChoiceField(
@@ -77,10 +85,10 @@ class IssueSerializer(core_serializers.AugmentedSerializerMixin,
             'project', 'project_uuid', 'project_name',
             'resource', 'resource_type', 'resource_name',
             'created', 'modified', 'is_reported_manually',
-            'first_response_sla',
+            'first_response_sla', 'template'
         )
-        read_only_fields = ('key', 'status', 'resolution', 'backend_id', 'link', 'priority', 'first_response_sla')
-        protected_fields = ('customer', 'project', 'resource', 'type', 'caller')
+        read_only_fields = ('key', 'status', 'resolution', 'backend_id', 'link', 'first_response_sla')
+        protected_fields = ('customer', 'project', 'resource', 'type', 'caller', 'template', 'priority')
         extra_kwargs = dict(
             url={'lookup_field': 'uuid'},
             customer={'lookup_field': 'uuid', 'view_name': 'customer-detail'},
@@ -107,7 +115,7 @@ class IssueSerializer(core_serializers.AugmentedSerializerMixin,
         return fields
 
     def get_resource_type(self, obj):
-        if obj.resource:
+        if isinstance(obj.resource, structure_models.ResourceMixin):
             return SupportedServices.get_name_for_model(obj.resource_content_type.model_class())
 
     def validate(self, attrs):
@@ -160,6 +168,16 @@ class IssueSerializer(core_serializers.AugmentedSerializerMixin,
             self.validate_project(resource.service_project_link.project)
         return resource
 
+    def validate_priority(self, priority):
+        user = self.context['request'].user
+        if not user.is_staff and not user.is_support:
+            raise serializers.ValidationError(_('Only staff or support can specify issue priority.'))
+        try:
+            models.Priority.objects.get(name=priority)
+        except (models.Priority.DoesNotExist, models.Priority.MultipleObjectsReturned):
+            raise serializers.ValidationError(_('Priority with requested name does not exist.'))
+        return priority
+
     @transaction.atomic()
     def create(self, validated_data):
         resource = validated_data.get('resource')
@@ -177,6 +195,17 @@ class IssueSerializer(core_serializers.AugmentedSerializerMixin,
         raw = self.issue_settings[config_name]
         template = Template(raw)
         return template.render(Context({'issue': issue}))
+
+
+class PrioritySerializer(core_serializers.AugmentedSerializerMixin,
+                         serializers.HyperlinkedModelSerializer):
+
+    class Meta(object):
+        model = models.Priority
+        fields = ('url', 'uuid', 'name', 'description', 'icon_url')
+        extra_kwargs = {
+            'url': {'lookup_field': 'uuid'},
+        }
 
 
 class CommentSerializer(core_serializers.AugmentedSerializerMixin,
@@ -224,7 +253,7 @@ class SupportUserSerializer(core_serializers.AugmentedSerializerMixin,
         )
 
 
-class WebHookReceiverSerializer(JiraWebHookReceiverSerializer):
+class WebHookReceiverSerializer(jira_serializers.WebHookReceiverSerializer):
     def get_project(self, project_key):
         class Project:
             def get_backend(self):
@@ -278,10 +307,11 @@ class OfferingSerializer(structure_serializers.PermissionFieldFilteringMixin,
     state = serializers.ReadOnlyField(source='get_state_display')
     report = serializers.JSONField(required=False)
     template_uuid = serializers.ReadOnlyField(source='template.uuid')
+    resource_type = serializers.SerializerMethodField()
 
     class Meta(object):
         model = models.Offering
-        fields = ('url', 'uuid', 'name', 'project', 'type', 'template', 'template_uuid', 'plan',
+        fields = ('url', 'uuid', 'name', 'project', 'type', 'template', 'template_uuid', 'resource_type', 'plan',
                   'state', 'type_label', 'unit_price',
                   'unit', 'created', 'modified', 'issue', 'issue_name', 'issue_link',
                   'issue_key', 'issue_description', 'issue_uuid', 'issue_status',
@@ -301,7 +331,7 @@ class OfferingSerializer(structure_serializers.PermissionFieldFilteringMixin,
 
     def validate_report(self, report):
         if not isinstance(report, list):
-            raise serializers.ValidationError('Report should be an object.')
+            raise serializers.ValidationError('Report should be a list.')
 
         if len(report) == 0:
             raise serializers.ValidationError('Report object should contain at least one section.')
@@ -321,12 +351,15 @@ class OfferingSerializer(structure_serializers.PermissionFieldFilteringMixin,
     def get_filtered_field_names(self):
         return ('project',)
 
+    def get_resource_type(self, obj):
+        return obj.get_scope_type()
+
 
 class ConfigurableFormDescriptionMixin(object):
     def _form_description(self, configuration, validated_data):
         result = []
 
-        for key in configuration['order']:
+        for key in configuration.get('order') or []:
             if key not in validated_data:
                 continue
 
@@ -379,21 +412,14 @@ class OfferingCreateSerializer(OfferingSerializer, ConfigurableFormDescriptionMi
                 'plan': _('Plan should be related to the same template.'),
             })
 
-        attributes = validated_data.get('attributes')
-        if attributes:
-            if not isinstance(template.config, dict) or not(template.config.get('options')):
-                raise serializers.ValidationError({'attributes': _('Extra attributes are not allowed.')})
+        attributes = validated_data.get('attributes', {})
+        if isinstance(template.config, dict) and template.config.get('options'):
             try:
                 validate_options(template.config['options'], attributes)
             except serializers.ValidationError as exc:
                 raise serializers.ValidationError({'attributes': exc})
             else:
                 validated_data.update(attributes)
-        else:
-            if template.config.get('options'):
-                raise serializers.ValidationError({
-                    'attributes': _('This field is required.'),
-                })
 
         offering_configuration = template.config
         type_label = offering_configuration.get('label', template.name)
@@ -420,6 +446,13 @@ class OfferingCreateSerializer(OfferingSerializer, ConfigurableFormDescriptionMi
                 article_code=plan.article_code,
                 unit_price=plan.unit_price,
                 unit=plan.unit,
+                plan=plan,
+            ))
+        else:
+            # Temporary workaround for backward compatibility
+            payload.update(dict(
+                product_code=offering_configuration.get('product_code', ''),
+                article_code=offering_configuration.get('article_code', ''),
             ))
 
         offering = models.Offering.objects.create(**payload)
@@ -439,7 +472,9 @@ class OfferingCompleteSerializer(serializers.Serializer):
         return instance
 
 
-class AttachmentSerializer(core_serializers.AugmentedSerializerMixin,
+class AttachmentSerializer(ProtectedMediaSerializerMixin,
+                           core_serializers.RestrictedSerializerMixin,
+                           core_serializers.AugmentedSerializerMixin,
                            serializers.HyperlinkedModelSerializer):
 
     class Meta(object):
@@ -470,7 +505,7 @@ class AttachmentSerializer(core_serializers.AugmentedSerializerMixin,
         raise exceptions.PermissionDenied()
 
 
-class TemplateAttachmentSerializer(serializers.ModelSerializer):
+class TemplateAttachmentSerializer(ProtectedMediaSerializerMixin, serializers.ModelSerializer):
     class Meta(object):
         model = models.TemplateAttachment
         fields = ('name', 'file')

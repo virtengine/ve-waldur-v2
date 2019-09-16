@@ -60,7 +60,7 @@ class TenantCreateExecutor(core_executors.CreateExecutor):
         serialized_network = core_utils.serialize_instance(network)
         serialized_subnet = core_utils.serialize_instance(subnet)
         creation_tasks = [
-            core_tasks.BackendMethodTask().si(serialized_tenant, 'create_tenant', state_transition='begin_creating'),
+            core_tasks.BackendMethodTask().si(serialized_tenant, 'create_tenant_safe', state_transition='begin_creating'),
             core_tasks.BackendMethodTask().si(serialized_tenant, 'add_admin_user_to_tenant'),
             core_tasks.BackendMethodTask().si(serialized_tenant, 'create_tenant_user'),
             core_tasks.BackendMethodTask().si(serialized_network, 'create_network', state_transition='begin_creating'),
@@ -71,10 +71,8 @@ class TenantCreateExecutor(core_executors.CreateExecutor):
         creation_tasks.append(core_tasks.BackendMethodTask().si(serialized_tenant, 'push_tenant_quotas', quotas))
         # handle security groups
         # XXX: Create default security groups that was connected to SPL earlier.
-        serialized_executor = core_utils.serialize_class(SecurityGroupCreateExecutor)
         for security_group in tenant.security_groups.all():
-            serialized_security_group = core_utils.serialize_instance(security_group)
-            creation_tasks.append(core_tasks.ExecutorTask().si(serialized_executor, serialized_security_group))
+            creation_tasks.append(SecurityGroupCreateExecutor.as_signature(security_group))
 
         if pull_security_groups:
             creation_tasks.append(core_tasks.BackendMethodTask().si(serialized_tenant, 'pull_tenant_security_groups'))
@@ -288,12 +286,16 @@ class TenantPullExecutor(core_executors.ActionExecutor):
 
     @classmethod
     def get_task_signature(cls, tenant, serialized_tenant, **kwargs):
+        service_settings = structure_models.ServiceSettings.objects.get(scope=tenant)
+        serialized_settings = core_utils.serialize_instance(service_settings)
         return chain(
             core_tasks.BackendMethodTask().si(
                 serialized_tenant, 'pull_tenant', state_transition='begin_updating'),
             core_tasks.BackendMethodTask().si(serialized_tenant, 'pull_tenant_quotas'),
             core_tasks.BackendMethodTask().si(serialized_tenant, 'pull_tenant_floating_ips'),
             core_tasks.BackendMethodTask().si(serialized_tenant, 'pull_tenant_security_groups'),
+            core_tasks.IndependentBackendMethodTask().si(serialized_settings, 'pull_images'),
+            core_tasks.IndependentBackendMethodTask().si(serialized_settings, 'pull_flavors'),
         )
 
 

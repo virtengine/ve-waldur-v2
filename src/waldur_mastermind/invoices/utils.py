@@ -1,12 +1,15 @@
+import base64
 import datetime
-
 from calendar import monthrange
+from decimal import Decimal
 
+import pdfkit
 from django.conf import settings
-from django.core.mail import EmailMessage
+from django.template.loader import render_to_string
 from django.utils import timezone
 
 from waldur_core.core import utils as core_utils
+from waldur_mastermind.common.mixins import UnitPriceMixin
 
 
 def get_current_month():
@@ -40,6 +43,15 @@ def get_current_month_days():
     return range[1]
 
 
+def get_full_hours(start, end):
+    seconds_in_hour = 60 * 60
+    full_hours, extra_seconds = divmod((end - start).total_seconds(), seconds_in_hour)
+    if extra_seconds > 0:
+        full_hours += 1
+
+    return int(full_hours)
+
+
 def check_past_date(year, month, day=None):
     day = day or 1
 
@@ -47,18 +59,6 @@ def check_past_date(year, month, day=None):
         return datetime.date(year=int(year), month=int(month), day=int(day)) <= timezone.now().date()
     except ValueError:
         return False
-
-
-def send_mail_attachment(subject, body, to, filename, attach_text, content_type='text/plain', from_email=None):
-    from_email = from_email or settings.DEFAULT_FROM_EMAIL
-    email = EmailMessage(
-        subject=subject,
-        body=body,
-        to=to,
-        from_email=from_email
-    )
-    email.attach(filename, attach_text, content_type)
-    return email.send()
 
 
 def parse_period(attrs, use_default=True):
@@ -78,3 +78,42 @@ def get_previous_month():
     date = timezone.now()
     month, year = (date.month - 1, date.year) if date.month != 1 else (12, date.year - 1)
     return datetime.date(year, month, 1)
+
+
+def filter_invoice_items(items):
+    return [item for item in items if item.total > 0]
+
+
+def create_invoice_pdf(invoice):
+    all_items = filter_invoice_items(invoice.items)
+    logo_path = settings.WALDUR_CORE['SITE_LOGO']
+    if logo_path:
+        with open(logo_path, 'r') as image_file:
+            deployment_logo = base64.b64encode(image_file.read())
+    else:
+        deployment_logo = None
+
+    context = dict(
+        invoice=invoice,
+        issuer_details=settings.WALDUR_INVOICES['ISSUER_DETAILS'],
+        currency=settings.WALDUR_CORE['CURRENCY_NAME'],
+        deployment_logo=deployment_logo,
+        items=all_items,
+    )
+    html = render_to_string('invoices/invoice.html', context)
+    pdf = pdfkit.from_string(html, False)
+    invoice.file = base64.b64encode(pdf)
+    invoice.save()
+
+
+def get_price_per_day(price, unit):
+    if unit == UnitPriceMixin.Units.PER_DAY:
+        return price
+    elif unit == UnitPriceMixin.Units.PER_MONTH:
+        return price / Decimal(30)
+    elif unit == UnitPriceMixin.Units.PER_HALF_MONTH:
+        return price / Decimal(15)
+    elif unit == UnitPriceMixin.Units.PER_HOUR:
+        return price * 24
+    else:
+        return price

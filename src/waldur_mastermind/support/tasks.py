@@ -7,7 +7,8 @@ from celery import shared_task
 from celery.task import Task as CeleryTask
 from django.conf import settings
 from django.core.mail import send_mail
-from django.template.loader import render_to_string
+from django.template.loader import get_template
+from django.template import Template, Context
 from django.utils import timezone
 
 from waldur_core.core import utils as core_utils
@@ -44,6 +45,20 @@ class SupportUserPullTask(CeleryTask):
             .update(is_active=False)
 
 
+@shared_task(name='waldur_mastermind.support.pull_priorities')
+def pull_priorities():
+    if not settings.WALDUR_SUPPORT['ENABLED']:
+        return
+
+    backend.get_active_backend().pull_priorities()
+
+
+@shared_task(name='waldur_mastermind.support.create_issue')
+def create_issue(serialized_issue):
+    issue = core_utils.deserialize_instance(serialized_issue)
+    backend.get_active_backend().create_issue(issue)
+
+
 @shared_task(name='waldur_mastermind.support.send_issue_updated_notification')
 def send_issue_updated_notification(serialized_issue):
     issue = core_utils.deserialize_instance(serialized_issue)
@@ -75,11 +90,22 @@ def _send_issue_notification(issue, template, receiver=None):
     context = {
         'issue_url': settings.ISSUE_LINK_TEMPLATE.format(uuid=issue.uuid),
         'site_name': settings.WALDUR_CORE['SITE_NAME'],
+        'issue': issue,
     }
 
-    subject = render_to_string('support/notification_%s_subject.txt' % template).strip()
-    text_message = render_to_string('support/notification_%s.txt' % template, context)
-    html_message = render_to_string('support/notification_%s.html' % template, context)
+    try:
+        notification_template = models.TemplateStatusNotification.objects.get(status=issue.status)
+        html_template = Template(notification_template.html)
+        text_template = Template(notification_template.text)
+        subject_template = Template(notification_template.subject)
+    except models.TemplateStatusNotification.DoesNotExist:
+        html_template = get_template('support/notification_%s.html' % template).template
+        text_template = get_template('support/notification_%s.txt' % template).template
+        subject_template = get_template('support/notification_%s_subject.txt' % template).template
+
+    html_message = html_template.render(Context(context))
+    text_message = text_template.render(Context(context, autoescape=False))
+    subject = subject_template.render(Context(context, autoescape=False)).strip()
 
     logger.debug('About to send an issue update notification to %s' % receiver.email)
 

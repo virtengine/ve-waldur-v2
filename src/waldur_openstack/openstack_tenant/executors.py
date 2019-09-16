@@ -1,12 +1,14 @@
 from __future__ import unicode_literals
 
 from celery import chain
+from django.db import transaction
 
 from waldur_core.core import executors as core_executors
 from waldur_core.core import tasks as core_tasks
 from waldur_core.core import utils as core_utils
 from waldur_core.structure import executors as structure_executors
 from waldur_openstack.openstack import executors as openstack_executors
+from waldur_openstack.openstack import models as openstack_models
 
 from . import tasks, models
 
@@ -265,18 +267,31 @@ class SnapshotPullExecutor(core_executors.ActionExecutor):
 
 
 class InstanceCreateExecutor(core_executors.CreateExecutor):
-    """ First - create instance volumes in parallel, after - create instance based on created volumes """
 
     @classmethod
     def get_task_signature(cls, instance, serialized_instance, ssh_key=None, flavor=None):
-        """ Create all instance volumes in parallel and wait for them to provision """
         serialized_volumes = [core_utils.serialize_instance(volume) for volume in instance.volumes.all()]
-
         _tasks = [tasks.ThrottleProvisionStateTask().si(serialized_instance, state_transition='begin_creating')]
+        _tasks += cls.create_volumes(serialized_volumes)
+        _tasks += cls.create_internal_ips(serialized_instance)
+        _tasks += cls.create_instance(serialized_instance, flavor, ssh_key)
+        _tasks += cls.pull_volumes(serialized_volumes)
+        _tasks += cls.pull_security_groups(serialized_instance)
+        _tasks += cls.create_floating_ips(instance, serialized_instance)
+        return chain(*_tasks)
+
+    @classmethod
+    def create_volumes(cls, serialized_volumes):
+        """
+        Create all instance volumes and wait for them to provision.
+        """
+        _tasks = []
+
         # Create volumes
         for serialized_volume in serialized_volumes:
             _tasks.append(tasks.ThrottleProvisionTask().si(
                 serialized_volume, 'create_volume', state_transition='begin_creating'))
+
         for index, serialized_volume in enumerate(serialized_volumes):
             # Wait for volume creation
             _tasks.append(core_tasks.PollRuntimeStateTask().si(
@@ -285,16 +300,42 @@ class InstanceCreateExecutor(core_executors.CreateExecutor):
                 success_state='available',
                 erred_state='error',
             ).set(countdown=30 if index == 0 else 0))
-            # Pull volume to sure that it is bootable
-            _tasks.append(core_tasks.BackendMethodTask().si(serialized_volume, 'pull_volume'))
+
+            # Pull volume runtime state
+            _tasks.append(core_tasks.BackendMethodTask().si(
+                serialized_volume,
+                'pull_volume',
+                update_fields=['runtime_state', 'bootable']
+            ))
+
             # Mark volume as OK
             _tasks.append(core_tasks.StateTransitionTask().si(serialized_volume, state_transition='set_ok'))
-        # Create instance based on volumes
+
+        return _tasks
+
+    @classmethod
+    def create_internal_ips(cls, serialized_instance):
+        """
+        Create all network ports for an OpenStack instance.
+        Although OpenStack Nova REST API allows to create network ports implicitly,
+        we're not using it, because it does not take into account subnets.
+        See also: https://specs.openstack.org/openstack/nova-specs/specs/juno/approved/selecting-subnet-when-creating-vm.html
+        Therefore we're creating network ports beforehand with correct subnet.
+        """
+        return [core_tasks.BackendMethodTask().si(serialized_instance, 'create_instance_internal_ips')]
+
+    @classmethod
+    def create_instance(cls, serialized_instance, flavor, ssh_key=None):
+        """
+        It is assumed that volumes and network ports have been created beforehand.
+        """
+        _tasks = []
         kwargs = {
             'backend_flavor_id': flavor.backend_id,
         }
         if ssh_key is not None:
             kwargs['public_key'] = ssh_key.public_key
+
         # Wait 10 seconds after volume creation due to OpenStack restrictions.
         _tasks.append(core_tasks.BackendMethodTask().si(
             serialized_instance, 'create_instance', **kwargs).set(countdown=10))
@@ -306,42 +347,41 @@ class InstanceCreateExecutor(core_executors.CreateExecutor):
             success_state=models.Instance.RuntimeStates.ACTIVE,
             erred_state=models.Instance.RuntimeStates.ERROR,
         ))
+        return _tasks
 
-        # Update volumes runtime state and device name
+    @classmethod
+    def pull_volumes(cls, serialized_volumes):
+        """
+        Update volumes runtime state and device name
+        """
+        _tasks = []
         for serialized_volume in serialized_volumes:
             _tasks.append(core_tasks.BackendMethodTask().si(
                 serialized_volume,
                 backend_method='pull_volume',
                 update_fields=['runtime_state', 'device']
             ))
+        return _tasks
 
-        # TODO: Port should be created before instance is created.
-        # The following calls should be removed: pull_created_instance_internal_ips and push_instance_internal_ips.
+    @classmethod
+    def pull_security_groups(cls, serialized_instance):
+        return [core_tasks.BackendMethodTask().si(serialized_instance, 'pull_instance_security_groups')]
 
-        # Pull instance internal IPs
-        # pull_instance_internal_ips method cannot be used, because it requires backend_id to update
-        # existing internal IPs. However, internal IPs of the created instance does not have backend_ids.
-        _tasks.append(core_tasks.BackendMethodTask().si(serialized_instance, 'pull_created_instance_internal_ips'))
+    @classmethod
+    def create_floating_ips(cls, instance, serialized_instance):
+        _tasks = []
 
-        # Consider the case when instance has several internal IPs connected to
-        # different subnets within the same network.
-        # When OpenStack instance is provisioned, network port is created.
-        # This port is pulled into Waldur using the pull_created_instance_internal_ips method.
-        # However, it does not take into account subnets, because OpenStack
-        # does not allow to specify subnet on instance creation.
-        # See also: https://specs.openstack.org/openstack/nova-specs/specs/juno/approved/selecting-subnet-when-creating-vm.html
-        # Therefore we need to push remaining network ports for subnets explicitly.
-        _tasks.append(core_tasks.BackendMethodTask().si(serialized_instance, 'push_instance_internal_ips'))
-
-        # Pull instance security groups
-        _tasks.append(core_tasks.BackendMethodTask().si(serialized_instance, 'pull_instance_security_groups'))
+        if not instance.floating_ips.exists():
+            return _tasks
 
         # Create non-existing floating IPs
         for floating_ip in instance.floating_ips.filter(backend_id=''):
             serialized_floating_ip = core_utils.serialize_instance(floating_ip)
             _tasks.append(core_tasks.BackendMethodTask().si(serialized_floating_ip, 'create_floating_ip'))
+
         # Push instance floating IPs
         _tasks.append(core_tasks.BackendMethodTask().si(serialized_instance, 'push_instance_floating_ips'))
+
         # Wait for operation completion
         for index, floating_ip in enumerate(instance.floating_ips):
             _tasks.append(core_tasks.PollRuntimeStateTask().si(
@@ -353,10 +393,9 @@ class InstanceCreateExecutor(core_executors.CreateExecutor):
 
         shared_tenant = instance.service_project_link.service.settings.scope
         if shared_tenant:
-            serialized_executor = core_utils.serialize_class(openstack_executors.TenantPullFloatingIPsExecutor)
-            serialized_tenant = core_utils.serialize_instance(shared_tenant)
-            _tasks.append(core_tasks.ExecutorTask().si(serialized_executor, serialized_tenant))
-        return chain(*_tasks)
+            _tasks.append(openstack_executors.TenantPullFloatingIPsExecutor.as_signature(shared_tenant))
+
+        return _tasks
 
     @classmethod
     def get_success_signature(cls, instance, serialized_instance, **kwargs):
@@ -397,29 +436,85 @@ class InstanceDeleteExecutor(core_executors.DeleteExecutor):
     def get_task_signature(cls, instance, serialized_instance, force=False, **kwargs):
         delete_volumes = kwargs.pop('delete_volumes', True)
         release_floating_ips = kwargs.pop('release_floating_ips', True)
-        delete_instance = cls.get_delete_instance_tasks(instance, serialized_instance, release_floating_ips)
+
+        delete_instance_tasks = cls.get_delete_instance_tasks(serialized_instance)
+        release_floating_ips_tasks = cls.get_release_floating_ips_tasks(instance, release_floating_ips)
+        detach_volumes_tasks = cls.get_detach_data_volumes_tasks(instance)
+        delete_volumes_tasks = cls.get_delete_data_volumes_tasks(instance)
+        delete_internal_ips_tasks = cls.get_delete_internal_ips_tasks(serialized_instance)
 
         # Case 1. Instance does not exist at backend
         if not instance.backend_id:
-            return core_tasks.StateTransitionTask().si(
-                serialized_instance,
-                state_transition='begin_deleting'
-            )
+            return chain(cls.get_delete_incomplete_instance_tasks(instance, serialized_instance))
 
         # Case 2. Instance exists at backend.
-        # Data volumes are deleted by OpenStack because delete_on_termination=True
+        # Data volumes are detached and deleted explicitly
+        # because once volume is attached after instance is created,
+        # it is not removed automatically.
+        # System volume is deleted implicitly since delete_on_termination=True
         elif delete_volumes:
-            return chain(delete_instance)
+            return chain(
+                detach_volumes_tasks +
+                delete_volumes_tasks +
+                delete_instance_tasks +
+                release_floating_ips_tasks +
+                delete_internal_ips_tasks
+            )
 
         # Case 3. Instance exists at backend.
         # Data volumes are detached and not deleted.
         else:
-            detach_volumes = cls.get_detach_data_volumes_tasks(instance, serialized_instance)
-            return chain(detach_volumes + delete_instance)
+            return chain(
+                detach_volumes_tasks +
+                delete_instance_tasks +
+                release_floating_ips_tasks +
+                delete_internal_ips_tasks
+            )
 
     @classmethod
-    def get_delete_instance_tasks(cls, instance, serialized_instance, release_floating_ips):
-        _tasks = [
+    def get_delete_incomplete_instance_tasks(cls, instance, serialized_instance):
+        _tasks = []
+
+        _tasks.append(core_tasks.StateTransitionTask().si(
+            serialized_instance,
+            state_transition='begin_deleting'
+        ))
+
+        _tasks += cls.get_delete_internal_ips_tasks(serialized_instance)
+
+        for volume in instance.volumes.all():
+            if volume.backend_id:
+                serialized_volume = core_utils.serialize_instance(volume)
+                _tasks.append(core_tasks.BackendMethodTask().si(
+                    serialized_volume,
+                    'delete_volume',
+                    state_transition='begin_deleting'
+                ))
+                _tasks.append(core_tasks.PollBackendCheckTask().si(
+                    serialized_volume,
+                    'is_volume_deleted'
+                ))
+
+        _tasks += [tasks.DeleteIncompleteInstanceTask().si(serialized_instance)]
+
+        return _tasks
+
+    @classmethod
+    def get_delete_internal_ips_tasks(cls, serialized_instance):
+        """
+        OpenStack Neutron ports should be deleted explicitly because we're creating them explicitly.
+        Otherwise when port quota is exhausted, user is not able to provision new VMs anymore.
+        """
+        return [
+            core_tasks.BackendMethodTask().si(
+                serialized_instance,
+                backend_method='delete_instance_internal_ips',
+            )
+        ]
+
+    @classmethod
+    def get_delete_instance_tasks(cls, serialized_instance):
+        return [
             core_tasks.BackendMethodTask().si(
                 serialized_instance,
                 backend_method='delete_instance',
@@ -430,6 +525,10 @@ class InstanceDeleteExecutor(core_executors.DeleteExecutor):
                 backend_check_method='is_instance_deleted',
             ),
         ]
+
+    @classmethod
+    def get_release_floating_ips_tasks(cls, instance, release_floating_ips):
+        _tasks = []
         if release_floating_ips:
             for index, floating_ip in enumerate(instance.floating_ips):
                 _tasks.append(core_tasks.BackendMethodTask().si(
@@ -445,15 +544,14 @@ class InstanceDeleteExecutor(core_executors.DeleteExecutor):
                 ).set(countdown=5 if not index else 0))
 
         shared_tenant = instance.service_project_link.service.settings.scope
-        if shared_tenant:
-            serialized_executor = core_utils.serialize_class(openstack_executors.TenantPullFloatingIPsExecutor)
-            serialized_tenant = core_utils.serialize_instance(shared_tenant)
-            _tasks.append(core_tasks.ExecutorTask().si(serialized_executor, serialized_tenant))
+        if shared_tenant and isinstance(shared_tenant, openstack_models.Tenant):
+            if shared_tenant.state == openstack_models.Tenant.States.OK:
+                _tasks.append(openstack_executors.TenantPullFloatingIPsExecutor.as_signature(shared_tenant))
 
         return _tasks
 
     @classmethod
-    def get_detach_data_volumes_tasks(cls, instance, serialized_instance):
+    def get_detach_data_volumes_tasks(cls, instance):
         data_volumes = instance.volumes.all().filter(bootable=False)
         detach_volumes = [
             core_tasks.BackendMethodTask().si(
@@ -467,11 +565,20 @@ class InstanceDeleteExecutor(core_executors.DeleteExecutor):
                 core_utils.serialize_instance(volume),
                 backend_pull_method='pull_volume_runtime_state',
                 success_state='available',
-                erred_state='error'
+                erred_state='error',
+                deleted_state='deleted',
             )
             for volume in data_volumes
         ]
         return detach_volumes + check_volumes
+
+    @classmethod
+    def get_delete_data_volumes_tasks(cls, instance):
+        data_volumes = instance.volumes.all().filter(bootable=False)
+        return [
+            VolumeDeleteExecutor.as_signature(volume)
+            for volume in data_volumes
+        ]
 
 
 class InstanceFlavorChangeExecutor(core_executors.ActionExecutor):
@@ -678,6 +785,7 @@ class BackupCreateExecutor(core_executors.CreateExecutor):
 class BackupDeleteExecutor(core_executors.DeleteExecutor):
 
     @classmethod
+    @transaction.atomic
     def pre_apply(cls, backup, **kwargs):
         for snapshot in backup.snapshots.all():
             snapshot.schedule_deleting()

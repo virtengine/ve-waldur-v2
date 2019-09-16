@@ -13,11 +13,14 @@ from django.contrib.admin import widgets
 from django.contrib.auth import admin as auth_admin, get_user_model
 from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
+from django.forms.utils import flatatt
+from django.shortcuts import get_object_or_404
 from django.urls import reverse
 from django.utils.functional import cached_property
 from django.utils.html import format_html_join
 from django.utils.safestring import mark_safe
 from django.utils.translation import ugettext_lazy as _
+from jsoneditor.forms import JSONEditor
 from rest_framework import permissions as rf_permissions
 from reversion.admin import VersionAdmin
 import six
@@ -42,16 +45,37 @@ class ReadonlyTextWidget(forms.TextInput):
         return render_to_readonly(self.format_value(value))
 
 
-class PasswordWidget(forms.PasswordInput):
+class CopyButtonMixin(object):
+    class Media:
+        js = (
+            settings.STATIC_URL + 'landing/js/copy2clipboard.js',
+        )
+
+    def render(self, name, value, attrs=None):
+        result = super(CopyButtonMixin, self).render(name, value, attrs)
+        button_attrs = {
+            'class': 'button copy-button',
+            'data-target-id': attrs['id'],
+        }
+        result += "<a %(attrs)s>Copy</a>" % {'attrs': flatatt(button_attrs)}
+        return mark_safe(result)  # nosec
+
+
+class PasswordWidget(CopyButtonMixin, forms.PasswordInput):
     template_name = 'admin/core/widgets/password-widget.html'
 
     def __init__(self, attrs=None):
         super(PasswordWidget, self).__init__(attrs, render_value=True)
 
 
+class JsonWidget(CopyButtonMixin, JSONEditor):
+    class Media:
+        js = JSONEditor.Media.js + CopyButtonMixin.Media.js
+
+
 def format_json_field(value):
     template = '<div><pre style="overflow: hidden">{0}</pre></div>'
-    formatted_value = json.dumps(value, indent=True)
+    formatted_value = json.dumps(value, indent=True, ensure_ascii=False)
     return template.format(formatted_value)
 
 
@@ -85,12 +109,11 @@ class UserCreationForm(auth_admin.UserCreationForm):
 class UserChangeForm(auth_admin.UserChangeForm):
     class Meta(object):
         model = get_user_model()
-        fields = '__all__'
+        exclude = ('details',)
 
     def __init__(self, *args, **kwargs):
         super(UserChangeForm, self).__init__(*args, **kwargs)
         competences = [(key, key) for key in settings.WALDUR_CORE.get('USER_COMPETENCE_LIST', [])]
-        self.fields['preferred_language'] = OptionalChoiceField(choices=settings.LANGUAGES, required=False)
         self.fields['competence'] = OptionalChoiceField(choices=competences, required=False)
 
     def clean_civil_number(self):
@@ -151,7 +174,8 @@ class NativeNameAdminMixin(ExcludedFieldsAdminMixin):
 class UserAdmin(NativeNameAdminMixin, auth_admin.UserAdmin):
     list_display = ('username', 'uuid', 'email', 'full_name', 'native_name', 'is_active', 'is_staff', 'is_support')
     search_fields = ('username', 'uuid', 'full_name', 'native_name', 'email', 'civil_number')
-    list_filter = ('is_active', 'is_staff', 'is_support')
+    list_filter = ('is_active', 'is_staff', 'is_support', 'registration_method')
+    date_hierarchy = 'date_joined'
     fieldsets = (
         (None, {'fields': ('username', 'password', 'registration_method', 'uuid')}),
         (_('Personal info'), {'fields': (
@@ -161,9 +185,10 @@ class UserAdmin(NativeNameAdminMixin, auth_admin.UserAdmin):
         (_('Organization'), {'fields': ('organization', 'job_title',)}),
         (_('Permissions'), {'fields': ('is_active', 'is_staff', 'is_support', 'customer_roles', 'project_roles')}),
         (_('Important dates'), {'fields': ('last_login', 'date_joined', 'agreement_date')}),
+        (_('Authentication backend details'), {'fields': ('format_details', 'backend_id')}),
     )
     readonly_fields = ('registration_method', 'agreement_date', 'customer_roles', 'project_roles', 'uuid',
-                       'last_login', 'date_joined')
+                       'last_login', 'date_joined', 'format_details')
     form = UserChangeForm
     add_form = UserCreationForm
 
@@ -191,10 +216,16 @@ class UserAdmin(NativeNameAdminMixin, auth_admin.UserAdmin):
 
     project_roles.short_description = _('Roles in projects')
 
+    def format_details(self, obj):
+        return format_json_field(obj.details)
+
+    format_details.allow_tags = True
+    format_details.short_description = _('Details')
+
 
 class SshPublicKeyAdmin(admin.ModelAdmin):
     list_display = ('user', 'name', 'fingerprint')
-    search_fields = ('user__name', 'name', 'fingerprint')
+    search_fields = ('user__username', 'name', 'fingerprint')
     readonly_fields = ('user', 'name', 'fingerprint', 'public_key')
 
 
@@ -348,6 +379,60 @@ class ExtraActionsMixin(object):
         return getattr(action, 'name', action.__name__.replace('_', ' ').capitalize())
 
 
+class ExtraActionsObjectMixin(object):
+    """
+    Allows to add extra actions to admin object edit page.
+    """
+    change_form_template = 'admin/core/change_form.html'
+
+    def get_extra_object_actions(self):
+        raise NotImplementedError('Method "get_extra_object_actions" should be implemented in ExtraActionsMixin.')
+
+    def get_urls(self):
+        """
+        Inject extra action URLs.
+        """
+        urls = []
+
+        for action in self.get_extra_object_actions():
+            regex = r'^(.+)/change/{}/$'.format(self._get_action_href(action))
+            view = self.admin_site.admin_view(action)
+            urls.append(url(regex, view))
+
+        return urls + super(ExtraActionsObjectMixin, self).get_urls()
+
+    def change_view(self, request, object_id, form_url='', extra_context=None):
+        """
+        Inject extra links into template context.
+        """
+        links = []
+        obj = get_object_or_404(self.model, pk=object_id)
+
+        for action in self.get_extra_object_actions():
+            validator = self._get_action_validator(action)
+            links.append({
+                'label': self._get_action_label(action),
+                'href': self._get_action_href(action),
+                'show': True if not validator else validator(request, obj)
+            })
+
+        extra_context = extra_context or {}
+        extra_context['extra_object_links'] = links
+
+        return super(ExtraActionsObjectMixin, self).change_view(
+            request, object_id, form_url, extra_context=extra_context,
+        )
+
+    def _get_action_href(self, action):
+        return action.__name__
+
+    def _get_action_label(self, action):
+        return getattr(action, 'name', action.__name__.replace('_', ' ').capitalize())
+
+    def _get_action_validator(self, action):
+        return getattr(action, 'validator', None)
+
+
 class UpdateOnlyModelAdmin(object):
 
     def has_add_permission(self, request, obj=None):
@@ -355,6 +440,34 @@ class UpdateOnlyModelAdmin(object):
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+
+class ReadOnlyAdminMixin(object):
+    """
+    Disables all editing capabilities.
+    Please ensure that readonly_fields is specified in derived class.
+    """
+    change_form_template = 'admin/core/readonly_change_form.html'
+
+    def get_actions(self, request):
+        actions = super(ReadOnlyAdminMixin, self).get_actions(request)
+        del actions['delete_selected']
+        return actions
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def save_model(self, request, obj, form, change):
+        pass
+
+    def delete_model(self, request, obj):
+        pass
+
+    def save_related(self, request, form, formsets, change):
+        pass
 
 
 class GBtoMBWidget(widgets.AdminIntegerFieldWidget):

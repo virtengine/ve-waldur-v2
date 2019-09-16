@@ -11,18 +11,15 @@ from . import executors, models
 
 
 class FlavorAdmin(structure_admin.BackendModelAdmin):
-    list_filter = ('settings',)
     list_display = ('name', 'settings', 'cores', 'ram', 'disk')
 
 
 class ImageAdmin(structure_admin.BackendModelAdmin):
-    list_filter = ('settings',)
     list_display = ('name', 'settings', 'min_disk', 'min_ram')
 
 
 class FloatingIPAdmin(structure_admin.BackendModelAdmin):
-    list_filter = ('settings',)
-    list_display = ('address', 'settings', 'runtime_state', 'backend_network_id', 'is_booked')
+    list_display = ('name', 'address', 'settings', 'runtime_state', 'backend_network_id', 'is_booked')
 
 
 class SecurityGroupRule(admin.TabularInline):
@@ -35,7 +32,6 @@ class SecurityGroupRule(admin.TabularInline):
 
 class SecurityGroupAdmin(structure_admin.BackendModelAdmin):
     inlines = [SecurityGroupRule]
-    list_filter = ('settings',)
     list_display = ('name', 'settings')
 
 
@@ -116,7 +112,7 @@ class InstanceAdmin(ActionDetailsMixin, structure_admin.VirtualMachineAdmin):
     exclude = ('action_details',)
     inlines = [InternalIpInline]
     list_filter = structure_admin.VirtualMachineAdmin.list_filter + ('runtime_state',)
-    search_fields = structure_admin.VirtualMachineAdmin.search_fields + ('name', 'uuid', 'backend_id', 'runtime_state')
+    search_fields = structure_admin.VirtualMachineAdmin.search_fields + ('uuid', 'backend_id', 'runtime_state')
 
     class Pull(ExecutorAdminAction):
         executor = executors.InstancePullExecutor
@@ -172,7 +168,10 @@ admin.site.register(models.Image, ImageAdmin)
 admin.site.register(models.FloatingIP, FloatingIPAdmin)
 admin.site.register(models.SecurityGroup, SecurityGroupAdmin)
 admin.site.register(models.Volume, VolumeAdmin)
+admin.site.register(models.VolumeType, structure_admin.ServicePropertyAdmin)
+admin.site.register(models.VolumeAvailabilityZone, structure_admin.ServicePropertyAdmin)
 admin.site.register(models.Snapshot, SnapshotAdmin)
+admin.site.register(models.InstanceAvailabilityZone, structure_admin.ServicePropertyAdmin)
 admin.site.register(models.Instance, InstanceAdmin)
 admin.site.register(models.Backup, BackupAdmin)
 admin.site.register(models.BackupSchedule, BackupScheduleAdmin)

@@ -1,5 +1,6 @@
 import datetime
 import hashlib
+import json
 import logging
 import sys
 
@@ -85,7 +86,14 @@ class OpenStackSession(dict):
             args['project_name'] = session['project_name']
             args['project_domain_name'] = session['project_domain_name']
 
-        ks_session = keystone_session.Session(auth=v3.Token(**args), verify=verify_ssl)
+        auth_method = v3.Token(**args)
+        auth_data = {
+            'auth_token': session['auth_ref'].auth_token,
+            'body': session['auth_ref']._data
+        }
+        auth_state = json.dumps(auth_data)
+        auth_method.set_auth_state(auth_state)
+        ks_session = keystone_session.Session(auth=auth_method, verify=verify_ssl)
         return cls(ks_session=ks_session)
 
     def validate(self):
@@ -199,10 +207,12 @@ class BaseOpenStackBackend(ServiceBackend):
             client = getattr(self, attr_name)
         elif key in cache:  # try to get session from cache
             session = cache.get(key)
-            try:
-                client = OpenStackClient(session=session)
-            except (OpenStackSessionExpired, OpenStackAuthorizationFailed):
-                pass
+            # Cache miss is signified by a return value of None
+            if session is not None:
+                try:
+                    client = OpenStackClient(session=session)
+                except (OpenStackSessionExpired, OpenStackAuthorizationFailed):
+                    pass
 
         if client is None:  # create new token if session is not cached or expired
             client = OpenStackClient(**credentials)
@@ -248,7 +258,7 @@ class BaseOpenStackBackend(ServiceBackend):
         for quota_name, limit in self.get_tenant_quotas_limits(backend_id).items():
             scope.set_quota_limit(quota_name, limit)
         for quota_name, usage in self.get_tenant_quotas_usage(backend_id).items():
-            scope.set_quota_usage(quota_name, usage, fail_silently=True)
+            scope.set_quota_usage(quota_name, usage)
 
     def get_tenant_quotas_limits(self, tenant_backend_id):
         nova = self.nova_client
@@ -349,7 +359,7 @@ class BaseOpenStackBackend(ServiceBackend):
         backend_rules = backend_security_group['security_group_rules']
         cur_rules = {rule.backend_id: rule for rule in security_group.rules.all()}
         for backend_rule in backend_rules:
-            # Currently we support only rules for incoming traffic
+            # TODO: Currently we support only rules for incoming traffic
             if backend_rule['direction'] != 'ingress':
                 continue
             cur_rules.pop(backend_rule['id'], None)

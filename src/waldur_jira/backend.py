@@ -82,8 +82,7 @@ class JiraBackend(ServiceBackend):
         self.project = project
         self.verify = verify
 
-    def sync(self):
-        self.ping(raise_exception=True)
+    def pull_service_properties(self):
         self.pull_project_templates()
         self.pull_priorities()
 
@@ -122,10 +121,18 @@ class JiraBackend(ServiceBackend):
             return getattr(self, '_manager')
         except AttributeError:
             try:
+                if self.settings.token:
+                    if getattr(self.settings, 'email', None):
+                        basic_auth = (self.settings.email, self.settings.token)
+                    else:
+                        basic_auth = (self.settings.username, self.settings.token)
+                else:
+                    basic_auth = (self.settings.username, self.settings.password)
+
                 self._manager = JIRA(
                     server=self.settings.backend_url,
                     options={'verify': self.verify},
-                    basic_auth=(self.settings.username, self.settings.password),
+                    basic_auth=basic_auth,
                     validate=False)
             except JIRAError as e:
                 if check_captcha(e):
@@ -623,7 +630,7 @@ class JiraBackend(ServiceBackend):
         return args
 
     def _get_property(self, object_name, object_id, property_name):
-        url = self.manager._get_url('{0}/{1}/properties/{2}/'.format(object_name, object_id, property_name))
+        url = self.manager._get_url('{0}/{1}/properties/{2}'.format(object_name, object_id, property_name))
         response = self.manager._session.get(url)
         return response.json()
 

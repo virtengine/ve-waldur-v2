@@ -4,6 +4,7 @@ import logging
 import re
 
 from django.conf import settings
+from django.db import transaction
 from django.template.loader import render_to_string
 from django.utils import timezone
 
@@ -217,6 +218,8 @@ def log_resource_deleted(sender, instance, **kwargs):
 
 
 def log_resource_imported(sender, instance, **kwargs):
+    if not instance.pk:
+        return
     event_logger.resource.info(
         'Resource {resource_full_name} has been imported.',
         event_type='resource_import_succeeded',
@@ -239,6 +242,11 @@ def log_resource_creation_failed(instance):
 
 def log_resource_creation_scheduled(sender, instance, created=False, **kwargs):
     if created and isinstance(instance, StateMixin) and instance.state == StateMixin.States.CREATION_SCHEDULED:
+        transaction.on_commit(lambda: _log_resource_creation_scheduled(instance))
+
+
+def _log_resource_creation_scheduled(instance):
+    if instance.pk:
         event_logger.resource.info(
             'Resource {resource_name} creation has been scheduled.',
             event_type='resource_creation_scheduled',
@@ -392,3 +400,34 @@ def notify_about_user_profile_changes(sender, instance, created=False, **kwargs)
         msg,
         event_type='user_profile_changed',
         event_context={'affected_user': user})
+
+
+def update_customer_users_count(sender, **kwargs):
+    for customer in Customer.objects.all():
+        usage = len(set(customer.get_users()))
+        customer.set_quota_usage(Customer.Quotas.nc_user_count, usage)
+
+
+def log_spl_create(sender, instance, created=False, **kwargs):
+    if created:
+        event_logger.spl.info(
+            'ServiceProjectLink for project \'{project_name}\' '
+            '(service: \'{service_type}\', settings name: \'{settings_name}\', '
+            'settings type: \'{service_settings_type}\') '
+            'has been created.',
+            event_type='spl_creation_succeeded',
+            event_context={
+                'spl': instance,
+            })
+
+
+def log_spl_delete(sender, instance, **kwargs):
+    event_logger.spl.info(
+        'ServiceProjectLink for project \'{project_name}\' '
+        '(service: \'{service_type}\', settings name: \'{settings_name}\', '
+        'settings type: \'{service_settings_type}\') '
+        'has been deleted.',
+        event_type='spl_deletion_succeeded',
+        event_context={
+            'spl': instance,
+        })

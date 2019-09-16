@@ -35,16 +35,6 @@ config_defaults = {
         'token_lifetime': 3600,
         'session_lifetime': 3600,
     },
-    'elasticsearch': {
-        # This location is RHEL7-specific, may be different on other platforms
-        'ca_certs': '/etc/pki/tls/certs/ca-bundle.crt',  # only has effect if verify_certs is true
-        'host': 'localhost',
-        'password': '',
-        'port': '9200',
-        'protocol': 'http',
-        'username': '',
-        'verify_certs': 'true',  # only has effect if protocol is 'https'
-    },
     'events': {
         'hook': 'false',
         'log_file': '',  # empty to disable logging events to file
@@ -75,7 +65,7 @@ config_defaults = {
         'cors_allowed_domains': 'localhost,127.0.0.1',
     },
     'sentry': {
-        'dsn': '',  # raven package is needed for this to work
+        'dsn': '',  # Please ensure that Python Sentry SDK is installed.
     },
 }
 
@@ -229,7 +219,7 @@ LOGGING = {
             'level': config.get('events', 'log_level').upper(),
         },
         # Send logs to log server
-        # Note that waldur_core.logging.log.TCPEventHandler does not support exernal formatters
+        # Note that waldur_core.logging.log.TCPEventHandler does not support external formatters
         'tcp': {
             'class': 'waldur_core.logging.log.TCPEventHandler',
             'filters': ['is-not-event'],
@@ -241,13 +231,6 @@ LOGGING = {
             'host': config.get('events', 'logserver_host'),
             'level': config.get('events', 'log_level').upper(),
             'port': config.getint('events', 'logserver_port'),
-        },
-
-        # Send logs to web hook
-        'hook-event': {
-            'class': 'waldur_core.logging.log.HookHandler',
-            'filters': ['is-event'],
-            'level': config.get('events', 'log_level').upper(),
         },
     },
 
@@ -319,9 +302,6 @@ if config.getboolean('events', 'syslog'):
     LOGGING['handlers']['syslog-event']['address'] = '/dev/log'
     LOGGING['loggers']['waldur_core']['handlers'].append('syslog-event')
 
-if config.getboolean('events', 'hook'):
-    LOGGING['loggers']['waldur_core']['handlers'].append('hook-event')
-
 # Static files
 # See also: https://docs.djangoproject.com/en/1.11/ref/settings/#static-files
 STATIC_ROOT = config.get('global', 'static_root')
@@ -381,22 +361,10 @@ for app in INSTALLED_APPS:
 # Waldur Core internal configuration
 # See also: http://docs.waldur.com/
 WALDUR_CORE.update({
-    'ELASTICSEARCH': {
-        'host': config.get('elasticsearch', 'host'),
-        'password': config.get('elasticsearch', 'password'),
-        'port': config.get('elasticsearch', 'port'),
-        'protocol': config.get('elasticsearch', 'protocol'),
-        'username': config.get('elasticsearch', 'username'),
-    },
     'TOKEN_LIFETIME': timedelta(seconds=config.getint('auth', 'token_lifetime')),
     'OWNER_CAN_MANAGE_CUSTOMER': config.getboolean('global', 'owner_can_manage_customer'),
     'SHOW_ALL_USERS': config.getboolean('global', 'show_all_users'),
 })
-
-if WALDUR_CORE['ELASTICSEARCH']['protocol'] == 'https':
-    WALDUR_CORE['ELASTICSEARCH']['verify_certs'] = config.getboolean('elasticsearch', 'verify_certs')
-    if WALDUR_CORE['ELASTICSEARCH']['verify_certs']:
-        WALDUR_CORE['ELASTICSEARCH']['ca_certs'] = config.get('elasticsearch', 'ca_certs')
 
 # Swagger uses DRF session authentication which can be enabled in DEBUG mode
 if config.getboolean('global', 'debug'):
@@ -407,20 +375,13 @@ if config.getboolean('global', 'debug'):
 # Sentry integration
 # See also: https://docs.getsentry.com/hosted/clients/python/integrations/django/
 if config.get('sentry', 'dsn') != '':
-    INSTALLED_APPS = INSTALLED_APPS + ('raven.contrib.django.raven_compat',)
+    import sentry_sdk
+    from sentry_sdk.integrations.django import DjangoIntegration
 
-    RAVEN_CONFIG = {
-        'dsn': config.get('sentry', 'dsn'),
-    }
-
-    # Send logs to Sentry
-    # See also: https://docs.getsentry.com/hosted/clients/python/integrations/django/#integration-with-logging
-    LOGGING['handlers']['sentry'] = {
-        'class': 'raven.contrib.django.raven_compat.handlers.SentryHandler',
-        'level': 'ERROR',
-    }
-    for logger in ['celery.worker', 'django', 'waldur_core', 'requests']:
-        LOGGING['loggers'][logger]['handlers'].append('sentry')
+    sentry_sdk.init(
+        dsn=config.get('sentry', 'dsn'),
+        integrations=[DjangoIntegration()]
+    )
 
 # Additional configuration files for Waldur
 # 'override.conf.py' must be the first element to override settings in core.ini but not plugin configuration.

@@ -13,10 +13,13 @@ class SupportExtension(WaldurExtension):
             # wiki for JIRA-specific options:
             # https://opennode.atlassian.net/wiki/display/WD/JIRA+Service+Desk+configuration
             'ACTIVE_BACKEND': 'waldur_mastermind.support.backend.atlassian:ServiceDeskBackend',
+            'USE_OLD_API': False,
             'CREDENTIALS': {
                 'server': 'http://example.com/',
                 'username': 'USERNAME',
                 'password': 'PASSWORD',
+                'email': '',
+                'token': '',
                 'verify_ssl': False,
             },
             'PROJECT': {
@@ -28,6 +31,10 @@ class SupportExtension(WaldurExtension):
                 'reporter_field': 'Original Reporter',
                 'caller_field': 'Caller',
                 'sla_field': 'Time to first response',
+                # 'organisation_field': 'Reporter organization',
+                # 'project_field': 'Waldur project',
+                # 'affected_resource_field': 'Affected resource',
+                # 'template_field': 'Waldur template',
                 'summary': '{{issue.summary}}',
                 'description': (
                     '{{issue.description}}\n\n'
@@ -112,6 +119,11 @@ class SupportExtension(WaldurExtension):
             'pull-support-users': {
                 'task': 'support.SupportUserPullTask',
                 'schedule': timedelta(hours=6),
+                'args': (),
+            },
+            'pull-priorities': {
+                'task': 'waldur_mastermind.support.pull_priorities',
+                'schedule': timedelta(hours=24),
                 'args': (),
             },
             'remove-terminated-offerings': {

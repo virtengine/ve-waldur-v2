@@ -5,6 +5,7 @@ import mock
 
 from waldur_core.structure.models import ProjectRole
 from waldur_core.structure.tests import factories as structure_factories
+from waldur_openstack.openstack_tenant.tests.helpers import override_openstack_tenant_settings
 
 from . import factories, fixtures
 from .. import models
@@ -152,6 +153,32 @@ class VolumeAttachTestCase(test.APITransactionTestCase):
         response = self.get_response()
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
 
+    def test_volume_AZ_should_match_instance_AZ(self):
+        volume_az = self.fixture.volume_availability_zone
+        self.volume.availability_zone = volume_az
+        self.volume.state = models.Volume.States.OK
+        self.volume.runtime_state = 'available'
+        self.volume.save()
+
+        instance_az = self.fixture.instance_availability_zone
+        self.instance.availability_zone = instance_az
+        self.instance.state = models.Instance.States.OK
+        self.instance.runtime_state = models.Instance.RuntimeStates.ACTIVE
+        self.instance.save()
+
+        private_settings = self.fixture.openstack_tenant_service_settings
+        shared_settings = private_settings.scope.service_settings
+
+        shared_settings.options = {
+            'valid_availability_zones': {
+                instance_az.name: volume_az.name
+            }
+        }
+        shared_settings.save()
+
+        response = self.get_response()
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
+
 
 class VolumeSnapshotTestCase(test.APITransactionTestCase):
     def setUp(self):
@@ -169,18 +196,6 @@ class VolumeSnapshotTestCase(test.APITransactionTestCase):
 
         response = self.client.post(self.url, data=payload)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-
-    def test_snapshot_metadata_is_populated(self):
-        self.client.force_authenticate(self.fixture.owner)
-        payload = {'name': '%s snapshot' % self.volume.name}
-
-        response = self.client.post(self.url, data=payload)
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        snapshot = models.Snapshot.objects.get(uuid=response.data['uuid'])
-        self.assertIn('source_volume_name', snapshot.metadata)
-        self.assertEqual(snapshot.metadata['source_volume_name'], self.volume.name)
-        self.assertEqual(snapshot.metadata['source_volume_description'], self.volume.description)
-        self.assertEqual(snapshot.metadata['source_volume_image_metadata'], self.volume.image_metadata)
 
 
 @ddt
@@ -301,6 +316,7 @@ class VolumeImportableResourcesTest(BaseVolumeTest):
         get_volumes_mock.assert_called()
 
 
+@mock.patch('waldur_openstack.openstack_tenant.backend.OpenStackTenantBackend.import_volume')
 class VolumeImportTest(BaseVolumeTest):
 
     def setUp(self):
@@ -309,7 +325,6 @@ class VolumeImportTest(BaseVolumeTest):
         self.url = factories.VolumeFactory.get_list_url('import_resource')
         self.client.force_authenticate(self.fixture.owner)
 
-    @mock.patch('waldur_openstack.openstack_tenant.backend.OpenStackTenantBackend.import_volume')
     def test_backend_volume_is_imported(self, import_volume_mock):
         backend_id = 'backend_id'
 
@@ -327,7 +342,6 @@ class VolumeImportTest(BaseVolumeTest):
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
 
-    @mock.patch('waldur_openstack.openstack_tenant.backend.OpenStackTenantBackend.import_volume')
     def test_backend_volume_cannot_be_imported_if_it_is_registered_in_waldur(self, import_volume_mock):
         volume = factories.VolumeFactory(service_project_link=self.fixture.spl)
 
@@ -352,18 +366,23 @@ class VolumeCreateTest(test.APITransactionTestCase):
         self.image = factories.ImageFactory(settings=self.settings)
         self.image_url = factories.ImageFactory.get_url(self.image)
         self.spl_url = factories.OpenStackTenantServiceProjectLinkFactory.get_url(self.fixture.spl)
+        self.type = factories.VolumeTypeFactory(settings=self.settings)
+        self.type_url = factories.VolumeTypeFactory.get_url(self.type)
         self.client.force_authenticate(self.fixture.owner)
 
-    def test_image_name_populated_on_volume_creation(self):
-        url = factories.VolumeFactory.get_list_url()
+    def create_volume(self, **extra):
         payload = {
             'name': 'Test volume',
-            'image': self.image_url,
             'service_project_link': self.spl_url,
             'size': 10240
         }
+        payload.update(extra)
 
-        response = self.client.post(url, payload)
+        url = factories.VolumeFactory.get_list_url()
+        return self.client.post(url, payload)
+
+    def test_image_name_populated_on_volume_creation(self):
+        response = self.create_volume(image=self.image_url)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
         self.assertEqual(response.data['image_name'], self.image.name)
 
@@ -387,3 +406,45 @@ class VolumeCreateTest(test.APITransactionTestCase):
 
         system_volume = response.data['volumes'][0]
         self.assertEqual(system_volume['image_name'], self.image.name)
+
+    def test_type_populated_on_volume_creation(self):
+        response = self.create_volume(type=self.type_url)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data['type'], self.type_url)
+
+    def test_volume_type_should_be_related_to_the_same_service_settings(self):
+        response = self.create_volume(type=factories.VolumeTypeFactory.get_url())
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('type', response.data)
+
+    def test_availability_zone_should_be_related_to_the_same_service_settings(self):
+        response = self.create_volume(
+            availability_zone=factories.VolumeAvailabilityZoneFactory.get_url())
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_availability_zone_should_be_available(self):
+        zone = self.fixture.volume_availability_zone
+        zone.available = False
+        zone.save()
+
+        response = self.create_volume(
+            availability_zone=factories.VolumeAvailabilityZoneFactory.get_url(zone))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_availability_zone_name_is_validated(self):
+        zone = self.fixture.volume_availability_zone
+
+        response = self.create_volume(
+            availability_zone=factories.VolumeAvailabilityZoneFactory.get_url(zone))
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    @override_openstack_tenant_settings(REQUIRE_AVAILABILITY_ZONE=True)
+    def test_when_availability_zone_is_mandatory_and_exists_validation_fails(self):
+        self.fixture.volume_availability_zone
+        response = self.create_volume()
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @override_openstack_tenant_settings(REQUIRE_AVAILABILITY_ZONE=True)
+    def test_when_availability_zone_is_mandatory_and_does_not_exist_validation_succeeds(self):
+        response = self.create_volume()
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)

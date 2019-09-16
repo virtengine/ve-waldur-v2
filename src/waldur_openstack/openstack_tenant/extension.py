@@ -11,11 +11,25 @@ class OpenStackTenantExtension(WaldurExtension):
                 'OpenStackTenant.Volume': 4,
                 'OpenStackTenant.Snapshot': 4,
             },
+            'ALLOW_CUSTOMER_USERS_OPENSTACK_CONSOLE_ACCESS': False,
+            'REQUIRE_AVAILABILITY_ZONE': False,
         }
+
+    @staticmethod
+    def get_public_settings():
+        return [
+            'ALLOW_CUSTOMER_USERS_OPENSTACK_CONSOLE_ACCESS',
+            'REQUIRE_AVAILABILITY_ZONE',
+        ]
 
     @staticmethod
     def django_app():
         return 'waldur_openstack.openstack_tenant'
+
+    @staticmethod
+    def django_urls():
+        from .urls import urlpatterns
+        return urlpatterns
 
     @staticmethod
     def rest_urls():

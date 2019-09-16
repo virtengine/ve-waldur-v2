@@ -9,13 +9,11 @@ from django.conf import settings as django_settings
 from django.contrib import auth
 from django.db import transaction, IntegrityError
 from django.db.models import Q
-from django.http import Http404
 from django.utils.functional import cached_property
 from django.utils.translation import ugettext_lazy as _
-from django.views.static import serve
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters as rf_filters
-from rest_framework import generics, mixins, views, viewsets, status
+from rest_framework import mixins, views, viewsets, status
 from rest_framework import permissions as rf_permissions
 from rest_framework import serializers as rf_serializers
 from rest_framework.decorators import detail_route, list_route
@@ -33,11 +31,10 @@ from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
 from waldur_core.core.utils import datetime_to_timestamp, sort_dict
 from waldur_core.logging import models as logging_models
-from waldur_core.logging.loggers import expand_alert_groups
 from waldur_core.quotas.models import QuotaModelMixin, Quota
 from waldur_core.structure import (
     SupportedServices, ServiceBackendError, ServiceBackendNotImplemented,
-    filters, managers, models, permissions, serializers)
+    filters, managers, models, permissions, serializers, utils)
 from waldur_core.structure.managers import filter_queryset_for_user
 from waldur_core.structure.metadata import ActionsMetadata
 from waldur_core.structure.signals import resource_imported, structure_role_updated
@@ -60,6 +57,7 @@ class CustomerViewSet(core_mixins.EagerLoadMixin, viewsets.ModelViewSet):
     ordering_fields = (
         'abbreviation',
         'accounting_start_date',
+        'agreement_number',
         'contact_details',
         'created',
         'name',
@@ -110,7 +108,9 @@ class CustomerViewSet(core_mixins.EagerLoadMixin, viewsets.ModelViewSet):
         A new customer can only be created:
 
          - by users with staff privilege (is_staff=True);
-         - by organization owners if OWNER_CAN_MANAGE_CUSTOMER is set to True;
+         - by any user if OWNER_CAN_MANAGE_CUSTOMER is set to True;
+
+        If user who has created new organization is not staff, he is granted owner permission.
 
         Example of a valid request:
 
@@ -186,10 +186,12 @@ class CustomerViewSet(core_mixins.EagerLoadMixin, viewsets.ModelViewSet):
 
     def perform_update(self, serializer):
         self.check_customer_permissions(serializer.instance)
+        utils.check_customer_blocked(serializer.instance)
         return super(CustomerViewSet, self).perform_update(serializer)
 
     def perform_destroy(self, instance):
         self.check_customer_permissions(instance)
+        utils.check_customer_blocked(instance)
 
         core_signals.pre_delete_validate.send(
             sender=models.Customer,
@@ -212,30 +214,6 @@ class CustomerViewSet(core_mixins.EagerLoadMixin, viewsets.ModelViewSet):
         return self.get_paginated_response(serializer.data)
 
 
-class CustomerImageView(generics.RetrieveAPIView, generics.UpdateAPIView, generics.DestroyAPIView):
-
-    queryset = models.Customer.objects.all()
-    lookup_field = 'uuid'
-    serializer_class = serializers.CustomerImageSerializer
-
-    def retrieve(self, request, uuid=None):
-        image = self.get_object().image
-        if not image:
-            raise Http404
-        return serve(request, image.path, document_root='/')
-
-    def perform_destroy(self, instance):
-        instance.image = None
-        instance.save()
-
-    def check_object_permissions(self, request, customer):
-        if request.user.is_staff:
-            return
-        if customer.has_user(request.user, models.CustomerRole.OWNER):
-            return
-        raise PermissionDenied()
-
-
 class ProjectTypeViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = models.ProjectType.objects.all()
     serializer_class = serializers.ProjectTypeSerializer
@@ -248,8 +226,13 @@ class ProjectViewSet(core_mixins.EagerLoadMixin, core_views.ActionsViewSet):
     queryset = models.Project.objects.all().order_by('name')
     serializer_class = serializers.ProjectSerializer
     lookup_field = 'uuid'
-    filter_backends = (filters.GenericRoleFilter, DjangoFilterBackend)
+    filter_backends = (
+        filters.GenericRoleFilter,
+        DjangoFilterBackend,
+        filters.CustomerAccountingStartDateFilter,
+    )
     filter_class = filters.ProjectFilter
+    destroy_validators = partial_update_validators = [utils.check_customer_blocked]
 
     def get_serializer_context(self):
         context = super(ProjectViewSet, self).get_serializer_context()
@@ -365,6 +348,8 @@ class ProjectViewSet(core_mixins.EagerLoadMixin, core_views.ActionsViewSet):
 
         if not self.can_create_project_with(customer):
             raise PermissionDenied()
+
+        utils.check_customer_blocked(customer)
 
         customer.validate_quota_change({'nc_project_count': 1}, raise_exception=True)
 
@@ -544,6 +529,8 @@ class BasePermissionViewSet(viewsets.ModelViewSet):
         if not scope.can_manage_role(self.request.user, role, expiration_time):
             raise PermissionDenied()
 
+        utils.check_customer_blocked(scope)
+
         if self.quota_scope_field:
             quota_scope = getattr(scope, self.quota_scope_field)
         else:
@@ -557,6 +544,8 @@ class BasePermissionViewSet(viewsets.ModelViewSet):
         permission = serializer.instance
         scope = getattr(permission, self.scope_field)
         role = permission.role
+
+        utils.check_customer_blocked(scope)
 
         new_expiration_time = serializer.validated_data.get('expiration_time')
         old_expiration_time = permission.expiration_time
@@ -582,6 +571,8 @@ class BasePermissionViewSet(viewsets.ModelViewSet):
 
         if not scope.can_manage_role(self.request.user, role, expiration_time):
             raise PermissionDenied()
+
+        utils.check_customer_blocked(scope)
 
         scope.remove_user(affected_user, role, removed_by=self.request.user)
 
@@ -910,6 +901,8 @@ class ServiceSettingsViewSet(core_mixins.EagerLoadMixin,
     update_permissions = partial_update_permissions = [can_user_update_settings,
                                                        permissions.check_access_to_services_management]
 
+    update_validators = partial_update_validators = [utils.check_customer_blocked]
+
     @detail_route()
     def stats(self, request, uuid=None):
         """
@@ -995,7 +988,7 @@ class ResourceSummaryViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
         resource_models = self._filter_resources(resource_models)
 
         queryset = managers.ResourceSummaryQuerySet(resource_models.values())
-        return serializers.SummaryResourceSerializer.eager_load(queryset)
+        return serializers.SummaryResourceSerializer.eager_load(queryset, self.request)
 
     def _filter_by_types(self, resource_models):
         types = self.request.query_params.getlist('resource_type', None)
@@ -1161,7 +1154,7 @@ class ServicesViewSet(mixins.ListModelMixin,
         service_models = self._filter_by_types(service_models)
         # TODO: filter models by service type.
         queryset = managers.ServiceSummaryQuerySet(service_models.values())
-        return serializers.SummaryServiceSerializer.eager_load(queryset)
+        return serializers.SummaryServiceSerializer.eager_load(queryset, self.request)
 
     def _filter_by_types(self, service_models):
         types = self.request.query_params.getlist('service_type', None)
@@ -1185,10 +1178,15 @@ class BaseCounterView(viewsets.GenericViewSet):
     # Fix for schema generation
     queryset = []
     extra_counters = {}
+    dynamic_counters = set()
 
     @classmethod
     def register_counter(cls, name, func):
         cls.extra_counters[name] = func
+
+    @classmethod
+    def register_dynamic_counter(cls, func):
+        cls.dynamic_counters.add(func)
 
     def get_counters(self):
         counters = self.get_fields()
@@ -1199,24 +1197,17 @@ class BaseCounterView(viewsets.GenericViewSet):
     def list(self, request, uuid=None):
         result = {}
         counters = self.get_counters()
-        fields = request.query_params.getlist('fields') or counters.keys()
         for field, func in counters.items():
-            if field in fields:
-                result[field] = func()
-
+            result[field] = func()
+        for func in self.dynamic_counters:
+            result.update(func(self.object))
+        fields = request.query_params.getlist('fields')
+        if fields:
+            result = {k: v for k, v in result.items() if k in fields}
         return Response(result)
 
     def get_fields(self):
         raise NotImplementedError()
-
-    def _get_alerts(self, aggregate_by):
-        alert_types_to_exclude = expand_alert_groups(self.request.query_params.getlist('exclude_features'))
-        return filters.filter_alerts_by_aggregate(
-            logging_models.Alert.objects,
-            aggregate_by,
-            self.request.user,
-            self.object.uuid.hex,
-        ).filter(closed__isnull=True).exclude(alert_type__in=alert_types_to_exclude).count()
 
     @cached_property
     def object(self):
@@ -1230,7 +1221,6 @@ class CustomerCountersView(BaseCounterView):
     .. code-block:: javascript
 
         {
-            "alerts": 12,
             "services": 1,
             "projects": 1,
             "users": 3
@@ -1238,20 +1228,17 @@ class CustomerCountersView(BaseCounterView):
     """
     lookup_field = 'uuid'
     extra_counters = {}
+    dynamic_counters = set()
 
     def get_queryset(self):
         return filter_queryset_for_user(models.Customer.objects.all().only('pk', 'uuid'), self.request.user)
 
     def get_fields(self):
         return {
-            'alerts': self.get_alerts,
             'projects': self.get_projects,
             'services': self.get_services,
             'users': self.get_users
         }
-
-    def get_alerts(self):
-        return self._get_alerts('customer')
 
     def get_users(self):
         return self.object.get_users().count()
@@ -1280,7 +1267,6 @@ class ProjectCountersView(BaseCounterView):
 
         {
             "users": 0,
-            "alerts": 2,
             "apps": 0,
             "vms": 1,
             "private_clouds": 1,
@@ -1289,13 +1275,13 @@ class ProjectCountersView(BaseCounterView):
     """
     lookup_field = 'uuid'
     extra_counters = {}
+    dynamic_counters = set()
 
     def get_queryset(self):
         return filter_queryset_for_user(models.Project.objects.all().only('pk', 'uuid'), self.request.user)
 
     def get_fields(self):
         fields = {
-            'alerts': self.get_alerts,
             'vms': self.get_vms,
             'apps': self.get_apps,
             'private_clouds': self.get_private_clouds,
@@ -1303,9 +1289,6 @@ class ProjectCountersView(BaseCounterView):
             'users': self.get_users
         }
         return fields
-
-    def get_alerts(self):
-        return self._get_alerts('project')
 
     def get_vms(self):
         return self._total_count(models.VirtualMachine.get_all_models())
@@ -1764,6 +1747,11 @@ class QuotaTimelineCollector(object):
         return table
 
 
+def check_resource_backend_id(resource):
+    if not resource.backend_id:
+        raise ValidationError(_('Resource does not have backend ID.'))
+
+
 class ResourceViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
     """ Basic view set for all resource view sets. """
     lookup_field = 'uuid'
@@ -1775,11 +1763,17 @@ class ResourceViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
 
     @detail_route(methods=['post'])
     def pull(self, request, uuid=None):
+        if self.pull_executor == NotImplemented:
+            return Response({'detail': _('Pull operation is not implemented.')},
+                            status=status.HTTP_409_CONFLICT)
         self.pull_executor.execute(self.get_object())
         return Response({'detail': _('Pull operation was successfully scheduled.')}, status=status.HTTP_202_ACCEPTED)
 
     pull_executor = NotImplemented
-    pull_validators = [core_validators.StateValidator(models.NewResource.States.OK, models.NewResource.States.ERRED)]
+    pull_validators = [
+        core_validators.StateValidator(models.NewResource.States.OK, models.NewResource.States.ERRED),
+        check_resource_backend_id,
+    ]
 
 
 class BaseResourceViewSet(six.with_metaclass(ResourceViewMetaclass, ResourceViewSet)):
@@ -1832,6 +1826,11 @@ class ImportableResourceViewSet(BaseResourceViewSet):
             resource = serializer.save()
         except IntegrityError:
             raise rf_serializers.ValidationError(_('Resource is already registered.'))
+        else:
+            resource_imported.send(
+                sender=resource.__class__,
+                instance=resource,
+            )
         if self.import_resource_executor:
             self.import_resource_executor.execute(resource)
 
@@ -1844,3 +1843,11 @@ class ServiceCertificationViewSet(core_views.ActionsViewSet):
     unsafe_methods_permissions = [permissions.is_staff]
     serializer_class = serializers.ServiceCertificationSerializer
     queryset = models.ServiceCertification.objects.all()
+
+
+class DivisionViewSet(core_views.ReadOnlyActionsViewSet):
+    queryset = models.Division.objects.all().order_by('name')
+    serializer_class = serializers.DivisionSerializer
+    lookup_field = 'uuid'
+    filter_backends = (DjangoFilterBackend,)
+    filter_class = filters.DivisionFilter

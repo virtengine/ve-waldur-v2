@@ -50,6 +50,13 @@ class SecurityGroupHandlerTest(BaseServicePropertyTest):
 
         self.assertTrue(security_group_property.rules.filter(backend_id=openstack_security_rule.backend_id).exists())
 
+    def test_security_group_import(self):
+        resource = openstack_factories.SecurityGroupFactory(tenant=self.tenant)
+        self.assertTrue(models.SecurityGroup.objects.filter(
+            settings=self.service_settings,
+            backend_id=resource.backend_id
+        ).exists())
+
     def test_security_group_update(self):
         openstack_security_group = openstack_factories.SecurityGroupFactory(
             tenant=self.tenant,
@@ -89,8 +96,6 @@ class SecurityGroupHandlerTest(BaseServicePropertyTest):
 
     def test_security_group_is_deleted_when_openstack_security_group_is_deleted(self):
         openstack_security_group = openstack_factories.SecurityGroupFactory(tenant=self.tenant)
-        factories.SecurityGroupFactory(settings=self.service_settings, backend_id=openstack_security_group.backend_id)
-
         openstack_security_group.delete()
         self.assertEqual(models.SecurityGroup.objects.count(), 0)
 
@@ -200,8 +205,6 @@ class TenantChangeCredentialsTest(TestCase):
 
 
 class NetworkHandlerTest(BaseServicePropertyTest):
-    def setUp(self):
-        super(NetworkHandlerTest, self).setUp()
 
     def test_network_create(self):
         openstack_network = openstack_factories.NetworkFactory(
@@ -235,8 +238,6 @@ class NetworkHandlerTest(BaseServicePropertyTest):
 
     def test_network_delete(self):
         openstack_network = openstack_factories.NetworkFactory(tenant=self.tenant)
-        factories.NetworkFactory(settings=self.service_settings, backend_id=openstack_network.backend_id)
-
         openstack_network.delete()
         self.assertEqual(models.Network.objects.count(), 0)
 
@@ -246,7 +247,7 @@ class SubNetHandlerTest(BaseServicePropertyTest):
         super(SubNetHandlerTest, self).setUp()
 
         self.openstack_network = openstack_factories.NetworkFactory(tenant=self.tenant)
-        self.network = factories.NetworkFactory(
+        self.network = models.Network.objects.get(
             settings=self.service_settings,
             backend_id=self.openstack_network.backend_id
         )
@@ -289,8 +290,6 @@ class SubNetHandlerTest(BaseServicePropertyTest):
 
     def test_subnet_delete(self):
         openstack_subnet = openstack_factories.SubNetFactory(network__tenant=self.tenant)
-        factories.SubNetFactory(settings=self.service_settings, backend_id=openstack_subnet.backend_id)
-
         openstack_subnet.delete()
         self.assertEqual(models.SubNet.objects.count(), 0)
 
@@ -382,6 +381,7 @@ class CreateServiceFromTenantTest(TestCase):
         self.assertEquals(service_settings.type, apps.OpenStackTenantConfig.service_name)
         self.assertEquals(service_settings.options['tenant_id'], tenant.backend_id)
         self.assertEquals(service_settings.options['availability_zone'], tenant.availability_zone)
+        self.assertFalse('console_type' in service_settings.options)
 
         self.assertTrue(models.OpenStackTenantService.objects.filter(
             settings=service_settings,
@@ -397,6 +397,19 @@ class CreateServiceFromTenantTest(TestCase):
             service=service,
             project=tenant.service_project_link.project,
         ).exists())
+
+    def test_copy_console_type_from_admin_settings_to_private_settings(self):
+        service_project_link = openstack_factories.OpenStackServiceProjectLinkFactory()
+        service_project_link.service.settings.options['console_type'] = 'console_type'
+        service_project_link.service.settings.save()
+        tenant = openstack_factories.TenantFactory(service_project_link=service_project_link)
+        service_settings = structure_models.ServiceSettings.objects.get(
+            scope=tenant,
+            type=apps.OpenStackTenantConfig.service_name,
+        )
+        self.assertTrue('console_type' in service_settings.options)
+        self.assertEquals(service_settings.options['console_type'],
+                          service_project_link.service.settings.options['console_type'])
 
 
 class FlavorPriceListItemTest(TestCase):

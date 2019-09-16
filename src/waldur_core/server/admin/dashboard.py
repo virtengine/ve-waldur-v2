@@ -2,13 +2,14 @@ from __future__ import unicode_literals
 
 from django.apps import apps
 from django.conf import settings
-from django.urls import reverse
+from django.urls import reverse, NoReverseMatch
 from django.utils.translation import ugettext_lazy as _
 from fluent_dashboard.dashboard import modules, FluentIndexDashboard, FluentAppIndexDashboard
 import six
 
 from waldur_core import __version__
 from waldur_core.core import models as core_models, WaldurExtension
+from waldur_core.logging import models as logging_models
 from waldur_core.structure import models as structure_models, SupportedServices
 
 
@@ -101,8 +102,11 @@ class CustomIndexDashboard(FluentIndexDashboard):
         for model in (structure_models.Project,
                       structure_models.Customer,
                       core_models.User,
-                      structure_models.SharedServiceSettings):
-            quick_access_links.append(self._get_link_to_model(model))
+                      structure_models.SharedServiceSettings,
+                      logging_models.Report,):
+            link = self._get_link_to_model(model)
+            if 'url' in link:
+                quick_access_links.append(link)
 
         return quick_access_links
 
@@ -112,25 +116,34 @@ class CustomIndexDashboard(FluentIndexDashboard):
             'num': erred_amount,
             'resources': result['title']
         }
-        result['url'] = '%s?shared__exact=1&state__exact=%s' % (result['url'], erred_state)
+        if 'url' in result:
+            result['url'] = '%s?shared__exact=1&state__exact=%s' % (result['url'], erred_state)
         return result
 
     def _get_link_to_model(self, model):
-        return {
+        result = {
             'title': six.text_type(model._meta.verbose_name_plural).capitalize(),
-            'url': reverse('admin:%s_%s_changelist' % (model._meta.app_label, model._meta.model_name)),
             'external': True,
             'attrs': {'target': '_blank'},
         }
+        try:
+            result['url'] = reverse('admin:%s_%s_changelist' % (model._meta.app_label, model._meta.model_name))
+        except NoReverseMatch:
+            pass
+        return result
 
     def _get_link_to_instance(self, instance):
-        return {
+        result = {
             'title': six.text_type(instance),
-            'url': reverse('admin:%s_%s_change' % (instance._meta.app_label, instance._meta.model_name),
-                           args=(instance.pk,)),
             'external': True,
             'attrs': {'target': '_blank'},
         }
+        try:
+            result['url'] = reverse('admin:%s_%s_change' % (instance._meta.app_label, instance._meta.model_name),
+                                    args=(instance.pk,))
+        except NoReverseMatch:
+            pass
+        return result
 
     def _get_erred_shared_settings_module(self):
         """
@@ -147,8 +160,9 @@ class CustomIndexDashboard(FluentIndexDashboard):
             result_module.title = '%s (%s)' % (result_module.title, settings_in_erred_state)
             for service_settings in queryset.filter(state=erred_state).iterator():
                 module_child = self._get_link_to_instance(service_settings)
-                module_child['error'] = service_settings.error_message
-                result_module.children.append(module_child)
+                if 'url' in module_child:
+                    module_child['error'] = service_settings.error_message
+                    result_module.children.append(module_child)
         else:
             result_module.pre_content = _('Nothing found.')
 
@@ -170,7 +184,8 @@ class CustomIndexDashboard(FluentIndexDashboard):
             if erred_amount:
                 resources_in_erred_state_overall = resources_in_erred_state_overall + erred_amount
                 link = self._get_erred_resource_link(resource_model, erred_amount, erred_state)
-                children.append(link)
+                if 'url' in link:
+                    children.append(link)
 
         if resources_in_erred_state_overall:
             result_module.title = '%s (%s)' % (result_module.title, resources_in_erred_state_overall)

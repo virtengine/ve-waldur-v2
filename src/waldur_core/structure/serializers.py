@@ -21,10 +21,12 @@ import six
 from waldur_core.core import (models as core_models, fields as core_fields, serializers as core_serializers,
                               utils as core_utils)
 from waldur_core.core.fields import MappedChoiceField
+from waldur_core.media.serializers import ProtectedMediaSerializerMixin
 from waldur_core.monitoring.serializers import MonitoringSerializerMixin
 from waldur_core.quotas import serializers as quotas_serializers
 from waldur_core.structure import (models, SupportedServices, ServiceBackendError, ServiceBackendNotImplemented,
                                    executors)
+from waldur_core.structure.filters import filter_visible_users
 from waldur_core.structure.managers import filter_queryset_for_user
 
 User = auth.get_user_model()
@@ -234,7 +236,7 @@ class ProjectSerializer(core_serializers.RestrictedSerializerMixin,
         protected_fields = ('certifications',)
 
     @staticmethod
-    def eager_load(queryset):
+    def eager_load(queryset, request=None):
         related_fields = (
             'uuid',
             'name',
@@ -295,21 +297,13 @@ class ProjectSerializer(core_serializers.RestrictedSerializerMixin,
         return services
 
 
-class CustomerImageSerializer(serializers.ModelSerializer):
-    image = serializers.ImageField()
-
-    class Meta:
-        model = models.Customer
-        fields = ['image']
-
-
-class CustomerSerializer(core_serializers.RestrictedSerializerMixin,
+class CustomerSerializer(ProtectedMediaSerializerMixin,
+                         core_serializers.RestrictedSerializerMixin,
                          core_serializers.AugmentedSerializerMixin,
                          serializers.HyperlinkedModelSerializer, ):
     projects = PermissionProjectSerializer(many=True, read_only=True)
     owners = BasicUserSerializer(source='get_owners', many=True, read_only=True)
     support_users = BasicUserSerializer(source='get_support_users', many=True, read_only=True)
-    image = serializers.SerializerMethodField()
     quotas = quotas_serializers.BasicQuotaSerializer(many=True, read_only=True)
 
     COUNTRIES = core_fields.CountryField.COUNTRIES
@@ -317,6 +311,9 @@ class CustomerSerializer(core_serializers.RestrictedSerializerMixin,
         COUNTRIES = [item for item in COUNTRIES if item[0] in settings.WALDUR_CORE['COUNTRIES']]
     country = serializers.ChoiceField(required=False, choices=COUNTRIES, allow_blank=True)
     country_name = serializers.ReadOnlyField(source='get_country_display')
+    display_name = serializers.ReadOnlyField(source='get_display_name')
+    division_name = serializers.ReadOnlyField(source='division.name')
+    division_uuid = serializers.ReadOnlyField(source='division.uuid')
 
     class Meta(object):
         model = models.Customer
@@ -324,11 +321,14 @@ class CustomerSerializer(core_serializers.RestrictedSerializerMixin,
             'url',
             'uuid',
             'created',
-            'name', 'native_name', 'abbreviation', 'contact_details',
+            'name', 'native_name', 'abbreviation',
+            'division', 'division_name', 'division_uuid',
+            'contact_details',
+            'domain', 'display_name',
             'agreement_number', 'email', 'phone_number', 'access_subnets',
             'projects',
             'owners', 'support_users',
-            'registration_code',
+            'backend_id', 'registration_code', 'homepage',
             'quotas',
             'image',
             'country', 'country_name', 'vat_code', 'is_company',
@@ -339,15 +339,33 @@ class CustomerSerializer(core_serializers.RestrictedSerializerMixin,
         read_only_fields = ('access_subnets', 'accounting_start_date', 'default_tax_percent')
         extra_kwargs = {
             'url': {'lookup_field': 'uuid'},
+            'division': {'lookup_field': 'uuid'},
         }
 
-    def get_image(self, customer):
-        if not customer.image:
-            return settings.WALDUR_CORE.get('DEFAULT_CUSTOMER_LOGO')
-        return reverse('customer_image', kwargs={'uuid': customer.uuid}, request=self.context['request'])
+    def get_fields(self):
+        fields = super(CustomerSerializer, self).get_fields()
+
+        try:
+            request = self.context['view'].request
+            user = request.user
+        except (KeyError, AttributeError):
+            return fields
+
+        if not user.is_staff:
+            if 'domain' in fields:
+                fields['domain'].read_only = True
+
+        return fields
+
+    def create(self, validated_data):
+        user = self.context['request'].user
+        if 'domain' not in validated_data:
+            # Staff can specify domain name on organization creation
+            validated_data['domain'] = user.organization
+        return super(CustomerSerializer, self).create(validated_data)
 
     @staticmethod
-    def eager_load(queryset):
+    def eager_load(queryset, request=None):
         return queryset.prefetch_related('quotas', 'projects')
 
     def validate(self, attrs):
@@ -617,10 +635,12 @@ class ProjectPermissionSerializer(PermissionFieldFilteringMixin, BasePermissionS
 
 
 class BasicProjectPermissionSerializer(BasePermissionSerializer):
+    customer_name = serializers.ReadOnlyField(source='project.customer.name')
+
     class Meta(BasePermissionSerializer.Meta):
         model = models.ProjectPermission
         fields = (
-            'url', 'pk', 'role', 'project_uuid', 'project_name',
+            'url', 'pk', 'role', 'project_uuid', 'project_name', 'customer_name',
         )
         related_paths = dict(
             project=('name', 'uuid'),
@@ -644,7 +664,6 @@ class UserSerializer(serializers.HyperlinkedModelSerializer):
     email = serializers.EmailField()
     agree_with_policy = serializers.BooleanField(write_only=True, required=False,
                                                  help_text=_('User must agree with the policy to register.'))
-    preferred_language = serializers.ChoiceField(choices=settings.LANGUAGES, allow_blank=True, required=False)
     competence = serializers.ChoiceField(choices=settings.WALDUR_CORE.get('USER_COMPETENCE_LIST', []),
                                          allow_blank=True,
                                          required=False)
@@ -707,10 +726,16 @@ class UserSerializer(serializers.HyperlinkedModelSerializer):
         except (KeyError, AttributeError):
             return fields
 
-        if not user.is_staff and not user.is_support:
-            del fields['is_active']
-            del fields['is_staff']
-            del fields['description']
+        if not user.is_staff:
+            protected_fields = ('is_active', 'is_staff', 'is_support', 'description')
+            if user.is_support:
+                for field in protected_fields:
+                    if field in fields:
+                        fields[field].read_only = True
+            else:
+                for field in protected_fields:
+                    if field in fields:
+                        del fields[field]
 
         if not self._can_see_token(user):
             del fields['token']
@@ -718,6 +743,15 @@ class UserSerializer(serializers.HyperlinkedModelSerializer):
 
         if request.method in ('PUT', 'PATCH'):
             fields['username'].read_only = True
+            protected_methods = settings.WALDUR_CORE['PROTECT_USER_DETAILS_FOR_REGISTRATION_METHODS']
+            if user.registration_method and user.registration_method in protected_methods:
+                detail_fields = (
+                    'full_name', 'native_name',
+                    'job_title', 'email', 'phone_number',
+                    'organization',
+                )
+                for field in detail_fields:
+                    fields[field].read_only = True
 
         return fields
 
@@ -803,6 +837,9 @@ class SshKeySerializer(serializers.HyperlinkedModelSerializer):
             'url': {'lookup_field': 'uuid'},
         }
 
+    def validate_name(self, value):
+        return value.strip()
+
     def validate_public_key(self, value):
         value = value.strip()
         if len(value.splitlines()) > 1:
@@ -854,6 +891,7 @@ class ServiceCertificationSerializer(serializers.HyperlinkedModelSerializer):
 
 
 class ServiceSettingsSerializer(PermissionFieldFilteringMixin,
+                                core_serializers.RestrictedSerializerMixin,
                                 core_serializers.AugmentedSerializerMixin,
                                 serializers.HyperlinkedModelSerializer):
     customer_native_name = serializers.ReadOnlyField(source='customer.native_name')
@@ -892,7 +930,7 @@ class ServiceSettingsSerializer(PermissionFieldFilteringMixin,
         return 'customer',
 
     @staticmethod
-    def eager_load(queryset):
+    def eager_load(queryset, request=None):
         return queryset.select_related('customer').prefetch_related('quotas', 'certifications')
 
     def get_fields(self):
@@ -1040,7 +1078,7 @@ class BaseServiceSerializer(six.with_metaclass(ServiceSerializerMetaclass,
         return super(BaseServiceSerializer, cls).__new__(cls, *args, **kwargs)
 
     @staticmethod
-    def eager_load(queryset):
+    def eager_load(queryset, request=None):
         queryset = queryset.select_related('customer', 'settings')
         projects = models.Project.objects.all().only('uuid', 'name')
         return queryset.prefetch_related(django_models.Prefetch('projects', queryset=projects), 'quotas')
@@ -1115,16 +1153,17 @@ class BaseServiceSerializer(six.with_metaclass(ServiceSerializerMetaclass,
             name = self.initial_data.get('name')
             if not name or not name.strip():
                 raise serializers.ValidationError({'name': 'Name cannot be empty'})
-            # Make shallow copy to protect from mutations
-            settings_fields = self.Meta.settings_fields[:]
-            create_settings = any([attrs.get(f) for f in settings_fields])
-            if not settings and not create_settings:
-                raise serializers.ValidationError(
-                    _('Either service settings or credentials must be supplied.'))
 
             extra_fields = tuple()
             if self.SERVICE_ACCOUNT_EXTRA_FIELDS is not NotImplemented:
-                extra_fields += tuple(self.SERVICE_ACCOUNT_EXTRA_FIELDS.keys())
+                extra_fields = tuple(self.SERVICE_ACCOUNT_EXTRA_FIELDS.keys())
+
+            # Make shallow copy to protect from mutations
+            settings_fields = self.Meta.settings_fields[:]
+            create_settings = any([attrs.get(f) for f in settings_fields + extra_fields])
+            if not settings and not create_settings:
+                raise serializers.ValidationError(
+                    _('Either service settings or credentials must be supplied.'))
 
             if create_settings:
                 required = getattr(self.Meta, 'required_fields', tuple())
@@ -1252,7 +1291,8 @@ class ResourceSerializerMetaclass(serializers.SerializerMetaclass):
 
     def __new__(cls, name, bases, args):
         serializer = super(ResourceSerializerMetaclass, cls).__new__(cls, name, bases, args)
-        SupportedServices.register_resource_serializer(args['Meta'].model, serializer)
+        if 'Meta' in args:
+            SupportedServices.register_resource_serializer(args['Meta'].model, serializer)
         return serializer
 
 
@@ -1448,7 +1488,7 @@ class BaseResourceSerializer(six.with_metaclass(ResourceSerializerMetaclass,
         return obj.get_access_url()
 
     @staticmethod
-    def eager_load(queryset):
+    def eager_load(queryset, request=None):
         return (
             queryset
             .select_related(
@@ -1466,8 +1506,9 @@ class BaseResourceSerializer(six.with_metaclass(ResourceSerializerMetaclass,
         # skip validation on object update
         if not self.instance:
             service_type = SupportedServices.get_model_key(self.Meta.model)
-            queryset = fields['service_settings'].queryset.filter(type=service_type)
-            fields['service_settings'].queryset = queryset
+            if 'service_settings' in fields and not fields['service_settings'].read_only:
+                queryset = fields['service_settings'].queryset.filter(type=service_type)
+                fields['service_settings'].queryset = queryset
         return fields
 
     def validate(self, attrs):
@@ -1517,6 +1558,22 @@ class BaseResourceSerializer(six.with_metaclass(ResourceSerializerMetaclass,
         resource = super(BaseResourceSerializer, self).create(data)
         resource.increase_backend_quotas_usage()
         return resource
+
+
+class BaseResourceActionSerializer(BaseResourceSerializer):
+    project = serializers.HyperlinkedRelatedField(
+        view_name='project-detail',
+        lookup_field='uuid',
+        read_only=True,
+    )
+    service_settings = serializers.HyperlinkedRelatedField(
+        view_name='servicesettings-detail',
+        lookup_field='uuid',
+        read_only=True,
+    )
+
+    class Meta(BaseResourceSerializer.Meta):
+        pass
 
 
 class SummaryResourceSerializer(core_serializers.BaseSummarySerializer):
@@ -1624,7 +1681,8 @@ class VirtualMachineSerializer(BaseResourceSerializer):
             if ssh_public_key:
                 ssh_public_key.query_params = {'user_uuid': user.uuid.hex}
                 if not user.is_staff:
-                    subquery = Q(user=user) | Q(is_shared=True)
+                    visible_users = list(filter_visible_users(User.objects.all(), user))
+                    subquery = Q(user__in=visible_users) | Q(is_shared=True)
                     ssh_public_key.queryset = ssh_public_key.queryset.filter(subquery)
         return fields
 
@@ -1692,3 +1750,16 @@ class PrivateCloudSerializer(BaseResourceSerializer):
 
     class Meta(BaseResourceSerializer.Meta):
         fields = BaseResourceSerializer.Meta.fields + ('extra_configuration',)
+
+
+class DivisionSerializer(serializers.HyperlinkedModelSerializer):
+    type = serializers.ReadOnlyField(source='type.name')
+    parent_uuid = serializers.ReadOnlyField(source='parent.uuid')
+
+    class Meta(object):
+        model = models.Division
+        fields = ('uuid', 'url', 'name', 'type', 'parent_uuid', 'parent')
+        extra_kwargs = {
+            'url': {'lookup_field': 'uuid'},
+            'parent': {'lookup_field': 'uuid'},
+        }

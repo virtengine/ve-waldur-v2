@@ -78,7 +78,12 @@ class GenericRelatedField(Field):
 
     def __init__(self, related_models=(), **kwargs):
         super(GenericRelatedField, self).__init__(**kwargs)
-        self.related_models = related_models
+        self._related_models = related_models
+
+    @property
+    def related_models(self):
+        val = self._related_models
+        return callable(val) and val() or val
 
     def _get_url(self, obj):
         """
@@ -110,6 +115,8 @@ class GenericRelatedField(Field):
                 break
         if kwargs is None:
             raise AttributeError('Related object does not have any of lookup_fields')
+        if self.related_models and not isinstance(obj, tuple(self.related_models)):
+            return None
         request = self._get_request()
         return request.build_absolute_uri(reverse(self._get_url(obj), kwargs=kwargs))
 
@@ -128,8 +135,12 @@ class GenericRelatedField(Field):
             raise serializers.ValidationError(_('URL is invalid: %s.') % data)
         except (Resolver404, AttributeError, MultipleObjectsReturned, ObjectDoesNotExist):
             raise serializers.ValidationError(_("Can't restore object from url: %s") % data)
-        if model not in self.related_models:
-            raise serializers.ValidationError(_('%s object does not support such relationship.') % six.text_type(obj))
+
+        if self.related_models and model not in self.related_models:
+            context = (model, ', '.join(six.text_type(model) for model in self.related_models))
+            message = _('%s is not valid. Valid models are: %s') % context
+            raise serializers.ValidationError(message)
+
         return obj
 
 
@@ -324,7 +335,7 @@ class ExtraFieldOptionsMixin(object):
 
     def get_fields(self):
         fields = super(ExtraFieldOptionsMixin, self).get_fields()
-        extra_field_options = getattr(self.Meta, 'extra_field_options') or {}
+        extra_field_options = getattr(self.Meta, 'extra_field_options', {})
         for name, options in extra_field_options.items():
             field = fields.get(name)
             if field:
@@ -474,11 +485,11 @@ class BaseSummarySerializer(serializers.Serializer):
         raise NotImplementedError('Method `get_serializer` should be implemented for SummarySerializer.')
 
     @classmethod
-    def eager_load(cls, summary_queryset):
+    def eager_load(cls, summary_queryset, request):
         optimized_querysets = []
         for queryset in summary_queryset.querysets:
             serializer = cls.get_serializer(queryset.model)
-            optimized_querysets.append(serializer.eager_load(queryset))
+            optimized_querysets.append(serializer.eager_load(queryset, request))
         summary_queryset.querysets = optimized_querysets
         return summary_queryset
 
@@ -507,3 +518,11 @@ class GeoLocationField(serializers.JSONField):
 
         validators.append(geo_location_validator)
         super(GeoLocationField, self).__init__(validators=validators, *args, **kwargs)
+
+
+class UnicodeIntegerField(serializers.IntegerField):
+
+    def to_internal_value(self, data):
+        if isinstance(data, unicode):
+            data = core_utils.normalize_unicode(data)
+        return super(UnicodeIntegerField, self).to_internal_value(data)

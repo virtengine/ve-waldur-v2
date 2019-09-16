@@ -1,5 +1,4 @@
-from django.db import transaction
-from django.db.models import signals
+from django.db.models import F, signals
 
 from waldur_core.quotas import models, utils, fields
 from waldur_core.quotas.exceptions import CreationConditionFailedQuotaError
@@ -14,20 +13,14 @@ def create_global_quotas(**kwargs):
 
 def increase_global_quota(sender, instance=None, created=False, **kwargs):
     if created and hasattr(sender, 'GLOBAL_COUNT_QUOTA_NAME'):
-        with transaction.atomic():
-            global_quota = models.Quota.objects.select_for_update().get(
-                name=getattr(sender, 'GLOBAL_COUNT_QUOTA_NAME'))
-            global_quota.usage += 1
-            global_quota.save()
+        name = getattr(sender, 'GLOBAL_COUNT_QUOTA_NAME')
+        models.Quota.objects.filter(name=name).update(usage=F('usage') + 1)
 
 
 def decrease_global_quota(sender, **kwargs):
     if hasattr(sender, 'GLOBAL_COUNT_QUOTA_NAME'):
-        with transaction.atomic():
-            global_quota = models.Quota.objects.select_for_update().get(
-                name=getattr(sender, 'GLOBAL_COUNT_QUOTA_NAME'))
-            global_quota.usage -= 1
-            global_quota.save()
+        name = getattr(sender, 'GLOBAL_COUNT_QUOTA_NAME')
+        models.Quota.objects.filter(name=name).update(usage=F('usage') - 1)
 
 
 # new quotas
@@ -51,7 +44,7 @@ def count_quota_handler_factory(count_quota_field):
         if signal == signals.post_save and kwargs.get('created'):
             count_quota_field.add_usage(instance, delta=1)
         elif signal == signals.post_delete:
-            count_quota_field.add_usage(instance, delta=-1, fail_silently=True)
+            count_quota_field.add_usage(instance, delta=-1)
 
     return recalculate_count_quota
 

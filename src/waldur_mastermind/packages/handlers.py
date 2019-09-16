@@ -1,5 +1,11 @@
 from __future__ import unicode_literals
 
+from django.conf import settings
+from django.utils import timezone
+
+from waldur_mastermind.invoices import registrators
+
+from . import models
 from .log import event_logger
 
 
@@ -26,3 +32,28 @@ def log_openstack_package_deletion(sender, instance, **kwargs):
             'package_template_name': instance.template.name,
             'service_settings': instance.service_settings,
         })
+
+
+def add_new_openstack_package_details_to_invoice(sender, instance, created=False, **kwargs):
+    if not settings.WALDUR_PACKAGES['BILLING_ENABLED']:
+        return
+
+    if created and instance.tenant.backend_id:
+        registrators.RegistrationManager.register(instance, timezone.now())
+
+
+def update_invoice_on_openstack_package_deletion(sender, instance, **kwargs):
+    if not settings.WALDUR_PACKAGES['BILLING_ENABLED']:
+        return
+
+    registrators.RegistrationManager.terminate(instance, timezone.now())
+
+
+def add_new_openstack_tenant_to_invoice(sender, instance, created=False, **kwargs):
+    if not settings.WALDUR_PACKAGES['BILLING_ENABLED']:
+        return
+
+    if instance.backend_id and (created or not instance.tracker.previous('backend_id')):
+        package = models.OpenStackPackage.objects.filter(tenant=instance).first()
+        if package:
+            registrators.RegistrationManager.register(package, timezone.now())

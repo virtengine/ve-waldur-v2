@@ -173,3 +173,79 @@ class AttachmentFactory(factory.DjangoModelFactory):
     @classmethod
     def get_list_url(cls):
         return 'http://testserver' + reverse('support-attachment-list')
+
+
+class TemplateFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = models.Template
+
+    name = factory.Sequence(lambda n: 'template_%s' % n)
+    description = factory.Sequence(lambda n: 'template_description_%s' % n)
+
+    @classmethod
+    def get_url(cls, template=None, action=None):
+        if template is None:
+            template = TemplateFactory()
+        url = 'http://testserver' + reverse('support-template-detail', kwargs={'uuid': template.uuid.hex})
+        return url if action is None else url + action + '/'
+
+    @classmethod
+    def get_list_url(cls):
+        return 'http://testserver' + reverse('support-template-list')
+
+
+class IgnoredIssueStatusFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = models.IgnoredIssueStatus
+
+    name = factory.Sequence(lambda n: 'status_%s' % n)
+
+
+class TemplateStatusNotificationFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = models.TemplateStatusNotification
+
+    status = factory.Sequence(lambda n: 'status_%s' % n)
+    html = 'Test template {{issue.summary}}'
+    text = 'Test template {{issue.summary}}'
+    subject = 'Test template {{issue.summary}}'
+
+
+class PriorityFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = models.Priority
+
+    backend_id = factory.Sequence(lambda n: n)
+    name = factory.Sequence(lambda n: 'priority-%s' % n)
+
+    @classmethod
+    def get_url(cls, priority=None):
+        if priority is None:
+            priority = PriorityFactory()
+        return 'http://testserver' + reverse('support-priority-detail', kwargs={'uuid': priority.uuid.hex})
+
+    @classmethod
+    def get_list_url(cls):
+        return 'http://testserver' + reverse('support-priority-list')
+
+
+class RequestTypeFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = models.RequestType
+
+    backend_id = factory.Sequence(lambda n: n)
+    name = factory.Sequence(lambda n: 'request_type_%s' % n)
+    issue_type_name = factory.Sequence(lambda n: 'issue_type_%s' % n)
+
+
+class SupportCustomerFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = models.SupportCustomer
+
+    user = factory.SubFactory(structure_factories.UserFactory)
+    backend_id = factory.Sequence(lambda n: 'qm:%s' % n)
+
+
+class IssueStatusFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = models.IssueStatus

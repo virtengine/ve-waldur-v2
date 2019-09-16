@@ -1,4 +1,4 @@
-""" Custom loggers that allows to store logs in DB and Elastic """
+""" Custom loggers that allows to store logs in DB """
 
 from __future__ import unicode_literals
 
@@ -11,8 +11,6 @@ import types
 import uuid
 
 from django.apps import apps
-from django.contrib.contenttypes import models as ct_models
-from django.db import transaction, IntegrityError
 import six
 
 from waldur_core.logging import models
@@ -27,10 +25,6 @@ class LoggerError(AttributeError):
 
 
 class EventLoggerError(AttributeError):
-    pass
-
-
-class AlertLoggerError(AttributeError):
     pass
 
 
@@ -83,7 +77,9 @@ class BaseLogger(object):
             self.fields = {
                 k: self.get_field_model(v)
                 for k, v in self.__class__.__dict__.items()
-                if not k.startswith('_') and not isinstance(v, types.FunctionType) and k != 'Meta'}
+                if (not k.startswith('_') and
+                    not isinstance(v, types.FunctionType) and
+                    not isinstance(v, staticmethod) and k != 'Meta')}
 
         missed = set(self.fields.keys()) - set(self.get_nullable_fields()) - set(kwargs.keys())
         if missed:
@@ -177,6 +173,15 @@ class EventLogger(BaseLogger):
     def get_supported_groups(self):
         return getattr(self._meta, 'event_groups', {})
 
+    @staticmethod
+    def get_scopes(event_context):
+        """
+        This method receives event context and returns set of Django model objects.
+        For example, if resource is specified in event context then it should return
+        resource, project and customer.
+        """
+        return set()
+
     def info(self, *args, **kwargs):
         self.process('info', *args, **kwargs)
 
@@ -197,125 +202,18 @@ class EventLogger(BaseLogger):
 
         context = self.compile_context(**event_context)
         msg = self.compile_message(message_template, context)
-
         log = getattr(self.logger, level)
         log(msg, extra={'event_type': event_type, 'event_context': context})
 
-
-class AlertLogger(BaseLogger):
-    """ Base alert logger API.
-
-        Fields which must be passed during alert log emitting (alert context)
-        should be defined as attributes for this class in the form of:
-
-        field_name = ObjectClass || '<app_label>.<class_name>'
-
-        A list of supported event types can be defined with help of method get_supported_types,
-        or 'alert_types' property of Meta class. Event type won't be validated if this list is empty.
-
-        Example usage:
-
-        .. code-block:: python
-
-            from waldur_core.logging.loggers import AlertLogger, alert_logger
-            from waldur_core.quotas import models
-
-            class QuotaAlertLogger(AlertLogger):
-                quota = models.Quota
-
-                class Meta:
-                    alert_types = ('quota_usage_is_over_threshold', )
-
-            alert_logger.register('quota', QuotaAlertLogger)
-
-
-            alert_logger.quota.warning(
-                'Quota {quota_name} is over threshold. Limit: {quota_limit}, usage: {quota_usage}',
-                scope=quota,
-                alert_type='quota_usage_is_over_threshold',
-                alert_context={
-                    'quota': quota
-                })
-    """
-
-    def get_supported_types(self):
-        return getattr(self._meta, 'alert_types', tuple())
-
-    def get_supported_groups(self):
-        return getattr(self._meta, 'alert_groups', {})
-
-    def info(self, *args, **kwargs):
-        return self.process(models.Alert.SeverityChoices.INFO, *args, **kwargs)
-
-    def error(self, *args, **kwargs):
-        return self.process(models.Alert.SeverityChoices.ERROR, *args, **kwargs)
-
-    def warning(self, *args, **kwargs):
-        return self.process(models.Alert.SeverityChoices.WARNING, *args, **kwargs)
-
-    def debug(self, *args, **kwargs):
-        return self.process(models.Alert.SeverityChoices.DEBUG, *args, **kwargs)
-
-    def process(self, severity, message_template, scope, alert_type='undefined', alert_context=None, fail_silently=True):
-        self.validate_logging_type(alert_type)
-
-        if not alert_context:
-            alert_context = {}
-
-        context = self.compile_context(**alert_context)
-        msg = self.compile_message(message_template, context)
-        content_type = ct_models.ContentType.objects.get_for_model(scope)
-
-        try:
-            with transaction.atomic():
-                alert = models.Alert.objects.select_for_update().get(
-                    content_type=content_type,
-                    object_id=scope.id,
-                    alert_type=alert_type,
-                    closed__isnull=True
-                )
-                if alert.severity != severity or alert.message != msg:
-                    alert.severity = severity
-                    alert.message = msg
-                    alert.save()
-
-                    logger.info(
-                        'Updated alert for scope %s (id: %s), with type %s',
-                        scope, scope.id, alert_type)
-
-                return alert, False
-        except models.Alert.DoesNotExist:
-            pass
-
-        try:
-            alert = models.Alert.objects.create(
-                scope=scope,
-                alert_type=alert_type,
-                severity=severity,
-                message=msg,
-                context=context
-            )
-            logger.info(
-                'Created new alert for scope %s (id: %s), with type %s',
-                scope, scope.id, alert_type)
-            return alert, True
-        except IntegrityError:
-            logger.warning(
-                'Could not create alert for scope %s (id: %s), with type %s due to concurrent update',
-                scope, scope.id, alert_type)
-            if fail_silently:
-                return None, False
-            else:
-                raise
-
-    def close(self, scope, alert_type):
-        try:
-            content_type = ct_models.ContentType.objects.get_for_model(scope)
-            alert = models.Alert.objects.get(
-                object_id=scope.id, content_type=content_type, alert_type=alert_type, closed__isnull=True)
-            alert.close()
-        except models.Alert.DoesNotExist:
-            pass
+        event = models.Event.objects.create(
+            event_type=event_type,
+            message=msg,
+            context=context,
+        )
+        if event_context:
+            for scope in self.get_scopes(event_context) or []:
+                if scope and scope.id:
+                    models.Feed.objects.create(scope=scope, event=event)
 
 
 class LoggableMixin(object):
@@ -326,16 +224,7 @@ class LoggableMixin(object):
     def get_log_fields(self):
         return ('uuid', 'name')
 
-    def filter_by_logged_object(self):
-        """
-        Return query dictionary to search current object in ElasticSearch.
-        Model may return custom query, but backend doesn't need to know details.
-        """
-        return {
-            self.__class__.__name__ + '_uuid': self.uuid.hex
-        }
-
-    def _get_log_context(self, entity_name):
+    def _get_log_context(self, entity_name=None):
 
         context = {}
         for field in self.get_log_fields():
@@ -344,7 +233,10 @@ class LoggableMixin(object):
 
             value = getattr(self, field)
 
-            name = "{}_{}".format(entity_name, field)
+            if entity_name:
+                name = "{}_{}".format(entity_name, field)
+            else:
+                name = field
             if isinstance(value, uuid.UUID):
                 context[name] = value.hex
             elif isinstance(value, LoggableMixin):
@@ -355,14 +247,16 @@ class LoggableMixin(object):
                 context[name] = float(value)
             elif isinstance(value, dict):
                 context[name] = value
+            elif callable(value):
+                context[name] = value()
             else:
                 context[name] = six.text_type(value)
 
         return context
 
     @classmethod
-    def get_permitted_objects_uuids(cls, user):
-        return {}
+    def get_permitted_objects(cls, user):
+        return cls.objects.none()
 
 
 class BaseLoggerRegistry(object):
@@ -404,27 +298,9 @@ class EventLoggerRegistry(BaseLoggerRegistry):
     def get_loggers(self):
         return [l for l in self.__dict__.values() if isinstance(l, EventLogger)]
 
-    def get_permitted_objects_uuids(self, user):
-        from waldur_core.logging.utils import get_loggable_models
-        permitted_objects_uuids = {}
-        for model in get_loggable_models():
-            for field, uuids in model.get_permitted_objects_uuids(user).items():
-                permitted_objects_uuids[field] = [uuid_obj.hex for uuid_obj in uuids]
-        return permitted_objects_uuids
-
-
-class AlertLoggerRegistry(BaseLoggerRegistry):
-
-    def get_loggers(self):
-        return [l for l in self.__dict__.values() if isinstance(l, AlertLogger)]
-
 
 def get_valid_events():
     return event_logger.get_all_types()
-
-
-def get_valid_alerts():
-    return alert_logger.get_all_types()
 
 
 def get_event_groups():
@@ -435,16 +311,8 @@ def get_event_groups_keys():
     return sorted(get_event_groups().keys())
 
 
-def get_alert_groups():
-    return alert_logger.get_all_groups()
-
-
 def expand_event_groups(groups):
     return event_logger.expand_groups(groups)
-
-
-def expand_alert_groups(groups):
-    return alert_logger.expand_groups(groups)
 
 
 class CustomEventLogger(EventLogger):
@@ -458,16 +326,7 @@ class CustomEventLogger(EventLogger):
         nullable_fields = ('scope',)
 
 
-class ThresholdAlertLogger(AlertLogger):
-    object = 'logging.AlertThresholdMixin'
-
-    class Meta:
-        alert_types = ('threshold_exceeded',)
-
-
 # This global objects represent the default loggers registry
 event_logger = EventLoggerRegistry()
-alert_logger = AlertLoggerRegistry()
 
 event_logger.register('custom', CustomEventLogger)
-alert_logger.register('threshold', ThresholdAlertLogger)

@@ -3,7 +3,7 @@ from django.core.exceptions import ValidationError
 from django.forms import ModelForm
 from django.urls import reverse
 from django.utils.translation import ugettext_lazy as _
-from jsoneditor.forms import JSONEditor
+from waldur_core.core.admin import JsonWidget
 
 from waldur_core.core.admin import ExecutorAdminAction, PasswordWidget
 from waldur_core.quotas.admin import QuotaInline
@@ -38,7 +38,7 @@ class ServiceProjectLinkAdmin(structure_admin.ServiceProjectLinkAdmin):
 class TenantAdminForm(ModelForm):
     class Meta:
         widgets = {
-            'extra_configuration': JSONEditor(),
+            'extra_configuration': JsonWidget(),
             'user_password': PasswordWidget(),
         }
 
@@ -99,17 +99,17 @@ class TenantAdmin(structure_admin.ResourceAdmin):
         def validate(self, tenant):
             if tenant.state not in (models.Tenant.States.OK, models.Tenant.States.ERRED):
                 raise ValidationError(_('Tenant has to be OK or erred.'))
+            if not tenant.backend_id:
+                raise ValidationError(_('Tenant does not have backend ID.'))
 
     pull = Pull()
 
 
 class FlavorAdmin(structure_admin.BackendModelAdmin):
-    list_filter = ('settings',)
     list_display = ('name', 'settings', 'cores', 'ram', 'disk')
 
 
 class ImageAdmin(structure_admin.BackendModelAdmin):
-    list_filter = ('settings', )
     list_display = ('name', 'min_disk', 'min_ram')
 
 

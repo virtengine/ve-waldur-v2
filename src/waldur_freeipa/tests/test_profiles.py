@@ -9,6 +9,7 @@ from waldur_core.structure.tests import factories as structure_factories
 from waldur_freeipa.tests.helpers import override_plugin_settings
 
 from . import factories
+from .. import tasks
 from ..backend import FreeIPABackend
 
 
@@ -109,6 +110,8 @@ class ProfileCreateTest(BaseProfileTest):
             preferred_language=self.user.preferred_language,
             ssh_key=[],
             gecos=','.join([self.user.full_name, self.user.email, self.user.phone_number]),
+            user_password=None,
+            organization_unit=self.user.organization,
         )
 
     def test_when_profile_created_ssh_keys_are_attached(self, mock_client):
@@ -265,6 +268,25 @@ class ProfileSshKeysTest(test.APITransactionTestCase):
         response = self.update_keys()
         self.assertEqual(status.HTTP_200_OK, response.status_code)
         mock_client().user_mod.assert_not_called()
+
+    def test_task_is_scheduled_when_key_is_created(self, mock_client):
+        with mock.patch('waldur_freeipa.tasks.sync_profile_ssh_keys') as mock_task:
+            structure_factories.SshPublicKeyFactory(user=self.user)
+            mock_task.delay.assert_called_once_with(self.profile.id)
+
+    def test_task_is_scheduled_when_key_is_deleted(self, mock_client):
+        with mock.patch('waldur_freeipa.tasks.sync_profile_ssh_keys') as mock_task:
+            self.user.sshpublickey_set.first().delete()
+            mock_task.delay.assert_called_once_with(self.profile.id)
+
+    def test_profile_is_updated_when_task_is_called(self, mock_client):
+        mock_client().user_show.return_value = {
+            'ipasshpubkey': self.expected_keys
+        }
+        self.user.sshpublickey_set.all().delete()
+
+        tasks.sync_profile_ssh_keys(self.profile.id)
+        mock_client().user_mod.assert_called_once_with(self.profile.username, ipasshpubkey=None)
 
 
 @ddt

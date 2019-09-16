@@ -2,8 +2,10 @@ import logging
 
 from celery import shared_task
 from django.conf import settings
+from django.core.exceptions import ObjectDoesNotExist
+from python_freeipa import exceptions as freeipa_exceptions
 
-from . import utils
+from . import models, utils
 from .backend import FreeIPABackend
 
 
@@ -21,6 +23,10 @@ def schedule_sync():
 
     if not settings.WALDUR_FREEIPA['ENABLED']:
         logger.debug('Skipping FreeIPA synchronization because plugin is disabled.')
+        return
+
+    if not settings.WALDUR_FREEIPA['GROUP_SYNCHRONIZATION_ENABLED']:
+        logger.debug('Skipping FreeIPA group synchronization because this feature is disabled.')
         return
 
     utils.renew_task_status()
@@ -61,3 +67,21 @@ def schedule_sync_gecos():
 @shared_task()
 def _sync_gecos():
     FreeIPABackend().synchronize_gecos()
+
+
+@shared_task(name='waldur_freeipa.sync_profile_ssh_keys')
+def sync_profile_ssh_keys(profile_id):
+    try:
+        profile = models.Profile.objects.get(id=profile_id)
+    except ObjectDoesNotExist:
+        logger.debug('Skipping SSH key synchronization because FreeIPA profile has been deleted. '
+                     'Profile ID: %s', profile_id)
+        return
+
+    try:
+        FreeIPABackend().update_ssh_keys(profile)
+    except freeipa_exceptions.NotFound:
+        logger.warning('Skipping SSH key synchronization because '
+                       'FreeIPA profile has been removed on backend. '
+                       'Profile ID: %s', profile.id)
+        return

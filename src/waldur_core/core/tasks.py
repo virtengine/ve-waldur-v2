@@ -313,7 +313,7 @@ class RecoverTask(StateTransitionTask):
         instance.save(update_fields=['error_message'])
 
 
-class ExecutorTask(Task):
+class PreApplyExecutorTask(Task):
     """ Run executor as a task """
 
     @classmethod
@@ -322,10 +322,10 @@ class ExecutorTask(Task):
 
     def run(self, serialized_executor, serialized_instance, *args, **kwargs):
         self.executor = utils.deserialize_class(serialized_executor)
-        return super(ExecutorTask, self).run(serialized_instance, *args, **kwargs)
+        return super(PreApplyExecutorTask, self).run(serialized_instance, *args, **kwargs)
 
     def execute(self, instance, **kwargs):
-        self.executor.execute(instance, async=False, **kwargs)
+        self.executor.pre_apply(instance, **kwargs)
 
 
 class BackgroundTask(CeleryTask):
@@ -464,7 +464,7 @@ Request.__str__ = log_celery_task
 
 
 class PollRuntimeStateTask(Task):
-    max_retries = 300
+    max_retries = 1200
     default_retry_delay = 5
 
     @classmethod
@@ -474,11 +474,11 @@ class PollRuntimeStateTask(Task):
     def get_backend(self, instance):
         return instance.get_backend()
 
-    def execute(self, instance, backend_pull_method, success_state, erred_state):
+    def execute(self, instance, backend_pull_method, success_state, erred_state, deleted_state=None):
         backend = self.get_backend(instance)
         getattr(backend, backend_pull_method)(instance)
         instance.refresh_from_db()
-        if instance.runtime_state not in (success_state, erred_state):
+        if instance.runtime_state not in (success_state, erred_state, deleted_state):
             self.retry()
         elif instance.runtime_state == erred_state:
             raise RuntimeStateException(
@@ -504,3 +504,19 @@ class PollBackendCheckTask(Task):
         if not getattr(backend, backend_check_method)(instance):
             self.retry()
         return instance
+
+
+class ExtensionTaskMixin(CeleryTask):
+    """
+    This mixin allows to skip task scheduling if extension is disabled.
+    Subclasses should implement "is_extension_disabled" method which returns boolean value.
+    """
+    def is_extension_disabled(self):
+        return False
+
+    def apply_async(self, args=None, kwargs=None, **options):
+        if self.is_extension_disabled():
+            message = 'Task %s is not scheduled, because its extension is disabled.' % self.name
+            logger.info(message)
+            return self.AsyncResult(options.get('task_id') or str(uuid4()))
+        return super(ExtensionTaskMixin, self).apply_async(args=args, kwargs=kwargs, **options)

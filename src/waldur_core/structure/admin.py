@@ -8,7 +8,7 @@ from django.conf.urls import url
 from django.contrib import admin, messages
 from django.contrib.admin import SimpleListFilter
 from django.contrib.admin.widgets import FilteredSelectMultiple
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ValidationError, FieldDoesNotExist
 from django.db import models as django_models
 from django.forms import ModelMultipleChoiceField, ModelForm, RadioSelect, ChoiceField, CharField
 from django.http import HttpResponseRedirect
@@ -16,11 +16,14 @@ from django.shortcuts import render
 from django.utils import timezone
 from django.utils.translation import ugettext_lazy as _
 from django.utils.translation import ungettext
-from jsoneditor.forms import JSONEditor
 import six
 
 from waldur_core.core import utils as core_utils
-from waldur_core.core.admin import get_admin_url, ExecutorAdminAction, PasswordWidget, NativeNameAdminMixin
+from waldur_core.core.admin import (
+    get_admin_url, ExecutorAdminAction, PasswordWidget,
+    NativeNameAdminMixin, JsonWidget, ReadOnlyAdminMixin,
+)
+from waldur_core.core.admin_filters import RelatedOnlyDropdownFilter
 from waldur_core.core.models import User
 from waldur_core.core.tasks import send_task
 from waldur_core.core.validators import BackendURLValidator
@@ -31,6 +34,19 @@ logger = logging.getLogger(__name__)
 
 
 class BackendModelAdmin(admin.ModelAdmin):
+
+    def get_list_filter(self, request):
+        try:
+            self.model._meta.get_field('settings')
+            return ('settings__shared', ('settings', RelatedOnlyDropdownFilter))
+        except FieldDoesNotExist:
+            return self.list_filter
+
+    def lookup_allowed(self, lookup, value):
+        if lookup == 'settings__shared__exact':
+            return True
+        return super(BackendModelAdmin, self).lookup_allowed(lookup, value)
+
     def has_add_permission(self, request):
         return False
 
@@ -188,15 +204,18 @@ class CustomerAdmin(FormRequestAdminMixin,
                     ProtectedModelMixin,
                     admin.ModelAdmin):
     form = CustomerAdminForm
-    fields = ('name', 'uuid', 'image', 'native_name', 'abbreviation', 'contact_details', 'registration_code',
+    fields = ('name', 'uuid', 'image', 'native_name', 'abbreviation', 'division', 'contact_details',
+              'registration_code', 'backend_id',
               'agreement_number', 'email', 'phone_number', 'access_subnets',
               'country', 'vat_code', 'is_company', 'owners', 'support_users',
               'type', 'address', 'postal', 'bank_name', 'bank_account',
-              'accounting_start_date', 'default_tax_percent')
+              'accounting_start_date', 'default_tax_percent', 'blocked')
     list_display = ('name', 'uuid', 'abbreviation',
                     'created', 'accounting_start_date',
                     'get_vm_count', 'get_app_count', 'get_private_cloud_count')
+    list_filter = ('blocked', 'division')
     search_fields = ('name', 'uuid', 'abbreviation')
+    date_hierarchy = 'created'
     readonly_fields = ('uuid',)
     inlines = [QuotaInline]
 
@@ -319,6 +338,7 @@ class ServiceSettingsAdminForm(ModelForm):
         field_info = utils.get_all_services_field_info()
         fields_required = field_info.fields_required
         extra_fields_required = field_info.extra_fields_required
+        fields_default = field_info.extra_fields_default[service_type]
 
         # Check required fields of service type
         for field in fields_required[service_type]:
@@ -334,19 +354,31 @@ class ServiceSettingsAdminForm(ModelForm):
         try:
             if 'options' in cleaned_data:
                 options = json.loads(cleaned_data.get('options'))
-                unfilled = set(extra_fields_required[service_type]) - set(options.keys())
+                unfilled = set(extra_fields_required[service_type]) - set(options.keys()) - set(fields_default.keys())
+
                 if unfilled:
                     self.add_error('options', _('This field must include keys: %s') %
                                    ', '.join(unfilled))
+                service_serializer = SupportedServices.get_service_serializer_for_key(service_type)
+                options_serializer_class = getattr(service_serializer.Meta, 'options_serializer', None)
+                if options_serializer_class:
+                    options_serializer = options_serializer_class(data=options)
+                    if not options_serializer.is_valid():
+                        self.add_error('options', json.dumps(options_serializer.errors))
+                    else:
+                        cleaned_data['options'] = options_serializer.validated_data
         except ValueError:
             self.add_error('options', _('JSON is not valid'))
 
+        return cleaned_data
+
     class Meta:
         widgets = {
-            'options': JSONEditor(),
-            'geolocations': JSONEditor(),
-            'username': forms.TextInput(attrs={'autocomplete': 'off'}),
-            'password': PasswordWidget(attrs={'autocomplete': 'off'}),
+            'options': JsonWidget(),
+            'geolocations': JsonWidget(),
+            'username': forms.TextInput(attrs={'autocomplete': 'new-password'}),
+            'password': PasswordWidget(attrs={'autocomplete': 'new-password'}),
+            'token': PasswordWidget(attrs={'autocomplete': 'new-password'}),
         }
 
     def __init__(self, *args, **kwargs):
@@ -474,6 +506,17 @@ class SharedServiceSettingsAdmin(PrivateServiceSettingsAdmin):
 
     def save_form(self, request, form, change):
         obj = super(SharedServiceSettingsAdmin, self).save_form(request, form, change)
+
+        """If required field is not filled, but it has got a default value, we set a default value."""
+        field_info = utils.get_all_services_field_info()
+        extra_fields_default = field_info.extra_fields_default[obj.type]
+        extra_fields_required = field_info.extra_fields_required[obj.type]
+        default = (set(extra_fields_required) - set(obj.options.keys())) & set(extra_fields_default.keys())
+
+        if default:
+            for d in default:
+                obj.options[d] = extra_fields_default[d]
+
         if not change:
             obj.shared = True
         return obj
@@ -491,7 +534,20 @@ class SharedServiceSettingsAdmin(PrivateServiceSettingsAdmin):
 
 class ServiceAdmin(admin.ModelAdmin):
     list_display = ('settings', 'customer')
+    list_filter = (
+        ('settings', RelatedOnlyDropdownFilter),
+        ('customer', RelatedOnlyDropdownFilter),
+    )
     ordering = ('customer',)
+
+
+class ServicePropertyAdmin(ReadOnlyAdminMixin, admin.ModelAdmin):
+    search_fields = ('name',)
+    list_filter = (
+        ('settings', RelatedOnlyDropdownFilter),
+    )
+    readonly_fields = ('name', 'settings')
+    list_display = ('name', 'settings')
 
 
 class ServiceProjectLinkAdmin(admin.ModelAdmin):
@@ -545,7 +601,8 @@ class ResourceAdmin(BackendModelAdmin):
     readonly_fields = ('error_message',)
     list_display = ('uuid', 'name', 'backend_id', 'state', 'created',
                     'get_service', 'get_project', 'error_message', 'get_settings_shared')
-    list_filter = ('state', DerivedFromSharedSettingsResourceFilter)
+    list_filter = BackendModelAdmin.list_filter + ('state', DerivedFromSharedSettingsResourceFilter)
+    search_fields = ('name',)
 
     def get_settings_shared(self, obj):
         return obj.service_project_link.service.settings.shared
@@ -590,9 +647,22 @@ class VirtualMachineAdmin(ResourceAdmin):
     detect_coordinates.short_description = _('Detect coordinates of virtual machines')
 
 
+class DivisionTypeAdmin(admin.ModelAdmin):
+    list_display = ('name',)
+    search_fields = ['name']
+
+
+class DivisionAdmin(admin.ModelAdmin):
+    list_display = ('name', 'type', 'parent')
+    search_fields = ['name']
+    list_filter = ('type',)
+
+
 admin.site.register(models.ServiceCertification, ServiceCertificationAdmin)
 admin.site.register(models.Customer, CustomerAdmin)
 admin.site.register(models.ProjectType, admin.ModelAdmin)
 admin.site.register(models.Project, ProjectAdmin)
 admin.site.register(models.PrivateServiceSettings, PrivateServiceSettingsAdmin)
 admin.site.register(models.SharedServiceSettings, SharedServiceSettingsAdmin)
+admin.site.register(models.DivisionType, DivisionTypeAdmin)
+admin.site.register(models.Division, DivisionAdmin)

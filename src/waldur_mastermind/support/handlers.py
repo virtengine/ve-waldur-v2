@@ -12,20 +12,67 @@ def log_issue_save(sender, instance, created=False, **kwargs):
     if created:
         return
 
-    event_logger.waldur_issue.info(
-        'Issue {issue_key} has been updated.',
-        event_type='issue_update_succeeded',
-        event_context={
-            'issue': instance,
-        })
+    if not instance.key:
+        # If issue does not have key, it is not actually created on backend.
+        # Therefore it is okay to skip logging in this case.
+        return
+
+    # If issue got a key, it means that it has been actually created on backend.
+    if instance.tracker.has_changed('key'):
+        event_logger.waldur_issue.info(
+            'Issue {issue_key} has been created.',
+            event_type='issue_creation_succeeded',
+            event_context={
+                'issue': instance,
+            })
+    else:
+        updated_fields = instance.tracker.changed()
+        updated_fields.pop('modified')  # waldur-specific field
+        event_logger.waldur_issue.info(
+            'Issue {issue_key} has been updated. Changed fields: %s.' % ", ".join(updated_fields.keys()),
+            event_type='issue_update_succeeded',
+            event_context={
+                'issue': instance,
+            })
 
 
 def log_issue_delete(sender, instance, **kwargs):
+    if not instance.key:
+        # If issue does not have key, it is not actually created on backend.
+        # Therefore it is okay to skip logging in this case.
+        return
+
     event_logger.waldur_issue.info(
         'Issue {issue_key} has been deleted.',
         event_type='issue_deletion_succeeded',
         event_context={
             'issue': instance,
+        })
+
+
+def log_attachment_save(sender, instance, created=False, **kwargs):
+    if created:
+        event_logger.waldur_attachment.info(
+            'Attachment for issue {issue_key} has been created.',
+            event_type='attachment_created',
+            event_context={
+                'attachment': instance,
+            })
+    else:
+        event_logger.waldur_attachment.info(
+            'Attachment for issue {issue_key} has been updated.',
+            event_type='attachment_updated',
+            event_context={
+                'attachment': instance,
+            })
+
+
+def log_attachment_delete(sender, instance, **kwargs):
+    event_logger.waldur_attachment.info(
+        'Attachment for issue {issue_key} has been deleted.',
+        event_type='attachment_deleted',
+        event_context={
+            'attachment': instance,
         })
 
 
@@ -82,6 +129,11 @@ def send_issue_updated_notification(sender, instance, created=False, **kwargs):
 
     # Skip notification if issue just has been created on backend.
     if 'backend_id' in instance.tracker.changed():
+        return
+
+    # Skip notification if issue status is ignored.
+    if 'status' in instance.tracker.changed() and \
+            models.IgnoredIssueStatus.objects.filter(name=instance.status).exists():
         return
 
     serialized_issue = core_utils.serialize_instance(instance)

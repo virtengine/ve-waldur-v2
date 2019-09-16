@@ -6,7 +6,7 @@ from django.db import migrations, models
 
 
 def migrate_data(apps, schema_editor):
-    from waldur_mastermind.invoices.models import Invoice
+    Invoice = apps.get_model('invoices', 'Invoice')
 
     for invoice in Invoice.objects.all():
         invoice.update_current_cost()
@@ -24,5 +24,5 @@ class Migration(migrations.Migration):
             name='current_cost',
             field=models.DecimalField(decimal_places=2, default=0, editable=False, help_text='Cached value for current cost.', max_digits=10),
         ),
-        migrations.RunPython(migrate_data, reverse_code=migrations.RunPython.noop),
+        migrations.RunPython(migrate_data, reverse_code=migrations.RunPython.noop, elidable=True),
     ]

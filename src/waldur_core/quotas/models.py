@@ -1,14 +1,13 @@
 from __future__ import unicode_literals
 
 from collections import defaultdict
-import functools
 from functools import reduce
 import inspect
 import logging
 
 from django.contrib.contenttypes import fields as ct_fields
 from django.contrib.contenttypes import models as ct_models
-from django.db import models
+from django.db import models, transaction
 from django.db.models import Sum
 from django.utils.encoding import python_2_unicode_compatible
 from django.utils.translation import ugettext_lazy as _
@@ -89,22 +88,6 @@ class Quota(UuidMixin, AlertThresholdMixin, LoggableMixin, ReversionMixin, model
         return self.usage >= self.threshold
 
 
-def _fail_silently(method):
-
-    @functools.wraps(method)
-    def wrapped(self, quota_name, *args, **kwargs):
-        try:
-            return method(self, quota_name, *args, **kwargs)
-        except Quota.DoesNotExist:
-            if not kwargs.get('fail_silently', False):
-                raise Quota.DoesNotExist(_('Object %(object)s does not have quota with name %(name)s.') % {
-                    'object': self,
-                    'name': quota_name
-                })
-
-    return wrapped
-
-
 class QuotaModelMixin(models.Model):
     """
     Add general fields and methods to model for quotas usage.
@@ -145,23 +128,29 @@ class QuotaModelMixin(models.Model):
 
     quotas = ct_fields.GenericRelation('quotas.Quota', related_query_name='quotas')
 
-    @_fail_silently
-    def set_quota_limit(self, quota_name, limit, fail_silently=False):
-        quota = self.quotas.get(name=quota_name)
+    def get_or_create_quota(self, quota_name_or_field):
+        if isinstance(quota_name_or_field, six.string_types):
+            quota_name_or_field = getattr(self.Quotas, quota_name_or_field)
+        quota, _ = quota_name_or_field.get_or_create_quota(self)
+        return quota
+
+    @transaction.atomic
+    def set_quota_limit(self, quota_name, limit):
+        quota = self.get_or_create_quota(quota_name)
         if quota.limit != limit:
             quota.limit = limit
             quota.save(update_fields=['limit'])
 
-    @_fail_silently
-    def set_quota_usage(self, quota_name, usage, fail_silently=False):
-        quota = self.quotas.get(name=quota_name)
+    @transaction.atomic
+    def set_quota_usage(self, quota_name, usage):
+        quota = self.get_or_create_quota(quota_name)
         if quota.usage != usage:
             quota.usage = usage
             quota.save(update_fields=['usage'])
 
-    @_fail_silently
-    def add_quota_usage(self, quota_name, usage_delta, fail_silently=False, validate=False):
-        quota = self.quotas.get(name=quota_name)
+    @transaction.atomic
+    def add_quota_usage(self, quota_name, usage_delta, validate=False):
+        quota = self.get_or_create_quota(quota_name)
         if validate and quota.is_exceeded(usage_delta):
             raise exceptions.QuotaValidationError(
                 _('%(quota)s "%(name)s" quota is over limit. Required: %(usage)s, limit: %(limit)s.') % dict(
@@ -326,3 +315,40 @@ class ExtendableQuotaModelMixin(QuotaModelMixin):
         # For counter quotas we need to register signals explicitly
         if isinstance(quota_field, fields.CounterQuotaField):
             QuotasConfig.register_counter_field_signals(model=cls, counter_field=quota_field)
+
+
+class SharedQuotaMixin(object):
+    """
+    This mixin updates quotas for several scopes.
+    """
+
+    def get_quota_deltas(self):
+        """
+        This method should return dict where key is quota name and value is quota diff.
+        For example:
+        {
+            'storage': 1024,
+            'volumes': 1,
+        }
+        """
+        raise NotImplementedError()
+
+    def get_quota_scopes(self):
+        """
+        This method should return list of quota model mixins.
+        """
+        raise NotImplementedError()
+
+    def apply_quota_changes(self, validate=False, mult=1):
+        scopes = self.get_quota_scopes()
+        deltas = self.get_quota_deltas()
+        for name, delta in deltas.items():
+            for scope in scopes:
+                if scope:
+                    scope.add_quota_usage(name, delta * mult, validate=validate)
+
+    def increase_backend_quotas_usage(self, validate=True):
+        self.apply_quota_changes(validate=validate)
+
+    def decrease_backend_quotas_usage(self):
+        self.apply_quota_changes(mult=-1)

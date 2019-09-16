@@ -1,5 +1,7 @@
 from __future__ import unicode_literals
 
+from datetime import timedelta
+
 from waldur_core.core import WaldurExtension
 
 
@@ -12,8 +14,16 @@ class MarketplaceExtension(WaldurExtension):
             'MANAGER_CAN_APPROVE_ORDER': False,
             'ADMIN_CAN_APPROVE_ORDER': False,
             'NOTIFY_STAFF_ABOUT_APPROVALS': False,
+            'NOTIFY_ABOUT_RESOURCE_CHANGE': True,
+            'DISABLE_SENDING_NOTIFICATIONS_ABOUT_RESOURCE_UPDATE': True,
+            'OWNER_CAN_REGISTER_SERVICE_PROVIDER': False,
+            'ORDER_LINK_TEMPLATE': 'https://www.example.com/#/projects/'
+                                   '{project_uuid}/marketplace-order-list/',
+            'ORDER_ITEM_LINK_TEMPLATE': 'https://www.example.com/#/projects/{project_uuid}/'
+                                        'marketplace-order-item-details/{order_item_uuid}/',
+            'PUBLIC_RESOURCES_LINK_TEMPLATE': 'https://www.example.com/#/organizations/{organization_uuid}/'
+                                        'marketplace-public-resources/'
         }
-        ORDER_LINK_TEMPLATE = 'https://www.example.com/#/projects/{order.project.uuid}/marketplace-order-list/'
 
     @staticmethod
     def django_app():
@@ -29,6 +39,7 @@ class MarketplaceExtension(WaldurExtension):
             'OWNER_CAN_APPROVE_ORDER',
             'MANAGER_CAN_APPROVE_ORDER',
             'ADMIN_CAN_APPROVE_ORDER',
+            'OWNER_CAN_REGISTER_SERVICE_PROVIDER',
         ]
 
     @staticmethod
@@ -43,4 +54,16 @@ class MarketplaceExtension(WaldurExtension):
 
     @staticmethod
     def celery_tasks():
-        return {}
+        from celery.schedules import crontab
+        return {
+            'waldur-marketplace-calculate-usage': {
+                'task': 'waldur_mastermind.marketplace.calculate_usage_for_current_month',
+                'schedule': timedelta(hours=1),
+                'args': (),
+            },
+            'waldur-mastermind-send-notifications-about-usages': {
+                'task': 'waldur_mastermind.marketplace.send_notifications_about_usages',
+                'schedule': crontab(minute=0, hour=15, day_of_month='23'),
+                'args': (),
+            }
+        }

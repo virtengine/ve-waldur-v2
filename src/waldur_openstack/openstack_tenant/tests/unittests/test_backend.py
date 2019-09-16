@@ -1,5 +1,7 @@
 from __future__ import unicode_literals
 
+import uuid
+
 from ddt import data, ddt
 from django.test import TestCase
 from cinderclient.v2.volumes import Volume
@@ -45,7 +47,10 @@ class BaseBackendTest(TestCase):
             'status': 'ACTIVE',
             'key_name': '',
             'created': '2012-04-23T08:10:00Z',
-            'OS-SRV-USG:launched_at': '2012-04-23T09:15'
+            'OS-SRV-USG:launched_at': '2012-04-23T09:15',
+            'flavor': {
+                'id': backend_id
+            }
         })
 
     def _get_valid_flavor(self, backend_id):
@@ -187,6 +192,25 @@ class PullFloatingIPTest(BaseBackendTest):
 
         backend_ip_address = backend_ip['floating_ip_address']
         self.assertEqual(models.FloatingIP.objects.filter(address=backend_ip_address).count(), 1)
+
+    def test_backend_id_is_filled_up_when_floating_ip_is_looked_up_by_address(self):
+        backend_floating_ips = self._get_valid_new_backend_ip(self.fixture.internal_ip)
+        self.neutron_client_mock.list_floatingips.return_value = backend_floating_ips
+        backend_ip = backend_floating_ips['floatingips'][0]
+        factories.FloatingIPFactory(
+            is_booked=True,
+            settings=self.settings,
+            name='booked ip',
+            address=backend_ip['floating_ip_address'],
+            runtime_state='booked_state')
+
+        self.tenant_backend.pull_floating_ips()
+
+        backend_ip_address = backend_ip['floating_ip_address']
+        self.assertEqual(models.FloatingIP.objects.filter(address=backend_ip_address).count(), 1)
+
+        floating_ip = models.FloatingIP.objects.filter(address=backend_ip_address).get()
+        self.assertEqual(floating_ip.backend_id, backend_ip['id'])
 
     def test_floating_ip_name_is_not_update_if_it_was_set_by_user(self):
         internal_ip = factories.InternalIPFactory(instance=self.fixture.instance)
@@ -395,8 +419,7 @@ class PullSubnetsTest(BaseBackendTest):
         self.assertEqual(subnet.name, 'subnet-1')
 
 
-class GetVolumesTest(BaseBackendTest):
-
+class VolumesBaseTest(BaseBackendTest):
     def _generate_volumes(self, backend=False, count=1):
         volumes = []
         for i in range(count):
@@ -408,6 +431,8 @@ class GetVolumesTest(BaseBackendTest):
 
         return volumes
 
+
+class GetVolumesTest(VolumesBaseTest):
     def test_all_backend_volumes_are_returned(self):
         backend_volumes = self._generate_volumes(backend=True, count=2)
         volumes = backend_volumes + self._generate_volumes()
@@ -418,6 +443,82 @@ class GetVolumesTest(BaseBackendTest):
         returned_backend_ids = [item.backend_id for item in result]
         expected_backend_ids = [item.id for item in volumes]
         self.assertItemsEqual(returned_backend_ids, expected_backend_ids)
+
+
+class CreateVolumesTest(VolumesBaseTest):
+    def setUp(self):
+        super(CreateVolumesTest, self).setUp()
+        self.patcher = mock.patch('waldur_openstack.openstack_base.backend.OpenStackClient')
+        mock_client = self.patcher.start()
+        cinder = mock.MagicMock()
+        cinder.volumes.create.return_value = self._generate_volumes()[0]
+        mock_client().cinder = cinder
+
+    def tearDown(self):
+        super(CreateVolumesTest, self).tearDown()
+        mock.patch.stopall()
+
+    def test_use_default_volume_type_if_type_not_populated(self):
+        volume_type = factories.VolumeTypeFactory(settings=self.settings)
+        self.tenant.default_volume_type_name = volume_type.name
+        self.tenant.save()
+        volume = self._get_volume()
+        self.assertEqual(volume.type.name, volume_type.name)
+
+    def test_do_not_use_volume_type_if_settings_have_no_scope(self):
+        self.settings.scope = None
+        self.settings.save()
+        volume = self._get_volume()
+        self.assertEqual(volume.type, None)
+
+    @mock.patch('waldur_openstack.openstack_tenant.backend.logger')
+    def test_not_use_default_volume_type_if_it_not_exists(self, mock_logger):
+        self.tenant.default_volume_type_name = 'not_exists_value_type'
+        self.tenant.save()
+        volume = self._get_volume()
+        self.assertEqual(volume.type, None)
+        mock_logger.error.assert_called_once()
+
+    @mock.patch('waldur_openstack.openstack_tenant.backend.logger')
+    def test_not_use_default_volume_type_if_two_types_exist(self, mock_logger):
+        volume_type = factories.VolumeTypeFactory(settings=self.settings)
+        factories.VolumeTypeFactory(name=volume_type.name, settings=self.settings)
+        self.tenant.default_volume_type_name = volume_type.name
+        self.tenant.save()
+        volume = self._get_volume()
+        self.assertEqual(volume.type, None)
+        mock_logger.error.assert_called_once()
+
+    def test_use_default_volume_availability_zone_if_zone_not_populated(self):
+        volume_availability_zone = factories.VolumeAvailabilityZoneFactory(settings=self.settings)
+        self.tenant.service_settings.options['volume_availability_zone_name'] = volume_availability_zone.name
+        self.tenant.service_settings.save()
+        volume = self._get_volume()
+        self.assertEqual(volume.availability_zone.name, volume_availability_zone.name)
+
+    def test_do_not_use_volume_availability_zone_if_settings_have_no_scope(self):
+        self.settings.scope = None
+        self.settings.save()
+        volume = self._get_volume()
+        self.assertEqual(volume.availability_zone, None)
+
+    @mock.patch('waldur_openstack.openstack_tenant.backend.logger')
+    def test_not_use_default_volume_availability_zone_if_it_not_exists(self, mock_logger):
+        self.tenant.service_settings.options['volume_availability_zone_name'] = 'not_exists_volume_availability_zone'
+        self.tenant.service_settings.save()
+        volume = self._get_volume()
+        self.assertEqual(volume.availability_zone, None)
+        mock_logger.error.assert_called_once()
+
+    def _get_volume(self):
+        volume = factories.VolumeFactory(
+            service_project_link=self.fixture.spl,
+            backend_id=None,
+        )
+
+        backend = OpenStackTenantBackend(self.settings)
+        backend.create_volume(volume)
+        return volume
 
 
 class ImportVolumeTest(BaseBackendTest):
@@ -450,6 +551,169 @@ class ImportVolumeTest(BaseBackendTest):
         self.assertEqual(volume.name, self.backend_volume.name)
 
 
+class PullVolumeTest(BaseBackendTest):
+
+    def setUp(self):
+        super(PullVolumeTest, self).setUp()
+        self.spl = self.fixture.spl
+        self.backend_volume_id = 'backend_id'
+        self.backend_volume = self._get_valid_volume(self.backend_volume_id)
+
+        self.cinder_client_mock.volumes.get.return_value = self.backend_volume
+
+    def test_volume_instance_is_pulled(self):
+        vm = factories.InstanceFactory(backend_id='instance_backend_id', service_project_link=self.spl)
+        volume = factories.VolumeFactory(
+            backend_id=self.backend_volume_id,
+            instance=vm,
+            service_project_link=self.spl,
+        )
+        self.backend_volume.attachments = [
+            dict(server_id=vm.backend_id)
+        ]
+        self.tenant_backend.pull_volume(volume)
+        volume.refresh_from_db()
+
+        self.assertEqual(volume.instance, vm)
+
+    def test_volume_image_is_pulled(self):
+        volume = factories.VolumeFactory(
+            backend_id=self.backend_volume_id,
+            service_project_link=self.spl,
+        )
+        image = factories.ImageFactory(settings=self.settings)
+        self.backend_volume.volume_image_metadata = {'image_id': image.backend_id}
+        self.tenant_backend.pull_volume(volume)
+        volume.refresh_from_db()
+
+        self.assertEqual(volume.image, image)
+
+    def test_volume_image_is_not_pulled(self):
+        volume = factories.VolumeFactory(
+            backend_id=self.backend_volume_id,
+            service_project_link=self.spl,
+        )
+        self.backend_volume.volume_image_metadata = {}
+        self.tenant_backend.pull_volume(volume)
+        volume.refresh_from_db()
+
+        self.assertEqual(volume.image, None)
+
+
+class PullInstanceAvailabilityZonesTest(BaseBackendTest):
+    def test_default_zone_is_not_pulled(self):
+        self.nova_client_mock.availability_zones.list.return_value = [
+            mock.Mock(**{
+                "zoneName": "nova",
+                "zoneState": {
+                    "available": True
+                }
+            })
+        ]
+        self.tenant_backend.pull_instance_availability_zones()
+        self.assertEqual(models.InstanceAvailabilityZone.objects.count(), 0)
+
+    def test_missing_zone_is_created(self):
+        self.nova_client_mock.availability_zones.list.return_value = [
+            mock.Mock(**{
+                "zoneName": "AZ_T1",
+                "zoneState": {
+                    "available": True
+                }
+            })
+        ]
+
+        self.tenant_backend.pull_instance_availability_zones()
+        self.assertEqual(models.InstanceAvailabilityZone.objects.count(), 1)
+
+        zone = models.InstanceAvailabilityZone.objects.get()
+        self.assertEqual(zone.name, 'AZ_T1')
+        self.assertTrue(zone.available)
+
+    def test_stale_zone_is_removed(self):
+        self.fixture.instance_availability_zone
+        self.nova_client_mock.availability_zones.list.return_value = []
+
+        self.tenant_backend.pull_instance_availability_zones()
+        self.assertEqual(models.InstanceAvailabilityZone.objects.count(), 0)
+
+    def test_existing_zone_is_updated(self):
+        zone = self.fixture.instance_availability_zone
+        self.nova_client_mock.availability_zones.list.return_value = [
+            mock.Mock(**{
+                "zoneName": zone.name,
+                "zoneState": {
+                    "available": False
+                }
+            })
+        ]
+
+        self.tenant_backend.pull_instance_availability_zones()
+        self.assertEqual(models.InstanceAvailabilityZone.objects.count(), 1)
+
+        zone = models.InstanceAvailabilityZone.objects.get()
+        self.assertFalse(zone.available)
+
+
+class PullVolumeAvailabilityZonesTest(BaseBackendTest):
+    def setUp(self):
+        super(PullVolumeAvailabilityZonesTest, self).setUp()
+        self.tenant_backend.is_volume_availability_zone_supported = lambda: True
+
+    def test_default_zone_is_not_pulled(self):
+        self.cinder_client_mock.availability_zones.list.return_value = [
+            mock.Mock(**{
+                "zoneName": "nova",
+                "zoneState": {
+                    "available": True
+                }
+            })
+        ]
+        self.tenant_backend.pull_volume_availability_zones()
+        self.assertEqual(models.VolumeAvailabilityZone.objects.count(), 0)
+
+    def test_missing_zone_is_created(self):
+        self.cinder_client_mock.availability_zones.list.return_value = [
+            mock.Mock(**{
+                "zoneName": "AZ_T1",
+                "zoneState": {
+                    "available": True
+                }
+            })
+        ]
+
+        self.tenant_backend.pull_volume_availability_zones()
+        self.assertEqual(models.VolumeAvailabilityZone.objects.count(), 1)
+
+        zone = models.VolumeAvailabilityZone.objects.get()
+        self.assertEqual(zone.name, 'AZ_T1')
+        self.assertTrue(zone.available)
+
+    def test_stale_zone_is_removed(self):
+        self.fixture.volume_availability_zone
+        self.cinder_client_mock.availability_zones.list.return_value = []
+
+        self.tenant_backend.pull_volume_availability_zones()
+        self.assertEqual(models.VolumeAvailabilityZone.objects.count(), 0)
+
+    def test_existing_zone_is_updated(self):
+        zone = self.fixture.volume_availability_zone
+        self.cinder_client_mock.availability_zones.list.return_value = [
+            mock.Mock(**{
+                "zoneName": zone.name,
+                "zoneState": {
+                    "available": False
+                }
+            })
+        ]
+
+        self.tenant_backend.pull_volume_availability_zones()
+        self.assertEqual(models.VolumeAvailabilityZone.objects.count(), 1)
+
+        zone = models.VolumeAvailabilityZone.objects.get()
+        self.assertFalse(zone.available)
+
+
 class PullInstanceTest(BaseBackendTest):
 
     def setUp(self):
@@ -470,8 +734,11 @@ class PullInstanceTest(BaseBackendTest):
             status = 'ERRED'
             fault = {'message': 'OpenStack Nova error.'}
 
-            def to_dict(self):
-                return {}
+            @classmethod
+            def to_dict(cls):
+                return {
+                    'OS-EXT-AZ:availability_zone': 'AZ_TST'
+                }
 
         self.nova_client_mock = mock.Mock()
         self.tenant_backend.nova_client = self.nova_client_mock
@@ -479,6 +746,26 @@ class PullInstanceTest(BaseBackendTest):
         self.nova_client_mock.servers.get.return_value = MockInstance
         self.nova_client_mock.volumes.get_server_volumes.return_value = []
         self.nova_client_mock.flavors.get.return_value = MockFlavor
+
+    def test_availability_zone_is_pulled(self):
+        zone = self.fixture.instance_availability_zone
+        zone.name = 'AZ_TST'
+        zone.save()
+
+        instance = self.fixture.instance
+
+        self.tenant_backend.pull_instance(instance)
+        instance.refresh_from_db()
+
+        self.assertEqual(instance.availability_zone, zone)
+
+    def test_invalid_availability_zone_is_skipped(self):
+        instance = self.fixture.instance
+
+        self.tenant_backend.pull_instance(instance)
+        instance.refresh_from_db()
+
+        self.assertEqual(instance.availability_zone, None)
 
     def test_error_message_is_synchronized(self):
         instance = self.fixture.instance
@@ -523,7 +810,7 @@ class PullInstanceInternalIpsTest(BaseBackendTest):
         # Arrange
         instance = self.fixture.instance
         internal_ip = self.fixture.internal_ip
-        internal_ip.backend_id = ''
+        internal_ip.backend_id = None
         internal_ip.save()
         self.setup_neutron('port_id', instance.backend_id, internal_ip.subnet.backend_id)
 
@@ -634,7 +921,7 @@ class PullInternalIpsTest(BaseBackendTest):
         # Arrange
         instance = self.fixture.instance
         internal_ip = self.fixture.internal_ip
-        internal_ip.backend_id = ''
+        internal_ip.backend_id = None
         internal_ip.save()
         self.setup_neutron('port_id', instance.backend_id, internal_ip.subnet.backend_id)
 
@@ -819,14 +1106,12 @@ class GetInstancesTest(BaseBackendTest):
     def test_all_instances_returned(self):
         backend_instances = self._generate_instances(backend=True, count=3)
         instances = backend_instances + self._generate_instances()
-        flavors = []
-        for instance in instances:
-            flavor = self._get_valid_flavor(backend_id=instance.id)
-            instance.flavor = flavor._info
-            flavors.append(flavor)
+
+        def get_volume(backend_id):
+            return self._get_valid_flavor(backend_id=backend_id)
 
         self.nova_client_mock.servers.list.return_value = instances
-        self.nova_client_mock.flavors.list.return_value = flavors
+        self.nova_client_mock.flavors.get.side_effect = get_volume
 
         result = self.tenant_backend.get_instances()
 
@@ -946,3 +1231,37 @@ class PullInstanceFloatingIpsTest(BaseBackendTest):
 
         fip.refresh_from_db()
         self.assertEqual(ip2, fip.internal_ip)
+
+
+class CreateInstanceTest(VolumesBaseTest):
+    def setUp(self):
+        super(CreateInstanceTest, self).setUp()
+        self.flavor_id = 'small_flavor'
+        backend_flavor = self._get_valid_flavor(self.flavor_id)
+        self.nova_client_mock.flavors.get.return_value = backend_flavor
+        self.nova_client_mock.servers.create.return_value.id = uuid.uuid4()
+
+    def test_zone_name_is_passed_to_nova_client(self):
+        # Arrange
+        zone = self.fixture.instance_availability_zone
+        vm = self.fixture.instance
+        vm.availability_zone = zone
+        vm.save()
+
+        # Act
+        self.tenant_backend.create_instance(vm, self.flavor_id)
+
+        # Assert
+        kwargs = self.nova_client_mock.servers.create.mock_calls[0][2]
+        self.assertEqual(kwargs['availability_zone'], zone.name)
+
+    def test_default_zone_name_is_passed_to_nova_client(self):
+        # Arrange
+        self.settings.options['availability_zone'] = 'default_availability_zone'
+
+        # Act
+        self.tenant_backend.create_instance(self.fixture.instance, self.flavor_id)
+
+        # Assert
+        kwargs = self.nova_client_mock.servers.create.mock_calls[0][2]
+        self.assertEqual(kwargs['availability_zone'], 'default_availability_zone')

@@ -217,6 +217,67 @@ class PullSecurityGroupsTest(BaseBackendTestCase):
         return result
 
 
+class PushSecurityGroupTest(BaseBackendTestCase):
+    def test_egress_rules_are_not_modified(self):
+        security_group = self.fixture.security_group
+        rule = factories.SecurityGroupRuleFactory(security_group=security_group)
+
+        INGRESS_RULE_ID = 'c0b09f00-1d49-4e64-a0a7-8a186d928138'
+
+        self.mocked_neutron().show_security_group.return_value = {
+            'security_group': {
+                'security_group_rules': [
+                    {
+                        "direction": "egress",
+                        "ethertype": "IPv4",
+                        "id": "93aa42e5-80db-4581-9391-3a608bd0e448",
+                        "port_range_max": None,
+                        "port_range_min": None,
+                        "protocol": None,
+                        "remote_group_id": None,
+                        "remote_ip_prefix": None,
+                        "security_group_id": "85cc3048-abc3-43cc-89b3-377341426ac5",
+                        "project_id": "e4f50856753b4dc6afee5fa6b9b6c550",
+                        "revision_number": 1,
+                        "created_at": "2018-03-19T19:16:56Z",
+                        "updated_at": "2018-03-19T19:16:56Z",
+                        "tenant_id": "e4f50856753b4dc6afee5fa6b9b6c550",
+                        "description": ""
+                    },
+                    {
+                        "direction": "ingress",
+                        "ethertype": "IPv6",
+                        "id": INGRESS_RULE_ID,
+                        "port_range_max": None,
+                        "port_range_min": None,
+                        "protocol": None,
+                        "remote_group_id": "85cc3048-abc3-43cc-89b3-377341426ac5",
+                        "remote_ip_prefix": None,
+                        "security_group_id": "85cc3048-abc3-43cc-89b3-377341426ac5",
+                        "project_id": "e4f50856753b4dc6afee5fa6b9b6c550",
+                        "revision_number": 2,
+                        "created_at": "2018-03-19T19:16:56Z",
+                        "updated_at": "2018-03-19T19:16:56Z",
+                        "tenant_id": "e4f50856753b4dc6afee5fa6b9b6c550",
+                        "description": ""
+                    },
+                ]
+            }
+        }
+
+        self.backend.push_security_group_rules(security_group)
+
+        self.mocked_neutron().delete_security_group_rule.assert_called_once_with(INGRESS_RULE_ID)
+        self.mocked_neutron().create_security_group_rule.assert_called_once_with({'security_group_rule': {
+            'security_group_id': security_group.backend_id,
+            'direction': 'ingress',
+            'protocol': rule.protocol,
+            'port_range_min': rule.from_port,
+            'port_range_max': rule.to_port,
+            'remote_ip_prefix': rule.cidr,
+        }})
+
+
 class PullNetworksTest(BaseBackendTestCase):
 
     def setUp(self):
@@ -298,9 +359,7 @@ class PullSubnetsTest(BaseBackendTestCase):
     def test_missing_subnets_are_created(self):
         self.backend.pull_subnets()
 
-        self.mocked_neutron().list_subnets.assert_called_once_with(
-            network_id=['network_id']
-        )
+        self.mocked_neutron().list_subnets.assert_called_once()
         self.assertEqual(models.SubNet.objects.count(), 1)
         subnet = models.SubNet.objects.get(
             backend_id='backend_id',
@@ -468,6 +527,36 @@ class ImportTenantSubnets(BaseBackendTestCase):
         self.backend.import_tenant_subnets(self.tenant)
 
         self.assertEqual(models.SubNet.objects.count(), 0)
+
+
+class MockTenant(object):
+    def __init__(self, name, id=None):
+        self.name = name
+        self.id = id
+
+
+class CreateTenantTest(BaseBackendTestCase):
+    def test_name_is_replaced_if_it_is_already_taken(self):
+        self.tenant.name = 'First Tenant'
+        self.tenant.save()
+        self.mocked_keystone().projects.list.return_value = [
+            MockTenant('First Tenant'),
+            MockTenant('Second Tenant'),
+        ]
+        self.mocked_keystone().projects.create.return_value = MockTenant('First Tenant', 'VALID_ID')
+        self.backend.create_tenant_safe(self.tenant)
+        self.tenant.refresh_from_db()
+        self.assertNotEqual(self.tenant.name, 'First Tenant')
+        self.assertTrue(self.tenant.name.startswith('First Tenant'))
+
+    def test_name_is_not_replaced_if_it_is_not_taken(self):
+        self.tenant.name = 'First Tenant'
+        self.tenant.save()
+        self.mocked_keystone().projects.list.return_value = []
+        self.mocked_keystone().projects.create.return_value = MockTenant('First Tenant', 'VALID_ID')
+        self.backend.create_tenant_safe(self.tenant)
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.name, 'First Tenant')
 
 
 class PullImagesTest(BaseBackendTestCase):

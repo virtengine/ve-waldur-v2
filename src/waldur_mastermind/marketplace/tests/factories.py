@@ -2,10 +2,13 @@ from decimal import Decimal
 
 import factory
 from django.db.models import signals
+from django.utils import timezone
 from rest_framework.reverse import reverse
 
+from waldur_core.core import utils as core_utils
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.common.mixins import UnitPriceMixin
+
 from .. import models
 
 
@@ -72,6 +75,15 @@ class CategoryFactory(factory.DjangoModelFactory):
     def get_list_url(cls, action=None):
         url = 'http://testserver' + reverse('marketplace-category-list')
         return url if action is None else url + action + '/'
+
+
+class CategoryComponentFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = models.CategoryComponent
+
+    category = factory.SubFactory(CategoryFactory)
+    name = factory.Sequence(lambda n: 'component-%s' % n)
+    type = factory.Sequence(lambda n: 'component-%s' % n)
 
 
 class OfferingFactory(factory.DjangoModelFactory):
@@ -156,21 +168,12 @@ class OrderFactory(factory.DjangoModelFactory):
         return url if action is None else url + action + '/'
 
 
-class OrderItemFactory(factory.DjangoModelFactory):
-    class Meta(object):
-        model = models.OrderItem
-
-    order = factory.SubFactory(OrderFactory)
-    offering = factory.SubFactory(OfferingFactory)
-
-
 class PlanFactory(factory.DjangoModelFactory):
     class Meta(object):
         model = models.Plan
 
     offering = factory.SubFactory(OfferingFactory)
     name = factory.Sequence(lambda n: 'plan-%s' % n)
-    unit_price = Decimal(100)
     unit = UnitPriceMixin.Units.QUANTITY
 
     @classmethod
@@ -185,3 +188,117 @@ class PlanFactory(factory.DjangoModelFactory):
     def get_list_url(cls, action=None):
         url = 'http://testserver' + reverse('marketplace-plan-list')
         return url if action is None else url + action + '/'
+
+
+class OfferingComponentFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = models.OfferingComponent
+
+    offering = factory.SubFactory(OfferingFactory)
+    type = 'cpu'
+    billing_type = models.OfferingComponent.BillingTypes.FIXED
+
+
+class PlanComponentFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = models.PlanComponent
+
+    plan = factory.SubFactory(PlanFactory)
+    component = factory.SubFactory(OfferingComponentFactory)
+    price = Decimal(10)
+    amount = 1
+
+
+class OrderItemFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = models.OrderItem
+
+    order = factory.SubFactory(OrderFactory)
+    offering = factory.SubFactory(OfferingFactory)
+    plan = factory.SubFactory(PlanFactory)
+
+    @classmethod
+    def get_url(cls, order_item=None, action=None):
+        if order_item is None:
+            order_item = OrderItemFactory()
+        url = 'http://testserver' + reverse('marketplace-order-item-detail',
+                                            kwargs={'uuid': order_item.uuid})
+        return url if action is None else url + action + '/'
+
+    @classmethod
+    def get_list_url(cls, action=None):
+        url = 'http://testserver' + reverse('marketplace-order-item-list')
+        return url if action is None else url + action + '/'
+
+
+class CartItemFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = models.CartItem
+
+    offering = factory.SubFactory(OfferingFactory)
+    user = factory.SubFactory(structure_factories.UserFactory)
+    project = factory.SubFactory(structure_factories.ProjectFactory)
+
+    @classmethod
+    def get_url(cls, item=None):
+        if item is None:
+            item = CartItemFactory()
+        return reverse('marketplace-cart-item-detail', kwargs={'uuid': item.uuid})
+
+    @classmethod
+    def get_list_url(cls, action=None):
+        url = reverse('marketplace-cart-item-list')
+        return url if action is None else url + action + '/'
+
+
+class ResourceFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = models.Resource
+
+    offering = factory.SubFactory(OfferingFactory)
+    project = factory.SubFactory(structure_factories.ProjectFactory)
+
+    @classmethod
+    def get_url(cls, resource=None, action=None):
+        if resource is None:
+            resource = ResourceFactory()
+        url = reverse('marketplace-resource-detail', kwargs={'uuid': resource.uuid})
+        return url if action is None else url + action + '/'
+
+    @classmethod
+    def get_list_url(cls, action=None):
+        url = reverse('marketplace-resource-list')
+        return url if action is None else url + action + '/'
+
+
+class OfferingFileFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = models.OfferingFile
+
+    name = factory.Sequence(lambda n: 'offering-file-%s' % n)
+    file = factory.django.FileField()
+    offering = factory.SubFactory(OfferingFactory)
+
+    @classmethod
+    def get_url(cls, offering_file=None, action=None):
+        if offering_file is None:
+            offering_file = OfferingFileFactory()
+        url = 'http://testserver' + reverse('marketplace-offering-file-detail',
+                                            kwargs={'uuid': offering_file.uuid})
+        return url if action is None else url + action + '/'
+
+    @classmethod
+    def get_list_url(cls, action=None):
+        url = 'http://testserver' + reverse('marketplace-offering-file-list')
+        return url if action is None else url + action + '/'
+
+
+class ComponentUsageFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = models.ComponentUsage
+
+    resource = factory.SubFactory(ResourceFactory)
+    component = factory.SubFactory(OfferingComponentFactory)
+    usage = 1
+    date = timezone.now()
+    billing_period = core_utils.month_start(timezone.now())

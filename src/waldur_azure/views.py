@@ -1,18 +1,17 @@
-from django.http import HttpResponse
+from django.db import transaction
 from django.utils.translation import ugettext_lazy as _
-from rest_framework import decorators, exceptions, viewsets, response, status, serializers as rf_serializers
+from rest_framework import decorators, viewsets, \
+    response, status, serializers as rf_serializers
 
 from waldur_core.core import validators as core_validators
 from waldur_core.structure import views as structure_views
 
 from . import models, serializers, executors, filters
-from .backend import SizeQueryset
 
 
 class AzureServiceViewSet(structure_views.BaseServiceViewSet):
     queryset = models.AzureService.objects.all()
     serializer_class = serializers.ServiceSerializer
-    import_serializer_class = serializers.VirtualMachineImportSerializer
 
 
 class AzureServiceProjectLinkViewSet(structure_views.BaseServiceProjectLinkViewSet):
@@ -31,35 +30,39 @@ class ImageViewSet(structure_views.BaseServicePropertyViewSet):
 
 
 class SizeViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = SizeQueryset()
+    queryset = models.Size.objects.all()
     serializer_class = serializers.SizeSerializer
+    filter_class = filters.SizeFilter
     lookup_field = 'uuid'
+
+
+class LocationViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = models.Location.objects.filter(enabled=True)
+    serializer_class = serializers.LocationSerializer
+    filter_class = filters.LocationFilter
+    lookup_field = 'uuid'
+
+
+class ResourceGroupViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = models.ResourceGroup.objects.all()
+    serializer_class = serializers.ResourceGroupSerializer
+    lookup_field = 'uuid'
+
+
+class PublicIPViewSet(structure_views.BaseResourceViewSet):
+    queryset = models.PublicIP.objects.all()
+    filter_class = filters.PublicIPFilter
+    serializer_class = serializers.PublicIPSerializer
+    create_executor = executors.PublicIPCreateExecutor
+    delete_executor = executors.PublicIPDeleteExecutor
 
 
 class VirtualMachineViewSet(structure_views.BaseResourceViewSet):
     queryset = models.VirtualMachine.objects.all()
+    filter_class = filters.VirtualMachineFilter
     serializer_class = serializers.VirtualMachineSerializer
+    create_executor = executors.VirtualMachineCreateExecutor
     delete_executor = executors.VirtualMachineDeleteExecutor
-
-    @decorators.detail_route()
-    def rdp(self, request, uuid=None):
-        vm = self.get_object()
-
-        try:
-            rdp_endpoint = vm.endpoints.get(name=models.InstanceEndpoint.Name.RDP)
-        except models.InstanceEndpoint.DoesNotExist:
-            raise exceptions.NotFound("This virtual machine doesn't run remote desktop")
-
-        response = HttpResponse(content_type='application/x-rdp')
-        response['Content-Disposition'] = 'attachment; filename="{}.rdp"'.format(vm.name)
-        response.write(
-            "full address:s:%s.cloudapp.net:%s\n"
-            "prompt for credentials:i:1\n\n" % (vm.service_project_link.cloud_service_name, rdp_endpoint.public_port))
-
-        return response
-
-    rdp_validators = [core_validators.StateValidator(models.VirtualMachine.States.OK),
-                      core_validators.RuntimeStateValidator('running')]
 
     @decorators.detail_route(methods=['post'])
     def start(self, request, uuid=None):
@@ -91,10 +94,35 @@ class VirtualMachineViewSet(structure_views.BaseResourceViewSet):
                           core_validators.RuntimeStateValidator('running')]
     restart_serializer_class = rf_serializers.Serializer
 
-    def perform_create(self, serializer):
-        instance = serializer.save()
-        executors.VirtualMachineCreateExecutor.execute(
-            instance,
-            backend_image_id=serializer.validated_data['image'].backend_id,
-            backend_size_id=serializer.validated_data['size'].pk,
-        )
+
+class SQLServerViewSet(structure_views.BaseResourceViewSet):
+    queryset = models.SQLServer.objects.all()
+    filter_class = filters.SQLServerFilter
+    serializer_class = serializers.SQLServerSerializer
+    create_executor = executors.SQLServerCreateExecutor
+    delete_executor = executors.SQLServerDeleteExecutor
+
+    @decorators.detail_route(methods=['post'])
+    def create_database(self, request, uuid=None):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        database = serializer.save()
+
+        transaction.on_commit(lambda: executors.SQLDatabaseCreateExecutor().execute(database))
+
+        payload = {
+            'status': _('SQL database creation was scheduled'),
+            'database_uuid': database.uuid,
+        }
+        return response.Response(payload, status=status.HTTP_202_ACCEPTED)
+
+    create_database_validators = [core_validators.StateValidator(models.SQLServer.States.OK)]
+    create_database_serializer_class = serializers.SQLDatabaseCreateSerializer
+
+
+class SQLDatabaseViewSet(structure_views.BaseResourceViewSet):
+    queryset = models.SQLDatabase.objects.all()
+    filter_class = filters.SQLDatabaseFilter
+    serializer_class = serializers.SQLDatabaseSerializer
+    create_executor = executors.SQLDatabaseCreateExecutor
+    delete_executor = executors.SQLDatabaseDeleteExecutor

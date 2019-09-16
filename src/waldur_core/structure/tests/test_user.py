@@ -9,6 +9,7 @@ from rest_framework import test
 from six.moves import mock
 
 from waldur_core.core.models import User
+from waldur_core.core.tests.helpers import override_waldur_core_settings
 from waldur_core.structure.models import CustomerRole
 from waldur_core.structure.serializers import PasswordSerializer
 from waldur_core.structure.tests import factories
@@ -154,6 +155,28 @@ class UserPermissionApiTest(test.APITransactionTestCase):
         }
 
         self._ensure_user_cannot_change_field(self.users['owner'], 'email', data)
+
+    def test_user_cannot_make_himself_support(self):
+        user = factories.UserFactory(agreement_date=timezone.now())
+        url = factories.UserFactory.get_url(user)
+        self.client.force_authenticate(user)
+
+        response = self.client.patch(url, {'is_support': True})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        user.refresh_from_db()
+        self.assertFalse(user.is_support)
+
+    def test_support_cannot_make_himself_staff(self):
+        user = factories.UserFactory(agreement_date=timezone.now(), is_support=True)
+        self.client.force_authenticate(user)
+        url = factories.UserFactory.get_url(user)
+
+        response = self.client.patch(url, {'is_staff': True})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        user.refresh_from_db()
+        self.assertFalse(user.is_staff)
 
     def test_staff_user_cannot_change_civil_number(self):
         self.client.force_authenticate(self.users['staff'])
@@ -462,7 +485,7 @@ class CustomUsersFilterTest(test.APITransactionTestCase):
         self.assertEquals(actual, expected)
 
 
-@freeze_time('2017-01-19 00:00:00')
+@freeze_time('2017-01-19')
 class UserUpdateTest(test.APITransactionTestCase):
     def setUp(self):
         fixture = fixtures.UserFixture()
@@ -516,6 +539,20 @@ class UserUpdateTest(test.APITransactionTestCase):
         response = self.client.put(self.url, self.valid_payload)
         self.assertEquals(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn('token_lifetime', response.data)
+
+    @override_waldur_core_settings(PROTECT_USER_DETAILS_FOR_REGISTRATION_METHODS=['PROTECTED'])
+    def test_user_can_not_update_profile_if_registration_method_is_protected(self):
+        # Arrange
+        self.user.registration_method = 'PROTECTED'
+        self.user.save()
+
+        # Act
+        self.valid_payload['organization'] = 'New org'
+        self.client.put(self.url, self.valid_payload)
+
+        # Assert
+        self.user.refresh_from_db()
+        self.assertNotEqual(self.user.organization, 'New org')
 
 
 @mock.patch('waldur_core.structure.handlers.event_logger')

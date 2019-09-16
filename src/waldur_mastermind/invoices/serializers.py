@@ -2,23 +2,20 @@ from __future__ import unicode_literals
 
 import datetime
 from django.conf import settings
-from django.utils.translation import ugettext_lazy as _
 from rest_framework import serializers
+from rest_framework.reverse import reverse
 
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core import utils as core_utils
-from waldur_core.structure import SupportedServices
 from waldur_mastermind.common.utils import quantize_price
-from waldur_openstack.openstack import models as openstack_models
-from waldur_mastermind.support import models as support_models
 
-from . import models
+from . import models, utils
 
 
 class InvoiceItemSerializer(serializers.HyperlinkedModelSerializer):
     tax = serializers.DecimalField(max_digits=15, decimal_places=7)
     total = serializers.DecimalField(max_digits=15, decimal_places=7)
-    factor = serializers.IntegerField(source='get_factor')
+    factor = serializers.ReadOnlyField(source='get_factor')
 
     scope_type = serializers.SerializerMethodField()
     scope_uuid = serializers.SerializerMethodField()
@@ -38,58 +35,23 @@ class InvoiceItemSerializer(serializers.HyperlinkedModelSerializer):
         return
 
 
-class OpenStackItemSerializer(InvoiceItemSerializer):
-    tenant_name = serializers.ReadOnlyField(source='get_tenant_name')
-    tenant_uuid = serializers.ReadOnlyField(source='get_tenant_uuid')
-    template_name = serializers.ReadOnlyField(source='get_template_name')
-    template_uuid = serializers.ReadOnlyField(source='get_template_uuid')
-    template_category = serializers.ReadOnlyField(source='get_template_category')
-
-    class Meta(InvoiceItemSerializer.Meta):
-        model = models.OpenStackItem
-        fields = InvoiceItemSerializer.Meta.fields + ('package', 'tenant_name', 'tenant_uuid', 'usage_days',
-                                                      'template_name', 'template_uuid', 'template_category')
-        extra_kwargs = {
-            'package': {'lookup_field': 'uuid', 'view_name': 'openstack-package-detail'},
-        }
-
-    def get_scope_type(self, item):
-        return SupportedServices.get_name_for_model(openstack_models.Tenant)
-
-    def get_scope_uuid(self, item):
-        return item.get_tenant_uuid()
-
-
-class OfferingItemSerializer(InvoiceItemSerializer):
-    offering_type = serializers.ReadOnlyField(source='get_offering_type')
-
-    class Meta(InvoiceItemSerializer.Meta):
-        model = models.OfferingItem
-        fields = InvoiceItemSerializer.Meta.fields + ('offering', 'offering_type', 'usage_days')
-        extra_kwargs = {
-            'offering': {'lookup_field': 'uuid', 'view_name': 'support-offering-detail'},
-        }
-
-    def get_scope_type(self, item):
-        return support_models.Offering.get_scope_type()
-
-    def get_scope_uuid(self, item):
-        return item.get_offering_uuid()
-
-
 class GenericItemSerializer(InvoiceItemSerializer):
+    details = serializers.JSONField()
 
     class Meta(InvoiceItemSerializer.Meta):
-        model = models.GenericInvoiceItem
-        fields = InvoiceItemSerializer.Meta.fields + ('quantity',)
+        model = models.InvoiceItem
+        fields = InvoiceItemSerializer.Meta.fields + ('quantity', 'details', 'usage_days',)
 
     def get_scope_type(self, item):
-        return SupportedServices.get_name_for_model(item.content_type.model_class())
+        try:
+            return item.content_type.model_class().get_scope_type()
+        except AttributeError:
+            return None
 
     def get_scope_uuid(self, item):
         if item.scope:
             return item.scope.uuid.hex
-        return item.details['scope_uuid']
+        return item.details.get('scope_uuid')
 
 
 class InvoiceSerializer(core_serializers.RestrictedSerializerMixin,
@@ -97,20 +59,18 @@ class InvoiceSerializer(core_serializers.RestrictedSerializerMixin,
     price = serializers.DecimalField(max_digits=15, decimal_places=7)
     tax = serializers.DecimalField(max_digits=15, decimal_places=7)
     total = serializers.DecimalField(max_digits=15, decimal_places=7)
-    openstack_items = OpenStackItemSerializer(many=True)
-    offering_items = OfferingItemSerializer(many=True)
-    generic_items = GenericItemSerializer(many=True)
+    items = serializers.SerializerMethodField()
     issuer_details = serializers.SerializerMethodField()
     customer_details = serializers.SerializerMethodField()
     due_date = serializers.DateField()
+    file = serializers.SerializerMethodField()
 
     class Meta(object):
         model = models.Invoice
         fields = (
             'url', 'uuid', 'number', 'customer', 'price', 'tax', 'total',
             'state', 'year', 'month', 'issuer_details', 'invoice_date', 'due_date',
-            'customer', 'customer_details',
-            'openstack_items', 'offering_items', 'generic_items',
+            'customer', 'customer_details', 'items', 'file',
         )
         extra_kwargs = {
             'url': {'lookup_field': 'uuid'},
@@ -133,16 +93,18 @@ class InvoiceSerializer(core_serializers.RestrictedSerializerMixin,
             'bank_account': invoice.customer.bank_account,
         }
 
+    def get_file(self, obj):
+        if not obj.has_file():
+            return None
 
-class InvoiceNotificationSerializer(serializers.Serializer):
-    link_template = serializers.URLField(help_text=_('The template must include {uuid} parameter '
-                                                     'e.g. http://example.com/invoice/{uuid}'))
+        return reverse('invoice-pdf',
+                       kwargs={'uuid': obj.uuid},
+                       request=self.context['request'])
 
-    def validate_link_template(self, link_template):
-        if '{uuid}' not in link_template:
-            raise serializers.ValidationError(_("Link template must include '{uuid}' parameter."))
-
-        return link_template
+    def get_items(self, invoice):
+        items = utils.filter_invoice_items(invoice.items.all())
+        serializer = GenericItemSerializer(items, many=True, context=self.context)
+        return serializer.data
 
 
 class InvoiceItemReportSerializer(serializers.ModelSerializer):
@@ -156,7 +118,7 @@ class InvoiceItemReportSerializer(serializers.ModelSerializer):
     customer_name = serializers.ReadOnlyField(source='invoice.customer.name')
 
     class Meta(object):
-        model = models.OpenStackItem
+        model = models.InvoiceItem
         fields = (
             'customer_uuid', 'customer_name',
             'project_uuid', 'project_name',
@@ -205,21 +167,9 @@ class InvoiceItemReportSerializer(serializers.ModelSerializer):
         return extra_kwargs
 
 
-class OpenStackItemReportSerializer(InvoiceItemReportSerializer):
-    class Meta(InvoiceItemReportSerializer.Meta):
-        model = models.OpenStackItem
-        fields = InvoiceItemReportSerializer.Meta.fields + ('usage_days',)
-
-
-class OfferingItemReportSerializer(InvoiceItemReportSerializer):
-    class Meta(InvoiceItemReportSerializer.Meta):
-        model = models.OfferingItem
-        fields = InvoiceItemReportSerializer.Meta.fields + ('usage_days',)
-
-
 class GenericItemReportSerializer(InvoiceItemReportSerializer):
     class Meta(InvoiceItemReportSerializer.Meta):
-        model = models.GenericInvoiceItem
+        model = models.InvoiceItem
         fields = InvoiceItemReportSerializer.Meta.fields + ('quantity',)
 
 
@@ -271,9 +221,7 @@ class SAFReportSerializer(serializers.Serializer):
         return self.format_date(date)
 
     def get_quantity(self, invoice_item):
-        if hasattr(invoice_item, 'quantity'):
-            return invoice_item.quantity
-        return invoice_item.usage_days
+        return invoice_item.get_factor(False)
 
     def get_total(self, invoice_item):
         return quantize_price(invoice_item.price)

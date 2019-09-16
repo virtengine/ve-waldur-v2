@@ -1,43 +1,78 @@
+import six
+
 from django.core.exceptions import ObjectDoesNotExist
-from rest_framework import serializers, status
+from rest_framework import serializers
 from rest_framework.reverse import reverse
 
-from waldur_mastermind.common.utils import internal_api_request
+from waldur_mastermind.marketplace import processors
+from waldur_mastermind.marketplace.utils import get_order_item_url
+from waldur_mastermind.marketplace_support.utils import format_description
 from waldur_mastermind.support import models as support_models
 from waldur_mastermind.support import views as support_views
 
+from .views import IssueViewSet
 
-def process_support(order_item, user):
-    try:
-        template = order_item.offering.scope
-    except ObjectDoesNotExist:
-        template = None
 
-    if not isinstance(template, support_models.OfferingTemplate):
-        raise serializers.ValidationError('Offering has invalid scope. Support template is expected.')
+class CreateRequestProcessor(processors.BaseCreateResourceProcessor):
+    viewset = support_views.OfferingViewSet
 
-    project = order_item.order.project
-    project_url = reverse('project-detail', kwargs={'uuid': project.uuid})
-    template_url = reverse('support-offering-template-detail', kwargs={'uuid': template.uuid})
+    def get_post_data(self):
+        order_item = self.order_item
+        try:
+            template = order_item.offering.scope
+        except ObjectDoesNotExist:
+            template = None
 
-    post_data = dict(
-        project=project_url,
-        template=template_url,
-        name=order_item.attributes.pop('name', ''),
-    )
-    description = order_item.attributes.pop('description', '')
-    if description:
-        post_data['description'] = description
-    if order_item.attributes:
-        post_data['attributes'] = order_item.attributes
-    post_data.update(order_item.attributes)
+        if not isinstance(template, support_models.OfferingTemplate):
+            raise serializers.ValidationError('Offering has invalid scope. Support template is expected.')
 
-    view = support_views.OfferingViewSet.as_view({'post': 'create'})
-    response = internal_api_request(view, user, post_data)
-    if response.status_code != status.HTTP_201_CREATED:
-        raise serializers.ValidationError(response.data)
+        project = order_item.order.project
+        project_url = reverse('project-detail', kwargs={'uuid': project.uuid})
+        template_url = reverse('support-offering-template-detail', kwargs={'uuid': template.uuid})
+        attributes = order_item.attributes.copy()
 
-    offering_uuid = response.data['uuid']
-    offering = support_models.Offering.objects.get(uuid=offering_uuid)
-    order_item.scope = offering
-    order_item.save()
+        post_data = dict(
+            project=project_url,
+            template=template_url,
+            name=attributes.pop('name', ''),
+        )
+
+        description = attributes.pop('description', '')
+        description += format_description('CREATE_RESOURCE_TEMPLATE', {
+            'order_item': order_item,
+            'order_item_url': get_order_item_url(order_item),
+        })
+
+        if order_item.limits:
+            components_map = order_item.offering.get_usage_components()
+            for key, value in order_item.limits.items():
+                component = components_map[key]
+                description += "\n%s (%s): %s %s" % \
+                               (component.name, component.type, value, component.measured_unit)
+
+        if order_item.plan and order_item.plan.scope:
+            post_data['plan'] = reverse('support-offering-plan-detail', kwargs={
+                'uuid': order_item.plan.scope.uuid
+            })
+
+        if description:
+            post_data['description'] = description
+        if attributes:
+            post_data['attributes'] = attributes
+        return post_data
+
+
+class DeleteRequestProcessor(processors.DeleteResourceProcessor):
+    def get_viewset(self):
+        return IssueViewSet
+
+    def get_resource(self):
+        return self.order_item
+
+
+class UpdateRequestProcessor(processors.UpdateResourceProcessor):
+    def get_view(self):
+        return IssueViewSet.as_view({'post': 'update'})
+
+    def get_post_data(self):
+        return {'uuid': six.text_type(self.order_item.uuid)}

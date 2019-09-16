@@ -68,7 +68,7 @@ class SshPublicKeyFactory(factory.DjangoModelFactory):
                                   )
 
     @classmethod
-    def get_url(cls, key):
+    def get_url(cls, key=None):
         if key is None:
             key = SshPublicKeyFactory()
         return 'http://testserver' + reverse('sshpublickey-detail', kwargs={'uuid': str(key.uuid)})
@@ -283,3 +283,29 @@ class TestSnapshotFactory(factory.DjangoModelFactory):
 
     class Meta(object):
         model = test_models.TestSnapshot
+
+
+class DivisionTypeFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = models.DivisionType
+
+    name = factory.Sequence(lambda n: 'DivisionType_%s' % n)
+
+
+class DivisionFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = models.Division
+
+    name = factory.Sequence(lambda n: 'Division_%s' % n)
+    type = factory.SubFactory(DivisionTypeFactory)
+
+    @classmethod
+    def get_url(cls, division=None, action=None):
+        if division is None:
+            division = DivisionFactory()
+        url = 'http://testserver' + reverse('division-detail', kwargs={'uuid': division.uuid})
+        return url if action is None else url + action + '/'
+
+    @classmethod
+    def get_list_url(cls):
+        return 'http://testserver' + reverse('division-list')

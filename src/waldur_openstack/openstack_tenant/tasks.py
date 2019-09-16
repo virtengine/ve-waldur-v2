@@ -79,6 +79,16 @@ class SetBackupErredTask(core_tasks.ErrorStateTransitionTask):
             schedule.save()
 
 
+class DeleteIncompleteInstanceTask(core_tasks.Task):
+
+    def execute(self, instance):
+        with transaction.atomic():
+            scopes = [instance] + list(instance.volumes.all()) + list(instance.floating_ips)
+            for scope in scopes:
+                if not scope.backend_id:
+                    scope.decrease_backend_quotas_usage()
+
+
 class ForceDeleteBackupTask(core_tasks.DeletionTask):
 
     def execute(self, backup):
@@ -140,8 +150,7 @@ class BaseScheduleTask(core_tasks.BackgroundTask):
        is increased or quota usage is decreased.
        Instead it is expected that user would manually reactivate schedule in this case.
 
-    7. Schedule is skipped and new resources are not created as long as schedule is disabled or
-       number of resources has reached value of maximal_number_of_resources attribute.
+    7. Schedule is skipped and new resources are not created as long as schedule is disabled.
     """
 
     model = NotImplemented
@@ -154,11 +163,9 @@ class BaseScheduleTask(core_tasks.BackgroundTask):
     def run(self):
         schedules = self.model.objects.filter(is_active=True, next_trigger_at__lt=timezone.now())
         for schedule in schedules:
-            existing_resources = self._get_number_of_resources(schedule)
-            if existing_resources > schedule.maximal_number_of_resources:
+            existing_resources = self._get_resources(schedule)
+            if existing_resources.count() >= schedule.maximal_number_of_resources:
                 self._schedule_exceeding_resources_deletion(schedule, existing_resources)
-                continue
-            elif existing_resources == schedule.maximal_number_of_resources:
                 logger.debug('Skipping schedule %s because number of resources %s has reached limit %s.',
                              schedule, existing_resources, schedule.maximal_number_of_resources)
                 continue
@@ -174,7 +181,7 @@ class BaseScheduleTask(core_tasks.BackgroundTask):
                 resource = self._create_resource(schedule, kept_until=kept_until)
             except quotas_exceptions.QuotaValidationError as e:
                 message = 'Failed to schedule "%s" creation. Error: %s' % (self.model.__name__, e)
-                logger.exception(
+                logger.debug(
                     'Resource schedule (PK: %s), (Name: %s) execution failed. %s' % (schedule.pk,
                                                                                      schedule.name,
                                                                                      message))
@@ -187,12 +194,26 @@ class BaseScheduleTask(core_tasks.BackgroundTask):
                 schedule.update_next_trigger_at()
                 schedule.save()
 
-    def _schedule_exceeding_resources_deletion(self, schedule, resources_count):
-        amount_to_remove = resources_count - schedule.maximal_number_of_resources
-        self._log_backup_cleanup(schedule, amount_to_remove, resources_count)
-        ok_or_erred = Q(state=core_models.StateMixin.States.OK) | Q(state=core_models.StateMixin.States.ERRED)
-        queryset = getattr(schedule, self.resource_attribute)
-        resources = queryset.filter(ok_or_erred).order_by('kept_until', 'created')
+    def _schedule_exceeding_resources_deletion(self, schedule, existing_resources):
+        deleting_states = (
+            Q(state=core_models.StateMixin.States.DELETION_SCHEDULED) |
+            Q(state=core_models.StateMixin.States.DELETING)
+        )
+
+        terminal_states = (
+            Q(state=core_models.StateMixin.States.OK) |
+            Q(state=core_models.StateMixin.States.ERRED)
+        )
+
+        if existing_resources.filter(deleting_states).exists():
+            logger.debug('Deletion of exceeding resources for schedule %s is pending.', schedule)
+            return
+
+        total = existing_resources.count()
+        amount_to_remove = max(1, total - schedule.maximal_number_of_resources)
+        self._log_backup_cleanup(schedule, amount_to_remove, total)
+
+        resources = existing_resources.filter(terminal_states).order_by('kept_until', 'created')
         resources_to_remove = resources[:amount_to_remove]
         executor = self._get_delete_executor()
         for resource in resources_to_remove:
@@ -210,9 +231,8 @@ class BaseScheduleTask(core_tasks.BackgroundTask):
     def _get_delete_executor(self):
         raise NotImplementedError()
 
-    def _get_number_of_resources(self, schedule):
-        resources = getattr(schedule, self.resource_attribute)
-        return resources.count()
+    def _get_resources(self, schedule):
+        return getattr(schedule, self.resource_attribute)
 
 
 class ScheduleBackups(BaseScheduleTask):
@@ -220,6 +240,7 @@ class ScheduleBackups(BaseScheduleTask):
     model = models.BackupSchedule
     resource_attribute = 'backups'
 
+    @transaction.atomic()
     def _create_resource(self, schedule, kept_until):
         backup = models.Backup.objects.create(
             name='Backup#%s of %s' % (schedule.call_count, schedule.instance.name),
@@ -283,6 +304,7 @@ class ScheduleSnapshots(BaseScheduleTask):
     model = models.SnapshotSchedule
     resource_attribute = 'snapshots'
 
+    @transaction.atomic()
     def _create_resource(self, schedule, kept_until):
         snapshot = models.Snapshot.objects.create(
             name='Snapshot#%s of %s' % (schedule.call_count, schedule.source_volume.name),
@@ -291,7 +313,6 @@ class ScheduleSnapshots(BaseScheduleTask):
             source_volume=schedule.source_volume,
             snapshot_schedule=schedule,
             size=schedule.source_volume.size,
-            metadata=serializers.SnapshotSerializer.get_snapshot_metadata(schedule.source_volume),
             kept_until=kept_until,
         )
         snapshot.increase_backend_quotas_usage()

@@ -13,14 +13,15 @@ from django.core.cache import cache
 from django.core.validators import MaxLengthValidator
 from django.core.validators import MinValueValidator, MaxValueValidator
 from django.db import models, transaction
-from django.db.models import Q
+from django.db.models import Q, signals
 from django.utils import timezone
 from django.utils.encoding import python_2_unicode_compatible
 from django.utils.lru_cache import lru_cache
 from django.utils.translation import ugettext_lazy as _
 from model_utils import FieldTracker
 from model_utils.fields import AutoCreatedField
-from model_utils.models import TimeStampedModel
+from model_utils.models import TimeStampedModel, SoftDeletableModel
+from model_utils.managers import SoftDeletableManagerMixin
 import pyvat
 from taggit.managers import TaggableManager
 
@@ -29,12 +30,13 @@ from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
 from waldur_core.core.fields import JSONField
 from waldur_core.core.models import CoordinatesMixin, AbstractFieldTracker
-from waldur_core.core.validators import validate_name, validate_cidr_list, FileTypeValidator
+from waldur_core.core.validators import validate_name, validate_cidr_list
+from waldur_core.media.validators import CertificateValidator
 from waldur_core.logging.loggers import LoggableMixin
 from waldur_core.monitoring.models import MonitoringModelMixin
 from waldur_core.quotas import models as quotas_models, fields as quotas_fields
 from waldur_core.structure import SupportedServices
-from waldur_core.structure.images import ImageModelMixin
+from waldur_core.media.models import ImageModelMixin
 from waldur_core.structure.managers import StructureManager, filter_queryset_for_user, \
     ServiceSettingsManager, PrivateServiceSettingsManager, SharedServiceSettingsManager
 from waldur_core.structure.signals import structure_role_granted, structure_role_revoked
@@ -76,13 +78,8 @@ class StructureModel(models.Model):
 class StructureLoggableMixin(LoggableMixin):
 
     @classmethod
-    def get_permitted_objects_uuids(cls, user):
-        """
-        Return query dictionary to search objects available to user.
-        """
-        uuids = filter_queryset_for_user(cls.objects.all(), user).values_list('uuid', flat=True)
-        key = core_utils.camel_case_to_underscore(cls.__name__) + '_uuid'
-        return {key: uuids}
+    def get_permitted_objects(cls, user):
+        return filter_queryset_for_user(cls.objects.all(), user)
 
 
 class TagMixin(models.Model):
@@ -300,9 +297,49 @@ class CustomerPermission(BasePermission):
 
 
 def get_next_agreement_number():
-    inital_number = settings.WALDUR_CORE['INITIAL_CUSTOMER_AGREEMENT_NUMBER']
+    initial_number = settings.WALDUR_CORE['INITIAL_CUSTOMER_AGREEMENT_NUMBER']
     last_number = Customer.objects.aggregate(models.Max('agreement_number')).get('agreement_number__max')
-    return (last_number or inital_number) + 1
+    return (last_number or initial_number) + 1
+
+
+@python_2_unicode_compatible
+class DivisionType(core_models.UuidMixin,
+                   core_models.NameMixin,
+                   models.Model):
+
+    class Meta(object):
+        verbose_name = _('division type')
+        ordering = ('name',)
+
+    def __str__(self):
+        return self.name
+
+
+@python_2_unicode_compatible
+class Division(core_models.UuidMixin,
+               core_models.NameMixin,
+               models.Model):
+
+    type = models.ForeignKey('DivisionType')
+    parent = models.ForeignKey('Division', null=True, blank=True)
+
+    class Meta(object):
+        verbose_name = _('division')
+        ordering = ('name',)
+
+    @classmethod
+    def get_url_name(cls):
+        return 'division'
+
+    def __str__(self):
+        full_path = [self.name]
+        d = self.parent
+
+        while d is not None:
+            full_path.append(d.name)
+            d = d.parent
+
+        return ' -> '.join(full_path[::-1])
 
 
 @python_2_unicode_compatible
@@ -312,7 +349,7 @@ class Customer(core_models.UuidMixin,
                quotas_models.ExtendableQuotaModelMixin,
                PermissionMixin,
                VATMixin,
-               LoggableMixin,
+               StructureLoggableMixin,
                ImageModelMixin,
                TimeStampedModel,
                StructureModel):
@@ -329,7 +366,12 @@ class Customer(core_models.UuidMixin,
     access_subnets = models.TextField(validators=[validate_cidr_list], blank=True, default='',
                                       help_text=_('Enter a comma separated list of IPv4 or IPv6 '
                                                   'CIDR addresses from where connection to self-service is allowed.'))
+    backend_id = models.CharField(max_length=255, blank=True, help_text=_(
+        'Organization identifier in another application.'
+    ))
     registration_code = models.CharField(max_length=160, default='', blank=True)
+    homepage = models.URLField(max_length=255, blank=True)
+    domain = models.CharField(max_length=255, blank=True)
 
     type = models.CharField(blank=True, max_length=150)
     address = models.CharField(blank=True, max_length=300)
@@ -339,10 +381,13 @@ class Customer(core_models.UuidMixin,
     accounting_start_date = models.DateTimeField(_('Start date of accounting'), default=timezone.now)
     default_tax_percent = models.DecimalField(default=0, max_digits=4, decimal_places=2,
                                               validators=[MinValueValidator(0), MaxValueValidator(100)])
+    blocked = models.BooleanField(default=False)
+    division = models.ForeignKey('Division', null=True, blank=True, on_delete=models.SET_NULL)
     tracker = FieldTracker()
 
     class Meta(object):
         verbose_name = _('organization')
+        ordering = ('name',)
 
     GLOBAL_COUNT_QUOTA_NAME = 'nc_global_customer_count'
 
@@ -442,22 +487,39 @@ class Customer(core_models.UuidMixin,
         return timezone.now() >= self.accounting_start_date
 
     @classmethod
-    def get_permitted_objects_uuids(cls, user):
-        if user.is_staff:
-            customer_queryset = cls.objects.all()
+    def get_permitted_objects(cls, user):
+        if user.is_staff or user.is_support:
+            return cls.objects.all()
         else:
-            customer_queryset = cls.objects.filter(
+            return cls.objects.filter(
                 permissions__user=user,
                 permissions__role=CustomerRole.OWNER,
                 permissions__is_active=True
             )
-        return {'customer_uuid': filter_queryset_for_user(customer_queryset, user).values_list('uuid', flat=True)}
+
+    def get_display_name(self):
+        if self.abbreviation:
+            return self.abbreviation
+        if self.domain:
+            return '{name} ({domain})'.format(name=self.name, domain=self.domain)
+        return self.name
+
+    def delete(self, *args, **kwargs):
+        """Delete customers' projects if they all mark as 'removed'."""
+        if not self.projects.count():
+            for project in Project.structure_objects.filter(customer=self):
+                project.delete(soft=False)
+
+        return super(Customer, self).delete(*args, **kwargs)
 
     def __str__(self):
-        return '%(name)s (%(abbreviation)s)' % {
-            'name': self.name,
-            'abbreviation': self.abbreviation
-        }
+        if self.abbreviation:
+            return '%(name)s (%(abbreviation)s)' % {
+                'name': self.name,
+                'abbreviation': self.abbreviation
+            }
+        else:
+            return self.name
 
 
 class ProjectRole(models.CharField):
@@ -516,6 +578,10 @@ class ProjectType(core_models.DescribableMixin, core_models.UuidMixin, core_mode
         return self.name
 
 
+class SoftDeletableManager(SoftDeletableManagerMixin, StructureManager):
+    pass
+
+
 @python_2_unicode_compatible
 class Project(core_models.DescribableMixin,
               core_models.UuidMixin,
@@ -525,7 +591,8 @@ class Project(core_models.DescribableMixin,
               PermissionMixin,
               StructureLoggableMixin,
               TimeStampedModel,
-              StructureModel):
+              StructureModel,
+              SoftDeletableModel):
     class Permissions(object):
         customer_path = 'customer'
         project_path = 'self'
@@ -584,6 +651,9 @@ class Project(core_models.DescribableMixin,
     type = models.ForeignKey(
         ProjectType, verbose_name=_('project type'), blank=True, null=True, on_delete=models.PROTECT)
 
+    objects = SoftDeletableManager()
+    structure_objects = StructureManager()
+
     @property
     def full_name(self):
         return self.name
@@ -597,6 +667,29 @@ class Project(core_models.DescribableMixin,
             query = query & Q(projectpermission__role=role)
 
         return get_user_model().objects.filter(query).order_by('username')
+
+    @transaction.atomic()
+    def _soft_delete(self, using=None):
+        """ Method for project soft delete. It doesn't delete a project, only mark as 'removed',
+        but it sends needed signals and delete ServiceProjectLink objects
+        """
+        signals.pre_delete.send(sender=self.__class__, instance=self, using=using)
+
+        for model in ServiceProjectLink.get_all_models():
+            for spl in model.objects.filter(project=self):
+                spl.delete()
+
+        self.is_removed = True
+        self.save(using=using)
+
+        signals.post_delete.send(sender=self.__class__, instance=self, using=using)
+
+    def delete(self, using=None, soft=True, *args, **kwargs):
+        """Use soft delete, i.e. mark a project as 'removed'."""
+        if soft:
+            self._soft_delete(using)
+        else:
+            return super(SoftDeletableModel, self).delete(using=using, *args, **kwargs)
 
     def __str__(self):
         return '%(name)s | %(customer)s' % {
@@ -635,6 +728,9 @@ class Project(core_models.DescribableMixin,
         return itertools.chain.from_iterable(
             m.objects.filter(project=self) for m in ServiceProjectLink.get_all_models())
 
+    class Meta:
+        base_manager_name = 'objects'
+
 
 @python_2_unicode_compatible
 class ServiceCertification(core_models.UuidMixin, core_models.DescribableMixin):
@@ -661,11 +757,12 @@ class ServiceSettings(quotas_models.ExtendableQuotaModelMixin,
                       core_models.NameMixin,
                       core_models.StateMixin,
                       TagMixin,
-                      LoggableMixin):
+                      StructureLoggableMixin):
 
     class Meta:
         verbose_name = "Service settings"
         verbose_name_plural = "Service settings"
+        ordering = ('name',)
 
     class Permissions(object):
         customer_path = 'customer'
@@ -682,12 +779,7 @@ class ServiceSettings(quotas_models.ExtendableQuotaModelMixin,
     domain = models.CharField(max_length=200, blank=True, null=True)
     token = models.CharField(max_length=255, blank=True, null=True)
     certificate = models.FileField(upload_to='certs', blank=True, null=True,
-                                   validators=[FileTypeValidator(
-                                       allowed_types=[
-                                           'application/x-pem-file',
-                                           'application/x-x509-ca-cert',
-                                           'text/plain'],
-                                       allowed_extensions=['pem'])])
+                                   validators=[CertificateValidator])
     type = models.CharField(max_length=255, db_index=True, validators=[validate_service_type])
     options = JSONField(default=dict, help_text=_('Extra options'), blank=True)
     geolocations = JSONField(default=list, blank=True,
@@ -766,7 +858,7 @@ class PrivateServiceSettings(ServiceSettings):
 class Service(core_models.UuidMixin,
               core_models.DescendantMixin,
               quotas_models.QuotaModelMixin,
-              LoggableMixin,
+              StructureLoggableMixin,
               StructureModel):
     """ Base service class. """
 
@@ -997,7 +1089,7 @@ class ResourceMixin(MonitoringModelMixin,
                     core_models.NameMixin,
                     core_models.DescendantMixin,
                     core_models.BackendModelMixin,
-                    LoggableMixin,
+                    StructureLoggableMixin,
                     TagMixin,
                     TimeStampedModel,
                     StructureModel):
@@ -1056,25 +1148,9 @@ class ResourceMixin(MonitoringModelMixin,
         context = super(ResourceMixin, self)._get_log_context(entity_name)
         # XXX: Add resource_full_name here, because event context does not support properties as fields
         context['resource_full_name'] = self.full_name
-        # required for lookups in ElasticSearch by the client
         context['resource_type'] = SupportedServices.get_name_for_model(self)
 
-        # XXX: a hack for IaaS / PaaS / SaaS tags
-        # XXX: should be moved to itacloud assembly
-        if self.tags.filter(name='IaaS').exists():
-            context['resource_delivery_model'] = 'IaaS'
-        elif self.tags.filter(name='PaaS').exists():
-            context['resource_delivery_model'] = 'PaaS'
-        elif self.tags.filter(name='SaaS').exists():
-            context['resource_delivery_model'] = 'SaaS'
-
         return context
-
-    def filter_by_logged_object(self):
-        return {
-            'resource_uuid': self.uuid.hex,
-            'resource_type': SupportedServices.get_name_for_model(self)
-        }
 
     def get_parents(self):
         return [self.service_project_link]

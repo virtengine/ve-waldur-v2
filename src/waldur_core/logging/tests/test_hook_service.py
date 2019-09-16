@@ -1,20 +1,16 @@
-import logging
-import time
-
 from django.conf import settings
 from django.core import mail
 from six.moves import mock
+from rest_framework import test
 
 from waldur_core.logging import models as logging_models
-from waldur_core.logging.log import HookHandler
 from waldur_core.logging.tasks import process_event
+from waldur_core.logging.tests.factories import EventFactory
 from waldur_core.structure import models as structure_models
-from waldur_core.structure.log import event_logger
 from waldur_core.structure.tests import factories as structure_factories
-from waldur_core.core.tests.utils import PostgreSQLTest
 
 
-class TestHookService(PostgreSQLTest):
+class TestHookService(test.APITransactionTestCase):
     def setUp(self):
         self.owner = structure_factories.UserFactory()
         self.customer = structure_factories.CustomerFactory()
@@ -24,45 +20,19 @@ class TestHookService(PostgreSQLTest):
         self.event_type = 'customer_update_succeeded'
         self.other_event = 'customer_deletion_succeeded'
         self.message = 'Customer {customer_name} has been updated.'
-        self.event = {
-            'message': self.message,
-            'type': self.event_type,
-            'context': event_logger.customer.compile_context(customer=self.customer),
-            'timestamp': time.time()
-        }
+        self.event = EventFactory(event_type=self.event_type)
+        self.payload = dict(
+            created=self.event.created,
+            message=self.event.message,
+            context=self.event.context,
+            event_type=self.event.event_type,
+        )
+        logging_models.Feed.objects.create(scope=self.customer, event=self.event)
 
         # Create email hook for another user
         self.other_hook = logging_models.EmailHook.objects.create(user=self.other_user,
                                                                   email=self.owner.email,
                                                                   event_types=[self.event_type])
-
-    @mock.patch('celery.app.base.Celery.send_task')
-    def test_logger_handler_sends_task_if_handler_attached(self, mocked_task):
-        # Prepare logger
-        logger = logging.getLogger('waldur_core')
-        logger.setLevel(logging.DEBUG)
-
-        # Inject handler
-        handler = HookHandler()
-        logger.addHandler(handler)
-
-        event_logger.customer.warning(self.message,
-                                      event_type=self.event_type,
-                                      event_context={'customer': self.customer})
-
-        mocked_task.assert_called_once_with('waldur_core.logging.process_event', mock.ANY, {}, countdown=2)
-        mocked_task.reset_mock()
-
-        # Remove hook handler so that other tests won't depend on it
-        logger.removeHandler(handler)
-
-        # Trigger an event
-        event_logger.customer.warning(self.message,
-                                      event_type=self.event_type,
-                                      event_context={'customer': self.customer})
-
-        # If hook handler is not attached hook is not processed
-        self.assertFalse(mocked_task.called)
 
     def test_email_hook_filters_events_by_user_and_event_type(self):
         # Create email hook for customer owner
@@ -71,7 +41,7 @@ class TestHookService(PostgreSQLTest):
                                                              event_types=[self.event_type])
 
         # Trigger processing
-        process_event(self.event)
+        process_event(self.event.id)
 
         # Test that one message has been sent for email hook of customer owner
         self.assertEqual(len(mail.outbox), 1)
@@ -88,11 +58,11 @@ class TestHookService(PostgreSQLTest):
                                                               event_types=[self.event_type])
 
         # Trigger processing
-        process_event(self.event)
+        process_event(self.event.id)
 
         # Event is captured and POST request is triggered because event_type and user_uuid match
         requests_post.assert_called_once_with(
-            self.web_hook.destination_url, json=mock.ANY, verify=settings.VERIFY_WEBHOOK_REQUESTS)
+            self.web_hook.destination_url, json=self.payload, verify=settings.VERIFY_WEBHOOK_REQUESTS)
 
     def test_email_hook_processor_can_be_called_twice(self):
         # Create email hook for customer owner

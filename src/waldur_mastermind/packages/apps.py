@@ -9,7 +9,9 @@ class PackageConfig(AppConfig):
     def ready(self):
         OpenStackPackage = self.get_model('OpenStackPackage')
 
-        from . import handlers
+        from waldur_mastermind.invoices import registrators
+        from waldur_openstack.openstack import models
+        from . import handlers, registrators as openstack_registrator
         from . import cost_planning  # noqa: F401
 
         signals.post_save.connect(
@@ -22,4 +24,27 @@ class PackageConfig(AppConfig):
             handlers.log_openstack_package_deletion,
             sender=OpenStackPackage,
             dispatch_uid='waldur_mastermind.packages.log_openstack_package_deletion',
+        )
+
+        registrators.RegistrationManager.add_registrator(
+            OpenStackPackage,
+            openstack_registrator.OpenStackItemRegistrator
+        )
+
+        signals.post_save.connect(
+            handlers.add_new_openstack_package_details_to_invoice,
+            sender=OpenStackPackage,
+            dispatch_uid='waldur_mastermind.invoices.add_new_openstack_package_details_to_invoice',
+        )
+
+        signals.pre_delete.connect(
+            handlers.update_invoice_on_openstack_package_deletion,
+            sender=OpenStackPackage,
+            dispatch_uid='waldur_mastermind.invoices.update_invoice_on_openstack_package_deletion',
+        )
+
+        signals.post_save.connect(
+            handlers.add_new_openstack_tenant_to_invoice,
+            sender=models.Tenant,
+            dispatch_uid='waldur_mastermind.invoices.add_new_openstack_tenant_to_invoice',
         )

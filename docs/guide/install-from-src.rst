@@ -31,7 +31,7 @@ Additional requirements:
 
   .. code-block:: bash
 
-    venv/bin/pip install --requirement docker/api/requirements.txt
+    venv/bin/pip install --requirement docker-test/api/requirements.txt
     venv/bin/pip install --editable .
 
 4. Create and edit settings file (see 'Configuration' section for details):
@@ -41,7 +41,7 @@ Additional requirements:
     cp src/waldur_core/server/settings.py.example src/waldur_core/server/settings.py
     vi src/waldur_core/server/settings.py
 
-5. Initialise PostgeSQL database:
+5. Initialise PostgreSQL database:
 
   .. code-block:: bash
 

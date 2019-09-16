@@ -1,26 +1,30 @@
 from datetime import timedelta
 
 from ddt import ddt, data
+from django.core import mail
 from django.test import TestCase
+from django.test import override_settings
 from django.utils import timezone
 from freezegun import freeze_time
+import mock
 
 from waldur_core.core.tests.helpers import override_waldur_core_settings
 from waldur_core.structure.tests import factories as structure_factories
+from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.packages.tests import fixtures as package_fixtures
 
-from .. import factories
-from ... import models, tasks
+from .. import factories, utils as test_utils
+from ... import models, tasks, utils
 
 
 class CreateMonthlyInvoicesForPackagesTest(TestCase):
 
     def test_invoice_is_created_monthly(self):
-        with freeze_time('2016-11-01 00:00:00'):
+        with freeze_time('2016-11-01'):
             fixture = package_fixtures.PackageFixture()
             package = fixture.openstack_package
 
-        with freeze_time('2016-12-01 00:00:00'):
+        with freeze_time('2016-12-01'):
             invoice = models.Invoice.objects.get(customer=fixture.customer)
 
             # Create monthly invoices
@@ -32,19 +36,19 @@ class CreateMonthlyInvoicesForPackagesTest(TestCase):
 
             # Check that new invoice where created with the same openstack items
             new_invoice = models.Invoice.objects.get(customer=fixture.customer, state=models.Invoice.States.PENDING)
-            self.assertEqual(package, new_invoice.openstack_items.first().package)
+            self.assertEqual(package, new_invoice.generic_items.first().scope)
 
     def test_old_invoices_are_marked_as_created(self):
 
         # previous year
-        with freeze_time('2016-11-01 00:00:00'):
+        with freeze_time('2016-11-01'):
             invoice1 = factories.InvoiceFactory()
 
         # previous month
-        with freeze_time('2017-01-15 00:00:00'):
+        with freeze_time('2017-01-15'):
             invoice2 = factories.InvoiceFactory()
 
-        with freeze_time('2017-02-4 00:00:00'):
+        with freeze_time('2017-02-4'):
             tasks.create_monthly_invoices()
             invoice1.refresh_from_db()
             self.assertEqual(invoice1.state, models.Invoice.States.CREATED,
@@ -75,3 +79,30 @@ class CheckAccountingStartDateTest(TestCase):
             customer.save()
             tasks.create_monthly_invoices()
             self.assertEqual(invoice_exists, models.Invoice.objects.filter(customer=customer).exists())
+
+
+@override_settings(task_always_eager=True)
+@test_utils.override_invoices_settings(INVOICE_LINK_TEMPLATE='http://example.com/invoice/{uuid}')
+class NotificationTest(TestCase):
+    def setUp(self):
+        self.fixture = structure_fixtures.CustomerFixture()
+        self.fixture.owner
+        self.invoice = factories.InvoiceFactory(customer=self.fixture.customer)
+        self.patcher = mock.patch('waldur_mastermind.invoices.utils.pdfkit')
+        mock_pdfkit = self.patcher.start()
+        mock_pdfkit.from_string.return_value = 'pdf content'
+
+    def tearDown(self):
+        super(NotificationTest, self).tearDown()
+        mock.patch.stopall()
+
+    def test_send_invoice_without_pdf(self):
+        tasks.send_invoice_notification(self.invoice.uuid)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(len(mail.outbox[0].attachments), 0)
+
+    def test_send_invoice_with_pdf(self):
+        utils.create_invoice_pdf(self.invoice)
+        tasks.send_invoice_notification(self.invoice.uuid)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(len(mail.outbox[0].attachments), 1)

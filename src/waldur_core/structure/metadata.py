@@ -47,6 +47,8 @@ class ActionSerializer(object):
         try:
             self.view.initial(self.request)
         except exceptions.APIException as e:
+            if isinstance(e, serializers.ValidationError):
+                return ', '.join(force_text(i) for i in e.detail)
             return force_text(e)
 
     def get_method(self):
@@ -105,8 +107,7 @@ class ActionsMetadata(SimpleMetadata):
         for action_name, action in actions.items():
             if action_name == 'update':
                 view.request = clone_request(request, 'PUT')
-            else:
-                view.action = action_name
+            view.action = action_name
 
             data = ActionSerializer(action, action_name, request, view, resource)
             metadata[action_name] = data.serialize()
@@ -194,7 +195,7 @@ class ActionsMetadata(SimpleMetadata):
 
         attrs = [
             'label', 'help_text', 'default_value', 'placeholder', 'required',
-            'min_length', 'max_length', 'min_value', 'max_value', 'many'
+            'min_length', 'max_length', 'min_value', 'max_value', 'many', 'factor', 'units'
         ]
 
         if getattr(field, 'read_only', False):

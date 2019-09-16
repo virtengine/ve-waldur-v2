@@ -38,6 +38,9 @@ class ServiceSerializer(core_serializers.ExtraFieldOptionsMixin,
     SERVICE_ACCOUNT_EXTRA_FIELDS = {
         'tenant_name': '',
         'availability_zone': _('Default availability zone for provisioned instances'),
+        'volume_availability_zone_name': _('Default availability zone name for provisioned volumes'),
+        'valid_availability_zones': _('Optional dictionary where key is Nova availability '
+                                      'zone name and value is Cinder availability zone name.'),
         'external_network_id': _('ID of OpenStack external network that will be connected to tenants'),
         'latitude': _('Latitude of the datacenter (e.g. 40.712784)'),
         'longitude': _('Longitude of the datacenter (e.g. -74.005941)'),
@@ -49,7 +52,7 @@ class ServiceSerializer(core_serializers.ExtraFieldOptionsMixin,
 
     class Meta(structure_serializers.BaseServiceSerializer.Meta):
         model = models.OpenStackService
-        required_fields = 'backend_url', 'username', 'password'
+        required_fields = 'backend_url', 'username', 'password', 'console_type'
         extra_field_options = {
             'backend_url': {
                 'label': 'API URL',
@@ -68,11 +71,17 @@ class ServiceSerializer(core_serializers.ExtraFieldOptionsMixin,
             'availability_zone': {
                 'placeholder': 'default',
             },
+            'volume_availability_zone_name': {
+                'label': 'Name of default volume availability zone to use',
+            },
             'access_url': {
                 'label': 'Access URL',
             },
             'create_ha_routers': {
                 'default_value': False,
+            },
+            'console_type': {
+                'default_value': 'novnc',
             },
         }
 
@@ -139,7 +148,7 @@ class TenantQuotaSerializer(serializers.Serializer):
     security_group_rule_count = serializers.IntegerField(min_value=1, required=False)
 
 
-class FloatingIPSerializer(structure_serializers.BaseResourceSerializer):
+class FloatingIPSerializer(structure_serializers.BaseResourceActionSerializer):
     service = serializers.HyperlinkedRelatedField(
         source='service_project_link.service',
         view_name='openstack-detail',
@@ -156,7 +165,8 @@ class FloatingIPSerializer(structure_serializers.BaseResourceSerializer):
             'tenant', 'tenant_name', 'tenant_uuid')
         related_paths = ('tenant',)
         read_only_fields = structure_serializers.BaseResourceSerializer.Meta.read_only_fields + (
-            'runtime_state', 'address', 'description', 'name', 'tenant', 'backend_network_id')
+            'runtime_state', 'address', 'description', 'name', 'tenant', 'backend_network_id',
+            'service_settings', 'project')
         extra_kwargs = dict(
             tenant={'lookup_field': 'uuid', 'view_name': 'openstack-tenant-detail'},
             **structure_serializers.BaseResourceSerializer.Meta.extra_kwargs
@@ -225,6 +235,19 @@ class SecurityGroupRuleSerializer(serializers.ModelSerializer):
                     'to_port': _('Value should be in range [1, 65535], found %d') % to_port
                 })
 
+        elif protocol == '':
+            # See also: https://github.com/openstack/neutron/blob/af130e79cbe5d12b7c9f9f4dcbcdc8d972bfcfd4/neutron/db/securitygroups_db.py#L500
+
+            if from_port != -1:
+                raise serializers.ValidationError({
+                    'from_port': _('Port range is not supported if protocol is not specified.')
+                })
+
+            if to_port != -1:
+                raise serializers.ValidationError({
+                    'to_port': _('Port range is not supported if protocol is not specified.')
+                })
+
         else:
             raise serializers.ValidationError({
                 'protocol': _('Value should be one of (tcp, udp, icmp), found %s') % protocol
@@ -262,6 +285,12 @@ class SecurityGroupRuleUpdateSerializer(SecurityGroupRuleSerializer):
         return rule
 
 
+def validate_duplicate_security_group_rules(rules):
+    values = rules.values_list('protocol', 'from_port', 'to_port', 'cidr')
+    if len(set(values)) != len(values):
+        raise serializers.ValidationError(_('Duplicate security group rules are not allowed.'))
+
+
 class SecurityGroupRuleListUpdateSerializer(serializers.ListSerializer):
     child = SecurityGroupRuleUpdateSerializer()
 
@@ -273,11 +302,12 @@ class SecurityGroupRuleListUpdateSerializer(serializers.ListSerializer):
         security_group.rules.exclude(id__in=[r.id for r in rules if r.id]).delete()
         for rule in rules:
             rule.save()
+        validate_duplicate_security_group_rules(security_group.rules)
         security_group.change_backend_quotas_usage_on_rules_update(old_rules_count)
         return rules
 
 
-class SecurityGroupSerializer(structure_serializers.BaseResourceSerializer):
+class SecurityGroupSerializer(structure_serializers.BaseResourceActionSerializer):
     service = serializers.HyperlinkedRelatedField(
         source='service_project_link.service',
         view_name='openstack-detail',
@@ -294,6 +324,8 @@ class SecurityGroupSerializer(structure_serializers.BaseResourceSerializer):
             'tenant', 'tenant_name', 'tenant_uuid', 'rules',
         )
         related_paths = ('tenant',)
+        read_only_fields = structure_serializers.BaseResourceSerializer.Meta.read_only_fields + (
+            'service_settings', 'project')
         protected_fields = structure_serializers.BaseResourceSerializer.Meta.protected_fields + ('rules',)
         extra_kwargs = {
             'url': {'lookup_field': 'uuid', 'view_name': 'openstack-sgp-detail'},
@@ -330,6 +362,7 @@ class SecurityGroupSerializer(structure_serializers.BaseResourceSerializer):
             security_group = super(structure_serializers.BaseResourceSerializer, self).create(validated_data)
             for rule in rules:
                 security_group.rules.add(rule, bulk=False)
+            validate_duplicate_security_group_rules(security_group.rules)
             security_group.increase_backend_quotas_usage()
         return security_group
 
@@ -411,7 +444,7 @@ class TenantSerializer(structure_serializers.PrivateCloudSerializer):
         model = models.Tenant
         fields = structure_serializers.PrivateCloudSerializer.Meta.fields + (
             'availability_zone', 'internal_network_id', 'external_network_id',
-            'user_username', 'user_password', 'quotas', 'subnet_cidr',
+            'user_username', 'user_password', 'quotas', 'subnet_cidr', 'default_volume_type_name',
         )
         read_only_fields = structure_serializers.PrivateCloudSerializer.Meta.read_only_fields + (
             'internal_network_id', 'external_network_id',
@@ -591,7 +624,7 @@ class _NestedSubNetSerializer(serializers.ModelSerializer):
         fields = ('name', 'description', 'cidr', 'gateway_ip', 'allocation_pools', 'ip_version', 'enable_dhcp')
 
 
-class NetworkSerializer(structure_serializers.BaseResourceSerializer):
+class NetworkSerializer(structure_serializers.BaseResourceActionSerializer):
     service = serializers.HyperlinkedRelatedField(
         source='service_project_link.service',
         view_name='openstack-detail',
@@ -608,7 +641,7 @@ class NetworkSerializer(structure_serializers.BaseResourceSerializer):
         fields = structure_serializers.BaseResourceSerializer.Meta.fields + (
             'tenant', 'tenant_name', 'is_external', 'type', 'segmentation_id', 'subnets')
         read_only_fields = structure_serializers.BaseResourceSerializer.Meta.read_only_fields + (
-            'tenant', 'is_external', 'type', 'segmentation_id')
+            'tenant', 'is_external', 'type', 'segmentation_id', 'service_settings', 'project')
         extra_kwargs = dict(
             tenant={'lookup_field': 'uuid', 'view_name': 'openstack-tenant-detail'},
             **structure_serializers.BaseResourceSerializer.Meta.extra_kwargs
@@ -624,7 +657,7 @@ class NetworkSerializer(structure_serializers.BaseResourceSerializer):
         return super(NetworkSerializer, self).validate(attrs)
 
 
-class SubNetSerializer(structure_serializers.BaseResourceSerializer):
+class SubNetSerializer(structure_serializers.BaseResourceActionSerializer):
     service = serializers.HyperlinkedRelatedField(
         source='service_project_link.service',
         view_name='openstack-detail',
@@ -634,7 +667,7 @@ class SubNetSerializer(structure_serializers.BaseResourceSerializer):
         view_name='openstack-spl-detail',
         read_only=True)
     cidr = serializers.CharField(
-        validators=[subnet_cidr_validator], required=False, initial='192.168.42.0/24')
+        validators=[subnet_cidr_validator], required=False, initial='192.168.42.0/24', label='CIDR')
     allocation_pools = serializers.JSONField(read_only=True)
     network_name = serializers.CharField(source='network.name', read_only=True)
     tenant = serializers.HyperlinkedRelatedField(
@@ -649,16 +682,20 @@ class SubNetSerializer(structure_serializers.BaseResourceSerializer):
         model = models.SubNet
         fields = structure_serializers.BaseResourceSerializer.Meta.fields + (
             'tenant', 'tenant_name', 'network', 'network_name', 'cidr',
-            'gateway_ip', 'allocation_pools', 'ip_version', 'enable_dhcp', 'dns_nameservers')
+            'gateway_ip', 'disable_gateway', 'allocation_pools', 'ip_version', 'enable_dhcp', 'dns_nameservers')
         protected_fields = structure_serializers.BaseResourceSerializer.Meta.protected_fields + ('cidr',)
         read_only_fields = structure_serializers.BaseResourceSerializer.Meta.read_only_fields + (
-            'tenant', 'network', 'gateway_ip', 'ip_version', 'enable_dhcp')
+            'tenant', 'network', 'ip_version', 'enable_dhcp', 'service_settings', 'project')
         extra_kwargs = dict(
             network={'lookup_field': 'uuid', 'view_name': 'openstack-network-detail'},
             **structure_serializers.BaseResourceSerializer.Meta.extra_kwargs
         )
 
     def validate(self, attrs):
+        if attrs.get('disable_gateway') and attrs.get('gateway_ip'):
+            raise serializers.ValidationError(
+                _('These parameters are mutually exclusive: disable_gateway and gateway_ip.'))
+
         if self.instance is None:
             attrs['network'] = network = self.context['view'].get_object()
             if network.subnets.count() >= 1:
