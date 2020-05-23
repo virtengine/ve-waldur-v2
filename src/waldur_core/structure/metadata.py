@@ -2,8 +2,7 @@ from collections import OrderedDict
 
 from django.utils.encoding import force_text
 from django.utils.http import urlencode
-from rest_framework import exceptions
-from rest_framework import serializers
+from rest_framework import exceptions, serializers
 from rest_framework.metadata import SimpleMetadata
 from rest_framework.request import clone_request
 from rest_framework.reverse import reverse
@@ -12,7 +11,7 @@ from rest_framework.utils.field_mapping import ClassLookupDict
 from waldur_core.core.utils import sort_dict
 
 
-class ActionSerializer(object):
+class ActionSerializer:
     def __init__(self, func, name, request, view, resource):
         self.func = func
         self.name = name
@@ -29,7 +28,7 @@ class ActionSerializer(object):
             'destructive': self.is_destructive(),
             'url': self.get_url(),
             'reason': reason,
-            'enabled': not reason
+            'enabled': not reason,
         }
 
     def is_destructive(self):
@@ -81,9 +80,9 @@ class ActionsMetadata(SimpleMetadata):
     """
 
     label_lookup = ClassLookupDict(
-        mapping=merge_dictionaries({
-            serializers.JSONField: 'text'
-        }, SimpleMetadata.label_lookup.mapping)
+        mapping=merge_dictionaries(
+            {serializers.JSONField: 'text'}, SimpleMetadata.label_lookup.mapping
+        )
     )
 
     def determine_metadata(self, request, view):
@@ -134,7 +133,9 @@ class ActionsMetadata(SimpleMetadata):
             callback = getattr(view.__class__, key)
             if getattr(callback, 'deprecated', False):
                 continue
-            if 'post' not in getattr(callback, 'bind_to_methods', []):
+            if not hasattr(callback, 'detail'):
+                continue
+            if not callback.detail:
                 continue
             if key in disabled_actions:
                 continue
@@ -154,6 +155,8 @@ class ActionsMetadata(SimpleMetadata):
         """
         serializer = view.get_serializer(resource)
         fields = OrderedDict()
+        if not hasattr(serializer, 'fields'):
+            return fields
         if not isinstance(serializer, view.serializer_class) or action_name == 'update':
             fields = self.get_fields(serializer.fields)
         return fields
@@ -194,8 +197,18 @@ class ActionsMetadata(SimpleMetadata):
         field_info['required'] = getattr(field, 'required', False)
 
         attrs = [
-            'label', 'help_text', 'default_value', 'placeholder', 'required',
-            'min_length', 'max_length', 'min_value', 'max_value', 'many', 'factor', 'units'
+            'label',
+            'help_text',
+            'default_value',
+            'placeholder',
+            'required',
+            'min_length',
+            'max_length',
+            'min_value',
+            'max_value',
+            'many',
+            'factor',
+            'units',
         ]
 
         if getattr(field, 'read_only', False):
@@ -217,13 +230,15 @@ class ActionsMetadata(SimpleMetadata):
             if hasattr(field, 'query_params'):
                 field_info['url'] += '?%s' % urlencode(field.query_params)
             field_info['value_field'] = getattr(field, 'value_field', 'url')
-            field_info['display_name_field'] = getattr(field, 'display_name_field', 'display_name')
+            field_info['display_name_field'] = getattr(
+                field, 'display_name_field', 'display_name'
+            )
 
         if hasattr(field, 'choices') and not hasattr(field, 'queryset'):
             field_info['choices'] = [
                 {
                     'value': choice_value,
-                    'display_name': force_text(choice_name, strings_only=True)
+                    'display_name': force_text(choice_name, strings_only=True),
                 }
                 for choice_value, choice_name in field.choices.items()
             ]

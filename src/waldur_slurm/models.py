@@ -1,10 +1,11 @@
 from django.conf import settings
-from django.core.validators import MinValueValidator, MaxValueValidator
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.utils.translation import ugettext_lazy as _
 from model_utils import FieldTracker
 
 from waldur_core.structure import models as structure_models
+from waldur_slurm import mixins as slurm_mixins
 from waldur_slurm import utils
 
 
@@ -16,8 +17,9 @@ def get_batch_service(service_settings):
 
 
 class SlurmService(structure_models.Service):
-    projects = models.ManyToManyField(structure_models.Project,
-                                      related_name='+', through='SlurmServiceProjectLink')
+    projects = models.ManyToManyField(
+        structure_models.Project, related_name='+', through='SlurmServiceProjectLink'
+    )
 
     class Meta:
         unique_together = ('customer', 'settings')
@@ -30,7 +32,7 @@ class SlurmService(structure_models.Service):
 
 
 class SlurmServiceProjectLink(structure_models.ServiceProjectLink):
-    service = models.ForeignKey(SlurmService)
+    service = models.ForeignKey(on_delete=models.CASCADE, to=SlurmService)
 
     class Meta(structure_models.ServiceProjectLink.Meta):
         verbose_name = _('SLURM provider project link')
@@ -41,22 +43,36 @@ class SlurmServiceProjectLink(structure_models.ServiceProjectLink):
         return 'slurm-spl'
 
 
+SLURM_ALLOCATION_REGEX = 'a-zA-Z0-9-_'
+
+
 class Allocation(structure_models.NewResource):
     service_project_link = models.ForeignKey(
-        SlurmServiceProjectLink, related_name='allocations', on_delete=models.PROTECT)
+        SlurmServiceProjectLink, related_name='allocations', on_delete=models.PROTECT
+    )
     is_active = models.BooleanField(default=True)
     tracker = FieldTracker()
 
-    cpu_limit = models.BigIntegerField(default=-1)
+    cpu_limit = models.BigIntegerField(
+        default=settings.WALDUR_SLURM['DEFAULT_LIMITS']['CPU']
+    )
     cpu_usage = models.BigIntegerField(default=0)
 
-    gpu_limit = models.BigIntegerField(default=-1)
+    gpu_limit = models.BigIntegerField(
+        default=settings.WALDUR_SLURM['DEFAULT_LIMITS']['GPU']
+    )
     gpu_usage = models.BigIntegerField(default=0)
 
-    ram_limit = models.BigIntegerField(default=-1)
+    ram_limit = models.BigIntegerField(
+        default=settings.WALDUR_SLURM['DEFAULT_LIMITS']['RAM']
+    )
     ram_usage = models.BigIntegerField(default=0)
 
-    deposit_limit = models.DecimalField(max_digits=6, decimal_places=0, default=-1)
+    deposit_limit = models.DecimalField(
+        max_digits=6,
+        decimal_places=0,
+        default=settings.WALDUR_SLURM['DEFAULT_LIMITS']['DEPOSIT'],
+    )
     deposit_usage = models.DecimalField(max_digits=8, decimal_places=2, default=0)
 
     @classmethod
@@ -69,7 +85,10 @@ class Allocation(structure_models.NewResource):
     @classmethod
     def get_backend_fields(cls):
         return super(Allocation, cls).get_backend_fields() + (
-            'cpu_usage', 'gpu_usage', 'ram_usage', 'deposit_usage'
+            'cpu_usage',
+            'gpu_usage',
+            'ram_usage',
+            'deposit_usage',
         )
 
     @property
@@ -77,23 +96,32 @@ class Allocation(structure_models.NewResource):
         return get_batch_service(self.service_project_link.service.settings)
 
 
-class AllocationUsage(models.Model):
-    class Permissions(object):
+class AllocationUsage(slurm_mixins.UsageMixin):
+    class Permissions:
         customer_path = 'allocation__service_project_link__project__customer'
         project_path = 'allocation__service_project_link__project'
         service_path = 'allocation__service_project_link__service'
 
-    class Meta(object):
+    class Meta:
         ordering = ['allocation']
 
-    allocation = models.ForeignKey(Allocation)
-    username = models.CharField(max_length=32)
-    user = models.OneToOneField(settings.AUTH_USER_MODEL, blank=True, null=True)
+    allocation = models.ForeignKey(on_delete=models.CASCADE, to=Allocation)
 
     year = models.PositiveSmallIntegerField()
-    month = models.PositiveSmallIntegerField(validators=[MinValueValidator(1), MaxValueValidator(12)])
+    month = models.PositiveSmallIntegerField(
+        validators=[MinValueValidator(1), MaxValueValidator(12)]
+    )
 
-    cpu_usage = models.BigIntegerField(default=0)
-    ram_usage = models.BigIntegerField(default=0)
-    gpu_usage = models.BigIntegerField(default=0)
-    deposit_usage = models.DecimalField(max_digits=8, decimal_places=2, default=0)
+
+class AllocationUserUsage(slurm_mixins.UsageMixin):
+    """
+    Allocation usage per user. This model is responsible for the allocation usage definition for particular user.
+    """
+
+    allocation_usage = models.ForeignKey(to=AllocationUsage, on_delete=models.CASCADE)
+
+    user = models.ForeignKey(
+        to=settings.AUTH_USER_MODEL, on_delete=models.CASCADE, blank=True, null=True
+    )
+
+    username = models.CharField(max_length=32)

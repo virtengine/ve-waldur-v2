@@ -1,7 +1,6 @@
 import factory
-from factory import fuzzy
-
 from django.urls import reverse
+from factory import fuzzy
 
 from waldur_core.structure.tests import factories as structure_factories
 
@@ -9,17 +8,21 @@ from .. import models
 
 
 class SlurmServiceFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.SlurmService
 
-    settings = factory.SubFactory(structure_factories.ServiceSettingsFactory, type='SLURM')
+    settings = factory.SubFactory(
+        structure_factories.ServiceSettingsFactory, type='SLURM'
+    )
     customer = factory.SubFactory(structure_factories.CustomerFactory)
 
     @classmethod
     def get_url(cls, service=None, action=None):
         if service is None:
             service = SlurmServiceFactory()
-        url = 'http://testserver' + reverse('slurm-detail', kwargs={'uuid': service.uuid})
+        url = 'http://testserver' + reverse(
+            'slurm-detail', kwargs={'uuid': service.uuid.hex}
+        )
         return url if action is None else url + action + '/'
 
     @classmethod
@@ -28,7 +31,7 @@ class SlurmServiceFactory(factory.DjangoModelFactory):
 
 
 class SlurmServiceProjectLinkFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.SlurmServiceProjectLink
 
     service = factory.SubFactory(SlurmServiceFactory)
@@ -42,7 +45,7 @@ class SlurmServiceProjectLinkFactory(factory.DjangoModelFactory):
 
 
 class AllocationFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.Allocation
 
     name = factory.Sequence(lambda n: 'allocation%s' % n)
@@ -59,7 +62,9 @@ class AllocationFactory(factory.DjangoModelFactory):
     def get_url(cls, allocation=None, action=None):
         if allocation is None:
             allocation = AllocationFactory()
-        url = 'http://testserver' + reverse('slurm-allocation-detail', kwargs={'uuid': allocation.uuid})
+        url = 'http://testserver' + reverse(
+            'slurm-allocation-detail', kwargs={'uuid': allocation.uuid.hex}
+        )
         return url if action is None else url + action + '/'
 
     @classmethod
@@ -68,10 +73,9 @@ class AllocationFactory(factory.DjangoModelFactory):
 
 
 class AllocationUsageFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.AllocationUsage
 
-    username = factory.Sequence(lambda n: 'john%s' % n)
     allocation = factory.SubFactory(AllocationFactory)
 
     year = factory.Iterator(range(2012, 2016))
@@ -86,9 +90,9 @@ class AllocationUsageFactory(factory.DjangoModelFactory):
     def get_url(cls, allocation_usage=None):
         if allocation_usage is None:
             allocation_usage = AllocationUsageFactory()
-        return 'http://testserver' + reverse('slurm-allocation-usage-detail', kwargs={
-            'uuid': allocation_usage.uuid.hex
-        })
+        return 'http://testserver' + reverse(
+            'slurm-allocation-usage-detail', kwargs={'uuid': allocation_usage.uuid.hex}
+        )
 
     @classmethod
     def get_list_url(cls):

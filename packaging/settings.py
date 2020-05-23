@@ -2,8 +2,7 @@
 from waldur_core.server.base_settings import *
 
 import os
-
-from ConfigParser import RawConfigParser
+from configparser import RawConfigParser
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), '..'))
 TEMPLATES[0]['DIRS'] = [os.path.join(BASE_DIR, 'waldur_core', 'templates')]
@@ -27,7 +26,7 @@ config_defaults = {
         'media_root': os.path.join(work_dir, 'media'),
         'owner_can_manage_customer': 'false',
         'secret_key': '',
-        'show_all_users': 'true',
+        'show_all_users': 'false',
         'static_root': os.path.join(data_dir, 'static'),
         'template_debug': 'false',
     },
@@ -60,9 +59,6 @@ config_defaults = {
         'host': 'localhost',
         'port': '6379',
         'password': '',
-    },
-    'rest_api': {
-        'cors_allowed_domains': 'localhost,127.0.0.1',
     },
     'sentry': {
         'dsn': '',  # Please ensure that Python Sentry SDK is installed.
@@ -129,10 +125,10 @@ ALLOWED_HOSTS = ['*']
 #
 #   yum install python-psycopg2
 #
-# See also: https://docs.djangoproject.com/en/1.11/ref/settings/#databases
+# See also: https://docs.djangoproject.com/en/2.2/ref/settings/#databases
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.postgresql_psycopg2',
+        'ENGINE': 'django.db.backends.postgresql',
         'NAME': config.get('postgresql', 'name'),
         'HOST': config.get('postgresql', 'host'),
         'PORT': config.get('postgresql', 'port'),
@@ -142,14 +138,14 @@ DATABASES = {
 }
 
 # Logging
-# See also: https://docs.djangoproject.com/en/1.11/ref/settings/#logging
+# See also: https://docs.djangoproject.com/en/2.2/ref/settings/#logging
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,  # fixes Celery beat logging
 
     # Filters
     # Filter provides additional control over which log records are passed from logger to handler.
-    # See also: https://docs.djangoproject.com/en/1.11/topics/logging/#filters
+    # See also: https://docs.djangoproject.com/en/2.2/topics/logging/#filters
     'filters': {
         # Filter out only events (user-facing messages)
         'is-event': {
@@ -167,7 +163,7 @@ LOGGING = {
 
     # Formatters
     # Formatter describes the exact format of the log entry.
-    # See also: https://docs.djangoproject.com/en/1.11/topics/logging/#formatters
+    # See also: https://docs.djangoproject.com/en/2.2/topics/logging/#formatters
     'formatters': {
         'message-only': {
             'format': '%(message)s',
@@ -179,17 +175,17 @@ LOGGING = {
 
     # Handlers
     # Handler determines what happens to each message in a logger.
-    # See also: https://docs.djangoproject.com/en/1.11/topics/logging/#handlers
+    # See also: https://docs.djangoproject.com/en/2.2/topics/logging/#handlers
     'handlers': {
         # Send logs to admins by email
-        # See also: https://docs.djangoproject.com/en/1.11/topics/logging/#django.utils.log.AdminEmailHandler
+        # See also: https://docs.djangoproject.com/en/2.2/topics/logging/#django.utils.log.AdminEmailHandler
         'email-admins': {
             'filters': ['is-not-background-task'],
             'class': 'django.utils.log.AdminEmailHandler',
             'level': 'ERROR',
         },
         # Write logs to file
-        # See also: https://docs.python.org/2/library/logging.handlers.html#watchedfilehandler
+        # See also: https://docs.python.org/3/library/logging.handlers.html#watchedfilehandler
         'file': {
             'class': 'logging.handlers.WatchedFileHandler',
             'filename': '/dev/null',
@@ -205,7 +201,7 @@ LOGGING = {
             'level': config.get('events', 'log_level').upper(),
         },
         # Forward logs to syslog
-        # See also: https://docs.python.org/2/library/logging.handlers.html#sysloghandler
+        # See also: https://docs.python.org/3/library/logging.handlers.html#sysloghandler
         'syslog': {
             'class': 'logging.handlers.SysLogHandler',
             'filters': ['is-not-event'],
@@ -237,7 +233,7 @@ LOGGING = {
     # Loggers
     # A logger is the entry point into the logging system.
     # Each logger is a named bucket to which messages can be written for processing.
-    # See also: https://docs.djangoproject.com/en/1.11/topics/logging/#loggers
+    # See also: https://docs.djangoproject.com/en/2.2/topics/logging/#loggers
     #
     # Default logger configuration
     'root': {
@@ -282,10 +278,7 @@ if config.get('logging', 'log_level').upper() == 'DEBUG':
     # Enabling debugging at http.client level (requests->urllib3->http.client)
     # you will see the REQUEST, including HEADERS and DATA, and RESPONSE with HEADERS but without DATA.
     # the only thing missing will be the response.body which is not logged.
-    try:  # for Python 3
-        from http.client import HTTPConnection
-    except ImportError:
-        from httplib import HTTPConnection
+    from http.client import HTTPConnection
     HTTPConnection.debuglevel = 1
 
     LOGGING['loggers']['requests.packages.urllib3'] = {
@@ -303,42 +296,20 @@ if config.getboolean('events', 'syslog'):
     LOGGING['loggers']['waldur_core']['handlers'].append('syslog-event')
 
 # Static files
-# See also: https://docs.djangoproject.com/en/1.11/ref/settings/#static-files
+# See also: https://docs.djangoproject.com/en/2.2/ref/settings/#static-files
 STATIC_ROOT = config.get('global', 'static_root')
 
 # Django cache
-# https://docs.djangoproject.com/en/1.11/topics/cache/
+# https://docs.djangoproject.com/en/2.2/topics/cache/
 CACHES['default']['LOCATION'] = redis_url
 
 # Email
-# See also: https://docs.djangoproject.com/en/1.11/ref/settings/#default-from-email
+# See also: https://docs.djangoproject.com/en/2.2/ref/settings/#default-from-email
 if config.get('global', 'default_from_email') != '':
     DEFAULT_FROM_EMAIL = config.get('global', 'default_from_email')
 
-# Django CORS headers
-# See also: https://github.com/ottoyiu/django-cors-headers
-
-CORS_ALLOW_CREDENTIALS = True
-
-CORS_EXPOSE_HEADERS = (
-    'x-result-count',
-    'Link',
-)
-
-CORS_ORIGIN_ALLOW_ALL = False
-CORS_ORIGIN_WHITELIST = tuple(i.strip() for i in config.get('rest_api', 'cors_allowed_domains').split(','))
-
-INSTALLED_APPS = (
-    'corsheaders',
-) + INSTALLED_APPS
-
-MIDDLEWARE = (
-    'corsheaders.middleware.CorsMiddleware',
-    'django.middleware.common.CommonMiddleware',
-) + MIDDLEWARE
-
 # Session
-# https://docs.djangoproject.com/en/1.11/ref/settings/#sessions
+# https://docs.djangoproject.com/en/2.2/ref/settings/#sessions
 SESSION_COOKIE_AGE = config.getint('auth', 'session_lifetime')
 
 # Celery
@@ -380,7 +351,7 @@ if config.get('sentry', 'dsn') != '':
 
     sentry_sdk.init(
         dsn=config.get('sentry', 'dsn'),
-        integrations=[DjangoIntegration()]
+        integrations=[DjangoIntegration()],
     )
 
 # Additional configuration files for Waldur
@@ -391,4 +362,4 @@ for extension_name in extensions:
     # optionally load extension configurations
     extension_conf_file_path = os.path.join(conf_dir, extension_name)
     if os.path.isfile(extension_conf_file_path):
-        execfile(extension_conf_file_path)
+        exec(open(extension_conf_file_path, encoding='utf-8').read())  # nosec

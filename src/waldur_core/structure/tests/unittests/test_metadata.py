@@ -6,12 +6,9 @@ from waldur_core.structure.metadata import ActionsMetadata
 
 class ResourceProvisioningMetadataTest(TestCase):
     def get_serializer(self):
-        STATE_CHOICES = (
-            (1, 'Ready'),
-            (2, 'Erred')
-        )
+        STATE_CHOICES = ((1, 'Ready'), (2, 'Erred'))
 
-        class Queryset(object):
+        class Queryset:
             def all(self):
                 return {'key': 'value'}
 

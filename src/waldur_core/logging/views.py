@@ -1,22 +1,24 @@
-from __future__ import unicode_literals
-
 from django_filters.rest_framework import DjangoFilterBackend
-from rest_framework import response, viewsets, permissions, status, decorators, mixins
+from rest_framework import decorators, mixins, permissions, response, status, viewsets
 
-from waldur_core.core import filters as core_filters, permissions as core_permissions
+from waldur_core.core import filters as core_filters
+from waldur_core.core import permissions as core_permissions
 from waldur_core.core.managers import SummaryQuerySet
-from waldur_core.logging import models, serializers, filters, utils
+from waldur_core.logging import filters, models, serializers, utils
 from waldur_core.logging.loggers import get_event_groups
 
 
 class EventViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = models.Event.objects.all()
-    permission_classes = (permissions.IsAuthenticated, core_permissions.IsAdminOrReadOnly)
+    permission_classes = (
+        permissions.IsAuthenticated,
+        core_permissions.IsAdminOrReadOnly,
+    )
     serializer_class = serializers.EventSerializer
     filter_backends = (DjangoFilterBackend, filters.EventFilterBackend)
-    filter_class = filters.EventFilter
+    filterset_class = filters.EventFilter
 
-    @decorators.list_route()
+    @decorators.action(detail=False)
     def count(self, request, *args, **kwargs):
         """
         To get a count of events - run **GET** against */api/events/count/* as authenticated user.
@@ -30,14 +32,16 @@ class EventViewSet(viewsets.ReadOnlyModelViewSet):
         """
 
         self.queryset = self.filter_queryset(self.get_queryset())
-        return response.Response({'count': self.queryset.count()}, status=status.HTTP_200_OK)
+        return response.Response(
+            {'count': self.queryset.count()}, status=status.HTTP_200_OK
+        )
 
-    @decorators.list_route()
+    @decorators.action(detail=False)
     def scope_types(self, request, *args, **kwargs):
         """ Returns a list of scope types acceptable by events filter. """
         return response.Response(utils.get_scope_types_mapping().keys())
 
-    @decorators.list_route()
+    @decorators.action(detail=False)
     def event_groups(self, request, *args, **kwargs):
         """
         Returns a list of groups with event types.
@@ -51,13 +55,14 @@ class BaseHookViewSet(viewsets.ModelViewSet):
     Hooks API allows user to receive event notifications via different channel, like email or webhook.
     To get a list of all your hooks, run **GET** against */api/hooks/* as an authenticated user.
     """
+
     filter_backends = (core_filters.StaffOrUserFilter, DjangoFilterBackend)
     lookup_field = 'uuid'
 
 
 class WebHookViewSet(BaseHookViewSet):
     queryset = models.WebHook.objects.all()
-    filter_class = filters.WebHookFilter
+    filterset_class = filters.WebHookFilter
     serializer_class = serializers.WebHookSerializer
 
     def create(self, request, *args, **kwargs):
@@ -110,7 +115,7 @@ class WebHookViewSet(BaseHookViewSet):
 
 class EmailHookViewSet(BaseHookViewSet):
     queryset = models.EmailHook.objects.all()
-    filter_class = filters.EmailHookFilter
+    filterset_class = filters.EmailHookFilter
     serializer_class = serializers.EmailHookSerializer
 
     def create(self, request, *args, **kwargs):
@@ -147,7 +152,7 @@ class EmailHookViewSet(BaseHookViewSet):
 
 class PushHookViewSet(BaseHookViewSet):
     queryset = models.PushHook.objects.all()
-    filter_class = filters.PushHookFilter
+    filterset_class = filters.PushHookFilter
     serializer_class = serializers.PushHookSerializer
 
     def create(self, request, *args, **kwargs):
@@ -186,6 +191,7 @@ class HookSummary(mixins.ListModelMixin, viewsets.GenericViewSet):
     """
     Use */api/hooks/* to get a list of all the hooks of any type that a user can see.
     """
+
     serializer_class = serializers.SummaryHookSerializer
     filter_backends = (core_filters.StaffOrUserFilter, filters.HookSummaryFilterBackend)
 

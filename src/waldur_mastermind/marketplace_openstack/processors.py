@@ -12,7 +12,7 @@ from waldur_openstack.openstack_tenant import views as tenant_views
 from . import utils
 
 
-class PackageCreateProcessor(processors.CreateResourceProcessor):
+class TenantCreateProcessor(processors.CreateResourceProcessor):
     def get_serializer_class(self):
         return package_views.OpenStackPackageViewSet.create_serializer_class
 
@@ -30,13 +30,16 @@ class PackageCreateProcessor(processors.CreateResourceProcessor):
             template = None
 
         if not isinstance(template, package_models.PackageTemplate):
-            raise serializers.ValidationError('Plan has invalid scope. VPC package template is expected.')
+            raise serializers.ValidationError(
+                'Plan has invalid scope. VPC package template is expected.'
+            )
 
         project = order_item.order.project
 
-        project_url = reverse('project-detail', kwargs={'uuid': project.uuid})
-        spl_url = processors.get_spl_url(openstack_models.OpenStackServiceProjectLink, order_item)
-        template_url = reverse('package-template-detail', kwargs={'uuid': template.uuid})
+        project_url = reverse('project-detail', kwargs={'uuid': project.uuid.hex})
+        spl_url = processors.get_spl_url(
+            openstack_models.OpenStackServiceProjectLink, order_item
+        )
 
         fields = (
             'name',
@@ -48,19 +51,23 @@ class PackageCreateProcessor(processors.CreateResourceProcessor):
             'availability_zone',
         )
 
+        quotas = utils.map_limits_to_quotas(order_item.limits, order_item.offering)
+
         return dict(
             project=project_url,
             service_project_link=spl_url,
-            template=template_url,
+            template=template.uuid.hex,
+            quotas=quotas,
             **processors.copy_attributes(fields, order_item)
         )
 
     def get_scope_from_response(self, response):
-        return package_models.OpenStackPackage.objects.get(uuid=response.data['uuid']).tenant
+        return package_models.OpenStackPackage.objects.get(
+            uuid=response.data['uuid']
+        ).tenant
 
 
-class PackageUpdateProcessor(processors.UpdateResourceProcessor):
-
+class TenantUpdateProcessor(processors.UpdateResourceProcessor):
     def get_serializer_class(self):
         return package_views.OpenStackPackageViewSet.change_serializer_class
 
@@ -72,13 +79,15 @@ class PackageUpdateProcessor(processors.UpdateResourceProcessor):
         try:
             package = package_models.OpenStackPackage.objects.get(tenant=resource)
         except ObjectDoesNotExist:
-            raise serializers.ValidationError('OpenStack package for tenant does not exist.')
+            raise serializers.ValidationError(
+                'OpenStack package for tenant does not exist.'
+            )
 
         template = self.order_item.plan.scope
 
         return {
-            'package': reverse('openstack-package-detail', kwargs={'uuid': package.uuid}),
-            'template': reverse('package-template-detail', kwargs={'uuid': template.uuid})
+            'package': package.uuid.hex,
+            'template': template.uuid.hex,
         }
 
     def update_limits_process(self, user):
@@ -87,14 +96,14 @@ class PackageUpdateProcessor(processors.UpdateResourceProcessor):
             signals.limit_update_failed.send(
                 sender=self.order_item.resource.__class__,
                 order_item=self.order_item,
-                message='Limit updating is available only for tenants.'
+                message='Limit updating is available only for tenants.',
             )
             return
 
         utils.update_limits(self.order_item)
 
 
-class PackageDeleteProcessor(processors.DeleteResourceProcessor):
+class TenantDeleteProcessor(processors.DeleteResourceProcessor):
     viewset = openstack_views.TenantViewSet
 
 
@@ -110,7 +119,9 @@ class InstanceCreateProcessor(processors.BaseCreateResourceProcessor):
         'internal_ips_set',
         'floating_ips',
         'system_volume_size',
+        'system_volume_type',
         'data_volume_size',
+        'data_volume_type',
         'volumes',
         'ssh_public_key',
         'user_data',
@@ -131,6 +142,7 @@ class VolumeCreateProcessor(processors.BaseCreateResourceProcessor):
         'image',
         'size',
         'availability_zone',
+        'type',
     )
 
 

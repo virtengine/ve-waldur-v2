@@ -1,45 +1,18 @@
 import collections
 import logging
 
-from django.conf import settings
 from django.db import models
-from django.db.migrations.topological_sort import stable_topological_sort
 from django.utils.lru_cache import lru_cache
+from django.utils.topological_sort import stable_topological_sort
 from django.utils.translation import ugettext_lazy as _
 from rest_framework.exceptions import ValidationError
-import requests
 
 from . import SupportedServices
 
 logger = logging.getLogger(__name__)
-Coordinates = collections.namedtuple('Coordinates', ('latitude', 'longitude'))
-FieldInfo = collections.namedtuple('FieldInfo', 'fields fields_required extra_fields_required extra_fields_default')
-
-
-class GeoIpException(Exception):
-    pass
-
-
-def get_coordinates_by_ip(ip_address):
-    if not settings.IPSTACK_ACCESS_KEY:
-        raise GeoIpException("IPSTACK_ACCESS_KEY is empty.")
-
-    url = 'http://api.ipstack.com/{}?access_key={}&output=json&legacy=1'.format(
-        ip_address,
-        settings.IPSTACK_ACCESS_KEY)
-
-    try:
-        response = requests.get(url)
-    except requests.exceptions.RequestException as e:
-        raise GeoIpException("Request to geoip API %s failed: %s" % (url, e))
-
-    if response.ok:
-        data = response.json()
-        return Coordinates(latitude=data['latitude'],
-                           longitude=data['longitude'])
-    else:
-        params = (url, response.status_code, response.text)
-        raise GeoIpException("Request to geoip API %s failed: %s %s" % params)
+FieldInfo = collections.namedtuple(
+    'FieldInfo', 'fields fields_required extra_fields_required extra_fields_default'
+)
 
 
 @lru_cache(maxsize=1)
@@ -79,29 +52,48 @@ def get_all_services_field_info():
         service_model = service_models[service_name]['service']
         service_serializer = SupportedServices.get_service_serializer(service_model)
 
-        fields = service_serializer.SERVICE_ACCOUNT_FIELDS.keys() \
-            if service_serializer.SERVICE_ACCOUNT_FIELDS is not NotImplemented else []
+        fields = (
+            service_serializer.SERVICE_ACCOUNT_FIELDS.keys()
+            if service_serializer.SERVICE_ACCOUNT_FIELDS is not NotImplemented
+            else []
+        )
 
-        extra_field_options = getattr(service_serializer.Meta, 'extra_field_options', {})
-        fields_default_value = {k: v.get('default_value')
-                                for k, v in extra_field_options.items()
-                                if v.get('default_value')}
+        extra_field_options = getattr(
+            service_serializer.Meta, 'extra_field_options', {}
+        )
+        fields_default_value = {
+            k: v.get('default_value')
+            for k, v in extra_field_options.items()
+            if v.get('default_value')
+        }
 
-        fields_extra = service_serializer.SERVICE_ACCOUNT_EXTRA_FIELDS.keys() \
-            if service_serializer.SERVICE_ACCOUNT_EXTRA_FIELDS is not NotImplemented else []
+        fields_extra = (
+            service_serializer.SERVICE_ACCOUNT_EXTRA_FIELDS.keys()
+            if service_serializer.SERVICE_ACCOUNT_EXTRA_FIELDS is not NotImplemented
+            else []
+        )
 
-        fields_required = service_serializer.Meta.required_fields \
-            if hasattr(service_serializer.Meta, 'required_fields') else []
+        fields_required = (
+            service_serializer.Meta.required_fields
+            if hasattr(service_serializer.Meta, 'required_fields')
+            else []
+        )
 
         services_fields[service_name] = list(fields)
-        services_fields_required[service_name] = list(set(fields) & set(fields_required))
-        services_extra_fields_required[service_name] = list(set(fields_extra) & set(fields_required))
+        services_fields_required[service_name] = list(
+            set(fields) & set(fields_required)
+        )
+        services_extra_fields_required[service_name] = list(
+            set(fields_extra) & set(fields_required)
+        )
         services_fields_default_value[service_name] = fields_default_value
 
-    return FieldInfo(fields=services_fields,
-                     fields_required=services_fields_required,
-                     extra_fields_required=services_extra_fields_required,
-                     extra_fields_default=services_fields_default_value)
+    return FieldInfo(
+        fields=services_fields,
+        fields_required=services_fields_required,
+        extra_fields_required=services_extra_fields_required,
+        extra_fields_default=services_fields_default_value,
+    )
 
 
 def update_pulled_fields(instance, imported_instance, fields):
@@ -115,10 +107,18 @@ def update_pulled_fields(instance, imported_instance, fields):
         current_value = getattr(instance, field)
         if current_value != pulled_value:
             setattr(instance, field, pulled_value)
-            logger.info("%s's with PK %s %s field updated from value '%s' to value '%s'",
-                        instance.__class__.__name__, instance.pk, field, current_value, pulled_value)
+            logger.info(
+                "%s's with PK %s %s field updated from value '%s' to value '%s'",
+                instance.__class__.__name__,
+                instance.pk,
+                field,
+                current_value,
+                pulled_value,
+            )
             modified = True
-    error_message = getattr(imported_instance, 'error_message', '') or getattr(instance, 'error_message', '')
+    error_message = getattr(imported_instance, 'error_message', '') or getattr(
+        instance, 'error_message', ''
+    )
     if error_message and instance.error_message != error_message:
         instance.error_message = imported_instance.error_message
         modified = True
@@ -139,8 +139,10 @@ def handle_resource_not_found(resource):
         else:
             resource.error_message += ' (%s)' % message
     resource.save()
-    logger.warning('%s %s (PK: %s) does not exist at backend.' % (
-        resource.__class__.__name__, resource, resource.pk))
+    logger.warning(
+        '%s %s (PK: %s) does not exist at backend.'
+        % (resource.__class__.__name__, resource, resource.pk)
+    )
 
 
 def handle_resource_update_success(resource):
@@ -162,8 +164,10 @@ def handle_resource_update_success(resource):
 
     if update_fields:
         resource.save(update_fields=update_fields)
-    logger.info('%s %s (PK: %s) was successfully updated.' % (
-        resource.__class__.__name__, resource, resource.pk))
+    logger.info(
+        '%s %s (PK: %s) was successfully updated.'
+        % (resource.__class__.__name__, resource, resource.pk)
+    )
 
 
 def check_customer_blocked(obj):

@@ -1,18 +1,19 @@
-import mock
+from unittest import mock
+
 from rest_framework import status, test
 
-from . import factories, fixtures
+from waldur_core.core import utils as core_utils
+
 from .. import models
+from . import factories, fixtures
 
 
 class BaseNetworkTest(test.APITransactionTestCase):
-
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
 
 
 class NetworkCreateActionTest(BaseNetworkTest):
-
     def test_network_create_action_is_not_allowed(self):
         self.client.force_authenticate(user=self.fixture.user)
         url = factories.NetworkFactory.get_list_url()
@@ -30,7 +31,9 @@ class NetworkCreateSubnetActionTest(BaseNetworkTest):
         super(NetworkCreateSubnetActionTest, self).setUp()
         self.user = self.fixture.owner
         self.client.force_authenticate(self.user)
-        self.url = factories.NetworkFactory.get_url(network=self.fixture.network, action=self.action_name)
+        self.url = factories.NetworkFactory.get_url(
+            network=self.fixture.network, action=self.action_name
+        )
         self.request_data = {
             'name': 'test_subnet_name',
         }
@@ -55,6 +58,22 @@ class NetworkCreateSubnetActionTest(BaseNetworkTest):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         executor_action_mock.assert_called_once()
 
+    @mock.patch('waldur_openstack.openstack.executors.core_tasks.BackendMethodTask')
+    def test_do_not_create_router_for_subnet_if_enable_default_gateway_is_false(
+        self, core_tasks_mock
+    ):
+        request_data = {'name': 'test_subnet_name', 'enable_default_gateway': False}
+        response = self.client.post(self.url, request_data)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        subnet = models.SubNet.objects.get(uuid=response.data['uuid'])
+
+        core_tasks_mock().si.assert_called_once_with(
+            core_utils.serialize_instance(subnet),
+            'create_subnet',
+            state_transition='begin_creating',
+            enable_default_gateway=False,
+        )
+
     @mock.patch('waldur_openstack.openstack.executors.SubNetCreateExecutor.execute')
     def test_create_subnet_increases_quota_usage(self, executor_action_mock):
         response = self.client.post(self.url, self.request_data)
@@ -63,7 +82,9 @@ class NetworkCreateSubnetActionTest(BaseNetworkTest):
         executor_action_mock.assert_called_once()
 
     @mock.patch('waldur_openstack.openstack.executors.SubNetCreateExecutor.execute')
-    def test_create_subnet_does_not_create_subnet_if_quota_exceeds_set_limit(self, executor_action_mock):
+    def test_create_subnet_does_not_create_subnet_if_quota_exceeds_set_limit(
+        self, executor_action_mock
+    ):
         self.fixture.tenant.set_quota_limit(self.quota_name, 0)
         response = self.client.post(self.url, self.request_data)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -76,91 +97,94 @@ class NetworkCreateSubnetActionTest(BaseNetworkTest):
         url = factories.NetworkFactory.get_url(network=self.fixture.network)
         response = self.client.options(url)
         actions = dict(response.data['actions'])
-        self.assertEqual(actions, {
-            "create_subnet": {
-                "title": "Create Subnet",
-                "url": url + "create_subnet/",
-                "fields": {
-                    "name": {
-                        "type": "string",
-                        "required": True,
-                        "label": "Name",
-                        "max_length": 150
+        self.assertEqual(
+            actions,
+            {
+                "create_subnet": {
+                    "title": "Create Subnet",
+                    "url": url + "create_subnet/",
+                    "fields": {
+                        "name": {
+                            "type": "string",
+                            "required": True,
+                            "label": "Name",
+                            "max_length": 150,
+                        },
+                        "description": {
+                            "type": "string",
+                            "required": False,
+                            "label": "Description",
+                            "max_length": 500,
+                        },
+                        "cidr": {"type": "string", "required": False, "label": "CIDR"},
+                        "gateway_ip": {
+                            "type": "string",
+                            "required": False,
+                            "label": "Gateway ip",
+                        },
+                        "disable_gateway": {
+                            "type": "boolean",
+                            "required": False,
+                            "label": "Disable gateway",
+                        },
+                        "enable_default_gateway": {
+                            "type": "boolean",
+                            "required": False,
+                            "label": "Enable default gateway",
+                        },
                     },
-                    "description": {
-                        "type": "string",
-                        "required": False,
-                        "label": "Description",
-                        "max_length": 500
-                    },
-                    "cidr": {
-                        "type": "string",
-                        "required": False,
-                        "label": "CIDR"
-                    },
-                    "gateway_ip": {
-                        "type": "string",
-                        "required": False,
-                        "label": "Gateway ip"
-                    },
-                    "disable_gateway": {
-                        "type": "boolean",
-                        "required": False,
-                        "label": "Disable gateway"
-                    },
+                    "enabled": True,
+                    "reason": None,
+                    "destructive": False,
+                    "type": "form",
+                    "method": "POST",
                 },
-                "enabled": True,
-                "reason": None,
-                "destructive": False,
-                "type": "form",
-                "method": "POST"
-            },
-            "destroy": {
-                "title": "Destroy",
-                "url": url,
-                "enabled": True,
-                "reason": None,
-                "destructive": True,
-                "type": "button",
-                "method": "DELETE"
-            },
-            "pull": {
-                "title": "Pull",
-                "url": url + "pull/",
-                "enabled": True,
-                "reason": None,
-                "destructive": False,
-                "type": "button",
-                "method": "POST"
-            },
-            "update": {
-                "title": "Update",
-                "url": url,
-                "fields": {
-                    "name": {
-                        "type": "string",
-                        "required": True,
-                        "label": "Name",
-                        "max_length": 150
-                    },
-                    "description": {
-                        "type": "string",
-                        "required": False,
-                        "label": "Description",
-                        "max_length": 500
-                    }
+                "destroy": {
+                    "title": "Destroy",
+                    "url": url,
+                    "enabled": True,
+                    "reason": None,
+                    "destructive": True,
+                    "type": "button",
+                    "method": "DELETE",
                 },
-                "enabled": True,
-                "reason": None,
-                "destructive": False,
-                "type": "form",
-                "method": "PUT"
-            }
-        })
+                "pull": {
+                    "title": "Pull",
+                    "url": url + "pull/",
+                    "enabled": True,
+                    "reason": None,
+                    "destructive": False,
+                    "type": "button",
+                    "method": "POST",
+                },
+                "update": {
+                    "title": "Update",
+                    "url": url,
+                    "fields": {
+                        "name": {
+                            "type": "string",
+                            "required": True,
+                            "label": "Name",
+                            "max_length": 150,
+                        },
+                        "description": {
+                            "type": "string",
+                            "required": False,
+                            "label": "Description",
+                            "max_length": 500,
+                        },
+                    },
+                    "enabled": True,
+                    "reason": None,
+                    "destructive": False,
+                    "type": "form",
+                    "method": "PUT",
+                },
+            },
+        )
 
 
 class NetworkUpdateActionTest(BaseNetworkTest):
-
     def setUp(self):
         super(NetworkUpdateActionTest, self).setUp()
         self.user = self.fixture.owner
@@ -180,7 +204,6 @@ class NetworkUpdateActionTest(BaseNetworkTest):
 
 @mock.patch('waldur_openstack.openstack.executors.NetworkDeleteExecutor.execute')
 class NetworkDeleteActionTest(BaseNetworkTest):
-
     def setUp(self):
         super(NetworkDeleteActionTest, self).setUp()
         self.user = self.fixture.owner

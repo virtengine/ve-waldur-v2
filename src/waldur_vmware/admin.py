@@ -1,5 +1,3 @@
-from __future__ import unicode_literals
-
 from django.contrib import admin
 from django.contrib.admin import options
 from django.core.exceptions import ValidationError
@@ -14,7 +12,6 @@ from . import executors, models
 
 
 class DiskAdmin(structure_admin.ResourceAdmin):
-
     class Pull(ExecutorAdminAction):
         executor = executors.DiskPullExecutor
         short_description = _('Pull')
@@ -27,14 +24,18 @@ class DiskAdmin(structure_admin.ResourceAdmin):
 
 
 class VirtualMachineAdmin(structure_admin.ResourceAdmin):
-
     class Pull(ExecutorAdminAction):
         executor = executors.VirtualMachinePullExecutor
         short_description = _('Pull')
 
         def validate(self, instance):
-            if instance.state not in (models.VirtualMachine.States.OK, models.VirtualMachine.States.ERRED):
-                raise ValidationError(_('Virtual machine has to be in OK or ERRED state.'))
+            if instance.state not in (
+                models.VirtualMachine.States.OK,
+                models.VirtualMachine.States.ERRED,
+            ):
+                raise ValidationError(
+                    _('Virtual machine has to be in OK or ERRED state.')
+                )
 
     pull = Pull()
 
@@ -65,8 +66,12 @@ class CustomerInlineFormset(BaseInlineFormSet):
                 # Ensure that the same service settings are not used multiple times
                 service_settings = cleaned_data[self.service_property_field].settings
                 if service_settings in enabled_settings:
-                    raise ValidationError(_('There should be exactly one property '
-                                            'assigned to the each service settings.'))
+                    raise ValidationError(
+                        _(
+                            'There should be exactly one property '
+                            'assigned to the each service settings.'
+                        )
+                    )
                 else:
                     enabled_settings[service_settings] = True
 
@@ -78,6 +83,7 @@ class CustomerClusterInlineFormset(CustomerInlineFormset):
 class CustomerClusterInline(options.TabularInline):
     model = models.CustomerCluster
     extra = 1
+    classes = ['collapse']
     verbose_name_plural = 'Customer VMware clusters'
     formset = CustomerClusterInlineFormset
 
@@ -89,6 +95,7 @@ class CustomerNetworkInlineFormset(CustomerInlineFormset):
 class CustomerNetworkInline(options.TabularInline):
     model = models.CustomerNetwork
     extra = 1
+    classes = ['collapse']
     verbose_name_plural = 'Customer VMware networks for new VMs'
     formset = CustomerNetworkInlineFormset
 
@@ -96,12 +103,14 @@ class CustomerNetworkInline(options.TabularInline):
 class CustomerNetworkPairInline(options.TabularInline):
     model = models.CustomerNetworkPair
     extra = 1
+    classes = ['collapse']
     verbose_name_plural = 'Customer VMware networks for existing VMs'
 
 
 class CustomerDatastoreInline(options.TabularInline):
     model = models.CustomerDatastore
     extra = 1
+    classes = ['collapse']
     verbose_name_plural = 'Customer VMware datastores'
 
 
@@ -112,12 +121,15 @@ class CustomerFolderInlineInlineFormset(CustomerInlineFormset):
 class CustomerFolderInline(options.TabularInline):
     model = models.CustomerFolder
     extra = 1
+    classes = ['collapse']
     verbose_name_plural = 'Customer VMware folders'
     formset = CustomerFolderInlineInlineFormset
 
 
 admin.site.register(models.VMwareService, structure_admin.ServiceAdmin)
-admin.site.register(models.VMwareServiceProjectLink, structure_admin.ServiceProjectLinkAdmin)
+admin.site.register(
+    models.VMwareServiceProjectLink, structure_admin.ServiceProjectLinkAdmin
+)
 admin.site.register(models.Disk, DiskAdmin)
 admin.site.register(models.VirtualMachine, VirtualMachineAdmin)
 admin.site.register(models.Template, structure_admin.ServicePropertyAdmin)

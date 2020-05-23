@@ -9,6 +9,7 @@ class SlurmExtension(WaldurExtension):
             'PROJECT_PREFIX': 'waldur_project_',
             'ALLOCATION_PREFIX': 'waldur_allocation_',
             'PRIVATE_KEY_PATH': '/etc/waldur/id_rsa',
+            'DEFAULT_LIMITS': {'CPU': 16000, 'GPU': 400, 'RAM': 100000, 'DEPOSIT': 200},
         }
 
     @staticmethod
@@ -18,9 +19,11 @@ class SlurmExtension(WaldurExtension):
     @staticmethod
     def rest_urls():
         from .urls import register_in
+
         return register_in
 
     @staticmethod
     def get_cleanup_executor():
         from waldur_slurm.executors import SlurmCleanupExecutor
+
         return SlurmCleanupExecutor

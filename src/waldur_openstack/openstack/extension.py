@@ -2,7 +2,6 @@ from waldur_core.core import WaldurExtension
 
 
 class OpenStackExtension(WaldurExtension):
-
     class Settings:
         # wiki: https://opennode.atlassian.net/wiki/display/WD/OpenStack+plugin+configuration
         WALDUR_OPENSTACK = {
@@ -81,9 +80,6 @@ class OpenStackExtension(WaldurExtension):
                 },
             ),
             'SUBNET': {
-                # Allow cidr: 192.168.[1-255].0/24
-                'CIDR_REGEX': r'192\.168\.(?:25[0-4]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]?)\.0/24',
-                'CIDR_REGEX_EXPLANATION': 'Value should be 192.168.[1-254].0/24',
                 'ALLOCATION_POOL_START': '{first_octet}.{second_octet}.{third_octet}.10',
                 'ALLOCATION_POOL_END': '{first_octet}.{second_octet}.{third_octet}.200',
             },
@@ -94,7 +90,7 @@ class OpenStackExtension(WaldurExtension):
             # change cost of the project: delete tenants, change their configuration
             'MANAGER_CAN_MANAGE_TENANTS': False,
             'ADMIN_CAN_MANAGE_TENANTS': False,
-            'TENANT_CREDENTIALS_VISIBLE': True
+            'TENANT_CREDENTIALS_VISIBLE': True,
         }
 
     @staticmethod
@@ -104,11 +100,13 @@ class OpenStackExtension(WaldurExtension):
     @staticmethod
     def rest_urls():
         from .urls import register_in
+
         return register_in
 
     @staticmethod
     def celery_tasks():
         from datetime import timedelta
+
         return {
             'openstack-tenant-pull-quotas': {
                 'task': 'openstack.TenantPullQuotas',
@@ -120,6 +118,7 @@ class OpenStackExtension(WaldurExtension):
     @staticmethod
     def get_cleanup_executor():
         from .executors import OpenStackCleanupExecutor
+
         return OpenStackCleanupExecutor
 
     @staticmethod

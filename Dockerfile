@@ -7,6 +7,11 @@ LABEL   summary="Waldur Mastermind REST API Image" \
         description="Waldur Cloud Brokerage Platform" \
         url="https://waldur.com"
 
+# CentOS 7 docker image does not define preferred locale.
+# That's why ANSI_X3.4-1968 encoding is used by default.
+ENV LANG='en_US.UTF-8' LANGUAGE='en_US:en' LC_ALL='en_US.UTF-8'
+RUN localedef -i en_US -f UTF-8 en_US.UTF-8
+
 # Add tini
 ENV TINI_VERSION v0.16.1
 RUN cd /tmp && \
@@ -31,34 +36,37 @@ RUN cd /tmp && \
   rm gosu.asc
 
 # Install build dependencies for Waldur MasterMind from RPM repositories
-RUN yum --assumeyes install \
-    centos-release-openstack-pike \
-    epel-release \
-    https://download.postgresql.org/pub/repos/yum/9.6/redhat/rhel-7-x86_64/pgdg-centos96-9.6-3.noarch.rpm \
-RUN yum --assumeyes update && yum clean all
-RUN yum --assumeyes install --setopt=tsflags=nodocs \
-  gcc \
-  libffi-devel \
-  libjpeg-devel \
-  libxml2-devel \
-  libxslt-devel \
-  libyaml-devel \
-  openldap-devel \
-  openssl-devel \
-  postgresql-devel \
-  python-devel \
-  python-pip \
-  xmlsec1 \
-  xmlsec1-openssl \
-  zlib-devel \
-  crudini \
-  jq \
-  python2-httpie \
-  logrotate \
-  mailcap \
-  openssl \
-  uwsgi-plugin-python2 \
-  gettext
+RUN yum clean all && \
+    yum --assumeyes install epel-release && \
+    yum --assumeyes update && \
+    yum --assumeyes install --setopt=tsflags=nodocs \
+    gcc \
+    git \
+    libffi-devel \
+    libjpeg-devel \
+    libxml2-devel \
+    libxslt-devel \
+    libyaml-devel \
+    openldap-devel \
+    openssl-devel \
+    python3-devel \
+    xmlsec1 \
+    xmlsec1-openssl \
+    zlib-devel \
+    logrotate \
+    mailcap \
+    openssl \
+    uwsgi-plugin-python36 \
+    gettext \
+    which \
+    https://downloads.wkhtmltopdf.org/0.12/0.12.5/wkhtmltox-0.12.5-1.centos7.x86_64.rpm \
+    freetype \
+    liberation-serif-fonts \
+    liberation-sans-fonts \
+    liberation-mono-fonts \
+    liberation-narrow-fonts && \
+    yum clean all && \
+    rm -fr /var/cache/*
 
 RUN mkdir -p /usr/src/waldur
 

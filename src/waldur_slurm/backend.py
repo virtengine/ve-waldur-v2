@@ -1,11 +1,11 @@
-from functools import reduce
 import logging
 import operator
+import re
+from functools import reduce
 
 from django.conf import settings as django_settings
 from django.db import transaction
 from django.utils import timezone
-import six
 
 from waldur_core.structure import ServiceBackend, ServiceBackendError
 from waldur_freeipa import models as freeipa_models
@@ -13,7 +13,7 @@ from waldur_slurm.client import SlurmClient
 from waldur_slurm.client_moab import MoabClient
 from waldur_slurm.structures import Quotas
 
-from . import models, base
+from . import base, models
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ class SlurmBackend(ServiceBackend):
             self.client.list_accounts()
         except base.BatchError as e:
             if raise_exception:
-                six.reraise(ServiceBackendError, e)
+                raise ServiceBackendError(e)
             return False
         else:
             return True
@@ -66,6 +66,9 @@ class SlurmBackend(ServiceBackend):
             description=allocation.name,
             organization=project_account,
         )
+        allocation.backend_id = allocation_account
+        allocation.save()
+
         self.set_resource_limits(allocation)
 
         freeipa_profiles = {
@@ -79,7 +82,7 @@ class SlurmBackend(ServiceBackend):
                 self.add_user(allocation, username.lower())
 
     def delete_allocation(self, allocation):
-        account = self.get_allocation_name(allocation)
+        account = allocation.backend_id
         if self.client.get_account(account):
             self.client.delete_account(account)
 
@@ -87,14 +90,19 @@ class SlurmBackend(ServiceBackend):
         if self.get_allocation_queryset().filter(project=project).count() == 0:
             self.delete_project(project)
 
-        if self.get_allocation_queryset().filter(project__customer=project.customer).count() == 0:
+        if (
+            self.get_allocation_queryset()
+            .filter(project__customer=project.customer)
+            .count()
+            == 0
+        ):
             self.delete_customer(project.customer)
 
     def add_user(self, allocation, username):
         """
         Create association between user and SLURM account if it does not exist yet.
         """
-        account = self.get_allocation_name(allocation)
+        account = allocation.backend_id
         default_account = self.settings.options.get('default_account')
         if not self.client.get_association(username, account):
             self.client.create_association(username, account, default_account)
@@ -103,19 +111,21 @@ class SlurmBackend(ServiceBackend):
         """
         Delete association between user and SLURM account if it exists.
         """
-        account = self.get_allocation_name(allocation)
+        account = allocation.backend_id
         if self.client.get_association(username, account):
             self.client.delete_association(username, account)
 
     def set_resource_limits(self, allocation):
+        # TODO: add default limits configuration (https://opennode.atlassian.net/browse/WAL-3037)
+        default_limits = django_settings.WALDUR_SLURM['DEFAULT_LIMITS']
         quotas = Quotas(
-            cpu=allocation.cpu_limit,
-            gpu=allocation.gpu_limit,
-            ram=allocation.ram_limit,
-            deposit=allocation.deposit_limit,
+            cpu=default_limits['CPU'],
+            gpu=default_limits['GPU'],
+            ram=default_limits['RAM'],
+            deposit=default_limits['DEPOSIT'],
         )
 
-        self.client.set_resource_limits(self.get_allocation_name(allocation), quotas)
+        self.client.set_resource_limits(allocation.backend_id, quotas)
 
     def cancel_allocation(self, allocation):
         allocation.cpu_limit = allocation.cpu_usage
@@ -130,7 +140,7 @@ class SlurmBackend(ServiceBackend):
 
     def sync_usage(self):
         waldur_allocations = {
-            self.get_allocation_name(allocation): allocation
+            allocation.backend_id: allocation
             for allocation in self.get_allocation_queryset()
         }
 
@@ -138,18 +148,26 @@ class SlurmBackend(ServiceBackend):
         for account, usage in report.items():
             allocation = waldur_allocations.get(account)
             if not allocation:
-                logger.debug('Skipping usage report for account %s because it is not managed under Waldur', account)
+                logger.debug(
+                    'Skipping usage report for account %s because it is not managed under Waldur',
+                    account,
+                )
                 continue
             self._update_quotas(allocation, usage)
 
     def pull_allocation(self, allocation):
-        account = self.get_allocation_name(allocation)
+        account = allocation.backend_id
         report = self.get_usage_report([account])
         usage = report.get(account)
         if not usage:
-            logger.debug('Skipping usage report for account %s because it is not managed under Waldur', account)
+            logger.debug(
+                'Skipping usage report for account %s because it is not managed under Waldur',
+                account,
+            )
             return
         self._update_quotas(allocation, usage)
+        limits = self.get_allocation_limits(account)
+        self._update_limits(allocation, limits)
 
     def get_usage_report(self, accounts):
         report = {}
@@ -166,6 +184,18 @@ class SlurmBackend(ServiceBackend):
 
         return report
 
+    def get_allocation_limits(self, account):
+        output = self.client.get_limits(account)
+        limits = Quotas(cpu=output.cpu, gpu=output.gpu, ram=output.ram)
+
+        return limits
+
+    def _update_limits(self, allocation, limits):
+        allocation.cpu_limit = limits.cpu
+        allocation.gpu_limit = limits.gpu
+        allocation.ram_limit = limits.ram
+        allocation.save(update_fields=['cpu_limit', 'gpu_limit', 'ram_limit'])
+
     @transaction.atomic()
     def _update_quotas(self, allocation, usage):
         quotas = usage.pop('TOTAL_ACCOUNT_USAGE')
@@ -173,7 +203,9 @@ class SlurmBackend(ServiceBackend):
         allocation.gpu_usage = quotas.gpu
         allocation.ram_usage = quotas.ram
         allocation.deposit_usage = quotas.deposit
-        allocation.save(update_fields=['cpu_usage', 'gpu_usage', 'ram_usage', 'deposit_usage'])
+        allocation.save(
+            update_fields=['cpu_usage', 'gpu_usage', 'ram_usage', 'deposit_usage']
+        )
 
         usernames = usage.keys()
         usermap = {
@@ -181,19 +213,30 @@ class SlurmBackend(ServiceBackend):
             for profile in freeipa_models.Profile.objects.filter(username__in=usernames)
         }
 
+        allocation_usage, _ = models.AllocationUsage.objects.update_or_create(
+            allocation=allocation,
+            year=timezone.now().year,
+            month=timezone.now().month,
+            defaults={
+                'cpu_usage': quotas.cpu,
+                'gpu_usage': quotas.gpu,
+                'ram_usage': quotas.ram,
+                'deposit_usage': quotas.deposit,
+            },
+        )
+
         for username, quotas in usage.items():
-            models.AllocationUsage.objects.update_or_create(
-                allocation=allocation,
+            models.AllocationUserUsage.objects.update_or_create(
+                allocation_usage=allocation_usage,
+                user=usermap.get(username),
                 username=username,
-                year=timezone.now().year,
-                month=timezone.now().month,
                 defaults={
                     'cpu_usage': quotas.cpu,
                     'gpu_usage': quotas.gpu,
                     'ram_usage': quotas.ram,
                     'deposit_usage': quotas.deposit,
-                    'user': usermap.get(username),
-                })
+                },
+            )
 
     def create_customer(self, customer):
         customer_name = self.get_customer_name(customer)
@@ -211,17 +254,35 @@ class SlurmBackend(ServiceBackend):
         self.client.delete_account(self.get_project_name(project_uuid))
 
     def get_allocation_queryset(self):
-        return models.Allocation.objects.filter(service_project_link__service__settings=self.settings)
+        return models.Allocation.objects.filter(
+            service_project_link__service__settings=self.settings
+        )
 
     def get_customer_name(self, customer):
-        return self.get_account_name(django_settings.WALDUR_SLURM['CUSTOMER_PREFIX'], customer)
+        return self.get_account_name(
+            django_settings.WALDUR_SLURM['CUSTOMER_PREFIX'], customer
+        )
 
     def get_project_name(self, project):
-        return self.get_account_name(django_settings.WALDUR_SLURM['PROJECT_PREFIX'], project)
+        return self.get_account_name(
+            django_settings.WALDUR_SLURM['PROJECT_PREFIX'], project
+        )
+
+    def sanitize_allocation_name(self, name):
+        incorrect_symbols_regex = r'[^%s]+' % models.SLURM_ALLOCATION_REGEX
+        return re.sub(incorrect_symbols_regex, '', name)
 
     def get_allocation_name(self, allocation):
-        return self.get_account_name(django_settings.WALDUR_SLURM['ALLOCATION_PREFIX'], allocation)
+        prefix = django_settings.WALDUR_SLURM['ALLOCATION_PREFIX']
+        name = allocation.name
+        hexpart = allocation.uuid.hex[:5]
+        result_name = "%s%s_%s" % (prefix, name, hexpart)
+        return self.sanitize_allocation_name(result_name)
 
     def get_account_name(self, prefix, object_or_uuid):
-        key = isinstance(object_or_uuid, basestring) and object_or_uuid or object_or_uuid.uuid.hex
+        key = (
+            isinstance(object_or_uuid, str)
+            and object_or_uuid
+            or object_or_uuid.uuid.hex
+        )
         return '%s%s' % (prefix, key)

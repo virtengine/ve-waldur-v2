@@ -1,91 +1,95 @@
-from __future__ import unicode_literals
-
-from datetime import timedelta
+import functools
 import logging
+from datetime import timedelta
 
 from celery import shared_task
-from django.core import exceptions
+from django.conf import settings
 from django.db import transaction
 from django.db.utils import DatabaseError
 from django.utils import timezone
-import six
 
-from waldur_core.core import utils as core_utils, tasks as core_tasks, models as core_models
+from waldur_core.core import models as core_models
+from waldur_core.core import tasks as core_tasks
+from waldur_core.core import utils as core_utils
 from waldur_core.quotas.exceptions import QuotaValidationError
-from waldur_core.structure import SupportedServices, models, utils, ServiceBackendError, models as structure_models
+from waldur_core.structure import ServiceBackendError, SupportedServices
+from waldur_core.structure import models as structure_models
 
 logger = logging.getLogger(__name__)
 
 
-@shared_task(name='waldur_core.structure.detect_vm_coordinates_batch')
-def detect_vm_coordinates_batch(serialized_virtual_machines):
-    for vm in serialized_virtual_machines:
-        detect_vm_coordinates.delay(vm)
+def reraise_exceptions(func):
+    @functools.wraps(func)
+    def wrapped(self, service_settings, *args, **kwargs):
+        try:
+            return func(self, service_settings, *args, **kwargs)
+        except Exception as e:
+            raise e.__class__(
+                '%s, Service settings: %s, %s'
+                % (e, service_settings.name, service_settings.type)
+            )
 
-
-@shared_task(name='waldur_core.structure.detect_vm_coordinates')
-def detect_vm_coordinates(serialized_virtual_machine):
-
-    try:
-        vm = core_utils.deserialize_instance(serialized_virtual_machine)
-    except exceptions.ObjectDoesNotExist:
-        logger.warning('Missing virtual machine %s.', serialized_virtual_machine)
-        return
-
-    try:
-        coordinates = vm.detect_coordinates()
-    except utils.GeoIpException as e:
-        logger.warning('Unable to detect coordinates for virtual machines %s: %s.', serialized_virtual_machine, e)
-        return
-
-    if coordinates:
-        vm.latitude = coordinates.latitude
-        vm.longitude = coordinates.longitude
-        vm.save(update_fields=['latitude', 'longitude'])
+    return wrapped
 
 
 @shared_task(name='waldur_core.structure.check_expired_permissions')
 def check_expired_permissions():
-    for cls in models.BasePermission.get_all_models():
+    for cls in structure_models.BasePermission.get_all_models():
         for permission in cls.get_expired():
             permission.revoke()
 
 
 def connect_shared_settings(service_settings):
-    logger.debug('About to connect service settings "%s" to all available customers' % service_settings.name)
+    logger.debug(
+        'About to connect service settings "%s" to all available customers'
+        % service_settings.name
+    )
     if not service_settings.shared:
         raise ValueError('It is impossible to connect non-shared settings')
-    service_model = SupportedServices.get_service_models()[service_settings.type]['service']
+    service_model = SupportedServices.get_service_models()[service_settings.type][
+        'service'
+    ]
 
     with transaction.atomic():
-        for customer in models.Customer.objects.all():
+        for customer in structure_models.Customer.objects.all():
             defaults = {'available_for_all': True}
             try:
                 service, _ = service_model.objects.get_or_create(
-                    customer=customer, settings=service_settings, defaults=defaults)
+                    customer=customer, settings=service_settings, defaults=defaults
+                )
             except QuotaValidationError:
-                logger.warning('Unable to connect shared service '
-                               'settings to customer because quota is exceeded. '
-                               'Service settings ID: %s, customer ID: %s',
-                               service_settings.id, customer.id)
+                logger.warning(
+                    'Unable to connect shared service '
+                    'settings to customer because quota is exceeded. '
+                    'Service settings ID: %s, customer ID: %s',
+                    service_settings.id,
+                    customer.id,
+                )
                 continue
 
             service_project_link_model = service.projects.through
             for project in service.customer.projects.all():
                 try:
-                    service_project_link_model.objects.get_or_create(project=project, service=service)
+                    service_project_link_model.objects.get_or_create(
+                        project=project, service=service
+                    )
                 except QuotaValidationError:
-                    logger.warning('Unable to connect shared service to project because '
-                                   'quota is exceeded. Service ID: %s, project ID: %s',
-                                   service.id, project.id)
+                    logger.warning(
+                        'Unable to connect shared service to project because '
+                        'quota is exceeded. Service ID: %s, project ID: %s',
+                        service.id,
+                        project.id,
+                    )
                     continue
 
 
 class ConnectSharedSettingsTask(core_tasks.Task):
-
     def execute(self, service_settings):
         connect_shared_settings(service_settings)
-        logger.info('Successfully connected service settings "%s" to all available customers' % service_settings.name)
+        logger.info(
+            'Successfully connected service settings "%s" to all available customers'
+            % service_settings.name
+        )
 
 
 class BackgroundPullTask(core_tasks.BackgroundTask):
@@ -104,7 +108,9 @@ class BackgroundPullTask(core_tasks.BackgroundTask):
             self.on_pull_success(instance)
 
     def is_equal(self, other_task, serialized_instance):
-        return self.name == other_task.get('name') and serialized_instance in other_task.get('args', [])
+        return self.name == other_task.get(
+            'name'
+        ) and serialized_instance in other_task.get('args', [])
 
     def pull(self, instance):
         """ Pull instance from backend.
@@ -114,7 +120,7 @@ class BackgroundPullTask(core_tasks.BackgroundTask):
         raise NotImplementedError('Pull task should implement pull method.')
 
     def on_pull_fail(self, instance, error):
-        error_message = six.text_type(error)
+        error_message = str(error)
         self.log_error_message(instance, error_message)
         try:
             self.set_instance_erred(instance, error_message)
@@ -129,8 +135,14 @@ class BackgroundPullTask(core_tasks.BackgroundTask):
 
     def log_error_message(self, instance, error_message):
         logger_message = 'Failed to pull %s %s (PK: %s). Error: %s' % (
-            instance.__class__.__name__, instance.name, instance.pk, error_message)
-        if instance.state == instance.States.ERRED:  # report error on debug level if instance already was erred.
+            instance.__class__.__name__,
+            instance.name,
+            instance.pk,
+            error_message,
+        )
+        if (
+            instance.state == instance.States.ERRED
+        ):  # report error on debug level if instance already was erred.
             logger.debug(logger_message)
         else:
             logger.error(logger_message, exc_info=True)
@@ -144,6 +156,7 @@ class BackgroundPullTask(core_tasks.BackgroundTask):
 
 class BackgroundListPullTask(core_tasks.BackgroundTask):
     """ Schedules pull task for each stable object of the model. """
+
     model = NotImplemented
     pull_task = NotImplemented
 
@@ -152,7 +165,9 @@ class BackgroundListPullTask(core_tasks.BackgroundTask):
 
     def get_pulled_objects(self):
         States = self.model.States
-        return self.model.objects.filter(state__in=[States.ERRED, States.OK]).exclude(backend_id='')
+        return self.model.objects.filter(state__in=[States.ERRED, States.OK]).exclude(
+            backend_id=''
+        )
 
     def run(self):
         for instance in self.get_pulled_objects():
@@ -161,7 +176,7 @@ class BackgroundListPullTask(core_tasks.BackgroundTask):
 
 
 class ServiceListPullTask(BackgroundListPullTask):
-    model = models.ServiceSettings
+    model = structure_models.ServiceSettings
 
     def get_pulled_objects(self):
         States = self.model.States
@@ -169,21 +184,19 @@ class ServiceListPullTask(BackgroundListPullTask):
 
 
 class ServicePropertiesPullTask(BackgroundPullTask):
-
     def pull(self, service_settings):
         backend = service_settings.get_backend()
         backend.pull_service_properties()
 
 
 class ServiceResourcesPullTask(BackgroundPullTask):
-
+    @reraise_exceptions
     def pull(self, service_settings):
         backend = service_settings.get_backend()
         backend.pull_resources()
 
 
 class ServiceSubResourcesPullTask(BackgroundPullTask):
-
     def pull(self, service_settings):
         backend = service_settings.get_backend()
         backend.pull_subresources()
@@ -222,6 +235,7 @@ class BaseThrottleProvisionTask(RetryUntilAvailableTask):
     Before starting resource provisioning, count how many resources
     are already in "creating" state and delay provisioning if there are too many of them.
     """
+
     DEFAULT_LIMIT = 4
 
     def is_available(self, resource):
@@ -234,7 +248,8 @@ class BaseThrottleProvisionTask(RetryUntilAvailableTask):
         model_class = resource._meta.model
         return model_class.objects.filter(
             state=core_models.StateMixin.States.CREATING,
-            service_project_link__service__settings=service_settings).count()
+            service_project_link__service__settings=service_settings,
+        ).count()
 
     def get_limit(self, resource):
         return self.DEFAULT_LIMIT
@@ -244,7 +259,9 @@ class ThrottleProvisionTask(BaseThrottleProvisionTask, core_tasks.BackendMethodT
     pass
 
 
-class ThrottleProvisionStateTask(BaseThrottleProvisionTask, core_tasks.StateTransitionTask):
+class ThrottleProvisionStateTask(
+    BaseThrottleProvisionTask, core_tasks.StateTransitionTask
+):
     pass
 
 
@@ -252,6 +269,7 @@ class SetErredStuckResources(core_tasks.BackgroundTask):
     """
     This task marks all resources which have been provisioning for more than 3 hours as erred.
     """
+
     name = 'waldur_core.structure.SetErredStuckResources'
 
     def is_equal(self, other_task):
@@ -259,15 +277,31 @@ class SetErredStuckResources(core_tasks.BackgroundTask):
 
     def run(self):
         cutoff = timezone.now() - timedelta(hours=3)
-        states = (structure_models.NewResource.States.CREATING,
-                  structure_models.NewResource.States.CREATION_SCHEDULED)
-        resource_models = (structure_models.NewResource.get_all_models() +
-                           structure_models.SubResource.get_all_models())
+        states = (
+            structure_models.NewResource.States.CREATING,
+            structure_models.NewResource.States.CREATION_SCHEDULED,
+        )
+        resource_models = (
+            structure_models.NewResource.get_all_models()
+            + structure_models.SubResource.get_all_models()
+        )
         for model in resource_models:
             for resource in model.objects.filter(modified__lt=cutoff, state__in=states):
                 resource.set_erred()
                 resource.error_message = 'Provisioning has timed out.'
                 resource.save(update_fields=['state', 'error_message'])
-                logger.warning('Switching resource %s to erred state, '
-                               'because provisioning has timed out.',
-                               core_utils.serialize_instance(resource))
+                logger.warning(
+                    'Switching resource %s to erred state, '
+                    'because provisioning has timed out.',
+                    core_utils.serialize_instance(resource),
+                )
+
+
+@shared_task
+def send_change_email_notification(request_serialized):
+    request = core_utils.deserialize_instance(request_serialized)
+    link = settings.WALDUR_CORE['EMAIL_CHANGE_URL'].format(code=request.uuid.hex)
+    context = {'request': request, 'link': link}
+    core_utils.broadcast_mail(
+        'structure', 'change_email_request', context, [request.email]
+    )

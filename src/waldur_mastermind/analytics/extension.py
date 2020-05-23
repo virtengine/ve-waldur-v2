@@ -1,5 +1,3 @@
-from __future__ import unicode_literals
-
 from datetime import timedelta
 
 from waldur_core.core import WaldurExtension
@@ -18,7 +16,8 @@ class AnalyticsExtension(WaldurExtension):
                 'database': 'DATABASE',
                 'ssl': False,
                 'verify_ssl': False,
-            }
+            },
+            'DAILY_QUOTA_LIFETIME': timedelta(days=31),
         }
 
     @staticmethod
@@ -32,6 +31,7 @@ class AnalyticsExtension(WaldurExtension):
     @staticmethod
     def rest_urls():
         from .urls import register_in
+
         return register_in
 
     @staticmethod

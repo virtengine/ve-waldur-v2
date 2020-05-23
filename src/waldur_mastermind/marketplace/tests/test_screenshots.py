@@ -1,6 +1,5 @@
-from __future__ import unicode_literals
+from unittest import mock
 
-import mock
 from ddt import data, ddt
 from rest_framework import status, test
 
@@ -13,7 +12,6 @@ from . import factories
 
 @ddt
 class ScreenshotsGetTest(test.APITransactionTestCase):
-
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.screenshot = factories.ScreenshotFactory()
@@ -33,12 +31,14 @@ class ScreenshotsGetTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
     @data('staff', 'owner', 'user', 'customer_support', 'admin', 'manager')
-    def test_screenshots_of_offering_should_be_visible_to_all_authenticated_users(self, user):
+    def test_screenshots_of_offering_should_be_visible_to_all_authenticated_users(
+        self, user
+    ):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
         offering = self.screenshot.offering
         url = factories.ScreenshotFactory.get_list_url()
-        response = self.client.get(url, {'offering_uuid': offering.uuid})
+        response = self.client.get(url, {'offering_uuid': offering.uuid.hex})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.json()), 1)
 
@@ -53,7 +53,9 @@ class ScreenshotsCreateTest(test.APITransactionTestCase):
     def test_authorized_user_can_create_screenshot(self, user):
         response = self.create_screenshot(user)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertTrue(models.Screenshot.objects.filter(offering__customer=self.customer).exists())
+        self.assertTrue(
+            models.Screenshot.objects.filter(offering__customer=self.customer).exists()
+        )
 
     @data('user', 'customer_support', 'admin', 'manager')
     def test_unauthorized_user_can_not_create_screenshot(self, user):
@@ -84,7 +86,6 @@ class ScreenshotsCreateTest(test.APITransactionTestCase):
 
 @ddt
 class ScreenshotsUpdateTest(test.APITransactionTestCase):
-
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.customer = self.fixture.customer
@@ -94,7 +95,9 @@ class ScreenshotsUpdateTest(test.APITransactionTestCase):
         response, screenshot = self.update_screenshot(user)
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertEqual(screenshot.name, 'new_screenshot')
-        self.assertTrue(models.Screenshot.objects.filter(name='new_screenshot').exists())
+        self.assertTrue(
+            models.Screenshot.objects.filter(name='new_screenshot').exists()
+        )
 
     @data('user', 'customer_support', 'admin', 'manager')
     def test_unauthorized_user_can_not_update_screenshot(self, user):
@@ -109,9 +112,7 @@ class ScreenshotsUpdateTest(test.APITransactionTestCase):
         screenshot = factories.ScreenshotFactory(offering=self.offering)
         url = factories.ScreenshotFactory.get_url(screenshot=screenshot)
 
-        response = self.client.patch(url, {
-            'name': 'new_screenshot'
-        })
+        response = self.client.patch(url, {'name': 'new_screenshot'})
         screenshot.refresh_from_db()
 
         return response, screenshot
@@ -119,7 +120,6 @@ class ScreenshotsUpdateTest(test.APITransactionTestCase):
 
 @ddt
 class ScreenshotsDeleteTest(test.APITransactionTestCase):
-
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.customer = self.fixture.customer
@@ -130,14 +130,20 @@ class ScreenshotsDeleteTest(test.APITransactionTestCase):
     @data('staff', 'owner')
     def test_authorized_user_can_delete_screenshot(self, user):
         response = self.delete_screenshot(user)
-        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT, response.data)
-        self.assertFalse(models.Screenshot.objects.filter(offering__customer=self.customer).exists())
+        self.assertEqual(
+            response.status_code, status.HTTP_204_NO_CONTENT, response.data
+        )
+        self.assertFalse(
+            models.Screenshot.objects.filter(offering__customer=self.customer).exists()
+        )
 
     @data('user', 'customer_support', 'admin', 'manager')
     def test_unauthorized_user_can_not_delete_screenshot(self, user):
         response = self.delete_screenshot(user)
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-        self.assertTrue(models.Screenshot.objects.filter(offering__customer=self.customer).exists())
+        self.assertTrue(
+            models.Screenshot.objects.filter(offering__customer=self.customer).exists()
+        )
 
     def delete_screenshot(self, user):
         user = getattr(self.fixture, user)

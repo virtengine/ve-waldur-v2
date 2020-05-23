@@ -1,5 +1,5 @@
-from django.urls import reverse
 import factory
+from django.urls import reverse
 from factory import fuzzy
 
 from waldur_core.structure.tests import factories as structure_factories
@@ -8,7 +8,7 @@ from .. import models
 
 
 class SupportUserFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.SupportUser
 
     name = factory.Sequence(lambda n: 'user-%s' % n)
@@ -20,7 +20,7 @@ class SupportUserFactory(factory.DjangoModelFactory):
 
 
 class IssueFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.Issue
 
     backend_id = factory.Sequence(lambda n: 'TST-%s' % n)
@@ -33,7 +33,9 @@ class IssueFactory(factory.DjangoModelFactory):
     def get_url(cls, issue=None, action=None):
         if issue is None:
             issue = IssueFactory()
-        url = 'http://testserver' + reverse('support-issue-detail', kwargs={'uuid': issue.uuid.hex})
+        url = 'http://testserver' + reverse(
+            'support-issue-detail', kwargs={'uuid': issue.uuid.hex}
+        )
         return url if action is None else url + action + '/'
 
     @classmethod
@@ -42,7 +44,7 @@ class IssueFactory(factory.DjangoModelFactory):
 
 
 class CommentFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.Comment
 
     issue = factory.SubFactory(IssueFactory)
@@ -55,7 +57,9 @@ class CommentFactory(factory.DjangoModelFactory):
     def get_url(cls, comment=None, action=None):
         if comment is None:
             comment = IssueFactory()
-        url = 'http://testserver' + reverse('support-comment-detail', kwargs={'uuid': comment.uuid.hex})
+        url = 'http://testserver' + reverse(
+            'support-comment-detail', kwargs={'uuid': comment.uuid.hex}
+        )
         return url if action is None else url + action + '/'
 
     @classmethod
@@ -64,7 +68,7 @@ class CommentFactory(factory.DjangoModelFactory):
 
 
 class OfferingTemplateFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.OfferingTemplate
 
     name = factory.Sequence(lambda n: 'template-%s' % n)
@@ -100,7 +104,10 @@ class OfferingTemplateFactory(factory.DjangoModelFactory):
     def get_url(cls, offering_template=None, action=None):
         if offering_template is None:
             offering_template = OfferingTemplateFactory()
-        url = 'http://testserver' + reverse('support-offering-template-detail', kwargs={'uuid': offering_template.uuid})
+        url = 'http://testserver' + reverse(
+            'support-offering-template-detail',
+            kwargs={'uuid': offering_template.uuid.hex},
+        )
         return url if action is None else url + action + '/'
 
     @classmethod
@@ -109,7 +116,7 @@ class OfferingTemplateFactory(factory.DjangoModelFactory):
 
 
 class OfferingPlanFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.OfferingPlan
 
     name = factory.Sequence(lambda n: 'plan-%s' % n)
@@ -120,7 +127,9 @@ class OfferingPlanFactory(factory.DjangoModelFactory):
     def get_url(cls, plan=None, action=None):
         if plan is None:
             plan = OfferingPlanFactory()
-        url = 'http://testserver' + reverse('support-offering-plan-detail', kwargs={'uuid': plan.uuid})
+        url = 'http://testserver' + reverse(
+            'support-offering-plan-detail', kwargs={'uuid': plan.uuid.hex}
+        )
         return url if action is None else url + action + '/'
 
     @classmethod
@@ -129,7 +138,6 @@ class OfferingPlanFactory(factory.DjangoModelFactory):
 
 
 class OfferingFactory(factory.DjangoModelFactory):
-
     class Meta:
         model = models.Offering
 
@@ -142,7 +150,9 @@ class OfferingFactory(factory.DjangoModelFactory):
     def get_url(cls, offering=None, action=None):
         if offering is None:
             offering = OfferingFactory()
-        url = 'http://testserver' + reverse('support-offering-detail', kwargs={'uuid': offering.uuid.hex})
+        url = 'http://testserver' + reverse(
+            'support-offering-detail', kwargs={'uuid': offering.uuid.hex}
+        )
         return url if action is None else url + action + '/'
 
     @classmethod
@@ -156,7 +166,7 @@ class OfferingFactory(factory.DjangoModelFactory):
 
 
 class AttachmentFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.Attachment
 
     backend_id = factory.Sequence(lambda n: 'key_%s' % n)
@@ -167,7 +177,9 @@ class AttachmentFactory(factory.DjangoModelFactory):
     def get_url(cls, attachment=None, action=None):
         if attachment is None:
             attachment = AttachmentFactory()
-        url = 'http://testserver' + reverse('support-attachment-detail', kwargs={'uuid': attachment.uuid.hex})
+        url = 'http://testserver' + reverse(
+            'support-attachment-detail', kwargs={'uuid': attachment.uuid.hex}
+        )
         return url if action is None else url + action + '/'
 
     @classmethod
@@ -176,7 +188,7 @@ class AttachmentFactory(factory.DjangoModelFactory):
 
 
 class TemplateFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.Template
 
     name = factory.Sequence(lambda n: 'template_%s' % n)
@@ -186,7 +198,9 @@ class TemplateFactory(factory.DjangoModelFactory):
     def get_url(cls, template=None, action=None):
         if template is None:
             template = TemplateFactory()
-        url = 'http://testserver' + reverse('support-template-detail', kwargs={'uuid': template.uuid.hex})
+        url = 'http://testserver' + reverse(
+            'support-template-detail', kwargs={'uuid': template.uuid.hex}
+        )
         return url if action is None else url + action + '/'
 
     @classmethod
@@ -195,14 +209,14 @@ class TemplateFactory(factory.DjangoModelFactory):
 
 
 class IgnoredIssueStatusFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.IgnoredIssueStatus
 
     name = factory.Sequence(lambda n: 'status_%s' % n)
 
 
 class TemplateStatusNotificationFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.TemplateStatusNotification
 
     status = factory.Sequence(lambda n: 'status_%s' % n)
@@ -212,7 +226,7 @@ class TemplateStatusNotificationFactory(factory.DjangoModelFactory):
 
 
 class PriorityFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.Priority
 
     backend_id = factory.Sequence(lambda n: n)
@@ -222,7 +236,9 @@ class PriorityFactory(factory.DjangoModelFactory):
     def get_url(cls, priority=None):
         if priority is None:
             priority = PriorityFactory()
-        return 'http://testserver' + reverse('support-priority-detail', kwargs={'uuid': priority.uuid.hex})
+        return 'http://testserver' + reverse(
+            'support-priority-detail', kwargs={'uuid': priority.uuid.hex}
+        )
 
     @classmethod
     def get_list_url(cls):
@@ -230,7 +246,7 @@ class PriorityFactory(factory.DjangoModelFactory):
 
 
 class RequestTypeFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.RequestType
 
     backend_id = factory.Sequence(lambda n: n)
@@ -239,7 +255,7 @@ class RequestTypeFactory(factory.DjangoModelFactory):
 
 
 class SupportCustomerFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.SupportCustomer
 
     user = factory.SubFactory(structure_factories.UserFactory)
@@ -247,5 +263,30 @@ class SupportCustomerFactory(factory.DjangoModelFactory):
 
 
 class IssueStatusFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.IssueStatus
+
+
+class TemplateConfirmationCommentFactory(factory.DjangoModelFactory):
+    class Meta:
+        model = models.TemplateConfirmationComment
+
+
+class FeedbackFactory(factory.DjangoModelFactory):
+    issue = factory.SubFactory(IssueFactory)
+    evaluation = models.Feedback.Evaluation.POSITIVE
+
+    class Meta:
+        model = models.Feedback
+
+    @classmethod
+    def get_url(cls, feedback=None):
+        if feedback is None:
+            feedback = FeedbackFactory()
+        return 'http://testserver' + reverse(
+            'support-feedback-detail', kwargs={'uuid': feedback.uuid.hex}
+        )
+
+    @classmethod
+    def get_list_url(cls):
+        return 'http://testserver' + reverse('support-feedback-list')

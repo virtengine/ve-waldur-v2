@@ -1,21 +1,18 @@
-from __future__ import unicode_literals
-
-from functools import reduce
 import importlib
 import inspect
 import logging
+from functools import reduce
 
 from django.apps import apps
 from django.conf import settings
 from django.contrib.admindocs.views import simplify_regex
-from django.urls import RegexURLResolver, RegexURLPattern
+from django.urls import URLPattern, URLResolver
 from django_filters import ModelMultipleChoiceFilter
-from rest_framework.fields import ChoiceField, ReadOnlyField, ModelField
+from rest_framework.fields import ChoiceField, ModelField, ReadOnlyField
 from rest_framework.relations import HyperlinkedRelatedField, ManyRelatedField
 from rest_framework.serializers import ListSerializer, ModelSerializer
 from rest_framework.settings import api_settings
 from rest_framework.views import APIView
-import six
 
 from waldur_core.core.filters import ContentTypeFilter, MappedMultipleChoiceFilter
 from waldur_core.core.serializers import GenericRelatedField
@@ -31,20 +28,23 @@ def getdoc(obj, warning=True):
             name = '{}.{}'.format(obj.__module__, obj.__name__)
         elif inspect.ismethod(obj):
             cls = obj.im_class
-            name = '{}.{}.{}'.format(cls.__module__, cls.__name__, obj.im_func.func_name)
+            name = '{}.{}.{}'.format(
+                cls.__module__, cls.__name__, obj.im_func.func_name
+            )
         else:
-            name = six.text_type(obj)
+            name = str(obj)
         logger.warning("Docstring is missing for %s", name)
     return doc
 
 
-class ApiDocs(object):
+class ApiDocs:
     """ Generate RST docs for DRF endpoints from docstrings:
         - AppConfig class docstring may contain general info about an app,
           `verbose_name` in the config delivers human friendly title;
         - View class docstring describes intention of top-level endpoint;
         - View method docstring can explain usage of particular method or actions;
     """
+
     tree = {}
     exclude = ['rest_framework']
 
@@ -67,24 +67,32 @@ class ApiDocs(object):
 
     def get_all_view_names(self, urlpatterns, parent_pattern=None):
         for pattern in urlpatterns:
-            if isinstance(pattern, RegexURLResolver):
-                pp = None if pattern._regex == '^' else pattern
-                for ep in self.get_all_view_names(pattern.url_patterns, parent_pattern=pp):
+            if isinstance(pattern, URLResolver):
+                regex = pattern.pattern.regex
+                pp = None if regex.pattern == '^' else pattern
+                for ep in self.get_all_view_names(
+                    pattern.url_patterns, parent_pattern=pp
+                ):
                     yield ep
-            elif isinstance(pattern, RegexURLPattern) and self._is_drf_view(pattern):
+            elif isinstance(pattern, URLPattern) and self._is_drf_view(pattern):
                 suffix = '?P<%s>' % api_settings.FORMAT_SUFFIX_KWARG
-                if suffix not in pattern.regex.pattern:
+                regex = pattern.pattern.regex
+                if suffix not in regex.pattern:
                     yield ApiEndpoint(pattern, parent_pattern)
 
     def _is_drf_view(self, pattern):
-        return hasattr(pattern.callback, 'cls') and issubclass(pattern.callback.cls, APIView)
+        return hasattr(pattern.callback, 'cls') and issubclass(
+            pattern.callback.cls, APIView
+        )
 
     def _get_fields(self, fields):
         lines = []
         for field in fields:
             hl = '**' if field['required'] else ''
             cmnt = ' (%s)' % field['help_text'] if field['help_text'] else ''
-            txt = '\t* {hl}{name}{hl} -- ``{type}``{cmnt}'.format(hl=hl, cmnt=cmnt, **field)
+            txt = '\t* {hl}{name}{hl} -- ``{type}``{cmnt}'.format(
+                hl=hl, cmnt=cmnt, **field
+            )
             lines.append(txt)
         return '\n'.join(lines)
 
@@ -97,7 +105,7 @@ class ApiDocs(object):
             name = conf.verbose_name
             file = '%s.rst' % app
 
-            print '\t* %s' % file
+            print('\t* %s' % file)
 
             with open(path + '/' + file, 'w') as f:
                 doc = getdoc(conf) or name
@@ -120,13 +128,21 @@ class ApiDocs(object):
                         methods = act.methods
                         # 1st line is supposed to be List/Create view -- remove unfeasible methods
                         if idx == 1:
-                            methods = [m for m in methods if m not in ('PUT', 'PATCH', 'DELETE')]
+                            methods = [
+                                m
+                                for m in methods
+                                if m not in ('PUT', 'PATCH', 'DELETE')
+                            ]
                         # 2nd line is supposed to be Retrieve/Update/Delete view
                         if idx == 2 and act.path.endswith('>/'):
                             methods = [m for m in methods if m != 'POST']
 
                         f.write('.. topic:: ``%s``' % act.path + '\n\n')
-                        f.write('\tMethods: ' + ', '.join(['``%s``' % m for m in methods]) + '\n\n')
+                        f.write(
+                            '\tMethods: '
+                            + ', '.join(['``%s``' % m for m in methods])
+                            + '\n\n'
+                        )
 
                         # 1st line is supposed to be List/Create view -- add proper details
                         if idx == 1:
@@ -138,7 +154,11 @@ class ApiDocs(object):
 
                         # 2nd line is supposed to be Retrieve/Update/Delete view
                         if idx == 2 and act.path.endswith('>/'):
-                            update_fields = [o for o in fields if not o['readonly'] and not o['protected']]
+                            update_fields = [
+                                o
+                                for o in fields
+                                if not o['readonly'] and not o['protected']
+                            ]
                             if 'PUT' in methods and update_fields:
                                 f.write('\tSupported fields for update:\n\n')
                                 f.write(self._get_fields(update_fields))
@@ -172,7 +192,9 @@ class ApiDocs(object):
                             # docs for classic Views
                             for method in methods:
                                 try:
-                                    doc = getdoc(getattr(cls, method.lower()), warning=False)
+                                    doc = getdoc(
+                                        getattr(cls, method.lower()), warning=False
+                                    )
                                 except AttributeError:
                                     continue
                                 if doc:
@@ -196,7 +218,7 @@ class ApiDocs(object):
         file.write('\n'.join(['\t' + s for s in docstring.split('\n')]) + '\n')
 
 
-class ApiEndpoint(object):
+class ApiEndpoint:
     FIELDS = {
         # filter
         'BooleanFilter': 'boolean',
@@ -223,7 +245,7 @@ class ApiEndpoint(object):
         ('POST', 'create'),
         ('PUT', 'update'),
         ('PATCH', 'partial_update'),
-        ('DELETE', 'destroy')
+        ('DELETE', 'destroy'),
     ]
 
     VIEWS = {}
@@ -237,7 +259,11 @@ class ApiEndpoint(object):
         self.pattern = pattern
         self.callback = pattern.callback
         self.docstring = getdoc(self.callback.cls)
-        self.name_parent = simplify_regex(parent_pattern.regex.pattern).replace('/', '') if parent_pattern else None
+        self.name_parent = (
+            simplify_regex(parent_pattern.regex.pattern).replace('/', '')
+            if parent_pattern
+            else None
+        )
         self.path = self.get_path(parent_pattern)
         self.name = conf.verbose_name
         self.app = conf.label
@@ -245,10 +271,14 @@ class ApiEndpoint(object):
         cls = self.callback.cls
         action = self.path.split('/')[-2]
 
-        self.actions = [m for m in dir(cls) if hasattr(getattr(cls, m), 'bind_to_methods')]
+        self.actions = [
+            m for m in dir(cls) if hasattr(getattr(cls, m), 'bind_to_methods')
+        ]
         self.action = action if action in self.actions else None
         if self.action:
-            self.methods = [m.upper() for m in reduce(getattr, [action, 'bind_to_methods'], cls)]
+            self.methods = [
+                m.upper() for m in reduce(getattr, [action, 'bind_to_methods'], cls)
+            ]
         else:
             self.methods = []
             for method, action in self.METHODS:
@@ -275,15 +305,20 @@ class ApiEndpoint(object):
             ro = getattr(meta, 'read_only_fields', [])
             wo = getattr(meta, 'write_only_fields', [])
             pt = getattr(meta, 'protected_fields', [])
-            return [{
-                "name": key,
-                "type": self._get_field_type(field),
-                "help_text": field.help_text,
-                "required": field.required,
-                "readonly": key in ro or isinstance(field, ReadOnlyField) or field.read_only,
-                "writeonly": key in wo or field.write_only,
-                "protected": key in pt,
-            } for key, field in serializer.get_fields().items()]
+            return [
+                {
+                    "name": key,
+                    "type": self._get_field_type(field),
+                    "help_text": field.help_text,
+                    "required": field.required,
+                    "readonly": key in ro
+                    or isinstance(field, ReadOnlyField)
+                    or field.read_only,
+                    "writeonly": key in wo or field.write_only,
+                    "protected": key in pt,
+                }
+                for key, field in serializer.get_fields().items()
+            ]
 
         return []
 
@@ -300,12 +335,16 @@ class ApiEndpoint(object):
 
     def get_path(self, parent_pattern):
         if parent_pattern:
-            return "/{}{}".format(self.name_parent, simplify_regex(self.pattern.regex.pattern))
+            return "/{}{}".format(
+                self.name_parent, simplify_regex(self.pattern.regex.pattern)
+            )
         return simplify_regex(self.pattern.regex.pattern)
 
     def _get_field_type(self, field):
         if isinstance(field, MappedMultipleChoiceFilter):
-            return 'choice(%s)' % ', '.join(["'%s'" % f for f in sorted(field.mapped_to_model)])
+            return 'choice(%s)' % ', '.join(
+                ["'%s'" % f for f in sorted(field.mapped_to_model)]
+            )
         if isinstance(field, ChoiceField):
             return 'choice(%s)' % ', '.join(["'%s'" % f for f in sorted(field.choices)])
         if isinstance(field, HyperlinkedRelatedField):
@@ -313,14 +352,21 @@ class ApiEndpoint(object):
             if path:
                 return 'link to %s' % path
         if isinstance(field, GenericRelatedField):
-            paths = [self.VIEWS.get(GenericRelatedField()._get_url(m())) for m in field.related_models]
+            paths = [
+                self.VIEWS.get(GenericRelatedField()._get_url(m()))
+                for m in field.related_models
+            ]
             path = ', '.join([m for m in paths if m])
             if path:
                 return 'link to any: %s' % path
         if isinstance(field, ContentTypeFilter):
             return 'string in form <app_label>.<model_name>'
         if isinstance(field, ModelSerializer):
-            fields = {f['name']: f['type'] for f in self.get_serializer_fields(field) if not f['readonly']}
+            fields = {
+                f['name']: f['type']
+                for f in self.get_serializer_fields(field)
+                if not f['readonly']
+            }
             return '{%s}' % ', '.join(['%s: %s' % (k, v) for k, v in fields.items()])
         if isinstance(field, ModelMultipleChoiceFilter):
             return self._get_field_type(field.field)

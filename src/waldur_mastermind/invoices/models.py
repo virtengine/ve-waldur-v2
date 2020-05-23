@@ -1,23 +1,20 @@
-from __future__ import unicode_literals, division
-
-import StringIO
 import base64
-from datetime import timedelta
+import datetime
 import decimal
 import logging
 from calendar import monthrange
+from datetime import timedelta
+from io import BytesIO
 
-import datetime
 from django.conf import settings
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.contrib.postgres.fields import JSONField
 from django.core.exceptions import ValidationError
-from django.core.validators import MinValueValidator, MaxValueValidator
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.db.models import Q
 from django.utils import timezone
-from django.utils.encoding import python_2_unicode_compatible
 from django.utils.functional import cached_property
 from django.utils.translation import ugettext_lazy as _
 from model_utils import FieldTracker
@@ -29,6 +26,7 @@ from waldur_core.structure import models as structure_models
 from waldur_mastermind.common import mixins as common_mixins
 from waldur_mastermind.common.utils import quantize_price
 from waldur_mastermind.invoices.utils import get_price_per_day
+from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.packages import models as package_models
 
 from . import managers, utils
@@ -38,39 +36,60 @@ logger = logging.getLogger(__name__)
 Units = common_mixins.UnitPriceMixin.Units
 
 
-@python_2_unicode_compatible
 class Invoice(core_models.UuidMixin, models.Model):
     """ Invoice describes billing information about purchased resources for customers on a monthly basis """
 
-    class Permissions(object):
+    class Permissions:
         customer_path = 'customer'
 
-    class Meta(object):
+    class Meta:
         unique_together = ('customer', 'month', 'year')
 
-    class States(object):
+    class States:
         PENDING = 'pending'
         CREATED = 'created'
         PAID = 'paid'
         CANCELED = 'canceled'
 
-        CHOICES = ((PENDING, _('Pending')), (CREATED, _('Created')), (PAID, _('Paid')), (CANCELED, _('Canceled')))
+        CHOICES = (
+            (PENDING, _('Pending')),
+            (CREATED, _('Created')),
+            (PAID, _('Paid')),
+            (CANCELED, _('Canceled')),
+        )
 
-    month = models.PositiveSmallIntegerField(default=utils.get_current_month,
-                                             validators=[MinValueValidator(1), MaxValueValidator(12)])
+    month = models.PositiveSmallIntegerField(
+        default=utils.get_current_month,
+        validators=[MinValueValidator(1), MaxValueValidator(12)],
+    )
     year = models.PositiveSmallIntegerField(default=utils.get_current_year)
-    state = models.CharField(max_length=30, choices=States.CHOICES, default=States.PENDING)
-    customer = models.ForeignKey(structure_models.Customer,
-                                 verbose_name=_('organization'),
-                                 related_name='+',
-                                 on_delete=models.CASCADE)
-    current_cost = models.DecimalField(default=0, max_digits=10, decimal_places=2,
-                                       help_text=_('Cached value for current cost.'),
-                                       editable=False)
-    tax_percent = models.DecimalField(default=0, max_digits=4, decimal_places=2,
-                                      validators=[MinValueValidator(0), MaxValueValidator(100)])
-    invoice_date = models.DateField(null=True, blank=True,
-                                    help_text=_('Date then invoice moved from state pending to created.'))
+    state = models.CharField(
+        max_length=30, choices=States.CHOICES, default=States.PENDING
+    )
+    customer = models.ForeignKey(
+        structure_models.Customer,
+        verbose_name=_('organization'),
+        related_name='+',
+        on_delete=models.CASCADE,
+    )
+    current_cost = models.DecimalField(
+        default=0,
+        max_digits=10,
+        decimal_places=2,
+        help_text=_('Cached value for current cost.'),
+        editable=False,
+    )
+    tax_percent = models.DecimalField(
+        default=0,
+        max_digits=4,
+        decimal_places=2,
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+    )
+    invoice_date = models.DateField(
+        null=True,
+        blank=True,
+        help_text=_('Date then invoice moved from state pending to created.'),
+    )
     _file = models.TextField(blank=True, editable=False)
 
     tracker = FieldTracker()
@@ -113,7 +132,9 @@ class Invoice(core_models.UuidMixin, models.Model):
     @property
     def due_date(self):
         if self.invoice_date:
-            return self.invoice_date + datetime.timedelta(days=settings.WALDUR_INVOICES['PAYMENT_INTERVAL'])
+            return self.invoice_date + datetime.timedelta(
+                days=settings.WALDUR_INVOICES['PAYMENT_INTERVAL']
+            )
 
     @property
     def number(self):
@@ -126,7 +147,13 @@ class Invoice(core_models.UuidMixin, models.Model):
         if self.state != self.States.PENDING:
             raise IncorrectStateException(_('Invoice must be in pending state.'))
 
-        self.state = self.States.CREATED
+        if self.customer.paymentprofile_set.filter(
+            is_active=True, payment_type=PaymentType.FIXED_PRICE
+        ).count():
+            self.state = self.States.PAID
+        else:
+            self.state = self.States.CREATED
+
         self.invoice_date = timezone.now().date()
         self.save(update_fields=['state', 'invoice_date'])
 
@@ -136,7 +163,7 @@ class Invoice(core_models.UuidMixin, models.Model):
             return
 
         content = base64.b64decode(self._file)
-        return StringIO.StringIO(content)
+        return BytesIO(content)
 
     @file.setter
     def file(self, value):
@@ -152,28 +179,40 @@ class Invoice(core_models.UuidMixin, models.Model):
         return '%s | %s-%s' % (self.customer, self.year, self.month)
 
 
-@python_2_unicode_compatible
 class InvoiceItem(common_mixins.ProductCodeMixin, common_mixins.UnitPriceMixin):
     """
     It is expected that get_scope_type method is defined as class method in scope class
     as it is used in generic invoice item serializer.
     """
-    invoice = models.ForeignKey(Invoice, related_name='generic_items')
-    content_type = models.ForeignKey(ContentType, null=True, related_name='+')
+
+    invoice = models.ForeignKey(
+        on_delete=models.CASCADE, to=Invoice, related_name='generic_items'
+    )
+    content_type = models.ForeignKey(
+        on_delete=models.CASCADE, to=ContentType, null=True, related_name='+'
+    )
     object_id = models.PositiveIntegerField(null=True)
     quantity = models.PositiveIntegerField(default=0)
 
     scope = GenericForeignKey('content_type', 'object_id')
     name = models.TextField(default='')
-    details = JSONField(default=dict, blank=True, help_text=_('Stores data about scope'))
+    details = JSONField(
+        default=dict, blank=True, help_text=_('Stores data about scope')
+    )
 
-    start = models.DateTimeField(default=utils.get_current_month_start,
-                                 help_text=_('Date and time when item usage has started.'))
-    end = models.DateTimeField(default=utils.get_current_month_end,
-                               help_text=_('Date and time when item usage has ended.'))
+    start = models.DateTimeField(
+        default=utils.get_current_month_start,
+        help_text=_('Date and time when item usage has started.'),
+    )
+    end = models.DateTimeField(
+        default=utils.get_current_month_end,
+        help_text=_('Date and time when item usage has ended.'),
+    )
 
     # Project name and UUID should be stored separately because project is not available after removal
-    project = models.ForeignKey(structure_models.Project, on_delete=models.SET_NULL, null=True)
+    project = models.ForeignKey(
+        structure_models.Project, on_delete=models.SET_NULL, null=True
+    )
     project_name = models.CharField(max_length=150, blank=True)
     project_uuid = models.CharField(max_length=32, blank=True)
 
@@ -211,16 +250,25 @@ class InvoiceItem(common_mixins.ProductCodeMixin, common_mixins.UnitPriceMixin):
             else:
                 return self.usage_days
         elif self.unit == self.Units.PER_HALF_MONTH:
-            if (self.start.day == 1 and self.end.day == 15) or (self.start.day == 16 and self.end.day == month_days):
+            if (self.start.day == 1 and self.end.day == 15) or (
+                self.start.day == 16 and self.end.day == month_days
+            ):
                 return 1
-            elif (self.start.day == 1 and self.end.day == month_days):
+            elif self.start.day == 1 and self.end.day == month_days:
                 return 2
-            elif (self.start.day == 1 and self.end.day > 15):
-                return quantize_price(1 + (self.end.day - 15) / decimal.Decimal(month_days / 2))
-            elif (self.start.day < 16 and self.end.day == month_days):
-                return quantize_price(1 + (16 - self.start.day) / decimal.Decimal(month_days / 2))
+            elif self.start.day == 1 and self.end.day > 15:
+                return quantize_price(
+                    1 + (self.end.day - 15) / decimal.Decimal(month_days / 2)
+                )
+            elif self.start.day < 16 and self.end.day == month_days:
+                return quantize_price(
+                    1 + (16 - self.start.day) / decimal.Decimal(month_days / 2)
+                )
             else:
-                return quantize_price((self.end.day - self.start.day + 1) / decimal.Decimal(month_days / 2.0))
+                return quantize_price(
+                    (self.end.day - self.start.day + 1)
+                    / decimal.Decimal(month_days / 2.0)
+                )
         # By default PER_MONTH
         else:
             if self.start.day == 1 and self.end.day == month_days:
@@ -253,7 +301,7 @@ class InvoiceItem(common_mixins.ProductCodeMixin, common_mixins.UnitPriceMixin):
     def __str__(self):
         return self.name or '<InvoiceItem %s>' % self.pk
 
-    def create_compensation(self, name, **kwargs):
+    def create_compensation(self, name, downtime, **kwargs):
         FIELDS = (
             'invoice',
             'project',
@@ -265,16 +313,18 @@ class InvoiceItem(common_mixins.ProductCodeMixin, common_mixins.UnitPriceMixin):
             'unit_price',
             'start',
             'end',
+            'details',
         )
 
         params = {field: getattr(self, field) for field in FIELDS}
         params.update(kwargs)
         if params['unit_price'] > 0:
             params['unit_price'] *= -1
-        params['details'] = {
-            'name': _('Compensation for downtime. Resource name: %s') % name
-        }
 
+        name = _('Compensation. %s') % name
+        params['details']['name'] = name
+        params['details']['downtime_id'] = downtime.id
+        params['name'] = name
         return InvoiceItem.objects.create(**params)
 
 
@@ -287,20 +337,33 @@ class ServiceDowntime(models.Model):
     Currently this model is restricted to OpenStack package only.
     It is expected that implementation would be generalized to support other resources as well.
     """
+
     start = models.DateTimeField(
         default=get_default_downtime_start,
-        help_text=_('Date and time when downtime has started.')
+        help_text=_('Date and time when downtime has started.'),
     )
     end = models.DateTimeField(
-        default=timezone.now,
-        help_text=_('Date and time when downtime has ended.')
+        default=timezone.now, help_text=_('Date and time when downtime has ended.')
     )
-    package = models.ForeignKey(package_models.OpenStackPackage)
+    package = models.ForeignKey(
+        on_delete=models.CASCADE,
+        to=package_models.OpenStackPackage,
+        blank=True,
+        null=True,
+        editable=False,
+    )
+    offering = models.ForeignKey(
+        on_delete=models.CASCADE, to=marketplace_models.Offering, blank=True, null=True
+    )
+    resource = models.ForeignKey(
+        on_delete=models.CASCADE, to=marketplace_models.Resource, blank=True, null=True
+    )
 
     def clean(self):
         self._validate_duration()
         self._validate_offset()
         self._validate_intersection()
+        self._validate_resource_and_offering()
 
     def _validate_duration(self):
         duration = self.end - self.start
@@ -308,7 +371,8 @@ class ServiceDowntime(models.Model):
         duration_min = settings.WALDUR_INVOICES['DOWNTIME_DURATION_MINIMAL']
         if duration_min is not None and duration < duration_min:
             raise ValidationError(
-                _('Downtime duration is too small. Minimal duration is %s') % duration_min
+                _('Downtime duration is too small. Minimal duration is %s')
+                % duration_min
             )
 
         duration_max = settings.WALDUR_INVOICES['DOWNTIME_DURATION_MAXIMAL']
@@ -320,9 +384,18 @@ class ServiceDowntime(models.Model):
     def _validate_offset(self):
         if self.start > timezone.now() or self.end > timezone.now():
             raise ValidationError(
-                _('Future downtime is not supported yet. '
-                  'Please select date in the past instead.')
+                _(
+                    'Future downtime is not supported yet. '
+                    'Please select date in the past instead.'
+                )
             )
+
+    def _validate_resource_and_offering(self):
+        if self.offering and self.resource:
+            raise ValidationError('Cannot define an offering and a resource.')
+
+        if not (self.offering or self.resource):
+            raise ValidationError('You must define an offering or a resource.')
 
     def get_intersection_subquery(self):
         left = Q(start__gte=self.start, start__lte=self.end)
@@ -332,7 +405,9 @@ class ServiceDowntime(models.Model):
         return Q(left | right | inside | outside)
 
     def _validate_intersection(self):
-        qs = ServiceDowntime.objects.filter(self.get_intersection_subquery(), package=self.package)
+        qs = ServiceDowntime.objects.filter(
+            self.get_intersection_subquery(), package=self.package
+        )
         if qs.exists():
             ids = ', '.join(str(item.id) for item in qs)
             raise ValidationError(
@@ -340,7 +415,57 @@ class ServiceDowntime(models.Model):
             )
 
 
-class InvoiceItemAdjuster(object):
+class PaymentType(models.CharField):
+    FIXED_PRICE = 'fixed_price'
+    MONTHLY_INVOICES = 'invoices'
+    PAYMENT_GW_MONTHLY = 'payment_gw_monthly'
+
+    CHOICES = (
+        (FIXED_PRICE, 'Fixed-price contract'),
+        (MONTHLY_INVOICES, 'Monthly invoices'),
+        (PAYMENT_GW_MONTHLY, ' Payment gateways (monthly)'),
+    )
+
+    def __init__(self, *args, **kwargs):
+        kwargs['max_length'] = 30
+        kwargs['choices'] = self.CHOICES
+        super(PaymentType, self).__init__(*args, **kwargs)
+
+
+class PaymentProfile(core_models.UuidMixin, core_models.NameMixin, models.Model):
+    organization = models.ForeignKey('structure.Customer', on_delete=models.PROTECT)
+    payment_type = PaymentType()
+    attributes = JSONField(default=dict, blank=True)
+    is_active = models.NullBooleanField(default=True)
+
+    tracker = FieldTracker()
+
+    def __str__(self):
+        return self.organization.name
+
+    class Permissions:
+        customer_path = 'organization'
+
+    @classmethod
+    def get_url_name(cls):
+        return 'payment-profile'
+
+    def save(self, *args, **kwargs):
+        if self.is_active is False:
+            self.is_active = None
+
+        if not self.tracker.previous(self.is_active) and self.is_active:
+            self.__class__.objects.filter(organization=self.organization).exclude(
+                pk=self.pk
+            ).update(is_active=None)
+
+        return super(PaymentProfile, self).save(*args, **kwargs)
+
+    class Meta:
+        unique_together = ('organization', 'is_active')
+
+
+class InvoiceItemAdjuster:
     def __init__(self, invoice, source, start, unit_price, unit):
         self.invoice = invoice
         self.source = source

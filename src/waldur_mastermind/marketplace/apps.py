@@ -1,5 +1,3 @@
-from __future__ import unicode_literals
-
 from django.apps import AppConfig
 from django.db.models import signals
 
@@ -9,9 +7,11 @@ class MarketplaceConfig(AppConfig):
     verbose_name = 'Marketplace'
 
     def ready(self):
+        from waldur_core.core import signals as core_signals
         from waldur_core.quotas import signals as quota_signals
+        from waldur_core.structure import SupportedServices
 
-        from . import handlers, models, signals as marketplace_signals
+        from . import handlers, models, utils, signals as marketplace_signals
 
         signals.post_save.connect(
             handlers.create_screenshot_thumbnail,
@@ -70,7 +70,7 @@ class MarketplaceConfig(AppConfig):
             handlers.update_aggregate_resources_count_when_resource_is_updated,
             sender=models.Resource,
             dispatch_uid='waldur_mastermind.marketplace.'
-                         'update_aggregate_resources_count_when_resource_is_updated',
+            'update_aggregate_resources_count_when_resource_is_updated',
         )
 
         quota_signals.recalculate_quotas.connect(
@@ -82,7 +82,7 @@ class MarketplaceConfig(AppConfig):
             handlers.close_resource_plan_period_when_resource_is_terminated,
             sender=models.Resource,
             dispatch_uid='waldur_mastermind.marketplace.'
-                         'close_resource_plan_period_when_resource_is_terminated',
+            'close_resource_plan_period_when_resource_is_terminated',
         )
 
         marketplace_signals.limit_update_succeeded.connect(
@@ -96,3 +96,8 @@ class MarketplaceConfig(AppConfig):
             sender=models.Resource,
             dispatch_uid='waldur_mastermind.marketplace.limit_update_failed',
         )
+
+        for resource_serializer in SupportedServices.get_resource_serializers():
+            core_signals.pre_serializer_fields.connect(
+                sender=resource_serializer, receiver=utils.add_marketplace_offering,
+            )

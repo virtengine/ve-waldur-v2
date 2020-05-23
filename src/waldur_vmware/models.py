@@ -1,7 +1,4 @@
-from __future__ import unicode_literals
-
 from django.db import models
-from django.utils.encoding import python_2_unicode_compatible
 from django.utils.translation import ugettext_lazy as _
 from model_utils import FieldTracker
 
@@ -11,9 +8,7 @@ from waldur_core.structure import models as structure_models
 
 class VMwareService(structure_models.Service):
     projects = models.ManyToManyField(
-        structure_models.Project,
-        related_name='+',
-        through='VMwareServiceProjectLink'
+        structure_models.Project, related_name='+', through='VMwareServiceProjectLink'
     )
 
     class Meta:
@@ -28,7 +23,7 @@ class VMwareService(structure_models.Service):
 
 class VMwareServiceProjectLink(structure_models.ServiceProjectLink):
 
-    service = models.ForeignKey(VMwareService)
+    service = models.ForeignKey(on_delete=models.CASCADE, to=VMwareService)
 
     class Meta(structure_models.ServiceProjectLink.Meta):
         verbose_name = _('VMware provider project link')
@@ -43,25 +38,33 @@ class VirtualMachineMixin(models.Model):
     class Meta:
         abstract = True
 
-    guest_os = models.CharField(max_length=50, help_text=_('Defines the valid guest operating system '
-                                                           'types used for configuring a virtual machine'))
-    cores = models.PositiveSmallIntegerField(default=0, help_text=_('Number of cores in a VM'))
-    cores_per_socket = models.PositiveSmallIntegerField(default=1, help_text=_('Number of cores per socket in a VM'))
-    ram = models.PositiveIntegerField(default=0, help_text=_('Memory size in MiB'), verbose_name=_('RAM'))
+    guest_os = models.CharField(
+        max_length=50,
+        help_text=_(
+            'Defines the valid guest operating system '
+            'types used for configuring a virtual machine'
+        ),
+    )
+    cores = models.PositiveSmallIntegerField(
+        default=0, help_text=_('Number of cores in a VM')
+    )
+    cores_per_socket = models.PositiveSmallIntegerField(
+        default=1, help_text=_('Number of cores per socket in a VM')
+    )
+    ram = models.PositiveIntegerField(
+        default=0, help_text=_('Memory size in MiB'), verbose_name=_('RAM')
+    )
     disk = models.PositiveIntegerField(default=0, help_text=_('Disk size in MiB'))
 
 
-@python_2_unicode_compatible
-class VirtualMachine(VirtualMachineMixin,
-                     core_models.RuntimeStateMixin,
-                     structure_models.NewResource):
+class VirtualMachine(
+    VirtualMachineMixin, core_models.RuntimeStateMixin, structure_models.NewResource
+):
     service_project_link = models.ForeignKey(
-        VMwareServiceProjectLink,
-        related_name='+',
-        on_delete=models.PROTECT
+        VMwareServiceProjectLink, related_name='+', on_delete=models.PROTECT
     )
 
-    class RuntimeStates(object):
+    class RuntimeStates:
         POWERED_OFF = 'POWERED_OFF'
         POWERED_ON = 'POWERED_ON'
         SUSPENDED = 'SUSPENDED'
@@ -72,7 +75,7 @@ class VirtualMachine(VirtualMachineMixin,
             (SUSPENDED, 'Suspended'),
         )
 
-    class GuestPowerStates(object):
+    class GuestPowerStates:
         RUNNING = 'RUNNING'
         SHUTTING_DOWN = 'SHUTTING_DOWN'
         RESETTING = 'RESETTING'
@@ -89,7 +92,7 @@ class VirtualMachine(VirtualMachineMixin,
             (UNAVAILABLE, 'Unavailable'),
         )
 
-    class ToolsStates(object):
+    class ToolsStates:
         STARTING = 'STARTING'
         RUNNING = 'RUNNING'
         NOT_RUNNING = 'NOT_RUNNING'
@@ -107,7 +110,7 @@ class VirtualMachine(VirtualMachineMixin,
     networks = models.ManyToManyField('Network', blank=True)
     guest_power_enabled = models.BooleanField(
         default=False,
-        help_text='Flag indicating if the virtual machine is ready to process soft power operations.'
+        help_text='Flag indicating if the virtual machine is ready to process soft power operations.',
     )
     guest_power_state = models.CharField(
         'The power state of the guest operating system.',
@@ -127,8 +130,13 @@ class VirtualMachine(VirtualMachineMixin,
     @classmethod
     def get_backend_fields(cls):
         return super(VirtualMachine, cls).get_backend_fields() + (
-            'runtime_state', 'cores', 'cores_per_socket', 'ram', 'disk',
-            'tools_installed', 'tools_state',
+            'runtime_state',
+            'cores',
+            'cores_per_socket',
+            'ram',
+            'disk',
+            'tools_installed',
+            'tools_state',
         )
 
     @classmethod
@@ -143,16 +151,15 @@ class VirtualMachine(VirtualMachineMixin,
         return self.name
 
 
-@python_2_unicode_compatible
 class Port(core_models.RuntimeStateMixin, structure_models.NewResource):
     service_project_link = models.ForeignKey(
-        VMwareServiceProjectLink,
-        related_name='+',
-        on_delete=models.PROTECT
+        VMwareServiceProjectLink, related_name='+', on_delete=models.PROTECT
     )
-    vm = models.ForeignKey(VirtualMachine)
-    network = models.ForeignKey('Network')
-    mac_address = models.CharField(max_length=32, blank=True, verbose_name=_('MAC address'))
+    vm = models.ForeignKey(on_delete=models.CASCADE, to=VirtualMachine)
+    network = models.ForeignKey(on_delete=models.CASCADE, to='Network')
+    mac_address = models.CharField(
+        max_length=32, blank=True, verbose_name=_('MAC address')
+    )
 
     @classmethod
     def get_backend_fields(cls):
@@ -166,16 +173,15 @@ class Port(core_models.RuntimeStateMixin, structure_models.NewResource):
         return self.name
 
 
-@python_2_unicode_compatible
 class Disk(structure_models.NewResource):
     service_project_link = models.ForeignKey(
-        VMwareServiceProjectLink,
-        related_name='+',
-        on_delete=models.PROTECT
+        VMwareServiceProjectLink, related_name='+', on_delete=models.PROTECT
     )
 
     size = models.PositiveIntegerField(help_text=_('Size in MiB'))
-    vm = models.ForeignKey(VirtualMachine, related_name='disks')
+    vm = models.ForeignKey(
+        on_delete=models.CASCADE, to=VirtualMachine, related_name='disks'
+    )
 
     @classmethod
     def get_url_name(cls):
@@ -189,10 +195,9 @@ class Disk(structure_models.NewResource):
         return super(Disk, cls).get_backend_fields() + ('name', 'size')
 
 
-@python_2_unicode_compatible
-class Template(VirtualMachineMixin,
-               core_models.DescribableMixin,
-               structure_models.ServiceProperty):
+class Template(
+    VirtualMachineMixin, core_models.DescribableMixin, structure_models.ServiceProperty
+):
     created = models.DateTimeField()
     modified = models.DateTimeField()
 
@@ -204,7 +209,6 @@ class Template(VirtualMachineMixin,
         return self.name
 
 
-@python_2_unicode_compatible
 class Cluster(structure_models.ServiceProperty):
     @classmethod
     def get_url_name(cls):
@@ -221,11 +225,10 @@ class CustomerCluster(models.Model):
     def __str__(self):
         return '%s / %s' % (self.customer, self.cluster)
 
-    class Meta(object):
+    class Meta:
         unique_together = ('customer', 'cluster')
 
 
-@python_2_unicode_compatible
 class Network(structure_models.ServiceProperty):
     type = models.CharField(max_length=255)
 
@@ -245,7 +248,7 @@ class CustomerNetwork(models.Model):
     def __str__(self):
         return '%s / %s' % (self.customer, self.network)
 
-    class Meta(object):
+    class Meta:
         unique_together = ('customer', 'network')
 
 
@@ -257,15 +260,18 @@ class CustomerNetworkPair(models.Model):
     def __str__(self):
         return '%s / %s' % (self.customer, self.network)
 
-    class Meta(object):
+    class Meta:
         unique_together = ('customer', 'network')
 
 
-@python_2_unicode_compatible
 class Datastore(structure_models.ServiceProperty):
     type = models.CharField(max_length=255)
-    capacity = models.PositiveIntegerField(help_text="Capacity, in MB.", null=True, blank=True)
-    free_space = models.PositiveIntegerField(help_text="Available space, in MB.", null=True, blank=True)
+    capacity = models.PositiveIntegerField(
+        help_text="Capacity, in MB.", null=True, blank=True
+    )
+    free_space = models.PositiveIntegerField(
+        help_text="Available space, in MB.", null=True, blank=True
+    )
 
     @classmethod
     def get_url_name(cls):
@@ -282,13 +288,11 @@ class CustomerDatastore(models.Model):
     def __str__(self):
         return '%s / %s' % (self.customer, self.datastore)
 
-    class Meta(object):
+    class Meta:
         unique_together = ('customer', 'datastore')
 
 
-@python_2_unicode_compatible
 class Folder(structure_models.ServiceProperty):
-
     def __str__(self):
         return '%s / %s' % (self.settings, self.name)
 
@@ -304,5 +308,5 @@ class CustomerFolder(models.Model):
     def __str__(self):
         return '%s / %s' % (self.customer, self.folder)
 
-    class Meta(object):
+    class Meta:
         unique_together = ('customer', 'folder')

@@ -2,12 +2,10 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.urls import reverse
 
-from waldur_core.cost_tracking.models import DefaultPriceListItem
 from waldur_mastermind.common import mixins as common_mixins
 
-from .. import factories, fixtures
 from ... import admin, models
-
+from .. import factories, fixtures
 
 User = get_user_model()
 
@@ -32,25 +30,21 @@ class PackageTemplateTest(TestCase):
             'category': 'small',
             'service_settings': cls.service_settings.id,
             'unit': common_mixins.UnitPriceMixin.Units.PER_DAY,
-
             '_continue': '1',
             'components-TOTAL_FORMS': 3,
             'components-INITIAL_FORMS': 0,
             'components-MIN_NUM_FORMS': 0,
             'components-MAX_NUM_FORMS': 1000,
-
             'components-0-id': '',
             'components-0-template': '',
             'components-0-type': 'ram',
             'components-0-amount': 1,
             'components-0-monthly_price': 1,
-
             'components-1-id': '',
             'components-1-template': '',
             'components-1-type': 'cores',
             'components-1-amount': 2,
             'components-1-monthly_price': 2,
-
             'components-2-id': '',
             'components-2-template': '',
             'components-2-type': 'storage',
@@ -65,14 +59,8 @@ class PackageTemplateTest(TestCase):
         response = self.client.post(self.add_url, self.inline_post_data)
         self.assertEqual(response.status_code, 302)
 
-        package_template = models.PackageTemplate.objects.last()
-        price_list_item = DefaultPriceListItem.objects.get(item_type='PackageTemplate')
-        self.assertEqual(price_list_item.key, package_template.name)
-        self.assertAlmostEqual(price_list_item.value, package_template.price / 24)
-
 
 class TestPackageComponentForm(TestCase):
-
     def test_package_component_form_is_valid_when_component_price_is_0(self):
         data = {
             'monthly_price': '0',
@@ -83,7 +71,9 @@ class TestPackageComponentForm(TestCase):
         form = admin.PackageComponentForm(data=data)
         self.assertTrue(form.is_valid())
 
-    def test_package_component_form_is_invalid_if_package_template_has_connected_packages_already(self):
+    def test_package_component_form_is_invalid_if_package_template_has_connected_packages_already(
+        self,
+    ):
         template = factories.PackageTemplateFactory()
         factories.OpenStackPackageFactory(template=template)
         instance = template.components.first()

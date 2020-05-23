@@ -34,16 +34,42 @@ class MarketplaceSlurmConfig(AppConfig):
             dispatch_uid='waldur_mastermind.marketpace_slurm.update_component_quota',
         )
 
+        signals.post_save.connect(
+            handlers.add_component_usage,
+            sender=marketplace_models.ComponentUsage,
+            dispatch_uid='marketplace_slurm.handlers.add_component_usage',
+        )
+
         marketplace_handlers.connect_resource_handlers(slurm_models.Allocation)
         marketplace_handlers.connect_resource_metadata_handlers(slurm_models.Allocation)
 
         USAGE = marketplace_models.OfferingComponent.BillingTypes.USAGE
-        manager.register(PLUGIN_NAME,
-                         create_resource_processor=processor.CreateAllocationProcessor,
-                         delete_resource_processor=processor.DeleteAllocationProcessor,
-                         components=(
-                             Component(type='cpu', name='CPU', measured_unit='hours', billing_type=USAGE),
-                             Component(type='gpu', name='GPU', measured_unit='hours', billing_type=USAGE),
-                             Component(type='ram', name='RAM', measured_unit='GB', billing_type=USAGE),
-                         ),
-                         service_type=SlurmConfig.service_name)
+        manager.register(
+            PLUGIN_NAME,
+            create_resource_processor=processor.CreateAllocationProcessor,
+            delete_resource_processor=processor.DeleteAllocationProcessor,
+            components=(
+                Component(
+                    type='cpu',
+                    name='CPU',
+                    measured_unit='hours',
+                    billing_type=USAGE,
+                    disable_quotas=True,
+                ),
+                Component(
+                    type='gpu',
+                    name='GPU',
+                    measured_unit='hours',
+                    billing_type=USAGE,
+                    disable_quotas=True,
+                ),
+                Component(
+                    type='ram',
+                    name='RAM',
+                    measured_unit='GB',
+                    billing_type=USAGE,
+                    disable_quotas=True,
+                ),
+            ),
+            service_type=SlurmConfig.service_name,
+        )

@@ -2,10 +2,7 @@ import datetime
 import hashlib
 import json
 import logging
-import sys
 
-from ceilometerclient import client as ceilometer_client
-from ceilometerclient import exc as ceilometer_exceptions
 from cinderclient import exceptions as cinder_exceptions
 from cinderclient.v2 import client as cinder_client
 from django.core.cache import cache
@@ -22,8 +19,8 @@ from neutronclient.v2_0 import client as neutron_client
 from novaclient import client as nova_client
 from novaclient import exceptions as nova_exceptions
 from requests import ConnectionError
-import six
 
+from waldur_core.core.utils import QuietSession
 from waldur_core.structure import ServiceBackend
 from waldur_core.structure.exceptions import SerializableBackendError
 from waldur_openstack.openstack.models import Tenant
@@ -43,13 +40,6 @@ class OpenStackAuthorizationFailed(OpenStackBackendError):
     pass
 
 
-def reraise(exc):
-    """
-    Reraise OpenStackBackendError while maintaining traceback.
-    """
-    six.reraise(OpenStackBackendError, exc, sys.exc_info()[2])
-
-
 class OpenStackSession(dict):
     """ Serializable session """
 
@@ -57,15 +47,27 @@ class OpenStackSession(dict):
         self.keystone_session = ks_session
         if not self.keystone_session:
             auth_plugin = v3.Password(**credentials)
-            self.keystone_session = keystone_session.Session(auth=auth_plugin, verify=verify_ssl)
+            session = None
+            if not verify_ssl:
+                session = QuietSession()
+                session.verify = False
+            self.keystone_session = keystone_session.Session(
+                auth=auth_plugin, verify=verify_ssl, session=session
+            )
 
         try:
             # This will eagerly sign in throwing AuthorizationFailure on bad credentials
             self.keystone_session.get_auth_headers()
         except keystone_exceptions.ClientException as e:
-            six.reraise(OpenStackAuthorizationFailed, e)
+            raise OpenStackAuthorizationFailed(e)
 
-        for opt in ('auth_ref', 'auth_url', 'project_id', 'project_name', 'project_domain_name'):
+        for opt in (
+            'auth_ref',
+            'auth_url',
+            'project_id',
+            'project_name',
+            'project_domain_name',
+        ):
             self[opt] = getattr(self.auth, opt)
 
     def __getattr__(self, name):
@@ -89,7 +91,7 @@ class OpenStackSession(dict):
         auth_method = v3.Token(**args)
         auth_data = {
             'auth_token': session['auth_ref'].auth_token,
-            'body': session['auth_ref']._data
+            'body': session['auth_ref']._data,
         }
         auth_state = json.dumps(auth_data)
         auth_method.set_auth_state(auth_state)
@@ -106,7 +108,7 @@ class OpenStackSession(dict):
         return str({k: v if k != 'password' else '***' for k, v in self.items()})
 
 
-class OpenStackClient(object):
+class OpenStackClient:
     """ Generic OpenStack client. """
 
     def __init__(self, session=None, verify_ssl=False, **credentials):
@@ -123,19 +125,25 @@ class OpenStackClient(object):
                 self.session = OpenStackSession(verify_ssl=verify_ssl, **credentials)
             except AttributeError as e:
                 logger.error('Failed to create OpenStack session.')
-                reraise(e)
+                raise OpenStackBackendError(e)
 
     @property
     def keystone(self):
-        return keystone_client.Client(session=self.session.keystone_session, interface='public')
+        return keystone_client.Client(
+            session=self.session.keystone_session, interface='public'
+        )
 
     @property
     def nova(self):
         try:
-            return nova_client.Client(version='2', session=self.session.keystone_session, endpoint_type='publicURL')
+            return nova_client.Client(
+                version='2',
+                session=self.session.keystone_session,
+                endpoint_type='publicURL',
+            )
         except nova_exceptions.ClientException as e:
             logger.exception('Failed to create nova client: %s', e)
-            reraise(e)
+            raise OpenStackBackendError(e)
 
     @property
     def neutron(self):
@@ -143,7 +151,7 @@ class OpenStackClient(object):
             return neutron_client.Client(session=self.session.keystone_session)
         except neutron_exceptions.NeutronClientException as e:
             logger.exception('Failed to create neutron client: %s', e)
-            reraise(e)
+            raise OpenStackBackendError(e)
 
     @property
     def cinder(self):
@@ -151,7 +159,7 @@ class OpenStackClient(object):
             return cinder_client.Client(session=self.session.keystone_session)
         except cinder_exceptions.ClientException as e:
             logger.exception('Failed to create cinder client: %s', e)
-            reraise(e)
+            raise OpenStackBackendError(e)
 
     @property
     def glance(self):
@@ -159,27 +167,26 @@ class OpenStackClient(object):
             return glance_client.Client(session=self.session.keystone_session)
         except glance_exceptions.ClientException as e:
             logger.exception('Failed to create glance client: %s', e)
-            reraise(e)
-
-    @property
-    def ceilometer(self):
-        try:
-            return ceilometer_client.Client('2', session=self.session.keystone_session)
-        except ceilometer_exceptions.BaseException as e:
-            logger.exception('Failed to create ceilometer client: %s', e)
-            reraise(e)
+            raise OpenStackBackendError(e)
 
 
 class BaseOpenStackBackend(ServiceBackend):
-
     def __init__(self, settings, tenant_id=None):
         self.settings = settings
         self.tenant_id = tenant_id
 
     def _get_cached_session_key(self, admin):
-        key = 'OPENSTACK_ADMIN_SESSION' if admin else 'OPENSTACK_SESSION_%s' % self.tenant_id
-        settings_key = str(self.settings.backend_url) + str(self.settings.password) + str(self.settings.username)
-        hashed_settings_key = hashlib.sha256(settings_key).hexdigest()
+        key = (
+            'OPENSTACK_ADMIN_SESSION'
+            if admin
+            else 'OPENSTACK_SESSION_%s' % self.tenant_id
+        )
+        settings_key = (
+            str(self.settings.backend_url)
+            + str(self.settings.password)
+            + str(self.settings.username)
+        )
+        hashed_settings_key = hashlib.sha256(settings_key.encode('utf-8')).hexdigest()
         return '%s_%s_%s' % (self.settings.uuid.hex, hashed_settings_key, key)
 
     def get_client(self, name=None, admin=False):
@@ -217,7 +224,7 @@ class BaseOpenStackBackend(ServiceBackend):
         if client is None:  # create new token if session is not cached or expired
             client = OpenStackClient(**credentials)
             setattr(self, attr_name, client)  # Cache client in the object
-            cache.set(key, dict(client.session), 24 * 60 * 60)  # Add session to cache
+            cache.set(key, dict(client.session), 10 * 60 * 60)  # Add session to cache
 
         if name:
             return getattr(client, name)
@@ -225,7 +232,7 @@ class BaseOpenStackBackend(ServiceBackend):
             return client
 
     def __getattr__(self, name):
-        clients = 'keystone', 'nova', 'neutron', 'cinder', 'glance', 'ceilometer'
+        clients = 'keystone', 'nova', 'neutron', 'cinder', 'glance'
         for client in clients:
             if name == '{}_client'.format(client):
                 return self.get_client(client, admin=False)
@@ -234,14 +241,15 @@ class BaseOpenStackBackend(ServiceBackend):
                 return self.get_client(client, admin=True)
 
         raise AttributeError(
-            "'%s' object has no attribute '%s'" % (self.__class__.__name__, name))
+            "'%s' object has no attribute '%s'" % (self.__class__.__name__, name)
+        )
 
     def ping(self, raise_exception=False):
         try:
             self.keystone_client
         except keystone_exceptions.ClientException as e:
             if raise_exception:
-                reraise(e)
+                raise OpenStackBackendError(e)
             return False
         else:
             return True
@@ -269,12 +277,14 @@ class BaseOpenStackBackend(ServiceBackend):
             nova_quotas = nova.quotas.get(tenant_id=tenant_backend_id)
             cinder_quotas = cinder.quotas.get(tenant_id=tenant_backend_id)
             neutron_quotas = neutron.show_quota(tenant_id=tenant_backend_id)['quota']
-        except (nova_exceptions.ClientException,
-                cinder_exceptions.ClientException,
-                neutron_exceptions.NeutronClientException) as e:
-            reraise(e)
+        except (
+            nova_exceptions.ClientException,
+            cinder_exceptions.ClientException,
+            neutron_exceptions.NeutronClientException,
+        ) as e:
+            raise OpenStackBackendError(e)
 
-        return {
+        quotas = {
             Tenant.Quotas.ram: nova_quotas.ram,
             Tenant.Quotas.vcpu: nova_quotas.cores,
             Tenant.Quotas.storage: self.gb2mb(cinder_quotas.gigabytes),
@@ -282,11 +292,19 @@ class BaseOpenStackBackend(ServiceBackend):
             Tenant.Quotas.volumes: cinder_quotas.volumes,
             Tenant.Quotas.instances: nova_quotas.instances,
             Tenant.Quotas.security_group_count: neutron_quotas['security_group'],
-            Tenant.Quotas.security_group_rule_count: neutron_quotas['security_group_rule'],
+            Tenant.Quotas.security_group_rule_count: neutron_quotas[
+                'security_group_rule'
+            ],
             Tenant.Quotas.floating_ip_count: neutron_quotas['floatingip'],
             Tenant.Quotas.network_count: neutron_quotas['network'],
             Tenant.Quotas.subnet_count: neutron_quotas['subnet'],
         }
+
+        for name, value in cinder_quotas._info.items():
+            if name.startswith('gigabytes_'):
+                quotas[name] = value
+
+        return quotas
 
     def get_tenant_quotas_usage(self, tenant_backend_id):
         nova = self.nova_client
@@ -296,8 +314,12 @@ class BaseOpenStackBackend(ServiceBackend):
             volumes = cinder.volumes.list()
             snapshots = cinder.volume_snapshots.list()
             instances = nova.servers.list()
-            security_groups = neutron.list_security_groups(tenant_id=tenant_backend_id)['security_groups']
-            floating_ips = neutron.list_floatingips(tenant_id=tenant_backend_id)['floatingips']
+            security_groups = neutron.list_security_groups(tenant_id=tenant_backend_id)[
+                'security_groups'
+            ]
+            floating_ips = neutron.list_floatingips(tenant_id=tenant_backend_id)[
+                'floatingips'
+            ]
             networks = neutron.list_networks(tenant_id=tenant_backend_id)['networks']
             subnets = neutron.list_subnets(tenant_id=tenant_backend_id)['subnets']
 
@@ -314,16 +336,18 @@ class BaseOpenStackBackend(ServiceBackend):
                 ram += getattr(flavor, 'ram', 0)
                 vcpu += getattr(flavor, 'vcpus', 0)
 
-        except (nova_exceptions.ClientException,
-                cinder_exceptions.ClientException,
-                neutron_exceptions.NeutronClientException) as e:
-            reraise(e)
+        except (
+            nova_exceptions.ClientException,
+            cinder_exceptions.ClientException,
+            neutron_exceptions.NeutronClientException,
+        ) as e:
+            raise OpenStackBackendError(e)
 
         volumes_size = sum(self.gb2mb(v.size) for v in volumes)
         snapshots_size = sum(self.gb2mb(v.size) for v in snapshots)
         storage = volumes_size + snapshots_size
 
-        return {
+        quotas = {
             Tenant.Quotas.ram: ram,
             Tenant.Quotas.vcpu: vcpu,
             Tenant.Quotas.storage: storage,
@@ -333,12 +357,21 @@ class BaseOpenStackBackend(ServiceBackend):
             Tenant.Quotas.snapshots_size: snapshots_size,
             Tenant.Quotas.instances: len(instances),
             Tenant.Quotas.security_group_count: len(security_groups),
-            Tenant.Quotas.security_group_rule_count: len(sum([sg['security_group_rules']
-                                                              for sg in security_groups], [])),
+            Tenant.Quotas.security_group_rule_count: len(
+                sum([sg['security_group_rules'] for sg in security_groups], [])
+            ),
             Tenant.Quotas.floating_ip_count: len(floating_ips),
             Tenant.Quotas.network_count: len(networks),
             Tenant.Quotas.subnet_count: len(subnets),
         }
+
+        for name, value in cinder.quotas.get(
+            tenant_id=tenant_backend_id, usage=True
+        )._info.items():
+            if name.startswith('gigabytes_'):
+                quotas[name] = value['in_use']
+
+        return quotas
 
     def _normalize_security_group_rule(self, rule):
         if rule['protocol'] is None:
@@ -371,7 +404,8 @@ class BaseOpenStackBackend(ServiceBackend):
                     'to_port': backend_rule['port_range_max'],
                     'protocol': backend_rule['protocol'],
                     'cidr': backend_rule['remote_ip_prefix'],
-                })
+                },
+            )
         security_group.rules.filter(backend_id__in=cur_rules.keys()).delete()
 
     def _get_current_properties(self, model):
@@ -382,7 +416,7 @@ class BaseOpenStackBackend(ServiceBackend):
         try:
             images = glance.images.list()
         except glance_exceptions.ClientException as e:
-            reraise(e)
+            raise OpenStackBackendError(e)
 
         images = [image for image in images if not image['status'] == 'deleted']
         if filter_function:
@@ -399,15 +433,24 @@ class BaseOpenStackBackend(ServiceBackend):
                         'name': backend_image['name'],
                         'min_ram': backend_image['min_ram'],
                         'min_disk': self.gb2mb(backend_image['min_disk']),
-                    })
-            model_class.objects.filter(backend_id__in=cur_images.keys(), settings=self.settings).delete()
+                    },
+                )
+            model_class.objects.filter(
+                backend_id__in=cur_images.keys(), settings=self.settings
+            ).delete()
 
     def _delete_backend_floating_ip(self, backend_id, tenant_backend_id):
         neutron = self.neutron_client
         try:
-            logger.info("Deleting floating IP %s from tenant %s", backend_id, tenant_backend_id)
+            logger.info(
+                "Deleting floating IP %s from tenant %s", backend_id, tenant_backend_id
+            )
             neutron.delete_floatingip(backend_id)
         except neutron_exceptions.NotFound:
-            logger.debug("Floating IP %s is already gone from tenant %s", backend_id, tenant_backend_id)
+            logger.debug(
+                "Floating IP %s is already gone from tenant %s",
+                backend_id,
+                tenant_backend_id,
+            )
         except neutron_exceptions.NeutronClientException as e:
-            reraise(e)
+            raise OpenStackBackendError(e)

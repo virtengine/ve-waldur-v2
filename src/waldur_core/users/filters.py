@@ -1,9 +1,7 @@
-from __future__ import unicode_literals
-
 import uuid
 
-from django.db.models import Q
 import django_filters
+from django.db.models import Q
 from django_filters.rest_framework import DjangoFilterBackend
 
 from waldur_core.core import filters as core_filters
@@ -11,18 +9,15 @@ from waldur_core.users import models
 
 
 class InvitationFilter(django_filters.FilterSet):
-    project = django_filters.UUIDFilter(
-        name='project__uuid',
-    )
+    project = django_filters.UUIDFilter(field_name='project__uuid',)
     project_url = core_filters.URLFilter(
-        view_name='project-detail',
-        name='project__uuid',
+        view_name='project-detail', field_name='project__uuid',
     )
     state = django_filters.MultipleChoiceFilter(choices=models.Invitation.State.CHOICES)
 
     o = django_filters.OrderingFilter(fields=('email', 'state', 'created'))
 
-    class Meta(object):
+    class Meta:
         model = models.Invitation
         fields = [
             'email',
@@ -34,8 +29,7 @@ class InvitationFilter(django_filters.FilterSet):
 
 class InvitationCustomerFilterBackend(DjangoFilterBackend):
     url_filter = core_filters.URLFilter(
-        view_name='customer-detail',
-        name='customer__uuid',
+        view_name='customer-detail', field_name='customer__uuid',
     )
 
     def filter_queryset(self, request, queryset, view):

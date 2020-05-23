@@ -1,5 +1,3 @@
-from __future__ import unicode_literals
-
 import functools
 import importlib
 import logging
@@ -8,7 +6,6 @@ from django.conf import settings
 from django.utils.encoding import force_text
 from django.utils.lru_cache import lru_cache
 from rest_framework.reverse import reverse
-import six
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +13,7 @@ logger = logging.getLogger(__name__)
 default_app_config = 'waldur_core.structure.apps.StructureConfig'
 
 
-class SupportedServices(object):
+class SupportedServices:
     """ Comprehensive list of currently supported services and resources.
         Build the list via serializers definition on application start.
         Example data structure of registry:
@@ -25,7 +22,7 @@ class SupportedServices(object):
             'gitlab': {
                 'name': 'GitLab',
                 'model_name': 'gitlab.gitlabservice',
-                'backend': nodeconductor_gitlab.backend.GitLabBackend,
+                'backend': waldur_gitlab.backend.GitLabBackend,
                 'detail_view': 'gitlab-detail',
                 'list_view': 'gitlab-list',
                 'properties': {},
@@ -54,10 +51,7 @@ class SupportedServices(object):
 
     @classmethod
     def _setdefault(cls, service_key):
-        cls._registry.setdefault(service_key, {
-            'resources': {},
-            'properties': {}
-        })
+        cls._registry.setdefault(service_key, {'resources': {}, 'properties': {}})
 
     @classmethod
     def register_backend(cls, backend_class, nested=False):
@@ -112,13 +106,21 @@ class SupportedServices(object):
         cls._setdefault(key)
         model_str = cls._get_model_str(model)
         cls._registry[key]['resources'].setdefault(model_str, {'name': model.__name__})
-        cls._registry[key]['resources'][model_str].setdefault('detail_view', cls.get_detail_view_for_model(model))
-        cls._registry[key]['resources'][model_str].setdefault('list_view', cls.get_list_view_for_model(model))
+        cls._registry[key]['resources'][model_str].setdefault(
+            'detail_view', cls.get_detail_view_for_model(model)
+        )
+        cls._registry[key]['resources'][model_str].setdefault(
+            'list_view', cls.get_list_view_for_model(model)
+        )
         cls._registry[key]['resources'][model_str].setdefault('serializer', serializer)
 
     @classmethod
     def register_resource_filter(cls, model, filter):
-        if model is NotImplemented or not cls._is_active_model(model) or model._meta.abstract:
+        if (
+            model is NotImplemented
+            or not cls._is_active_model(model)
+            or model._meta.abstract
+        ):
             return
         key = cls.get_model_key(model)
         cls._setdefault(key)
@@ -128,7 +130,11 @@ class SupportedServices(object):
 
     @classmethod
     def register_resource_view(cls, model, view):
-        if model is NotImplemented or not cls._is_active_model(model) or model._meta.abstract:
+        if (
+            model is NotImplemented
+            or not cls._is_active_model(model)
+            or model._meta.abstract
+        ):
             return
         key = cls.get_model_key(model)
         cls._setdefault(key)
@@ -145,12 +151,12 @@ class SupportedServices(object):
         model_str = cls._get_model_str(model)
         cls._registry[key]['properties'][model_str] = {
             'name': model.__name__,
-            'list_view': cls.get_list_view_for_model(model)
+            'list_view': cls.get_list_view_for_model(model),
         }
 
     @classmethod
     def get_service_backend(cls, key):
-        if not isinstance(key, six.string_types):
+        if not isinstance(key, str):
             key = cls.get_model_key(key)
         try:
             return cls._registry[key]['backend']
@@ -167,8 +173,10 @@ class SupportedServices(object):
                 "DigitalOcean": "/api/digitalocean/"
             }
         """
-        return {service['name']: reverse(service['list_view'], request=request)
-                for service in cls._registry.values()}
+        return {
+            service['name']: reverse(service['list_view'], request=request)
+            for service in cls._registry.values()
+        }
 
     @classmethod
     def get_service_serializer(cls, model):
@@ -180,11 +188,6 @@ class SupportedServices(object):
         return cls._registry[key]['serializer']
 
     @classmethod
-    def get_service_filter(cls, model):
-        key = cls.get_model_key(model)
-        return cls._registry[key]['filter']
-
-    @classmethod
     def get_resources(cls, request=None):
         """ Get a list of resources endpoints.
             {
@@ -194,9 +197,13 @@ class SupportedServices(object):
                 "GitLab.Project": "/api/gitlab-projects/"
             }
         """
-        return {'.'.join([service['name'], resource['name']]): reverse(resource['list_view'], request=request)
-                for service in cls._registry.values()
-                for resource in service['resources'].values()}
+        return {
+            '.'.join([service['name'], resource['name']]): reverse(
+                resource['list_view'], request=request
+            )
+            for service in cls._registry.values()
+            for resource in service['resources'].values()
+        }
 
     @classmethod
     def get_resource_serializer(cls, model):
@@ -238,16 +245,22 @@ class SupportedServices(object):
         for service in cls._registry.values():
             service_model = apps.get_model(service['model_name'])
             service_project_link = service_model.projects.through
-            service_project_link_url = reverse(cls.get_list_view_for_model(service_project_link), request=request)
+            service_project_link_url = reverse(
+                cls.get_list_view_for_model(service_project_link), request=request
+            )
 
             data[service['name']] = {
                 'url': reverse(service['list_view'], request=request),
                 'service_project_link_url': service_project_link_url,
-                'resources': {resource['name']: reverse(resource['list_view'], request=request)
-                              for resource in service['resources'].values()},
-                'properties': {resource['name']: reverse(resource['list_view'], request=request)
-                               for resource in service.get('properties', {}).values()},
-                'is_public_service': cls.is_public_service(service_model)
+                'resources': {
+                    resource['name']: reverse(resource['list_view'], request=request)
+                    for resource in service['resources'].values()
+                },
+                'properties': {
+                    resource['name']: reverse(resource['list_view'], request=request)
+                    for resource in service.get('properties', {}).values()
+                },
+                'is_public_service': cls.is_public_service(service_model),
             }
         return data
 
@@ -258,11 +271,11 @@ class SupportedServices(object):
             {
                 ...
                 'gitlab': {
-                    "service": nodeconductor_gitlab.models.GitLabService,
-                    "service_project_link": nodeconductor_gitlab.models.GitLabServiceProjectLink,
+                    "service": waldur_gitlab.models.GitLabService,
+                    "service_project_link": waldur_gitlab.models.GitLabServiceProjectLink,
                     "resources": [
-                        nodeconductor_gitlab.models.Group,
-                        nodeconductor_gitlab.models.Project
+                        waldur_gitlab.models.Group,
+                        waldur_gitlab.models.Project
                     ],
                 },
                 ...
@@ -279,7 +292,9 @@ class SupportedServices(object):
                 'service': service_model,
                 'service_project_link': service_project_link,
                 'resources': [apps.get_model(r) for r in service['resources'].keys()],
-                'properties': [apps.get_model(r) for r in service['properties'].keys() if '.' in r],
+                'properties': [
+                    apps.get_model(r) for r in service['properties'].keys() if '.' in r
+                ],
             }
 
         return data
@@ -297,9 +312,11 @@ class SupportedServices(object):
         """
         from django.apps import apps
 
-        return {'.'.join([service['name'], attrs['name']]): apps.get_model(resource)
-                for service in cls._registry.values()
-                for resource, attrs in service['resources'].items()}
+        return {
+            '.'.join([service['name'], attrs['name']]): apps.get_model(resource)
+            for service in cls._registry.values()
+            for resource, attrs in service['resources'].items()
+        }
 
     @classmethod
     @lru_cache(maxsize=20)
@@ -311,9 +328,11 @@ class SupportedServices(object):
     @classmethod
     @lru_cache(maxsize=20)
     def get_resource_serializers(cls):
-        return [resource['serializer']
-                for provider in cls._registry.values()
-                for resource in provider['resources'].values()]
+        return [
+            resource['serializer']
+            for provider in cls._registry.values()
+            for resource in provider['resources'].values()
+        ]
 
     @classmethod
     @lru_cache(maxsize=20)
@@ -334,7 +353,9 @@ class SupportedServices(object):
         model_str = cls._get_model_str(model)
         service = cls._registry[key]
         if model_str in service['resources']:
-            return '{}.{}'.format(service['name'], service['resources'][model_str]['name'])
+            return '{}.{}'.format(
+                service['name'], service['resources'][model_str]['name']
+            )
         else:
             return service['name']
 
@@ -344,11 +365,11 @@ class SupportedServices(object):
 
             >> SupportedServices.get_related_models(gitlab_models.Project)
             {
-                'service': nodeconductor_gitlab.models.GitLabService,
-                'service_project_link': nodeconductor_gitlab.models.GitLabServiceProjectLink,
+                'service': waldur_gitlab.models.GitLabService,
+                'service_project_link': waldur_gitlab.models.GitLabServiceProjectLink,
                 'resources': [
-                    nodeconductor_gitlab.models.Group,
-                    nodeconductor_gitlab.models.Project,
+                    waldur_gitlab.models.Group,
+                    waldur_gitlab.models.Project,
                 ]
             }
         """
@@ -360,8 +381,9 @@ class SupportedServices(object):
             model_str = cls._get_model_str(model)
 
         for models in cls.get_service_models().values():
-            if model_str == cls._get_model_str(models['service']) or \
-               model_str == cls._get_model_str(models['service_project_link']):
+            if model_str == cls._get_model_str(
+                models['service']
+            ) or model_str == cls._get_model_str(models['service_project_link']):
                 return models
 
             for resource_model in models['resources']:
@@ -374,8 +396,10 @@ class SupportedServices(object):
         # We need to use such tricky way to check because of inconsistent apps names:
         # some apps are included in format "<module_name>.<app_name>" like "waldur_core.openstack"
         # other apps are included in format "<app_name>" like "nodecondcutor_sugarcrm"
-        return ('.'.join(model.__module__.split('.')[:2]) in settings.INSTALLED_APPS or
-                '.'.join(model.__module__.split('.')[:1]) in settings.INSTALLED_APPS)
+        return (
+            '.'.join(model.__module__.split('.')[:2]) in settings.INSTALLED_APPS
+            or '.'.join(model.__module__.split('.')[:1]) in settings.INSTALLED_APPS
+        )
 
     @classmethod
     def _get_model_str(cls, model):
@@ -392,6 +416,7 @@ class SupportedServices(object):
     @classmethod
     def get_app_config(cls, model):
         from django.apps import apps
+
         return apps.get_containing_app_config(model.__module__)
 
     @classmethod
@@ -422,6 +447,7 @@ class SupportedServices(object):
 
 class ServiceBackendError(Exception):
     """ Base exception for errors occurring during backend communication. """
+
     pass
 
 
@@ -430,17 +456,26 @@ def log_backend_action(action=None):
 
     Expects django model instance as first argument.
     """
+
     def decorator(func):
         @functools.wraps(func)
         def wrapped(self, instance, *args, **kwargs):
-            action_name = func.func_name.replace('_', ' ') if action is None else action
+            action_name = func.__name__.replace('_', ' ') if action is None else action
 
-            logger.debug('About to %s `%s` (PK: %s).', action_name, instance, instance.pk)
+            logger.debug(
+                'About to %s `%s` (PK: %s).', action_name, instance, instance.pk
+            )
             result = func(self, instance, *args, **kwargs)
-            logger.debug('Action `%s` was executed successfully for `%s` (PK: %s).',
-                         action_name, instance, instance.pk)
+            logger.debug(
+                'Action `%s` was executed successfully for `%s` (PK: %s).',
+                action_name,
+                instance,
+                instance.pk,
+            )
             return result
+
         return wrapped
+
     return decorator
 
 
@@ -448,7 +483,7 @@ class ServiceBackendNotImplemented(NotImplementedError):
     pass
 
 
-class ServiceBackend(object):
+class ServiceBackend:
     """ Basic service backed with only common methods pre-defined. """
 
     DEFAULTS = {}
@@ -498,8 +533,8 @@ class ServiceBackend(object):
 
     @staticmethod
     def mb2gb(val):
-        return val / 1024 if val else 0
+        return int(val / 1024) if val else 0
 
     @staticmethod
     def mb2tb(val):
-        return val / 1024 / 1024 if val else 0
+        return int(val / 1024 / 1024) if val else 0

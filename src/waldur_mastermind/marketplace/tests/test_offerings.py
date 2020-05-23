@@ -1,12 +1,14 @@
-from __future__ import unicode_literals
-
+import base64
 import json
+import os
+import tempfile
 import uuid
+from unittest import mock
 
+import pkg_resources
 from ddt import data, ddt
-import mock
 from rest_framework import exceptions as rest_exceptions
-from rest_framework import test, status
+from rest_framework import status, test
 
 from waldur_core.media.utils import dummy_image
 from waldur_core.structure.tests import factories as structure_factories
@@ -17,13 +19,15 @@ from waldur_mastermind.marketplace import models
 from waldur_mastermind.marketplace.tests.factories import OFFERING_OPTIONS
 from waldur_mastermind.marketplace_vmware import VIRTUAL_MACHINE_TYPE
 
-from . import factories
 from .. import serializers
+from ..management.commands.export_offering import export_offering
+from ..management.commands.import_offering import create_offering, update_offering
+from . import factories
+from .helpers import override_marketplace_settings
 
 
 @ddt
 class OfferingGetTest(test.APITransactionTestCase):
-
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.offering = factories.OfferingFactory(shared=True)
@@ -43,45 +47,73 @@ class OfferingGetTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
 
-class OfferingFilterTest(test.APITransactionTestCase):
+@ddt
+class SecretOptionsTests(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.offering = factories.OfferingFactory(
+            shared=True, customer=self.fixture.customer
+        )
+        self.url = factories.OfferingFactory.get_url(self.offering)
 
+    @data('staff', 'owner')
+    def test_secret_options_are_visible_to_authorized_user(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue('secret_options' in response.data)
+
+    @data('user', 'customer_support', 'admin', 'manager')
+    def test_secret_options_are_not_visible_to_unauthorized_user(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse('secret_options' in response.data)
+
+
+class OfferingFilterTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         attributes = {
             'cloudDeploymentModel': 'private_cloud',
             'userSupportOption': ['phone'],
         }
-        self.offering = factories.OfferingFactory(customer=self.fixture.customer,
-                                                  attributes=attributes,
-                                                  shared=False)
+        self.offering = factories.OfferingFactory(
+            customer=self.fixture.customer, attributes=attributes, shared=False
+        )
         self.url = factories.OfferingFactory.get_list_url()
         self.client.force_authenticate(self.fixture.staff)
 
     def test_filter_choice_positive(self):
-        response = self.client.get(self.url, {'attributes': json.dumps({
-            'cloudDeploymentModel': 'private_cloud',
-        })})
+        response = self.client.get(
+            self.url,
+            {'attributes': json.dumps({'cloudDeploymentModel': 'private_cloud',})},
+        )
         self.assertEqual(len(response.data), 1)
 
     def test_filter_choice_negative(self):
-        response = self.client.get(self.url, {'attributes': json.dumps({
-            'cloudDeploymentModel': 'public_cloud',
-        })})
+        response = self.client.get(
+            self.url,
+            {'attributes': json.dumps({'cloudDeploymentModel': 'public_cloud',})},
+        )
         self.assertEqual(len(response.data), 0)
 
     def test_filter_list_positive(self):
         """
         If an attribute is a list, we use multiple choices.
         """
-        factories.OfferingFactory(attributes={
-            'userSupportOption': ['phone', 'email', 'fax'],
-        })
-        factories.OfferingFactory(attributes={
-            'userSupportOption': ['email'],
-        })
-        response = self.client.get(self.url, {'attributes': json.dumps({
-            'userSupportOption': ['fax', 'email'],
-        })})
+        factories.OfferingFactory(
+            attributes={'userSupportOption': ['phone', 'email', 'fax'],}
+        )
+        factories.OfferingFactory(
+            attributes={'userSupportOption': ['email'],}
+        )
+        response = self.client.get(
+            self.url,
+            {'attributes': json.dumps({'userSupportOption': ['fax', 'email'],})},
+        )
         self.assertEqual(len(response.data), 2)
 
     def test_shared_offerings_are_available_for_all_users(self):
@@ -150,13 +182,14 @@ class OfferingFilterTest(test.APITransactionTestCase):
         response = self.client.get(self.url, {'project_uuid': fixture.project.uuid.hex})
         self.assertEqual(len(response.data), 1)
 
-        response = self.client.get(self.url, {'project_uuid': self.fixture.project.uuid.hex})
+        response = self.client.get(
+            self.url, {'project_uuid': self.fixture.project.uuid.hex}
+        )
         self.assertEqual(len(response.data), 0)
 
 
 @ddt
 class OfferingCreateTest(test.APITransactionTestCase):
-
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.customer = self.fixture.customer
@@ -168,12 +201,16 @@ class OfferingCreateTest(test.APITransactionTestCase):
         self.assertTrue(models.Offering.objects.filter(customer=self.customer).exists())
 
     def test_validate_correct_geolocations(self):
-        response = self.create_offering('staff', add_payload={'geolocations': [{'latitude': 123, 'longitude': 345}]})
+        response = self.create_offering(
+            'staff', add_payload={'geolocations': [{'latitude': 123, 'longitude': 345}]}
+        )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertTrue(models.Offering.objects.filter(customer=self.customer).exists())
 
     def test_validate_invalid_geolocations(self):
-        response = self.create_offering('staff', add_payload={'geolocations': [{'longitude': 345}]})
+        response = self.create_offering(
+            'staff', add_payload={'geolocations': [{'longitude': 345}]}
+        )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertTrue('geolocations' in response.data.keys())
 
@@ -187,18 +224,23 @@ class OfferingCreateTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertTrue(models.Offering.objects.filter(customer=self.customer).exists())
         offering = models.Offering.objects.get(customer=self.customer)
-        self.assertEqual(offering.attributes, {
-            'cloudDeploymentModel': 'private_cloud',
-            'vendorType': 'reseller',
-            'userSupportOptions': ['web_chat', 'phone'],
-            'dataProtectionInternal': 'ipsec',
-            'dataProtectionExternal': 'tls12'
-        })
+        self.assertEqual(
+            offering.attributes,
+            {
+                'cloudDeploymentModel': 'private_cloud',
+                'vendorType': 'reseller',
+                'userSupportOptions': ['web_chat', 'phone'],
+                'dataProtectionInternal': 'ipsec',
+                'dataProtectionExternal': 'tls12',
+            },
+        )
 
     def test_dont_create_offering_if_attributes_is_not_valid(self):
         self.category = factories.CategoryFactory()
         self.section = factories.SectionFactory(category=self.category)
-        self.attribute = factories.AttributeFactory(section=self.section, key='userSupportOptions')
+        self.attribute = factories.AttributeFactory(
+            section=self.section, key='userSupportOptions'
+        )
         self.provider = factories.ServiceProviderFactory(customer=self.customer)
 
         self.client.force_authenticate(self.fixture.staff)
@@ -209,13 +251,15 @@ class OfferingCreateTest(test.APITransactionTestCase):
             'native_name': 'native_name',
             'category': factories.CategoryFactory.get_url(category=self.category),
             'customer': structure_factories.CustomerFactory.get_url(self.customer),
-            'attributes': json.dumps({
-                'cloudDeploymentModel': 'private_cloud',
-                'vendorType': 'reseller',
-                'userSupportOptions': ['chat', 'phone'],
-                'dataProtectionInternal': 'ipsec',
-                'dataProtectionExternal': 'tls12'
-            })
+            'attributes': json.dumps(
+                {
+                    'cloudDeploymentModel': 'private_cloud',
+                    'vendorType': 'reseller',
+                    'userSupportOptions': ['chat', 'phone'],
+                    'dataProtectionInternal': 'ipsec',
+                    'dataProtectionExternal': 'tls12',
+                }
+            ),
         }
         response = self.client.post(url, payload)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -232,7 +276,7 @@ class OfferingCreateTest(test.APITransactionTestCase):
             'name': 'offering',
             'category': factories.CategoryFactory.get_url(category=self.category),
             'customer': structure_factories.CustomerFactory.get_url(self.customer),
-            'attributes': '"String is not allowed, dictionary is expected."'
+            'attributes': '"String is not allowed, dictionary is expected."',
         }
         response = self.client.post(url, payload)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -247,7 +291,7 @@ class OfferingCreateTest(test.APITransactionTestCase):
                 'client_secret': uuid.uuid4(),
                 'subscription_id': uuid.uuid4(),
             },
-            'shared': True
+            'shared': True,
         }
         response = self.create_offering('owner', add_payload=plans_request)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -275,27 +319,14 @@ class OfferingCreateTest(test.APITransactionTestCase):
         self.assertFalse(offering.scope.shared)
 
     def test_create_offering_with_plans(self):
-        plans_request = {
-            'plans': [
-                {
-                    'name': 'Small',
-                    'description': 'Basic plan',
-                }
-            ]
-        }
+        plans_request = {'plans': [{'name': 'Small', 'description': 'Basic plan',}]}
         response = self.create_offering('owner', add_payload=plans_request)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(len(response.data['plans']), 1)
 
     def test_specify_max_amount_for_plan(self):
         plans_request = {
-            'plans': [
-                {
-                    'name': 'Small',
-                    'description': 'Basic plan',
-                    'max_amount': 10,
-                }
-            ]
+            'plans': [{'name': 'Small', 'description': 'Basic plan', 'max_amount': 10,}]
         }
         response = self.create_offering('owner', add_payload=plans_request)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -303,13 +334,7 @@ class OfferingCreateTest(test.APITransactionTestCase):
 
     def test_max_amount_should_be_at_least_one(self):
         plans_request = {
-            'plans': [
-                {
-                    'name': 'Small',
-                    'description': 'Basic plan',
-                    'max_amount': -1,
-                }
-            ]
+            'plans': [{'name': 'Small', 'description': 'Basic plan', 'max_amount': -1,}]
         }
         response = self.create_offering('owner', add_payload=plans_request)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -331,7 +356,7 @@ class OfferingCreateTest(test.APITransactionTestCase):
                     'prices': {'cores': 10},
                     'quotas': {'cores': 10},
                 }
-            ]
+            ],
         }
         response = self.create_offering('owner', add_payload=plans_request)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -360,7 +385,7 @@ class OfferingCreateTest(test.APITransactionTestCase):
                     'prices': {'cores': 10},
                     'quotas': {'cores': 10},
                 }
-            ]
+            ],
         }
         response = self.create_offering('owner', add_payload=plans_request)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -381,7 +406,7 @@ class OfferingCreateTest(test.APITransactionTestCase):
                     'unit': UnitPriceMixin.Units.PER_MONTH,
                     'prices': {'cores': 10},
                 }
-            ]
+            ],
         }
         response = self.create_offering('owner', add_payload=plans_request)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -407,7 +432,7 @@ class OfferingCreateTest(test.APITransactionTestCase):
                     'prices': {'cores': 10},
                     'quotas': {'cores': 10},
                 }
-            ]
+            ],
         }
         response = self.create_offering('owner', add_payload=plans_request)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -429,7 +454,7 @@ class OfferingCreateTest(test.APITransactionTestCase):
                     'prices': {'cores': 10},
                     'quotas': {'cores': 0},
                 }
-            ]
+            ],
         }
         response = self.create_offering('owner', add_payload=plans_request)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -450,7 +475,7 @@ class OfferingCreateTest(test.APITransactionTestCase):
                     'unit': UnitPriceMixin.Units.PER_MONTH,
                     'quotas': {'cores': 10},
                 }
-            ]
+            ],
         }
         response = self.create_offering('owner', add_payload=plans_request)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -469,16 +494,10 @@ class OfferingCreateTest(test.APITransactionTestCase):
                 {
                     'name': 'Small',
                     'unit': UnitPriceMixin.Units.PER_MONTH,
-                    'quotas': {
-                        'cores': 1,
-                        'invalid_component': 10,
-                    },
-                    'prices': {
-                        'cores': 1,
-                        'invalid_component': 10,
-                    },
+                    'quotas': {'cores': 1, 'invalid_component': 10,},
+                    'prices': {'cores': 1, 'invalid_component': 10,},
                 }
-            ]
+            ],
         }
         response = self.create_offering('owner', add_payload=plans_request)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -486,21 +505,27 @@ class OfferingCreateTest(test.APITransactionTestCase):
         self.assertTrue('invalid_component' in response.data['plans'][0])
 
     def test_create_offering_with_options(self):
-        response = self.create_offering('staff', attributes=True, add_payload={'options': OFFERING_OPTIONS})
+        response = self.create_offering(
+            'staff', attributes=True, add_payload={'options': OFFERING_OPTIONS}
+        )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
         self.assertTrue(models.Offering.objects.filter(customer=self.customer).exists())
         offering = models.Offering.objects.get(customer=self.customer)
         self.assertEqual(offering.options, OFFERING_OPTIONS)
 
     def test_create_offering_with_invalid_options(self):
-        options = {
-            'foo': 'bar'
-        }
-        response = self.create_offering('staff', attributes=True, add_payload={'options': options})
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+        options = {'foo': 'bar'}
+        response = self.create_offering(
+            'staff', attributes=True, add_payload={'options': options}
+        )
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
 
     def test_create_offering_with_invalid_type(self):
-        response = self.create_offering('staff', attributes=True, add_payload={'type': 'invalid'})
+        response = self.create_offering(
+            'staff', attributes=True, add_payload={'type': 'invalid'}
+        )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertTrue('type' in response.data)
 
@@ -511,7 +536,9 @@ class OfferingCreateTest(test.APITransactionTestCase):
         factories.ServiceProviderFactory(customer=self.customer)
         category = factories.CategoryFactory()
         section = factories.SectionFactory(category=category)
-        factories.AttributeFactory(section=section, key='required_attribute', required=True)
+        factories.AttributeFactory(
+            section=section, key='required_attribute', required=True
+        )
         payload = {
             'name': 'offering',
             'category': factories.CategoryFactory.get_url(category),
@@ -522,31 +549,45 @@ class OfferingCreateTest(test.APITransactionTestCase):
 
         response = self.client.post(url, payload)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertTrue('required_attribute' in response.content)
+        self.assertTrue(b'required_attribute' in response.content)
 
     def test_default_attribute_value_is_used_if_user_did_not_override_it(self):
         category = factories.CategoryFactory()
         section = factories.SectionFactory(category=category)
-        factories.AttributeFactory(section=section, key='support_phone', default='support@example.com')
+        factories.AttributeFactory(
+            section=section, key='support_phone', default='support@example.com'
+        )
 
-        response = self.create_offering('staff', add_payload={
-            'category': factories.CategoryFactory.get_url(category),
-            'attributes': {},
-        })
+        response = self.create_offering(
+            'staff',
+            add_payload={
+                'category': factories.CategoryFactory.get_url(category),
+                'attributes': {},
+            },
+        )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(response.data['attributes']['support_phone'], 'support@example.com')
+        self.assertEqual(
+            response.data['attributes']['support_phone'], 'support@example.com'
+        )
 
     def test_default_attribute_value_is_not_used_if_user_has_overriden_it(self):
         category = factories.CategoryFactory()
         section = factories.SectionFactory(category=category)
-        factories.AttributeFactory(section=section, key='support_phone', default='support@example.com')
+        factories.AttributeFactory(
+            section=section, key='support_phone', default='support@example.com'
+        )
 
-        response = self.create_offering('staff', add_payload={
-            'category': factories.CategoryFactory.get_url(category),
-            'attributes': {'support_phone': 'admin@example.com'}
-        })
+        response = self.create_offering(
+            'staff',
+            add_payload={
+                'category': factories.CategoryFactory.get_url(category),
+                'attributes': {'support_phone': 'admin@example.com'},
+            },
+        )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(response.data['attributes']['support_phone'], 'admin@example.com')
+        self.assertEqual(
+            response.data['attributes']['support_phone'], 'admin@example.com'
+        )
 
     def create_offering(self, user, attributes=False, add_payload=None):
         user = getattr(self.fixture, user)
@@ -559,12 +600,7 @@ class OfferingCreateTest(test.APITransactionTestCase):
             'category': factories.CategoryFactory.get_url(),
             'customer': structure_factories.CustomerFactory.get_url(self.customer),
             'type': 'Support.OfferingTemplate',  # This is used only for testing
-            'plans': [
-                {
-                    'name': 'Small',
-                    'unit': UnitPriceMixin.Units.PER_MONTH,
-                }
-            ],
+            'plans': [{'name': 'Small', 'unit': UnitPriceMixin.Units.PER_MONTH,}],
         }
 
         if attributes:
@@ -573,7 +609,7 @@ class OfferingCreateTest(test.APITransactionTestCase):
                 'vendorType': 'reseller',
                 'userSupportOptions': ['web_chat', 'phone'],
                 'dataProtectionInternal': 'ipsec',
-                'dataProtectionExternal': 'tls12'
+                'dataProtectionExternal': 'tls12',
             }
 
         if add_payload:
@@ -590,7 +626,6 @@ class OfferingCreateTest(test.APITransactionTestCase):
 
 @ddt
 class OfferingUpdateTest(test.APITransactionTestCase):
-
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.customer = self.fixture.customer
@@ -614,7 +649,11 @@ class OfferingUpdateTest(test.APITransactionTestCase):
         response = self.client.patch(self.url, {'name': 'new_offering'})
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
-    @data(models.Offering.States.ACTIVE, models.Offering.States.PAUSED, models.Offering.States.ARCHIVED)
+    @data(
+        models.Offering.States.ACTIVE,
+        models.Offering.States.PAUSED,
+        models.Offering.States.ARCHIVED,
+    )
     def test_owner_can_not_update_offering_in_active_or_paused_state(self, state):
         # Arrange
         self.offering.state = state
@@ -658,7 +697,9 @@ class OfferingUpdateTest(test.APITransactionTestCase):
         # Arrange
         category = factories.CategoryFactory()
         section = factories.SectionFactory(category=category)
-        factories.AttributeFactory(section=section, key='userSupportOptions', required=True)
+        factories.AttributeFactory(
+            section=section, key='userSupportOptions', required=True
+        )
 
         # Act
         self.client.force_authenticate(self.fixture.owner)
@@ -672,7 +713,9 @@ class OfferingUpdateTest(test.APITransactionTestCase):
         # Arrange
         category = factories.CategoryFactory()
         section = factories.SectionFactory(category=category)
-        factories.AttributeFactory(section=section, key='userSupportOptions', required=True)
+        factories.AttributeFactory(
+            section=section, key='userSupportOptions', required=True
+        )
 
         # Act
         attributes = {'userSupportOptions': 'email'}
@@ -732,14 +775,13 @@ class OfferingUpdateTest(test.APITransactionTestCase):
         component = self.offering.components.get()
         self.assertEqual('cores', component.type)
         self.assertEqual('hours', component.measured_unit)
-        self.assertEqual(models.OfferingComponent.BillingTypes.FIXED, component.billing_type)
+        self.assertEqual(
+            models.OfferingComponent.BillingTypes.FIXED, component.billing_type
+        )
 
     def test_it_should_be_possible_to_update_existing_components(self):
         factories.OfferingComponentFactory(
-            offering=self.offering,
-            type='cores',
-            name='CPU',
-            measured_unit='H',
+            offering=self.offering, type='cores', name='CPU', measured_unit='H',
         )
         # Act
         components = [
@@ -759,21 +801,16 @@ class OfferingUpdateTest(test.APITransactionTestCase):
         component = self.offering.components.get()
         self.assertEqual('Cores', component.name)
         self.assertEqual('hours', component.measured_unit)
-        self.assertEqual(models.OfferingComponent.BillingTypes.FIXED, component.billing_type)
+        self.assertEqual(
+            models.OfferingComponent.BillingTypes.FIXED, component.billing_type
+        )
 
     def test_it_should_be_possible_to_update_plan_name(self):
         # Arrange
         plan = factories.PlanFactory(offering=self.offering, name='Old name')
 
         # Act
-        payload = {
-            'plans': [
-                {
-                    'uuid': plan.uuid.hex,
-                    'name': 'New name',
-                }
-            ]
-        }
+        payload = {'plans': [{'uuid': plan.uuid.hex, 'name': 'New name',}]}
         self.client.force_authenticate(self.fixture.owner)
         response = self.client.patch(self.url, payload)
 
@@ -785,20 +822,14 @@ class OfferingUpdateTest(test.APITransactionTestCase):
     def test_it_should_be_possible_to_create_plan_components(self):
         # Arrange
         plan = factories.PlanFactory(offering=self.offering)
-        offering_component = factories.OfferingComponentFactory(offering=self.offering, type='ram')
+        offering_component = factories.OfferingComponentFactory(
+            offering=self.offering, type='ram'
+        )
 
         # Act
         payload = {
             'plans': [
-                {
-                    'uuid': plan.uuid.hex,
-                    'quotas': {
-                        'ram': 20,
-                    },
-                    'prices': {
-                        'ram': 2,
-                    }
-                }
+                {'uuid': plan.uuid.hex, 'quotas': {'ram': 20,}, 'prices': {'ram': 2,}}
             ]
         }
         self.client.force_authenticate(self.fixture.owner)
@@ -806,7 +837,9 @@ class OfferingUpdateTest(test.APITransactionTestCase):
 
         # Assert
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        plan_component = models.PlanComponent.objects.get(plan=plan, component=offering_component)
+        plan_component = models.PlanComponent.objects.get(
+            plan=plan, component=offering_component
+        )
         self.assertEqual(plan_component.amount, 20)
         self.assertEqual(plan_component.price, 2)
 
@@ -829,7 +862,9 @@ class OfferingUpdateTest(test.APITransactionTestCase):
         self.offering.type = VIRTUAL_MACHINE_TYPE
         self.offering.save()
 
-        cpu_component = factories.OfferingComponentFactory(offering=self.offering, type='cpu')
+        cpu_component = factories.OfferingComponentFactory(
+            offering=self.offering, type='cpu'
+        )
 
         # Act
         self.client.force_authenticate(self.fixture.owner)
@@ -842,26 +877,17 @@ class OfferingUpdateTest(test.APITransactionTestCase):
     def test_it_should_be_possible_to_update_plan_components(self):
         # Arrange
         plan = factories.PlanFactory(offering=self.offering)
-        offering_component = factories.OfferingComponentFactory(offering=self.offering, type='ram')
+        offering_component = factories.OfferingComponentFactory(
+            offering=self.offering, type='ram'
+        )
         plan_component = factories.PlanComponentFactory(
-            plan=plan,
-            component=offering_component,
-            amount=10,
-            price=1,
+            plan=plan, component=offering_component, amount=10, price=1,
         )
 
         # Act
         payload = {
             'plans': [
-                {
-                    'uuid': plan.uuid.hex,
-                    'quotas': {
-                        'ram': 20,
-                    },
-                    'prices': {
-                        'ram': 2,
-                    }
-                }
+                {'uuid': plan.uuid.hex, 'quotas': {'ram': 20,}, 'prices': {'ram': 2,}}
             ]
         }
         self.client.force_authenticate(self.fixture.owner)
@@ -878,9 +904,7 @@ class OfferingUpdateTest(test.APITransactionTestCase):
         plan = factories.PlanFactory(offering=self.offering)
 
         # Act
-        payload = {
-            'plans': []
-        }
+        payload = {'plans': []}
         self.client.force_authenticate(self.fixture.owner)
         response = self.client.patch(self.url, payload)
 
@@ -906,7 +930,7 @@ class OfferingUpdateTest(test.APITransactionTestCase):
                     'prices': {'cores': 10},
                     'quotas': {'cores': 10},
                 }
-            ]
+            ],
         }
         self.client.force_authenticate(self.fixture.owner)
         response = self.client.patch(self.url, payload)
@@ -918,7 +942,6 @@ class OfferingUpdateTest(test.APITransactionTestCase):
 
 @ddt
 class OfferingDeleteTest(test.APITransactionTestCase):
-
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.customer = self.fixture.customer
@@ -928,8 +951,12 @@ class OfferingDeleteTest(test.APITransactionTestCase):
     @data('staff', 'owner')
     def test_authorized_user_can_delete_offering(self, user):
         response = self.delete_offering(user)
-        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT, response.data)
-        self.assertFalse(models.Offering.objects.filter(customer=self.customer).exists())
+        self.assertEqual(
+            response.status_code, status.HTTP_204_NO_CONTENT, response.data
+        )
+        self.assertFalse(
+            models.Offering.objects.filter(customer=self.customer).exists()
+        )
 
     @data('user', 'customer_support', 'admin', 'manager')
     def test_unauthorized_user_can_not_delete_offering(self, user):
@@ -953,24 +980,18 @@ class OfferingDeleteTest(test.APITransactionTestCase):
 
 @ddt
 class OfferingAttributesTest(test.APITransactionTestCase):
-
     def setUp(self):
         self.serializer = serializers.OfferingCreateSerializer()
         self.category = factories.CategoryFactory()
         self.section = factories.SectionFactory(category=self.category)
         self.attribute = factories.AttributeFactory(
-            section=self.section,
-            key='userSupportOptions',
-            type='list'
+            section=self.section, key='userSupportOptions', type='list'
         )
         models.AttributeOption.objects.create(
-            attribute=self.attribute,
-            key='web_chat',
-            title='Web chat'),
+            attribute=self.attribute, key='web_chat', title='Web chat'
+        ),
         models.AttributeOption.objects.create(
-            attribute=self.attribute,
-            key='phone',
-            title='Telephone'
+            attribute=self.attribute, key='phone', title='Telephone'
         )
 
     @data(['web_chat', 'phone'])
@@ -1015,10 +1036,8 @@ class OfferingAttributesTest(test.APITransactionTestCase):
         self.attribute.type = attribute_type
         self.attribute.save()
         attributes = {
-            'attributes': {
-                'userSupportOptions': value,
-            },
-            'category': self.category
+            'attributes': {'userSupportOptions': value,},
+            'category': self.category,
         }
         self.assertIsNone(self.serializer._validate_attributes(attributes))
 
@@ -1026,13 +1045,14 @@ class OfferingAttributesTest(test.APITransactionTestCase):
         self.attribute.type = attribute_type
         self.attribute.save()
         attributes = {
-            'attributes': {
-                'userSupportOptions': value,
-            },
+            'attributes': {'userSupportOptions': value,},
             'category': self.category,
         }
-        self.assertRaises(rest_exceptions.ValidationError, self.serializer._validate_attributes,
-                          attributes)
+        self.assertRaises(
+            rest_exceptions.ValidationError,
+            self.serializer._validate_attributes,
+            attributes,
+        )
 
 
 class OfferingQuotaTest(test.APITransactionTestCase):
@@ -1046,14 +1066,22 @@ class OfferingQuotaTest(test.APITransactionTestCase):
         category = factories.CategoryFactory()
         provider = factories.ServiceProviderFactory()
         factories.OfferingFactory.create_batch(
-            3, category=category, customer=provider.customer, state=models.Offering.States.ACTIVE)
+            3,
+            category=category,
+            customer=provider.customer,
+            state=models.Offering.States.ACTIVE,
+        )
         self.assertEqual(3, self.get_usage(category))
 
     def test_draft_offerings_are_not_counted(self):
         category = factories.CategoryFactory()
         provider = factories.ServiceProviderFactory()
         factories.OfferingFactory.create_batch(
-            2, category=category, customer=provider.customer, state=models.Offering.States.DRAFT)
+            2,
+            category=category,
+            customer=provider.customer,
+            state=models.Offering.States.DRAFT,
+        )
         self.assertEqual(0, self.get_usage(category))
 
 
@@ -1072,7 +1100,7 @@ class OfferingCountTest(test.APITransactionTestCase):
             customer=self.customer,
             category=self.category,
             shared=shared,
-            state=models.Offering.States.ACTIVE
+            state=models.Offering.States.ACTIVE,
         )
         self.client.force_authenticate(user)
         response = self.client.get(self.url)
@@ -1093,7 +1121,6 @@ class OfferingCountTest(test.APITransactionTestCase):
 
 @ddt
 class OfferingStateTest(test.APITransactionTestCase):
-
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.customer = self.fixture.customer
@@ -1114,11 +1141,15 @@ class OfferingStateTest(test.APITransactionTestCase):
 
     def test_invalid_state(self):
         response, offering = self.update_offering_state('staff', 'pause')
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
         self.assertEqual(offering.state, offering.States.DRAFT)
 
     @data('activate', 'pause', 'archive')
-    def test_offering_state_changing_is_not_available_for_blocked_organization(self, state):
+    def test_offering_state_changing_is_not_available_for_blocked_organization(
+        self, state
+    ):
         self.customer.blocked = True
         self.customer.save()
         response, offering = self.update_offering_state('staff', state)
@@ -1130,8 +1161,9 @@ class OfferingStateTest(test.APITransactionTestCase):
         self.offering.save()
 
         # Act
-        response, offering = self.update_offering_state('staff', 'pause', {
-            'paused_reason': 'Not available anymore.'})
+        response, offering = self.update_offering_state(
+            'staff', 'pause', {'paused_reason': 'Not available anymore.'}
+        )
 
         # Assert
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
@@ -1156,12 +1188,15 @@ class AllowedCustomersTest(test.APITransactionTestCase):
         url = structure_factories.CustomerFactory.get_url(self.customer, 'offerings')
         user = getattr(self.fixture, 'staff')
         self.client.force_authenticate(user)
-        response = self.client.post(url, {
-            "offering_set": [
-                factories.OfferingFactory.get_url(),
-                factories.OfferingFactory.get_url(),
-            ]
-        })
+        response = self.client.post(
+            url,
+            {
+                "offering_set": [
+                    factories.OfferingFactory.get_url(),
+                    factories.OfferingFactory.get_url(),
+                ]
+            },
+        )
         self.customer.refresh_from_db()
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertEqual(len(self.customer.offering_set.all()), 2)
@@ -1170,12 +1205,202 @@ class AllowedCustomersTest(test.APITransactionTestCase):
         url = structure_factories.CustomerFactory.get_url(self.customer, 'offerings')
         user = getattr(self.fixture, 'owner')
         self.client.force_authenticate(user)
-        response = self.client.post(url, {
-            "offering_set": [
-                factories.OfferingFactory.get_url(),
-                factories.OfferingFactory.get_url(),
-            ]
-        })
+        response = self.client.post(
+            url,
+            {
+                "offering_set": [
+                    factories.OfferingFactory.get_url(),
+                    factories.OfferingFactory.get_url(),
+                ]
+            },
+        )
         self.customer.refresh_from_db()
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
         self.assertEqual(len(self.customer.offering_set.all()), 0)
+
+
+@ddt
+class OfferingPublicGetTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.offerings = [
+            factories.OfferingFactory(state=models.Offering.States.ACTIVE),
+            factories.OfferingFactory(state=models.Offering.States.DRAFT),
+            factories.OfferingFactory(
+                state=models.Offering.States.PAUSED, shared=False
+            ),
+        ]
+
+    @override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=False)
+    def test_anonymous_cannot_view_offerings(self):
+        url = factories.OfferingFactory.get_list_url()
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    @override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=True)
+    def test_anonymous_cannot_view_draft_offerings(self):
+        url = factories.OfferingFactory.get_list_url()
+        response = self.client.get(url)
+        for offering in response.data:
+            self.assertNotEqual(models.Offering.States.DRAFT, offering['state'])
+
+    @override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=True)
+    def test_anonymous_cannot_view_offering_scope(self):
+        url = factories.OfferingFactory.get_list_url()
+        response = self.client.get(url)
+        for offering in response.data:
+            self.assertNotIn('scope', offering)
+
+    @override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=True)
+    def test_anonymous_can_view_offering_scope(self):
+        url = factories.OfferingFactory.get_url(self.offerings[0])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    @override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=True)
+    @data('staff', 'owner', 'user', 'customer_support', 'admin')
+    def test_authenticated_user_can_view_offering_scope(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        url = factories.OfferingFactory.get_list_url()
+        response = self.client.get(url)
+        for offering in response.data:
+            self.assertIn('scope', offering)
+
+    @override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=True)
+    @data('staff', 'owner', 'user', 'customer_support', 'admin', 'manager', None)
+    def test_private_offerings_are_hidden(self, user):
+        if user:
+            user = getattr(self.fixture, user)
+            self.client.force_authenticate(user)
+        url = factories.OfferingFactory.get_list_url()
+        response = self.client.get(url)
+        for offering in response.data:
+            self.assertTrue('shared', offering)
+
+
+class OfferingExportImportTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.temp_dir = tempfile.gettempdir()
+
+    def test_export_offering(self):
+        offering = factories.OfferingFactory(
+            description='Описание с non-ASCII символами.'
+        )
+        export_offering(offering, self.temp_dir)
+        json_path = os.path.join(self.temp_dir, offering.uuid.hex + '.json')
+        self.assertTrue(os.path.exists(json_path))
+
+    def test_export_offering_with_thumbnail(self):
+        GIF = 'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
+
+        with open(os.path.join(self.temp_dir, 'pic.gif'), 'wb') as pic:
+            pic.write(base64.b64decode(GIF))
+
+        offering = factories.OfferingFactory(thumbnail=pic.name)
+        export_offering(offering, self.temp_dir)
+        filename, file_extension = os.path.splitext(offering.thumbnail.file.name)
+        pic_path = os.path.join(self.temp_dir, offering.uuid.hex + file_extension)
+        self.assertTrue(os.path.exists(pic_path))
+
+    def test_import_offering(self):
+        export_data = self._get_data()
+        create_offering(export_data, self.fixture.customer)
+
+        self.assertTrue(
+            models.Offering.objects.filter(
+                customer=self.fixture.customer, name='offering_name'
+            ).exists()
+        )
+        offering = models.Offering.objects.filter(
+            customer=self.fixture.customer, name='offering_name'
+        ).get()
+        self.assertTrue(offering.thumbnail)
+        self.assertEqual(offering.plans.count(), 1)
+        self.assertEqual(offering.plans.first().name, 'Start')
+        self.assertEqual(offering.plans.first().components.count(), 1)
+        self.assertEqual(offering.components.count(), 1)
+        self.assertEqual(offering.components.first().type, 'node')
+
+    def test_update_offering(self):
+        export_data = self._get_data()
+        offering = create_offering(export_data, self.fixture.customer)
+        export_data['name'] = 'new_offering_name'
+        export_data['plans'][0]['name'] = 'new_plan'
+        export_data['components'][0]['type'] = 'new_type'
+        export_data['plans'][0]['components'][0]['component']['type'] = 'new_type'
+
+        update_offering(offering, export_data)
+        offering.refresh_from_db()
+        self.assertEqual(offering.name, 'new_offering_name')
+        self.assertEqual(offering.plans.first().name, 'new_plan')
+        self.assertEqual(offering.components.first().type, 'new_type')
+
+    def _get_data(self):
+        path = os.path.abspath(os.path.dirname(__file__))
+        data = json.loads(
+            pkg_resources.resource_stream(__name__, 'offering.json').read().decode()
+        )
+        category = factories.CategoryFactory()
+        data['category_id'] = category.id
+
+        thumbnail = data.get('thumbnail')
+        if thumbnail:
+            data['thumbnail'] = os.path.join(os.path.dirname(path), thumbnail)
+
+        return data
+
+
+class OfferingDoiTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.dc_resp = json.loads(
+            pkg_resources.resource_stream(__name__, 'datacite-resp.json')
+            .read()
+            .decode()
+        )['data']
+        self.ref_pids = [
+            x['relatedIdentifier']
+            for x in self.dc_resp['attributes']['relatedIdentifiers']
+        ]
+        self.offering = factories.OfferingFactory(
+            datacite_doi='10.15159/t9zh-k971',
+            citation_count=self.dc_resp['attributes']['citationCount'],
+        )
+        self.offering_referral = factories.OfferingReferralFactory(scope=self.offering)
+        self.offering2 = factories.OfferingFactory(
+            datacite_doi='10.15159/t9zh-k972', citation_count=0,
+        )
+        self.offering_referral2 = factories.OfferingReferralFactory(
+            scope=self.offering2
+        )
+        self.fixture = fixtures.ProjectFixture()
+
+    def test_viewing_datacite_related_fields(self):
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OfferingFactory.get_url(self.offering)
+        response = self.client.get(url).json()
+
+        self.assertEqual(response['datacite_doi'], self.dc_resp['id'])
+        self.assertEqual(
+            response['citation_count'], self.dc_resp['attributes']['citationCount']
+        )
+
+    def test_authenticated_user_can_lookup_offering_referrals(self):
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OfferingReferralFactory.get_list_url()
+
+        response = self.client.get(
+            url, {'scope': factories.OfferingFactory.get_url(self.offering)}
+        ).json()
+
+        self.assertTrue('pid' in response[0])
+        self.assertTrue(len(response) == 1)
+
+    def test_anonymous_user_cannot_lookup_offering_referrals(self):
+        url = factories.OfferingReferralFactory.get_list_url()
+
+        response = self.client.get(
+            url, {'scope': factories.OfferingFactory.get_url(self.offering)}
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)

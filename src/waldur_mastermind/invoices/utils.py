@@ -56,7 +56,10 @@ def check_past_date(year, month, day=None):
     day = day or 1
 
     try:
-        return datetime.date(year=int(year), month=int(month), day=int(day)) <= timezone.now().date()
+        return (
+            datetime.date(year=int(year), month=int(month), day=int(day))
+            <= timezone.now().date()
+        )
     except ValueError:
         return False
 
@@ -76,20 +79,24 @@ def parse_period(attrs, use_default=True):
 
 def get_previous_month():
     date = timezone.now()
-    month, year = (date.month - 1, date.year) if date.month != 1 else (12, date.year - 1)
+    month, year = (
+        (date.month - 1, date.year) if date.month != 1 else (12, date.year - 1)
+    )
     return datetime.date(year, month, 1)
 
 
 def filter_invoice_items(items):
-    return [item for item in items if item.total > 0]
+    return [
+        item for item in items if item.total != 0
+    ]  # skip empty, but leave in credit and debit
 
 
 def create_invoice_pdf(invoice):
     all_items = filter_invoice_items(invoice.items)
     logo_path = settings.WALDUR_CORE['SITE_LOGO']
     if logo_path:
-        with open(logo_path, 'r') as image_file:
-            deployment_logo = base64.b64encode(image_file.read())
+        with open(logo_path, 'rb') as image_file:
+            deployment_logo = base64.b64encode(image_file.read()).decode("utf-8")
     else:
         deployment_logo = None
 
@@ -102,7 +109,7 @@ def create_invoice_pdf(invoice):
     )
     html = render_to_string('invoices/invoice.html', context)
     pdf = pdfkit.from_string(html, False)
-    invoice.file = base64.b64encode(pdf)
+    invoice.file = str(base64.b64encode(pdf), 'utf-8')
     invoice.save()
 
 

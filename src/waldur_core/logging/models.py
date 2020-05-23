@@ -1,5 +1,3 @@
-from __future__ import unicode_literals
-
 import logging
 
 import requests
@@ -39,10 +37,12 @@ class AlertThresholdMixin(models.Model):
     It is expected that model has scope field.
     """
 
-    class Meta(object):
+    class Meta:
         abstract = True
 
-    threshold = models.FloatField(default=0, validators=[validators.MinValueValidator(0)])
+    threshold = models.FloatField(
+        default=0, validators=[validators.MinValueValidator(0)]
+    )
 
     def is_over_threshold(self):
         """
@@ -54,6 +54,7 @@ class AlertThresholdMixin(models.Model):
     @lru_cache(maxsize=1)
     def get_all_models(cls):
         from django.apps import apps
+
         return [model for model in apps.get_models() if issubclass(model, cls)]
 
     @classmethod
@@ -69,7 +70,7 @@ class EventTypesMixin(models.Model):
     Mixin to add a event_types and event_groups fields.
     """
 
-    class Meta(object):
+    class Meta:
         abstract = True
 
     event_types = BetterJSONField('List of event types')
@@ -85,7 +86,7 @@ class BaseHook(EventTypesMixin, UuidMixin, TimeStampedModel):
     class Meta:
         abstract = True
 
-    user = models.ForeignKey(settings.AUTH_USER_MODEL)
+    user = models.ForeignKey(on_delete=models.CASCADE, to=settings.AUTH_USER_MODEL)
     is_active = models.BooleanField(default=True)
 
     # This timestamp would be updated periodically when event is sent via this hook
@@ -102,11 +103,19 @@ class BaseHook(EventTypesMixin, UuidMixin, TimeStampedModel):
         except SystemNotification.DoesNotExist:
             return self_types
         else:
-            return self_types | set(loggers.expand_event_groups(base_types.event_groups)) | set(base_types.event_types)
+            return (
+                self_types
+                | set(loggers.expand_event_groups(base_types.event_groups))
+                | set(base_types.event_types)
+            )
 
     @classmethod
     def get_active_hooks(cls):
-        return [obj for hook in cls.__subclasses__() for obj in hook.objects.filter(is_active=True)]
+        return [
+            obj
+            for hook in cls.__subclasses__()
+            for obj in hook.objects.filter(is_active=True)
+        ]
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -121,21 +130,22 @@ class BaseHook(EventTypesMixin, UuidMixin, TimeStampedModel):
 
 
 class WebHook(BaseHook):
-    class ContentTypeChoices(object):
+    class ContentTypeChoices:
         JSON = 1
         FORM = 2
         CHOICES = ((JSON, 'json'), (FORM, 'form'))
 
     destination_url = models.URLField()
     content_type = models.SmallIntegerField(
-        choices=ContentTypeChoices.CHOICES,
-        default=ContentTypeChoices.JSON
+        choices=ContentTypeChoices.CHOICES, default=ContentTypeChoices.JSON
     )
 
     def process(self, event):
-        logger.debug('Submitting web hook to URL %s, payload: %s', self.destination_url, event)
+        logger.debug(
+            'Submitting web hook to URL %s, payload: %s', self.destination_url, event
+        )
         payload = dict(
-            created=event.created,
+            created=event.created.isoformat(),
             message=event.message,
             context=event.context,
             event_type=event.event_type,
@@ -143,11 +153,19 @@ class WebHook(BaseHook):
 
         # encode event as JSON
         if self.content_type == WebHook.ContentTypeChoices.JSON:
-            requests.post(self.destination_url, json=payload, verify=settings.VERIFY_WEBHOOK_REQUESTS)
+            requests.post(
+                self.destination_url,
+                json=payload,
+                verify=settings.VERIFY_WEBHOOK_REQUESTS,
+            )
 
         # encode event as form
         elif self.content_type == WebHook.ContentTypeChoices.FORM:
-            requests.post(self.destination_url, data=payload, verify=settings.VERIFY_WEBHOOK_REQUESTS)
+            requests.post(
+                self.destination_url,
+                data=payload,
+                verify=settings.VERIFY_WEBHOOK_REQUESTS,
+            )
 
 
 class PushHook(BaseHook):
@@ -199,13 +217,14 @@ class PushHook(BaseHook):
                 'title': conf.get('NOTIFICATION_TITLE', 'Waldur notification'),
                 'image': 'icon',
             },
-            'data': {
-                'event': event.context
-            },
+            'data': {'event': event.context},
         }
         if self.type == self.Type.IOS:
             payload['content-available'] = '1'
-        logger.debug('Submitting GCM push notification with headers %s, payload: %s' % (headers, payload))
+        logger.debug(
+            'Submitting GCM push notification with headers %s, payload: %s'
+            % (headers, payload)
+        )
         requests.post(endpoint, json=payload, headers=headers)
 
 
@@ -214,19 +233,34 @@ class EmailHook(BaseHook):
 
     def process(self, event):
         if not self.email:
-            logger.debug('Skipping processing of email hook (PK=%s) because email is not defined' % self.pk)
+            logger.debug(
+                'Skipping processing of email hook (PK=%s) because email is not defined'
+                % self.pk
+            )
             return
-        subject = settings.WALDUR_CORE.get('NOTIFICATION_SUBJECT', 'Notifications from Waldur')
+        subject = settings.WALDUR_CORE.get(
+            'NOTIFICATION_SUBJECT', 'Notifications from Waldur'
+        )
         text_message = event.message
         html_message = render_to_string('logging/email.html', {'events': [event]})
-        logger.debug('Submitting email hook to %s, payload: %s', self.email, text_message)
-        send_mail(subject, text_message, settings.DEFAULT_FROM_EMAIL, [self.email], html_message=html_message)
+        logger.debug(
+            'Submitting email hook to %s, payload: %s', self.email, text_message
+        )
+        send_mail(
+            subject,
+            text_message,
+            settings.DEFAULT_FROM_EMAIL,
+            [self.email],
+            html_message=html_message,
+        )
 
 
 class SystemNotification(EventTypesMixin, models.Model):
     # Model doesn't inherit NameMixin, because this is circular dependence.
     name = models.CharField(_('name'), max_length=150)
-    hook_content_type = models.ForeignKey(ct_models.ContentType, related_name='+')
+    hook_content_type = models.ForeignKey(
+        on_delete=models.CASCADE, to=ct_models.ContentType, related_name='+'
+    )
     roles = JSONField('List of roles', default=list)
 
     @staticmethod
@@ -238,18 +272,28 @@ class SystemNotification(EventTypesMixin, models.Model):
         from waldur_core.structure import models as structure_models
         from waldur_core.logging import loggers
 
-        groups = [g[0] for g in loggers.event_logger.get_all_groups().items() if event_type in g[1]]
+        groups = [
+            g[0]
+            for g in loggers.event_logger.get_all_groups().items()
+            if event_type in g[1]
+        ]
 
-        for hook in cls.objects.filter(models.Q(event_types__contains=event_type) |
-                                       models.Q(event_groups__has_any_keys=groups)):
+        for hook in cls.objects.filter(
+            models.Q(event_types__contains=event_type)
+            | models.Q(event_groups__has_any_keys=groups)
+        ):
             hook_class = hook.hook_content_type.model_class()
             users_qs = []
 
             if project:
                 if 'admin' in hook.roles:
-                    users_qs.append(project.get_users(structure_models.ProjectRole.ADMINISTRATOR))
+                    users_qs.append(
+                        project.get_users(structure_models.ProjectRole.ADMINISTRATOR)
+                    )
                 if 'manager' in hook.roles:
-                    users_qs.append(project.get_users(structure_models.ProjectRole.MANAGER))
+                    users_qs.append(
+                        project.get_users(structure_models.ProjectRole.MANAGER)
+                    )
                 if 'owner' in hook.roles:
                     users_qs.append(project.customer.get_owners())
 
@@ -267,9 +311,7 @@ class SystemNotification(EventTypesMixin, models.Model):
             for user in users:
                 if user.email:
                     yield hook_class(
-                        user=user,
-                        event_types=hook.event_types,
-                        email=user.email
+                        user=user, event_types=hook.event_types, email=user.email
                     )
 
     def __str__(self):
@@ -277,7 +319,7 @@ class SystemNotification(EventTypesMixin, models.Model):
 
 
 class Report(UuidMixin, TimeStampedModel):
-    class States(object):
+    class States:
         PENDING = 'pending'
         DONE = 'done'
         ERRED = 'erred'
@@ -290,7 +332,9 @@ class Report(UuidMixin, TimeStampedModel):
 
     file = models.FileField(upload_to='logging_reports')
     file_size = models.PositiveIntegerField(null=True)
-    state = models.CharField(choices=States.CHOICES, default=States.PENDING, max_length=10)
+    state = models.CharField(
+        choices=States.CHOICES, default=States.PENDING, max_length=10
+    )
     error_message = models.TextField(blank=True)
 
 
@@ -300,7 +344,7 @@ class Event(UuidMixin):
     message = models.TextField()
     context = BetterJSONField(blank=True)
 
-    class Meta(object):
+    class Meta:
         ordering = ('-created',)
 
 
@@ -309,8 +353,10 @@ class FeedManager(GenericKeyMixin, models.Manager):
 
 
 class Feed(models.Model):
-    event = models.ForeignKey(Event)
-    content_type = models.ForeignKey(ct_models.ContentType, db_index=True)
+    event = models.ForeignKey(on_delete=models.CASCADE, to=Event)
+    content_type = models.ForeignKey(
+        on_delete=models.CASCADE, to=ct_models.ContentType, db_index=True
+    )
     object_id = models.PositiveIntegerField(db_index=True)
     scope = ct_fields.GenericForeignKey('content_type', 'object_id')
     objects = FeedManager()

@@ -1,11 +1,9 @@
-from __future__ import unicode_literals
-
 from django.apps import apps
 from django.utils import timezone
 from rest_framework import test
 
+from .. import models, utils
 from . import factories
-from .. import utils, models
 
 
 class FillActivatedFieldTest(test.APITransactionTestCase):

@@ -1,20 +1,23 @@
-from __future__ import unicode_literals
-
 from decimal import Decimal
 
 from django.core.validators import MinValueValidator
 from django.db import models
 from django.utils.translation import ugettext_lazy as _
 
+PRICE_MAX_DIGITS = 22
+
+PRICE_DECIMAL_PLACES = 10
+
 
 class UnitPriceMixin(models.Model):
     """
     Mixin to expose standardized "unit_price" and "unit" field.
     """
-    class Meta(object):
+
+    class Meta:
         abstract = True
 
-    class Units(object):
+    class Units:
         PER_MONTH = 'month'
         PER_HALF_MONTH = 'half_month'
         PER_DAY = 'day'
@@ -29,13 +32,17 @@ class UnitPriceMixin(models.Model):
             (QUANTITY, _('Quantity')),
         )
 
-    unit_price = models.DecimalField(default=0, max_digits=22, decimal_places=7,
-                                     validators=[MinValueValidator(Decimal('0'))])
+    unit_price = models.DecimalField(
+        default=0,
+        max_digits=22,
+        decimal_places=7,
+        validators=[MinValueValidator(Decimal('0'))],
+    )
     unit = models.CharField(default=Units.PER_DAY, max_length=30, choices=Units.CHOICES)
 
 
 class ProductCodeMixin(models.Model):
-    class Meta(object):
+    class Meta:
         abstract = True
 
     # technical code used by accounting software

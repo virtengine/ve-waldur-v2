@@ -1,10 +1,6 @@
 # The dancing with the function and its deletion is done
 # to keep the namespace clean: only __version__ is going to be exposed.
 
-from six import add_move, MovedModule
-
-add_move(MovedModule('mock', 'mock', 'unittest.mock'))
-
 
 def _get_version(package_name='waldur_mastermind'):
     import pkg_resources
@@ -17,15 +13,16 @@ def _get_version(package_name='waldur_mastermind'):
     except pkg_resources.DistributionNotFound:
         import os.path
         import re
-        import subprocess  # nosec
+        import subprocess  # noqa: S404
 
         repo_dir = os.path.join(os.path.dirname(__file__), os.path.pardir)
 
         try:
             with open(os.devnull, 'w') as DEV_NULL:
-                description = subprocess.check_output(   # nosec
+                description = subprocess.check_output(  # noqa: S603, S607
                     ['git', 'describe', '--tags', '--dirty=.dirty'],
-                    cwd=repo_dir, stderr=DEV_NULL
+                    cwd=repo_dir,
+                    stderr=DEV_NULL,
                 ).strip()
 
             v = re.search(r'-[0-9]+-', description)

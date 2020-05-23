@@ -20,13 +20,11 @@ Usage:
 
 """
 
-from ctypes import c_char_p, c_int, c_size_t, c_void_p
 import ctypes.util
 import glob
 import sys
 import threading
-
-import six
+from ctypes import c_char_p, c_int, c_size_t, c_void_p
 
 
 class MagicException(Exception):
@@ -41,8 +39,14 @@ class Magic:
 
     """
 
-    def __init__(self, mime=False, magic_file=None, mime_encoding=False,
-                 keep_going=False, uncompress=False):
+    def __init__(
+        self,
+        mime=False,
+        magic_file=None,
+        mime_encoding=False,
+        keep_going=False,
+        uncompress=False,
+    ):
         """
         Create a new libmagic wrapper.
 
@@ -79,7 +83,7 @@ class Magic:
                 # which is not what libmagic expects
                 if isinstance(buf, str) and str != bytes:
                     buf = buf.encode('utf-8', errors='replace')
-                return maybe_decode(magic_buffer(self.cookie, buf))
+                return magic_buffer(self.cookie, buf).decode('utf-8')
             except MagicException as e:
                 return self._handle509Bug(e)
 
@@ -89,7 +93,7 @@ class Magic:
             pass
         with self.lock:
             try:
-                return maybe_decode(magic_file(self.cookie, filename))
+                return magic_file(self.cookie, filename).decode('utf-8')
             except MagicException as e:
                 return self._handle509Bug(e)
 
@@ -156,9 +160,11 @@ def from_buffer(buffer, mime=False):
 
 libmagic = None
 # Let's try to find magic or magic1
-dll = ctypes.util.find_library('magic') \
-    or ctypes.util.find_library('magic1') \
+dll = (
+    ctypes.util.find_library('magic')
+    or ctypes.util.find_library('magic1')
     or ctypes.util.find_library('cygmagic-1')
+)
 
 # necessary because find_library returns None if it doesn't find the library
 if dll:
@@ -166,15 +172,15 @@ if dll:
 
 if not libmagic or not libmagic._name:
     windows_dlls = ['magic1.dll', 'cygmagic-1.dll']
-    platform_to_lib = {'darwin': ['/opt/local/lib/libmagic.dylib',
-                                  '/usr/local/lib/libmagic.dylib'] +
-                       # Assumes there will only be one version installed
-                       glob.glob('/usr/local/Cellar/libmagic/*/lib/libmagic.dylib'),  # flake8:noqa
-                       'win32': windows_dlls,
-                       'cygwin': windows_dlls,
-                       'linux': ['libmagic.so.1'],
-                       # fallback for some Linuxes (e.g. Alpine) where library search does not work # flake8:noqa
-                       }
+    platform_to_lib = {
+        'darwin': ['/opt/local/lib/libmagic.dylib', '/usr/local/lib/libmagic.dylib']
+        # Assumes there will only be one version installed
+        + glob.glob('/usr/local/Cellar/libmagic/*/lib/libmagic.dylib'),  # flake8:noqa
+        'win32': windows_dlls,
+        'cygwin': windows_dlls,
+        'linux': ['libmagic.so.1'],
+        # fallback for some Linuxes (e.g. Alpine) where library search does not work # flake8:noqa
+    }
     platform = 'linux' if sys.platform.startswith('linux') else sys.platform
     for dll in platform_to_lib.get(platform, []):
         try:
@@ -199,20 +205,11 @@ def errorcheck_null(result, func, args):
 
 
 def errorcheck_negative_one(result, func, args):
-    if result is -1:
+    if result == -1:
         err = magic_error(args[0])
         raise MagicException(err)
     else:
         return result
-
-
-# return str on python3.  Don't want to unconditionally
-# decode because that results in unicode on python2
-def maybe_decode(s):
-    if str == bytes:
-        return s
-    else:
-        return s.decode('utf-8')
 
 
 def coerce_filename(filename):
@@ -223,10 +220,9 @@ def coerce_filename(filename):
     # .encode('ascii').  If you use the filesystem encoding
     # then you'll get inconsistent behavior (crashes) depending on the user's
     # LANG environment variable
-    is_unicode = (sys.version_info[0] <= 2 and
-                  isinstance(filename, six.text_type)) or \
-                 (sys.version_info[0] >= 3 and
-                  isinstance(filename, str))
+    is_unicode = (sys.version_info[0] <= 2 and isinstance(filename, str)) or (
+        sys.version_info[0] >= 3 and isinstance(filename, str)
+    )
     if is_unicode:
         return filename.encode('utf-8', 'surrogateescape')
     else:

@@ -6,7 +6,6 @@ from django.contrib.auth import get_user_model
 from django.core.management.base import BaseCommand, CommandError
 from rest_framework import status
 from rest_framework.test import APIClient
-import six
 
 User = get_user_model()
 
@@ -16,8 +15,10 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument(
-            '-o', '--output',
-            dest='output', default=None,
+            '-o',
+            '--output',
+            dest='output',
+            default=None,
             help='Specifies file to which the output is written. The output will be printed to stdout by default.',
         )
 
@@ -34,7 +35,9 @@ class Command(BaseCommand):
             host = '127.0.0.1'
 
         client = APIClient(HTTP_HOST=host)
-        user, _ = User.objects.get_or_create(username='waldur_docs_exporter', is_staff=True)
+        user, _ = User.objects.get_or_create(
+            username='waldur_docs_exporter', is_staff=True
+        )
         client.force_authenticate(user=user)
         response = client.get('/docs/?format=openapi')
         user.delete()
@@ -44,7 +47,7 @@ class Command(BaseCommand):
 
         data = json.loads(response.content)
         if options['output'] is None:
-            self.stdout.write(six.text_type(data))
+            self.stdout.write(str(data))
         else:
             with open(options['output'], 'w') as output_file:
                 json.dump(data, output_file)

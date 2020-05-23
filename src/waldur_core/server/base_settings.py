@@ -1,9 +1,8 @@
 """
 Django base settings for Waldur Core.
 """
-from __future__ import absolute_import
-
 from datetime import timedelta
+import locale
 # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
 import os
 import warnings
@@ -12,6 +11,13 @@ from celery.schedules import crontab
 
 from waldur_core.core import WaldurExtension
 from waldur_core.server.admin.settings import *  # noqa: F403
+
+encoding = locale.getpreferredencoding()
+if encoding.lower() != 'utf-8':
+    raise Exception("""Your system's preferred encoding is `{}`, but Waldur requires `UTF-8`.
+Fix it by setting the LC_* and LANG environment settings. Example:
+LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+""".format(encoding))
 
 ADMINS = ()
 
@@ -40,7 +46,6 @@ INSTALLED_APPS = (
     'waldur_core.monitoring',
     'waldur_core.quotas',
     'waldur_core.structure',
-    'waldur_core.cost_tracking',
     'waldur_core.users',
     'waldur_core.media',
 
@@ -58,6 +63,7 @@ INSTALLED_APPS = (
 INSTALLED_APPS += ADMIN_INSTALLED_APPS  # noqa: F405
 
 MIDDLEWARE = (
+    'waldur_core.server.middleware.cors_middleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.locale.LocaleMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -84,6 +90,7 @@ REST_FRAMEWORK = {
         'waldur_core.core.renderers.BrowsableAPIRenderer',
     ),
     'DEFAULT_PAGINATION_CLASS': 'waldur_core.core.pagination.LinkHeaderPagination',
+    'DEFAULT_SCHEMA_CLASS': 'rest_framework.schemas.coreapi.AutoSchema',
     'PAGE_SIZE': 10,
     'EXCEPTION_HANDLER': 'waldur_core.core.views.exception_handler',
 
@@ -144,14 +151,14 @@ ROOT_URLCONF = 'waldur_core.server.urls'
 AUTH_USER_MODEL = 'core.User'
 
 # Session
-# https://docs.djangoproject.com/en/1.11/ref/settings/#sessions
+# https://docs.djangoproject.com/en/2.2/ref/settings/#sessions
 SESSION_COOKIE_AGE = 3600
 SESSION_SAVE_EVERY_REQUEST = True
 
 WSGI_APPLICATION = 'waldur_core.server.wsgi.application'
 
 # Internationalization
-# https://docs.djangoproject.com/en/1.11/topics/i18n/
+# https://docs.djangoproject.com/en/2.2/topics/i18n/
 LANGUAGE_CODE = 'en-us'
 
 TIME_ZONE = 'UTC'
@@ -175,7 +182,7 @@ USE_TZ = True
 DEFENDER_REDIS_URL = 'redis://localhost:6379/0'
 
 # Static files (CSS, JavaScript, Images)
-# https://docs.djangoproject.com/en/1.11/howto/static-files/
+# https://docs.djangoproject.com/en/2.2/howto/static-files/
 STATIC_URL = '/static/'
 
 # Celery
@@ -223,13 +230,6 @@ CELERY_BEAT_SCHEDULE = {
     'check-expired-permissions': {
         'task': 'waldur_core.structure.check_expired_permissions',
         'schedule': timedelta(hours=24),
-        'args': (),
-    },
-    'recalculate-price-estimates': {
-        'task': 'waldur_core.cost_tracking.recalculate_estimate',
-        # To avoid bugs and unexpected behavior - do not re-calculate estimates
-        # right in the end of the month.
-        'schedule': crontab(minute=10),
         'args': (),
     },
     'cancel-expired-invitations': {
@@ -302,6 +302,8 @@ WALDUR_CORE = {
     'INVITATION_DISABLE_MULTIPLE_ROLES': False,
     'PROTECT_USER_DETAILS_FOR_REGISTRATION_METHODS': [],
     'ATTACHMENT_LINK_MAX_AGE': timedelta(hours=1),
+    'EMAIL_CHANGE_URL': 'https://example.com/#/user_email_change/{code}/',
+    'EMAIL_CHANGE_MAX_AGE': timedelta(days=1),
 }
 
 WALDUR_CORE_PUBLIC_SETTINGS = [

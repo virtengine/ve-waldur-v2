@@ -1,9 +1,5 @@
 from collections import OrderedDict
 
-from waldur_core import _get_version
-
-__version__ = _get_version()
-
 default_app_config = 'waldur_openstack.openstack_tenant.apps.OpenStackTenantConfig'
 
 
@@ -44,11 +40,13 @@ class OsTypes:
         (OTHER, 'Other'),
     )
 
-    CATEGORIES = OrderedDict([
-        ('Linux', (CENTOS6, CENTOS7, UBUNTU, RHEL6, RHEL7)),
-        ('Windows', (WINDOWS,)),
-        ('Other', (FREEBSD, OTHER)),
-    ])
+    CATEGORIES = OrderedDict(
+        [
+            ('Linux', (CENTOS6, CENTOS7, UBUNTU, RHEL6, RHEL7)),
+            ('Windows', (WINDOWS,)),
+            ('Other', (FREEBSD, OTHER)),
+        ]
+    )
 
 
 class ApplicationTypes:

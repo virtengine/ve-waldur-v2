@@ -1,7 +1,4 @@
-from __future__ import unicode_literals
-
-from rest_framework import status
-from rest_framework import test
+from rest_framework import status, test
 
 from waldur_core.structure.tests.factories import UserFactory
 

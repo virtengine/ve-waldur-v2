@@ -1,10 +1,7 @@
-from __future__ import unicode_literals
-
 from waldur_core.core import WaldurExtension
 
 
 class VMwareExtension(WaldurExtension):
-
     class Settings:
         WALDUR_VMWARE = {
             'BASIC_MODE': False,
@@ -21,4 +18,5 @@ class VMwareExtension(WaldurExtension):
     @staticmethod
     def rest_urls():
         from .urls import register_in
+
         return register_in

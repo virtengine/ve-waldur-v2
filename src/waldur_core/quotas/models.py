@@ -1,31 +1,26 @@
-from __future__ import unicode_literals
-
-from collections import defaultdict
-from functools import reduce
 import inspect
 import logging
 
 from django.contrib.contenttypes import fields as ct_fields
 from django.contrib.contenttypes import models as ct_models
 from django.db import models, transaction
-from django.db.models import Sum
-from django.utils.encoding import python_2_unicode_compatible
+from django.db.models import F, Sum
 from django.utils.translation import ugettext_lazy as _
 from model_utils import FieldTracker
 from reversion import revisions as reversion
-import six
 
-from waldur_core.core.models import UuidMixin, ReversionMixin, DescendantMixin
+from waldur_core.core.models import DescendantMixin, ReversionMixin, UuidMixin
 from waldur_core.logging.loggers import LoggableMixin
 from waldur_core.logging.models import AlertThresholdMixin
-from waldur_core.quotas import exceptions, managers, fields
+from waldur_core.quotas import exceptions, fields, managers
 
 logger = logging.getLogger(__name__)
 
 
-@python_2_unicode_compatible
 @reversion.register(fields=['usage', 'limit'])
-class Quota(UuidMixin, AlertThresholdMixin, LoggableMixin, ReversionMixin, models.Model):
+class Quota(
+    UuidMixin, AlertThresholdMixin, LoggableMixin, ReversionMixin, models.Model
+):
     """
     Abstract quota for any resource.
 
@@ -33,6 +28,7 @@ class Quota(UuidMixin, AlertThresholdMixin, LoggableMixin, ReversionMixin, model
     customers on site.
     If quota limit is set to -1 quota will never be exceeded.
     """
+
     class Meta:
         unique_together = (('name', 'content_type', 'object_id'),)
 
@@ -40,7 +36,9 @@ class Quota(UuidMixin, AlertThresholdMixin, LoggableMixin, ReversionMixin, model
     usage = models.FloatField(default=0)
     name = models.CharField(max_length=150, db_index=True)
 
-    content_type = models.ForeignKey(ct_models.ContentType, null=True)
+    content_type = models.ForeignKey(
+        on_delete=models.CASCADE, to=ct_models.ContentType, null=True
+    )
     object_id = models.PositiveIntegerField(null=True)
     scope = ct_fields.GenericForeignKey('content_type', 'object_id')
 
@@ -119,7 +117,7 @@ class QuotaModelMixin(models.Model):
     Check methods docstrings for more details.
     """
 
-    class Quotas(six.with_metaclass(fields.FieldsContainerMeta)):
+    class Quotas(metaclass=fields.FieldsContainerMeta):
         enable_fields_caching = True
         # register model quota fields here
 
@@ -129,8 +127,12 @@ class QuotaModelMixin(models.Model):
     quotas = ct_fields.GenericRelation('quotas.Quota', related_query_name='quotas')
 
     def get_or_create_quota(self, quota_name_or_field):
-        if isinstance(quota_name_or_field, six.string_types):
-            quota_name_or_field = getattr(self.Quotas, quota_name_or_field)
+        if isinstance(quota_name_or_field, str):
+            try:
+                quota_name_or_field = getattr(self.Quotas, quota_name_or_field)
+            except AttributeError:
+                quota, _ = self.quotas.get_or_create(name=quota_name_or_field)
+                return quota
         quota, _ = quota_name_or_field.get_or_create_quota(self)
         return quota
 
@@ -150,16 +152,38 @@ class QuotaModelMixin(models.Model):
 
     @transaction.atomic
     def add_quota_usage(self, quota_name, usage_delta, validate=False):
+        if usage_delta < 0:
+            # Avoid race conditions by using F expressions.
+            # See also: https://docs.djangoproject.com/en/dev/ref/models/expressions/#avoiding-race-conditions-using-f
+            # Skip update if it would result in negative value.
+            return self.quotas.filter(name=quota_name, usage__gte=-usage_delta).update(
+                usage=F('usage') + usage_delta
+            )
         quota = self.get_or_create_quota(quota_name)
         if validate and quota.is_exceeded(usage_delta):
             raise exceptions.QuotaValidationError(
-                _('%(quota)s "%(name)s" quota is over limit. Required: %(usage)s, limit: %(limit)s.') % dict(
-                    quota=self, name=quota_name, usage=quota.usage + usage_delta, limit=quota.limit))
+                _(
+                    '%(quota)s "%(name)s" quota is over limit. Required: %(usage)s, limit: %(limit)s.'
+                )
+                % dict(
+                    quota=self,
+                    name=quota_name,
+                    usage=quota.usage + usage_delta,
+                    limit=quota.limit,
+                )
+            )
         quota.usage += usage_delta
         if quota.usage < 0:
-            logger.error('%(quota)s "%(name)s" quota usage should not be negative. '
-                         'Current usage: %(usage)s, delta: %(usage_delta)s',
-                         dict(quota=self, name=quota_name, usage=quota.usage, usage_delta=usage_delta))
+            logger.error(
+                '%(quota)s "%(name)s" quota usage should not be negative. '
+                'Current usage: %(usage)s, delta: %(usage_delta)s',
+                dict(
+                    quota=self,
+                    name=quota_name,
+                    usage=quota.usage,
+                    usage_delta=usage_delta,
+                ),
+            )
             quota.usage = 0
         quota.save(update_fields=['usage'])
 
@@ -188,16 +212,20 @@ class QuotaModelMixin(models.Model):
 
         """
         errors = []
-        for name, delta in six.iteritems(quota_deltas):
+        for name, delta in quota_deltas.items():
             quota = self.quotas.get(name=name)
             if quota.is_exceeded(delta):
-                errors.append('%s quota limit: %s, requires %s (%s)\n' % (
-                    quota.name, quota.limit, quota.usage + delta, quota.scope))
+                errors.append(
+                    '%s quota limit: %s, requires %s (%s)\n'
+                    % (quota.name, quota.limit, quota.usage + delta, quota.scope)
+                )
         if not raise_exception:
             return errors
         else:
             if errors:
-                raise exceptions.QuotaExceededException(_('One or more quotas were exceeded: %s') % ';'.join(errors))
+                raise exceptions.QuotaExceededException(
+                    _('One or more quotas were exceeded: %s') % ';'.join(errors)
+                )
 
     def can_user_update_quotas(self, user):
         """
@@ -206,7 +234,9 @@ class QuotaModelMixin(models.Model):
         return user.is_staff
 
     @classmethod
-    def get_sum_of_quotas_as_dict(cls, scopes, quota_names=None, fields=['usage', 'limit']):
+    def get_sum_of_quotas_as_dict(
+        cls, scopes, quota_names=None, fields=['usage', 'limit']
+    ):
         """
         Return dictionary with sum of all scopes' quotas.
 
@@ -227,18 +257,23 @@ class QuotaModelMixin(models.Model):
 
         scope_models = set([scope._meta.model for scope in scopes])
         if len(scope_models) > 1:
-            raise exceptions.QuotaError(_('All scopes have to be instances of the same model.'))
+            raise exceptions.QuotaError(
+                _('All scopes have to be instances of the same model.')
+            )
 
         filter_kwargs = {
             'content_type': ct_models.ContentType.objects.get_for_model(scopes[0]),
             'object_id__in': [scope.id for scope in scopes],
-            'name__in': quota_names
+            'name__in': quota_names,
         }
 
         result = {}
         if 'usage' in fields:
-            items = Quota.objects.filter(**filter_kwargs)\
-                         .values('name').annotate(usage=Sum('usage'))
+            items = (
+                Quota.objects.filter(**filter_kwargs)
+                .values('name')
+                .annotate(usage=Sum('usage'))
+            )
             for item in items:
                 result[item['name'] + '_usage'] = item['usage']
 
@@ -248,35 +283,25 @@ class QuotaModelMixin(models.Model):
             for quota_name in unlimited_quotas:
                 result[quota_name] = -1
 
-            items = Quota.objects\
-                         .filter(**filter_kwargs)\
-                         .exclude(name__in=unlimited_quotas)\
-                         .values('name')\
-                         .annotate(limit=Sum('limit'))
+            items = (
+                Quota.objects.filter(**filter_kwargs)
+                .exclude(name__in=unlimited_quotas)
+                .values('name')
+                .annotate(limit=Sum('limit'))
+            )
             for item in items:
                 result[item['name']] = item['limit']
 
         return result
 
     @classmethod
-    def get_sum_of_quotas_for_querysets(cls, querysets, quota_names=None):
-        partial_sums = [qs.model.get_sum_of_quotas_as_dict(qs, quota_names) for qs in querysets]
-        return reduce(cls._sum_dicts, partial_sums, defaultdict(lambda: 0))
-
-    @classmethod
-    def _sum_dicts(cls, total, partial):
-        for key, val in partial.items():
-            if val != -1:
-                total[key] += val
-        for key in partial.keys():
-            if key not in total:
-                total[key] = -1
-        return total
-
-    @classmethod
     def get_quotas_fields(cls, field_class=None):
         if not hasattr(cls, '_quota_fields') or not cls.Quotas.enable_fields_caching:
-            cls._quota_fields = dict(inspect.getmembers(cls.Quotas, lambda m: isinstance(m, fields.QuotaField))).values()
+            cls._quota_fields = dict(
+                inspect.getmembers(
+                    cls.Quotas, lambda m: isinstance(m, fields.QuotaField)
+                )
+            ).values()
         if field_class is not None:
             return [v for v in cls._quota_fields if isinstance(v, field_class)]
         return cls._quota_fields
@@ -312,12 +337,15 @@ class ExtendableQuotaModelMixin(QuotaModelMixin):
         quota_field.name = name
         setattr(cls.Quotas, name, quota_field)
         from waldur_core.quotas.apps import QuotasConfig
+
         # For counter quotas we need to register signals explicitly
         if isinstance(quota_field, fields.CounterQuotaField):
-            QuotasConfig.register_counter_field_signals(model=cls, counter_field=quota_field)
+            QuotasConfig.register_counter_field_signals(
+                model=cls, counter_field=quota_field
+            )
 
 
-class SharedQuotaMixin(object):
+class SharedQuotaMixin:
     """
     This mixin updates quotas for several scopes.
     """

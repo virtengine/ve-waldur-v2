@@ -6,7 +6,9 @@ from waldur_core.structure import models as structure_models
 
 
 class TestService(structure_models.Service):
-    projects = models.ManyToManyField(structure_models.Project, through='TestServiceProjectLink')
+    projects = models.ManyToManyField(
+        structure_models.Project, through='TestServiceProjectLink'
+    )
 
     @classmethod
     def get_url_name(cls):
@@ -14,7 +16,7 @@ class TestService(structure_models.Service):
 
 
 class TestServiceProjectLink(structure_models.ServiceProjectLink):
-    service = models.ForeignKey(TestService)
+    service = models.ForeignKey(on_delete=models.CASCADE, to=TestService)
 
     class Quotas(QuotaModelMixin.Quotas):
         vcpu = QuotaField(default_limit=20, is_backend=True)
@@ -32,7 +34,9 @@ class TestServiceProjectLink(structure_models.ServiceProjectLink):
 
 class TestNewInstance(QuotaModelMixin, structure_models.VirtualMachine):
 
-    service_project_link = models.ForeignKey(TestServiceProjectLink, on_delete=models.PROTECT)
+    service_project_link = models.ForeignKey(
+        TestServiceProjectLink, on_delete=models.PROTECT
+    )
     flavor_name = models.CharField(max_length=255, blank=True)
 
     class Quotas(QuotaModelMixin.Quotas):
@@ -53,14 +57,20 @@ class TestNewInstance(QuotaModelMixin, structure_models.VirtualMachine):
 
 class TestSubResource(structure_models.SubResource):
 
-    service_project_link = models.ForeignKey(TestServiceProjectLink, on_delete=models.PROTECT)
+    service_project_link = models.ForeignKey(
+        TestServiceProjectLink, on_delete=models.PROTECT
+    )
 
 
 class TestVolume(structure_models.Volume):
 
-    service_project_link = models.ForeignKey(TestServiceProjectLink, on_delete=models.PROTECT)
+    service_project_link = models.ForeignKey(
+        TestServiceProjectLink, on_delete=models.PROTECT
+    )
 
 
 class TestSnapshot(structure_models.Snapshot):
 
-    service_project_link = models.ForeignKey(TestServiceProjectLink, on_delete=models.PROTECT)
+    service_project_link = models.ForeignKey(
+        TestServiceProjectLink, on_delete=models.PROTECT
+    )

@@ -16,7 +16,10 @@ class QuotaScopeClassListFilter(admin.SimpleListFilter):
 
     def lookups(self, request, model_admin):
         models = utils.get_models_with_quotas()
-        return [(ct_models.ContentType.objects.get_for_model(m).id, m.__name__) for m in models]
+        return [
+            (ct_models.ContentType.objects.get_for_model(m).id, m.__name__)
+            for m in models
+        ]
 
     def queryset(self, request, queryset):
         content_type_id = self.value()
@@ -25,7 +28,7 @@ class QuotaScopeClassListFilter(admin.SimpleListFilter):
         return queryset
 
 
-class QuotaFieldTypeLimit(object):
+class QuotaFieldTypeLimit:
     fields = ('name', 'limit', 'usage', 'quota_field_type')
     readonly_fields = ('name', 'usage', 'quota_field_type')
 
@@ -67,6 +70,7 @@ class QuotaInline(QuotaFieldTypeLimit, GenericTabularInline):
     model = models.Quota
     form = QuotaForm
     extra = 0
+    classes = ['collapse']
     can_delete = False
 
 

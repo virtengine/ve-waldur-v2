@@ -1,10 +1,8 @@
-from __future__ import unicode_literals
-
+import rest_framework.authentication
 from django.conf import settings
 from django.utils import timezone
 from django.utils.translation import ugettext_lazy as _
 from rest_framework import exceptions
-import rest_framework.authentication
 
 import waldur_core.logging.middleware
 
@@ -15,7 +13,7 @@ def can_access_admin_site(user):
     return user.is_active and (user.is_staff or user.is_support)
 
 
-class AuthenticationBackend(object):
+class AuthenticationBackend:
     """
     Enables only support and staff to access admin site.
     """
@@ -80,7 +78,9 @@ class TokenAuthentication(rest_framework.authentication.TokenAuthentication):
         try:
             token = auth[1].decode()
         except UnicodeError:
-            msg = _('Invalid token header. Token string should not contain invalid characters.')
+            msg = _(
+                'Invalid token header. Token string should not contain invalid characters.'
+            )
             raise exceptions.AuthenticationFailed(msg)
 
         return self.authenticate_credentials(token)
@@ -102,8 +102,9 @@ def user_capturing_auth(auth):
     return CapturingAuthentication
 
 
-class CsrfExemptSessionAuthentication(rest_framework.authentication.SessionAuthentication):
-
+class CsrfExemptSessionAuthentication(
+    rest_framework.authentication.SessionAuthentication
+):
     def enforce_csrf(self, request):
         return  # Skip CSRF check
 

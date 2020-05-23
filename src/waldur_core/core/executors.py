@@ -1,9 +1,10 @@
 import operator
+from functools import reduce
 
-from waldur_core.core import models, utils, tasks
+from waldur_core.core import models, tasks, utils
 
 
-class BaseExecutor(object):
+class BaseExecutor:
     """ Base class for describing logical operation with backend.
 
     Executor describes celery signature or primitive of low-level tasks that
@@ -26,7 +27,9 @@ class BaseExecutor(object):
          - to execute several tasks - return Chain of tasks: `chain(t1.s(), t2.s())`
         Note! Celery chord and group is not supported.
         """
-        raise NotImplementedError('Executor %s should implement method `get_task_signature`' % cls.__name__)
+        raise NotImplementedError(
+            'Executor %s should implement method `get_task_signature`' % cls.__name__
+        )
 
     @classmethod
     def get_success_signature(cls, instance, serialized_instance, **kwargs):
@@ -39,20 +42,22 @@ class BaseExecutor(object):
         return None
 
     @classmethod
-    def execute(cls, instance, async=True, countdown=2, is_heavy_task=False, **kwargs):
+    def execute(
+        cls, instance, is_async=True, countdown=2, is_heavy_task=False, **kwargs
+    ):
         """ Execute high level-operation """
-        cls.pre_apply(instance, async=async, **kwargs)
+        cls.pre_apply(instance, is_async=is_async, **kwargs)
         serialized_instance = utils.serialize_instance(instance)
 
         signature = cls.get_task_signature(instance, serialized_instance, **kwargs)
         link = cls.get_success_signature(instance, serialized_instance, **kwargs)
         link_error = cls.get_failure_signature(instance, serialized_instance, **kwargs)
-        if async:
+        if is_async:
             return signature.apply_async(
                 link=link,
                 link_error=link_error,
                 countdown=countdown,
-                queue=is_heavy_task and 'heavy' or None
+                queue=is_heavy_task and 'heavy' or None,
             )
         else:
             result = signature.apply()
@@ -72,12 +77,16 @@ class BaseExecutor(object):
     def as_signature(cls, instance, **kwargs):
         serialized_instance = utils.serialize_instance(instance)
         pre_apply = tasks.PreApplyExecutorTask().si(
-            utils.serialize_class(cls), serialized_instance, **kwargs)
+            utils.serialize_class(cls), serialized_instance, **kwargs
+        )
         main = cls.get_task_signature(instance, serialized_instance, **kwargs)
         link = cls.get_success_signature(instance, serialized_instance, **kwargs)
         link_error = cls.get_failure_signature(instance, serialized_instance, **kwargs)
-        parts = [task for task in [pre_apply, main, link]
-                 if not isinstance(task, tasks.EmptyTask) and task is not None]
+        parts = [
+            task
+            for task in [pre_apply, main, link]
+            if not isinstance(task, tasks.EmptyTask) and task is not None
+        ]
         signature = reduce(operator.or_, parts)
         if link_error:
             signature = signature.on_error(link_error)
@@ -88,7 +97,7 @@ class ExecutorException(Exception):
     pass
 
 
-class ErrorExecutorMixin(object):
+class ErrorExecutorMixin:
     """ Set object as erred on fail. """
 
     @classmethod
@@ -96,16 +105,17 @@ class ErrorExecutorMixin(object):
         return tasks.ErrorStateTransitionTask().s(serialized_instance)
 
 
-class SuccessExecutorMixin(object):
+class SuccessExecutorMixin:
     """ Set object as OK on success, cleanup action and its details. """
 
     @classmethod
     def get_success_signature(cls, instance, serialized_instance, **kwargs):
         return tasks.StateTransitionTask().si(
-            serialized_instance, state_transition='set_ok', action='', action_details={})
+            serialized_instance, state_transition='set_ok', action='', action_details={}
+        )
 
 
-class DeleteExecutorMixin(object):
+class DeleteExecutorMixin:
     """ Delete object on success or if force flag is enabled """
 
     @classmethod
@@ -113,7 +123,9 @@ class DeleteExecutorMixin(object):
         return tasks.DeletionTask().si(serialized_instance)
 
     @classmethod
-    def get_failure_signature(cls, instance, serialized_instance, force=False, **kwargs):
+    def get_failure_signature(
+        cls, instance, serialized_instance, force=False, **kwargs
+    ):
         if force:
             return tasks.DeletionTask().si(serialized_instance)
         else:
@@ -121,7 +133,6 @@ class DeleteExecutorMixin(object):
 
 
 class EmptyExecutor(BaseExecutor):
-
     @classmethod
     def get_task_signature(cls, *args, **kwargs):
         return tasks.EmptyTask().si()
@@ -133,6 +144,7 @@ class CreateExecutor(SuccessExecutorMixin, ErrorExecutorMixin, BaseExecutor):
      - mark object as OK on success creation;
      - mark object as erred on failed creation;
     """
+
     pass
 
 
@@ -150,10 +162,12 @@ class UpdateExecutor(SuccessExecutorMixin, ErrorExecutorMixin, BaseExecutor):
         instance.save(update_fields=['state'])
 
     @classmethod
-    def execute(cls, instance, async=True, **kwargs):
+    def execute(cls, instance, is_async=True, **kwargs):
         if 'updated_fields' not in kwargs:
-            raise ExecutorException('updated_fields keyword argument should be defined for UpdateExecutor.')
-        super(UpdateExecutor, cls).execute(instance, async=async, **kwargs)
+            raise ExecutorException(
+                'updated_fields keyword argument should be defined for UpdateExecutor.'
+            )
+        super(UpdateExecutor, cls).execute(instance, is_async=is_async, **kwargs)
 
 
 class DeleteExecutor(DeleteExecutorMixin, BaseExecutor):
@@ -177,6 +191,7 @@ class ActionExecutor(SuccessExecutorMixin, ErrorExecutorMixin, BaseExecutor):
      - mark object as OK on success action execution;
      - mark object as erred on failed action execution;
     """
+
     # TODO: After refactoring field action should become mandatory for implementation
     action = ''
 

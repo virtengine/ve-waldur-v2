@@ -5,10 +5,13 @@
 </head>
 <body>
 <p>
-    Hello!
+    {{ comment.author.name }} added a new comment.
 </p>
 <p>
-    Please go to <a href="{{issue_url}}">{{ issue_url }}</a> to see it.
+    <a href="{{ issue_url }}">[{{ issue.key }}] {{ issue.summary }}</a>
 </p>
+<pre>
+    {{ comment.description }}
+</pre>
 </body>
 </html>

@@ -1,4 +1,4 @@
-from admin_tools.menu import items, Menu
+from admin_tools.menu import Menu, items
 from django.urls import reverse
 from django.utils.text import capfirst
 from django.utils.translation import ugettext_lazy as _
@@ -18,12 +18,14 @@ class CustomAppList(items.AppList):
                 apps[app_label] = {
                     'title': capfirst(model._meta.app_config.verbose_name),
                     'url': self._get_admin_app_list_url(model, context),
-                    'models': []
+                    'models': [],
                 }
-            apps[app_label]['models'].append({
-                'title': capfirst(model._meta.verbose_name_plural),
-                'url': self._get_admin_change_url(model, context)
-            })
+            apps[app_label]['models'].append(
+                {
+                    'title': capfirst(model._meta.verbose_name_plural),
+                    'url': self._get_admin_change_url(model, context),
+                }
+            )
 
         for app in sorted(apps, key=lambda k: apps[k]['title']):
             app_dict = apps[app]
@@ -48,8 +50,8 @@ class CustomMenu(Menu):
         'waldur_digitalocean.*',
         'waldur_slurm.*',
         'waldur_mastermind.slurm_invoices.*',
-        'waldur_rijkscloud.*',
         'waldur_vmware.*',
+        'waldur_rancher.*',
     )
 
     USERS = (
@@ -59,7 +61,6 @@ class CustomMenu(Menu):
 
     ACCOUNTING = (
         'waldur_mastermind.invoices.*',
-        'waldur_core.cost_tracking.*',
         'waldur_paypal.*',
     )
 
@@ -69,19 +70,17 @@ class CustomMenu(Menu):
         'waldur_jira.*',
     )
 
-    SUPPORT_MODULES = (
-        'waldur_mastermind.support.*',
-    )
+    SUPPORT_MODULES = ('waldur_mastermind.support.*',)
 
     MARKETPLACE = (
         'waldur_mastermind.marketplace.*',
         'waldur_mastermind.marketplace_packages.*',
         'waldur_mastermind.marketplace_support.*',
+        'waldur_pid.*',
     )
 
     EXTRA_MODELS = (
         'django.core.*',
-        'django_openid_auth.*',
         'rest_framework.authtoken.*',
         'waldur_core.core.*',
         'waldur_core.structure.*',
@@ -91,36 +90,13 @@ class CustomMenu(Menu):
         Menu.__init__(self, **kwargs)
         self.children += [
             items.MenuItem(_('Dashboard'), reverse('admin:index')),
-            items.ModelList(
-                _('Users'),
-                models=self.USERS
-            ),
-            items.ModelList(
-                _('Structure'),
-                models=(
-                    'waldur_core.structure.*',
-                )
-            ),
-            CustomAppList(
-                _('Accounting'),
-                models=self.ACCOUNTING,
-            ),
-            CustomAppList(
-                _('Marketplace'),
-                models=self.MARKETPLACE,
-            ),
-            CustomAppList(
-                _('Providers'),
-                models=self.IAAS_CLOUDS,
-            ),
-            CustomAppList(
-                _('Applications'),
-                models=self.APPLICATION_PROVIDERS,
-            ),
-            CustomAppList(
-                _('Support'),
-                models=self.SUPPORT_MODULES,
-            ),
+            items.ModelList(_('Users'), models=self.USERS),
+            items.ModelList(_('Structure'), models=('waldur_core.structure.*',)),
+            CustomAppList(_('Accounting'), models=self.ACCOUNTING,),
+            CustomAppList(_('Marketplace'), models=self.MARKETPLACE,),
+            CustomAppList(_('Providers'), models=self.IAAS_CLOUDS,),
+            CustomAppList(_('Applications'), models=self.APPLICATION_PROVIDERS,),
+            CustomAppList(_('Support'), models=self.SUPPORT_MODULES,),
             CustomAppList(
                 _('Utilities'),
                 exclude=flatten(
@@ -131,6 +107,6 @@ class CustomMenu(Menu):
                     self.ACCOUNTING,
                     self.USERS,
                     self.MARKETPLACE,
-                )
+                ),
             ),
         ]

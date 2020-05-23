@@ -1,7 +1,7 @@
-import cStringIO
 import datetime
 import os
 import tarfile
+from io import BytesIO
 
 from django.apps import apps
 from django.core.files.base import ContentFile
@@ -41,7 +41,7 @@ def create_report_archive(log_directory, interval):
         if stat.st_mtime > cutoff:
             log_filenames.append(full_path)
 
-    stream = cStringIO.StringIO()
+    stream = BytesIO()
 
     with tarfile.open(fileobj=stream, mode='w:gz') as archive:
         for filename in log_filenames:

@@ -1,11 +1,10 @@
-from rest_framework.permissions import BasePermission, SAFE_METHODS
+from rest_framework.permissions import SAFE_METHODS, BasePermission
 
 
 class IsAdminOrReadOnly(BasePermission):
     def has_permission(self, request, view):
-        return (
-            request.method in SAFE_METHODS or
-            (request.user.is_authenticated and request.user.is_staff)
+        return request.method in SAFE_METHODS or (
+            request.user.is_authenticated and request.user.is_staff
         )
 
 
@@ -51,7 +50,7 @@ class ActionsPermission(BasePermission):
             # only user with civil number will have access to all unsafe actions
             unsafe_methods_permissions = [has_civil_number]
             ...
-            @decorators.detail_route(method='POST')
+            @decorators.action(detail=True, method='POST')
             def action(...):
                 ...
 

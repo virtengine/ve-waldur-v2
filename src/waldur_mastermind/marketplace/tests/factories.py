@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 import factory
+from django.contrib.contenttypes.models import ContentType
 from django.db.models import signals
 from django.utils import timezone
 from rest_framework.reverse import reverse
@@ -8,9 +9,9 @@ from rest_framework.reverse import reverse
 from waldur_core.core import utils as core_utils
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.common.mixins import UnitPriceMixin
+from waldur_pid import models as pid_models
 
 from .. import models
-
 
 OFFERING_OPTIONS = {
     'order': ['storage', 'ram', 'cpu_count'],
@@ -38,7 +39,7 @@ OFFERING_OPTIONS = {
 
 
 class ServiceProviderFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.ServiceProvider
 
     customer = factory.SubFactory(structure_factories.CustomerFactory)
@@ -47,8 +48,10 @@ class ServiceProviderFactory(factory.DjangoModelFactory):
     def get_url(cls, service_provider=None, action=None):
         if service_provider is None:
             service_provider = ServiceProviderFactory()
-        url = 'http://testserver' + reverse('marketplace-service-provider-detail',
-                                            kwargs={'uuid': service_provider.uuid})
+        url = 'http://testserver' + reverse(
+            'marketplace-service-provider-detail',
+            kwargs={'uuid': service_provider.uuid.hex},
+        )
         return url if action is None else url + action + '/'
 
     @classmethod
@@ -58,7 +61,7 @@ class ServiceProviderFactory(factory.DjangoModelFactory):
 
 
 class CategoryFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.Category
 
     title = factory.Sequence(lambda n: 'category-%s' % n)
@@ -67,8 +70,9 @@ class CategoryFactory(factory.DjangoModelFactory):
     def get_url(cls, category=None, action=None):
         if category is None:
             category = CategoryFactory()
-        url = 'http://testserver' + reverse('marketplace-category-detail',
-                                            kwargs={'uuid': category.uuid})
+        url = 'http://testserver' + reverse(
+            'marketplace-category-detail', kwargs={'uuid': category.uuid.hex}
+        )
         return url if action is None else url + action + '/'
 
     @classmethod
@@ -78,7 +82,7 @@ class CategoryFactory(factory.DjangoModelFactory):
 
 
 class CategoryComponentFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.CategoryComponent
 
     category = factory.SubFactory(CategoryFactory)
@@ -87,7 +91,7 @@ class CategoryComponentFactory(factory.DjangoModelFactory):
 
 
 class OfferingFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.Offering
 
     name = factory.Sequence(lambda n: 'offering-%s' % n)
@@ -98,8 +102,9 @@ class OfferingFactory(factory.DjangoModelFactory):
     def get_url(cls, offering=None, action=None):
         if offering is None:
             offering = OfferingFactory()
-        url = 'http://testserver' + reverse('marketplace-offering-detail',
-                                            kwargs={'uuid': offering.uuid})
+        url = 'http://testserver' + reverse(
+            'marketplace-offering-detail', kwargs={'uuid': offering.uuid.hex}
+        )
         return url if action is None else url + action + '/'
 
     @classmethod
@@ -107,9 +112,59 @@ class OfferingFactory(factory.DjangoModelFactory):
         url = 'http://testserver' + reverse('marketplace-offering-list')
         return url if action is None else url + action + '/'
 
+    @classmethod
+    def get_referral_list(cls, offering):
+        return (
+            'http://testserver'
+            + reverse('marketplace-offering-referral-list')
+            + '?offering_uuid=%s' % offering.uuid.hex
+        )
+
+
+class ReferralFactory(factory.DjangoModelFactory):
+    class Meta:
+        model = pid_models.DataciteReferral
+        exclude = ['scope']
+
+    object_id = factory.SelfAttribute('scope.id')
+    content_type = factory.LazyAttribute(
+        lambda o: ContentType.objects.get_for_model(o.scope)
+    )
+
+    pid = factory.Sequence(lambda n: 'pid-%s' % n)
+    relation_type = factory.Sequence(lambda n: 'reltype-%s' % n)
+    resource_type = factory.Sequence(lambda n: 'restypee-%s' % n)
+    creator = factory.Sequence(lambda n: 'creator-%s' % n)
+    publisher = factory.Sequence(lambda n: 'publisher-%s' % n)
+    title = factory.Sequence(lambda n: 'title-%s' % n)
+    published = factory.Sequence(lambda n: 'published-%s' % n)
+    referral_url = factory.Sequence(lambda n: 'url-%s' % n)
+
+    @classmethod
+    def get_url(cls, offering_referral=None, action=None):
+        if offering_referral is None:
+            offering_referral = OfferingReferralFactory()
+        url = 'http://testserver' + reverse(
+            'marketplace-offering-referral-detail',
+            kwargs={'uuid': offering_referral.uuid.hex},
+        )
+        return url if action is None else url + action + '/'
+
+    @classmethod
+    def get_list_url(cls, action=None):
+        url = 'http://testserver' + reverse('marketplace-offering-referral-list')
+        return url if action is None else url + action + '/'
+
+
+class OfferingReferralFactory(ReferralFactory):
+    scope = factory.SubFactory(OfferingFactory)
+
+    class Meta:
+        model = pid_models.DataciteReferral
+
 
 class SectionFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.Section
 
     key = factory.Sequence(lambda n: 'section-%s' % n)
@@ -117,7 +172,7 @@ class SectionFactory(factory.DjangoModelFactory):
 
 
 class AttributeFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.Attribute
 
     key = factory.Sequence(lambda n: 'attribute-%s' % n)
@@ -126,7 +181,7 @@ class AttributeFactory(factory.DjangoModelFactory):
 
 @factory.django.mute_signals(signals.pre_save, signals.post_save)
 class ScreenshotFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.Screenshot
 
     name = factory.Sequence(lambda n: 'screenshot-%s' % n)
@@ -137,8 +192,9 @@ class ScreenshotFactory(factory.DjangoModelFactory):
     def get_url(cls, screenshot=None, action=None):
         if screenshot is None:
             screenshot = ScreenshotFactory()
-        url = 'http://testserver' + reverse('marketplace-screenshot-detail',
-                                            kwargs={'uuid': screenshot.uuid})
+        url = 'http://testserver' + reverse(
+            'marketplace-screenshot-detail', kwargs={'uuid': screenshot.uuid.hex}
+        )
         return url if action is None else url + action + '/'
 
     @classmethod
@@ -148,7 +204,7 @@ class ScreenshotFactory(factory.DjangoModelFactory):
 
 
 class OrderFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.Order
 
     created_by = factory.SubFactory(structure_factories.UserFactory)
@@ -158,8 +214,9 @@ class OrderFactory(factory.DjangoModelFactory):
     def get_url(cls, order=None, action=None):
         if order is None:
             order = OrderFactory()
-        url = 'http://testserver' + reverse('marketplace-order-detail',
-                                            kwargs={'uuid': order.uuid})
+        url = 'http://testserver' + reverse(
+            'marketplace-order-detail', kwargs={'uuid': order.uuid.hex}
+        )
         return url if action is None else url + action + '/'
 
     @classmethod
@@ -169,7 +226,7 @@ class OrderFactory(factory.DjangoModelFactory):
 
 
 class PlanFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.Plan
 
     offering = factory.SubFactory(OfferingFactory)
@@ -180,8 +237,9 @@ class PlanFactory(factory.DjangoModelFactory):
     def get_url(cls, plan=None, action=None):
         if plan is None:
             plan = PlanFactory()
-        url = 'http://testserver' + reverse('marketplace-plan-detail',
-                                            kwargs={'uuid': plan.uuid})
+        url = 'http://testserver' + reverse(
+            'marketplace-plan-detail', kwargs={'uuid': plan.uuid.hex}
+        )
         return url if action is None else url + action + '/'
 
     @classmethod
@@ -191,7 +249,7 @@ class PlanFactory(factory.DjangoModelFactory):
 
 
 class OfferingComponentFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.OfferingComponent
 
     offering = factory.SubFactory(OfferingFactory)
@@ -200,7 +258,7 @@ class OfferingComponentFactory(factory.DjangoModelFactory):
 
 
 class PlanComponentFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.PlanComponent
 
     plan = factory.SubFactory(PlanFactory)
@@ -210,7 +268,7 @@ class PlanComponentFactory(factory.DjangoModelFactory):
 
 
 class OrderItemFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.OrderItem
 
     order = factory.SubFactory(OrderFactory)
@@ -221,8 +279,9 @@ class OrderItemFactory(factory.DjangoModelFactory):
     def get_url(cls, order_item=None, action=None):
         if order_item is None:
             order_item = OrderItemFactory()
-        url = 'http://testserver' + reverse('marketplace-order-item-detail',
-                                            kwargs={'uuid': order_item.uuid})
+        url = 'http://testserver' + reverse(
+            'marketplace-order-item-detail', kwargs={'uuid': order_item.uuid.hex}
+        )
         return url if action is None else url + action + '/'
 
     @classmethod
@@ -232,7 +291,7 @@ class OrderItemFactory(factory.DjangoModelFactory):
 
 
 class CartItemFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.CartItem
 
     offering = factory.SubFactory(OfferingFactory)
@@ -243,7 +302,7 @@ class CartItemFactory(factory.DjangoModelFactory):
     def get_url(cls, item=None):
         if item is None:
             item = CartItemFactory()
-        return reverse('marketplace-cart-item-detail', kwargs={'uuid': item.uuid})
+        return reverse('marketplace-cart-item-detail', kwargs={'uuid': item.uuid.hex})
 
     @classmethod
     def get_list_url(cls, action=None):
@@ -252,7 +311,7 @@ class CartItemFactory(factory.DjangoModelFactory):
 
 
 class ResourceFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.Resource
 
     offering = factory.SubFactory(OfferingFactory)
@@ -262,7 +321,7 @@ class ResourceFactory(factory.DjangoModelFactory):
     def get_url(cls, resource=None, action=None):
         if resource is None:
             resource = ResourceFactory()
-        url = reverse('marketplace-resource-detail', kwargs={'uuid': resource.uuid})
+        url = reverse('marketplace-resource-detail', kwargs={'uuid': resource.uuid.hex})
         return url if action is None else url + action + '/'
 
     @classmethod
@@ -272,7 +331,7 @@ class ResourceFactory(factory.DjangoModelFactory):
 
 
 class OfferingFileFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.OfferingFile
 
     name = factory.Sequence(lambda n: 'offering-file-%s' % n)
@@ -283,8 +342,9 @@ class OfferingFileFactory(factory.DjangoModelFactory):
     def get_url(cls, offering_file=None, action=None):
         if offering_file is None:
             offering_file = OfferingFileFactory()
-        url = 'http://testserver' + reverse('marketplace-offering-file-detail',
-                                            kwargs={'uuid': offering_file.uuid})
+        url = 'http://testserver' + reverse(
+            'marketplace-offering-file-detail', kwargs={'uuid': offering_file.uuid.hex}
+        )
         return url if action is None else url + action + '/'
 
     @classmethod
@@ -294,7 +354,7 @@ class OfferingFileFactory(factory.DjangoModelFactory):
 
 
 class ComponentUsageFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.ComponentUsage
 
     resource = factory.SubFactory(ResourceFactory)

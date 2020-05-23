@@ -1,36 +1,35 @@
-from __future__ import unicode_literals
-
-from datetime import datetime
 import logging
 import re
+from datetime import datetime
 
+import pytz
 from croniter.croniter import croniter
 from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat import backends
 from cryptography.hazmat.primitives import serialization
 from django.apps import apps
 from django.conf import settings
-from django.contrib.auth.base_user import AbstractBaseUser
 from django.contrib.auth.models import PermissionsMixin, UserManager
 from django.contrib.postgres.fields import JSONField as BetterJSONField
 from django.core import validators
 from django.core.exceptions import ValidationError
 from django.core.mail import send_mail
-from django.db import models
+from django.db import models, transaction
 from django.utils import timezone as django_timezone
-from django.utils.encoding import force_text, python_2_unicode_compatible
+from django.utils.encoding import force_text
 from django.utils.lru_cache import lru_cache
 from django.utils.translation import ugettext_lazy as _
-from django_fsm import transition, FSMIntegerField
+from django_fsm import FSMIntegerField, transition
 from model_utils import FieldTracker
-import pytz
+from model_utils.models import TimeStampedModel
 from reversion import revisions as reversion
 from reversion.models import Version
-import six
 
 from waldur_core.core.fields import CronScheduleField, UUIDField
-from waldur_core.core.validators import validate_name, MinCronValueValidator
+from waldur_core.core.validators import MinCronValueValidator, validate_name
 from waldur_core.logging.loggers import LoggableMixin
+
+from .shims import AbstractBaseUser
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +38,8 @@ class DescribableMixin(models.Model):
     """
     Mixin to add a standardized "description" field.
     """
-    class Meta(object):
+
+    class Meta:
         abstract = True
 
     description = models.CharField(_('description'), max_length=500, blank=True)
@@ -50,7 +50,7 @@ class NameMixin(models.Model):
     Mixin to add a standardized "name" field.
     """
 
-    class Meta(object):
+    class Meta:
         abstract = True
 
     name = models.CharField(_('name'), max_length=150, validators=[validate_name])
@@ -60,17 +60,19 @@ class UiDescribableMixin(DescribableMixin):
     """
     Mixin to add a standardized "description" and "icon url" fields.
     """
-    class Meta(object):
+
+    class Meta:
         abstract = True
 
-    icon_url = models.URLField(_('icon url'), blank=True)
+    icon_url = models.URLField(_('icon url'), max_length=500, blank=True)
 
 
 class UuidMixin(models.Model):
     """
     Mixin to identify models by UUID.
     """
-    class Meta(object):
+
+    class Meta:
         abstract = True
 
     uuid = UUIDField()
@@ -80,33 +82,26 @@ class ErrorMessageMixin(models.Model):
     """
     Mixin to add a standardized "error_message" field.
     """
-    class Meta(object):
+
+    class Meta:
         abstract = True
 
     error_message = models.TextField(blank=True)
-
-
-class CoordinatesMixin(models.Model):
-    """
-    Mixin to add a latitude and longitude fields
-    """
-    class Meta(object):
-        abstract = True
-
-    latitude = models.FloatField(null=True, blank=True)
-    longitude = models.FloatField(null=True, blank=True)
 
 
 class ScheduleMixin(models.Model):
     """
     Mixin to add a standardized "schedule" fields.
     """
-    class Meta(object):
+
+    class Meta:
         abstract = True
 
     schedule = CronScheduleField(max_length=15, validators=[MinCronValueValidator(1)])
     next_trigger_at = models.DateTimeField(null=True)
-    timezone = models.CharField(max_length=50, default=django_timezone.get_current_timezone_name)
+    timezone = models.CharField(
+        max_length=50, default=django_timezone.get_current_timezone_name
+    )
     is_active = models.BooleanField(default=False)
 
     def update_next_trigger_at(self):
@@ -126,9 +121,12 @@ class ScheduleMixin(models.Model):
         except self.DoesNotExist:
             prev_instance = None
 
-        if prev_instance is None or (not prev_instance.is_active and self.is_active or
-                                     self.schedule != prev_instance.schedule or
-                                     self.timezone != prev_instance.timezone):
+        if prev_instance is None or (
+            not prev_instance.is_active
+            and self.is_active
+            or self.schedule != prev_instance.schedule
+            or self.timezone != prev_instance.timezone
+        ):
             self.update_next_trigger_at()
 
         super(ScheduleMixin, self).save(*args, **kwargs)
@@ -141,7 +139,8 @@ class UserDetailsMixin(models.Model):
     Note that civil_number and email fields are not included in this mixin
     because they have different constraints in User and Invitation model.
     """
-    class Meta(object):
+
+    class Meta:
         abstract = True
 
     full_name = models.CharField(_('full name'), max_length=100, blank=True)
@@ -151,40 +150,84 @@ class UserDetailsMixin(models.Model):
     job_title = models.CharField(_('job title'), max_length=40, blank=True)
 
 
-@python_2_unicode_compatible
-class User(LoggableMixin, UuidMixin, DescribableMixin, AbstractBaseUser, UserDetailsMixin, PermissionsMixin):
+class User(
+    LoggableMixin,
+    UuidMixin,
+    DescribableMixin,
+    AbstractBaseUser,
+    UserDetailsMixin,
+    PermissionsMixin,
+):
     username = models.CharField(
-        _('username'), max_length=128, unique=True,
-        help_text=_('Required. 128 characters or fewer. Letters, numbers and '
-                    '@/./+/-/_ characters'),
+        _('username'),
+        max_length=128,
+        unique=True,
+        help_text=_(
+            'Required. 128 characters or fewer. Letters, numbers and '
+            '@/./+/-/_ characters'
+        ),
         validators=[
-            validators.RegexValidator(re.compile('^[\w.@+-]+$'), _('Enter a valid username.'), 'invalid')
-        ])
+            validators.RegexValidator(
+                re.compile(r'^[\w.@+-]+$'), _('Enter a valid username.'), 'invalid'
+            )
+        ],
+    )
     # Civil number is nullable on purpose, otherwise
     # it wouldn't be possible to put a unique constraint on it
-    civil_number = models.CharField(_('civil number'), max_length=50, unique=True, blank=True, null=True, default=None)
+    civil_number = models.CharField(
+        _('civil number'),
+        max_length=50,
+        unique=True,
+        blank=True,
+        null=True,
+        default=None,
+    )
     email = models.EmailField(_('email address'), max_length=75, blank=True)
 
-    is_staff = models.BooleanField(_('staff status'), default=False,
-                                   help_text=_('Designates whether the user can log into this admin '
-                                               'site.'))
-    is_active = models.BooleanField(_('active'), default=True,
-                                    help_text=_('Designates whether this user should be treated as '
-                                                'active. Unselect this instead of deleting accounts.'))
-    is_support = models.BooleanField(_('support status'), default=False,
-                                     help_text=_('Designates whether the user is a global support user.'))
+    is_staff = models.BooleanField(
+        _('staff status'),
+        default=False,
+        help_text=_('Designates whether the user can log into this admin ' 'site.'),
+    )
+    is_active = models.BooleanField(
+        _('active'),
+        default=True,
+        help_text=_(
+            'Designates whether this user should be treated as '
+            'active. Unselect this instead of deleting accounts.'
+        ),
+    )
+    is_support = models.BooleanField(
+        _('support status'),
+        default=False,
+        help_text=_('Designates whether the user is a global support user.'),
+    )
     date_joined = models.DateTimeField(_('date joined'), default=django_timezone.now)
-    registration_method = models.CharField(_('registration method'), max_length=50, default='default', blank=True,
-                                           help_text=_('Indicates what registration method were used.'))
-    agreement_date = models.DateTimeField(_('agreement date'), blank=True, null=True,
-                                          help_text=_('Indicates when the user has agreed with the policy.'))
+    registration_method = models.CharField(
+        _('registration method'),
+        max_length=50,
+        default='default',
+        blank=True,
+        help_text=_('Indicates what registration method were used.'),
+    )
+    agreement_date = models.DateTimeField(
+        _('agreement date'),
+        blank=True,
+        null=True,
+        help_text=_('Indicates when the user has agreed with the policy.'),
+    )
     preferred_language = models.CharField(max_length=10, blank=True)
     competence = models.CharField(max_length=255, blank=True)
-    token_lifetime = models.PositiveIntegerField(null=True, help_text=_('Token lifetime in seconds.'),
-                                                 validators=[validators.MinValueValidator(60)])
-    details = BetterJSONField(blank=True,
-                              default=dict,
-                              help_text=_('Extra details from authentication backend.'))
+    token_lifetime = models.PositiveIntegerField(
+        null=True,
+        help_text=_('Token lifetime in seconds.'),
+        validators=[validators.MinValueValidator(60)],
+    )
+    details = BetterJSONField(
+        blank=True,
+        default=dict,
+        help_text=_('Extra details from authentication backend.'),
+    )
     backend_id = models.CharField(max_length=255, blank=True)
 
     tracker = FieldTracker()
@@ -193,12 +236,20 @@ class User(LoggableMixin, UuidMixin, DescribableMixin, AbstractBaseUser, UserDet
     USERNAME_FIELD = 'username'
     REQUIRED_FIELDS = ['email']
 
-    class Meta(object):
+    class Meta:
         verbose_name = _('user')
         verbose_name_plural = _('users')
 
     def get_log_fields(self):
-        return ('uuid', 'full_name', 'native_name', self.USERNAME_FIELD, 'is_staff', 'is_support', 'token_lifetime')
+        return (
+            'uuid',
+            'full_name',
+            'native_name',
+            self.USERNAME_FIELD,
+            'is_staff',
+            'is_support',
+            'token_lifetime',
+        )
 
     def get_full_name(self):
         # This method is used in django-reversion as name of revision creator.
@@ -227,8 +278,24 @@ class User(LoggableMixin, UuidMixin, DescribableMixin, AbstractBaseUser, UserDet
     def clean(self):
         super(User, self).clean()
         # User email has to be unique or empty
-        if self.email and User.objects.filter(email=self.email).exclude(id=self.id).exists():
-            raise ValidationError({'email': _('User with email "%s" already exists.') % self.email})
+        if (
+            self.email
+            and User.objects.filter(email=self.email).exclude(id=self.id).exists()
+        ):
+            raise ValidationError(
+                {'email': _('User with email "%s" already exists.') % self.email}
+            )
+
+    @transaction.atomic
+    def create_request_for_update_email(self, email):
+        if User.objects.filter(email=email).exclude(id=self.id).exists():
+            raise ValidationError(
+                {'email': _('User with email "%s" already exists.') % email}
+            )
+
+        ChangeEmailRequest.objects.filter(user=self).delete()
+        change_request = ChangeEmailRequest.objects.create(user=self, email=email,)
+        return change_request
 
     def __str__(self):
         if self.full_name:
@@ -237,8 +304,17 @@ class User(LoggableMixin, UuidMixin, DescribableMixin, AbstractBaseUser, UserDet
         return self.get_username()
 
 
+class ChangeEmailRequest(UuidMixin, TimeStampedModel):
+    user = models.OneToOneField(User, on_delete=models.CASCADE)
+    email = models.EmailField()
+
+    class Meta:
+        verbose_name = _('change email request')
+        verbose_name_plural = _('change email requests')
+
+
 def validate_ssh_public_key(ssh_key):
-    if isinstance(ssh_key, six.text_type):
+    if isinstance(ssh_key, str):
         ssh_key = ssh_key.encode('utf-8')
 
     try:
@@ -256,18 +332,20 @@ def get_ssh_key_fingerprint(ssh_key):
     import hashlib
 
     key_body = base64.b64decode(ssh_key.strip().split()[1].encode('ascii'))
-    fp_plain = hashlib.md5(key_body).hexdigest()  # nosec
+    fp_plain = hashlib.md5(key_body).hexdigest()  # noqa: S303
     return ':'.join(a + b for a, b in zip(fp_plain[::2], fp_plain[1::2]))
 
 
-@python_2_unicode_compatible
 class SshPublicKey(LoggableMixin, UuidMixin, models.Model):
     """
     User public key.
 
     Used for injection into VMs for remote access.
     """
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, db_index=True)
+
+    user = models.ForeignKey(
+        on_delete=models.CASCADE, to=settings.AUTH_USER_MODEL, db_index=True
+    )
     # Model doesn't inherit NameMixin, because name field can be blank.
     name = models.CharField(max_length=150, blank=True)
     fingerprint = models.CharField(max_length=47)  # In ideal world should be unique
@@ -276,35 +354,49 @@ class SshPublicKey(LoggableMixin, UuidMixin, models.Model):
     )
     is_shared = models.BooleanField(default=False)
 
-    class Meta(object):
+    class Meta:
         unique_together = ('user', 'name')
         verbose_name = _('SSH public key')
         verbose_name_plural = _('SSH public keys')
 
-    def save(self, force_insert=False, force_update=False, using=None, update_fields=None):
+    def save(
+        self, force_insert=False, force_update=False, using=None, update_fields=None
+    ):
         # Fingerprint is always set based on public_key
         try:
             self.fingerprint = get_ssh_key_fingerprint(self.public_key)
         except (IndexError, TypeError):
             logger.exception('Fingerprint calculation has failed')
-            raise ValueError(_('Public key format is incorrect. Fingerprint calculation has failed.'))
+            raise ValueError(
+                _('Public key format is incorrect. Fingerprint calculation has failed.')
+            )
 
-        if update_fields and 'public_key' in update_fields and 'fingerprint' not in update_fields:
+        if (
+            update_fields
+            and 'public_key' in update_fields
+            and 'fingerprint' not in update_fields
+        ):
             update_fields.append('fingerprint')
 
         super(SshPublicKey, self).save(force_insert, force_update, using, update_fields)
 
     def __str__(self):
-        return '%s - %s, user: %s, %s' % (self.name, self.fingerprint, self.user.username, self.user.full_name)
+        return '%s - %s, user: %s, %s' % (
+            self.name,
+            self.fingerprint,
+            self.user.username,
+            self.user.full_name,
+        )
 
 
 class RuntimeStateMixin(models.Model):
     """ Provide runtime_state field """
-    class RuntimeStates(object):
+
+    class RuntimeStates:
         ONLINE = 'online'
         OFFLINE = 'offline'
 
-    class Meta(object):
+    class Meta:
         abstract = True
 
     runtime_state = models.CharField(_('runtime state'), max_length=150, blank=True)
@@ -319,7 +411,7 @@ class RuntimeStateMixin(models.Model):
 
 
 class StateMixin(ErrorMessageMixin):
-    class States(object):
+    class States:
         CREATION_SCHEDULED = 5
         CREATING = 6
         UPDATE_SCHEDULED = 1
@@ -340,13 +432,10 @@ class StateMixin(ErrorMessageMixin):
             (ERRED, 'Erred'),
         )
 
-    class Meta(object):
+    class Meta:
         abstract = True
 
-    state = FSMIntegerField(
-        default=States.CREATION_SCHEDULED,
-        choices=States.CHOICES,
-    )
+    state = FSMIntegerField(default=States.CREATION_SCHEDULED, choices=States.CHOICES,)
 
     @property
     def human_readable_state(self):
@@ -364,16 +453,21 @@ class StateMixin(ErrorMessageMixin):
     def begin_deleting(self):
         pass
 
-    @transition(field=state, source=[States.OK, States.ERRED], target=States.UPDATE_SCHEDULED)
+    @transition(
+        field=state, source=[States.OK, States.ERRED], target=States.UPDATE_SCHEDULED
+    )
     def schedule_updating(self):
         pass
 
-    @transition(field=state, source=[States.OK, States.ERRED], target=States.DELETION_SCHEDULED)
+    @transition(
+        field=state, source=[States.OK, States.ERRED], target=States.DELETION_SCHEDULED
+    )
     def schedule_deleting(self):
         pass
 
-    @transition(field=state, source=[States.UPDATING, States.CREATING],
-                target=States.OK)
+    @transition(
+        field=state, source=[States.UPDATING, States.CREATING], target=States.OK
+    )
     def set_ok(self):
         pass
 
@@ -391,7 +485,7 @@ class StateMixin(ErrorMessageMixin):
         return [model for model in apps.get_models() if issubclass(model, cls)]
 
 
-class ReversionMixin(object):
+class ReversionMixin:
     """ Store historical values of instance, using django-reversion.
 
         Note: `ReversionMixin` model should be registered in django-reversion,
@@ -402,7 +496,9 @@ class ReversionMixin(object):
     def get_version_fields(self):
         """ Get field that are tracked in object history versions. """
         options = reversion._get_options(self)
-        return options.fields or [f.name for f in self._meta.fields if f not in options.exclude]
+        return options.fields or [
+            f.name for f in self._meta.fields if f not in options.exclude
+        ]
 
     def _is_version_duplicate(self):
         """ Define should new version be created for object or no.
@@ -415,12 +511,16 @@ class ReversionMixin(object):
         if self.id is None:
             return False
         try:
-            latest_version = Version.objects.get_for_object(self).latest('revision__date_created')
+            latest_version = Version.objects.get_for_object(self).latest(
+                'revision__date_created'
+            )
         except Version.DoesNotExist:
             return False
         latest_version_object = latest_version._object_version.object
         fields = self.get_version_fields()
-        return all([getattr(self, f) == getattr(latest_version_object, f) for f in fields])
+        return all(
+            [getattr(self, f) == getattr(latest_version_object, f) for f in fields]
+        )
 
     def save(self, **kwargs):
         if self._is_version_duplicate():
@@ -430,7 +530,7 @@ class ReversionMixin(object):
 
 
 # XXX: consider renaming it to AffinityMixin
-class DescendantMixin(object):
+class DescendantMixin:
     """ Mixin to provide child-parent relationships.
         Each related model can provide list of its parents/children.
     """
@@ -447,7 +547,9 @@ class DescendantMixin(object):
         """ Get all unique instance ancestors """
         ancestors = list(self.get_parents())
         ancestor_unique_attributes = set([(a.__class__, a.id) for a in ancestors])
-        ancestors_with_parents = [a for a in ancestors if isinstance(a, DescendantMixin)]
+        ancestors_with_parents = [
+            a for a in ancestors if isinstance(a, DescendantMixin)
+        ]
         for ancestor in ancestors_with_parents:
             for parent in ancestor.get_ancestors():
                 if (parent.__class__, parent.id) not in ancestor_unique_attributes:
@@ -460,6 +562,7 @@ class DescendantMixin(object):
                 yield child
                 for baby in child.get_descendants():
                     yield baby
+
         return list(set(traverse(self)))
 
 
@@ -476,7 +579,7 @@ class AbstractFieldTracker(FieldTracker):
             super(AbstractFieldTracker, self).finalize_class(sender, **kwargs)
 
 
-class BackendModelMixin(object):
+class BackendModelMixin:
     """
     Represents model that is connected to backend object.
 

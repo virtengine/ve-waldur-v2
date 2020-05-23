@@ -8,7 +8,7 @@ from .. import models
 
 
 class InvoiceFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.Invoice
 
     customer = factory.SubFactory(structure_factories.CustomerFactory)
@@ -18,7 +18,9 @@ class InvoiceFactory(factory.DjangoModelFactory):
     def get_url(cls, invoice=None, action=None):
         if invoice is None:
             invoice = InvoiceFactory()
-        url = 'http://testserver' + reverse('invoice-detail', kwargs={'uuid': invoice.uuid})
+        url = 'http://testserver' + reverse(
+            'invoice-detail', kwargs={'uuid': invoice.uuid.hex}
+        )
         return url if action is None else url + action + '/'
 
     @classmethod
@@ -27,8 +29,29 @@ class InvoiceFactory(factory.DjangoModelFactory):
 
 
 class InvoiceItemFactory(factory.DjangoModelFactory):
-    class Meta(object):
+    class Meta:
         model = models.InvoiceItem
 
     invoice = factory.SubFactory(InvoiceFactory)
     project = factory.SubFactory(structure_factories.ProjectFactory)
+
+
+class PaymentProfileFactory(factory.DjangoModelFactory):
+    class Meta:
+        model = models.PaymentProfile
+
+    organization = factory.SubFactory(structure_factories.CustomerFactory)
+    payment_type = models.PaymentType.MONTHLY_INVOICES
+
+    @classmethod
+    def get_url(cls, profile=None, action=None):
+        if profile is None:
+            profile = cls()
+        url = 'http://testserver' + reverse(
+            'payment-profile-detail', kwargs={'uuid': profile.uuid.hex}
+        )
+        return url if action is None else url + action + '/'
+
+    @classmethod
+    def get_list_url(cls):
+        return 'http://testserver' + reverse('payment-profile-list')

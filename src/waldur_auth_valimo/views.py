@@ -1,20 +1,17 @@
-from __future__ import unicode_literals
-
 from django.http import Http404
-from rest_framework import viewsets, mixins, response, decorators
+from rest_framework import decorators, mixins, response, viewsets
 
 from waldur_core.core import mixins as core_mixins
 from waldur_core.core.views import validate_authentication_method
 
-from . import models, serializers, executors
-
+from . import executors, models, serializers
 
 validate_valimo = validate_authentication_method('VALIMO')
 
 
-class AuthResultViewSet(core_mixins.CreateExecutorMixin,
-                        mixins.CreateModelMixin,
-                        viewsets.GenericViewSet):
+class AuthResultViewSet(
+    core_mixins.CreateExecutorMixin, mixins.CreateModelMixin, viewsets.GenericViewSet
+):
     queryset = models.AuthResult.objects.all()
     serializer_class = serializers.AuthResultSerializer
     permission_classes = ()
@@ -41,7 +38,7 @@ class AuthResultViewSet(core_mixins.CreateExecutorMixin,
         return super(AuthResultViewSet, self).create(request, *args, **kwargs)
 
     @validate_valimo
-    @decorators.list_route(methods=['POST'])
+    @decorators.action(detail=False, methods=['POST'])
     def result(self, request, *args, **kwargs):
         """
         To get PKI login status and details - issue post request against /api/auth-valimo/result/

@@ -11,13 +11,15 @@ from . import models, tasks
 class ProfileAdmin(core_admin.ExtraActionsMixin, admin.ModelAdmin):
     list_display = ('username', 'user', 'is_active', 'agreement_date')
     readonly_fields = ('username', 'user', 'is_active', 'agreement_date')
-    list_filter = ('is_active', )
-    search_fields = ('username', )
+    list_filter = ('is_active',)
+    search_fields = ('username',)
 
     def has_add_permission(self, request, obj=None):
         return False
 
     def has_delete_permission(self, request, obj=None):
+        if request.user.is_staff:
+            return True
         return False
 
     def get_extra_actions(self):

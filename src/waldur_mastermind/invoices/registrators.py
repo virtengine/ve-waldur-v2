@@ -20,8 +20,7 @@ from waldur_core.core import utils as core_utils
 from waldur_mastermind.invoices import models as invoices_models
 
 
-class BaseRegistrator(object):
-
+class BaseRegistrator:
     def get_customer(self, source):
         """ Return customer based on provided item. """
         raise NotImplementedError()
@@ -90,8 +89,9 @@ class BaseRegistrator(object):
         return {}
 
 
-class RegistrationManager(object):
+class RegistrationManager:
     """ The highest interface for invoice item registration and termination. """
+
     _registrators = {}
 
     @classmethod
@@ -109,10 +109,9 @@ class RegistrationManager(object):
     @classmethod
     def get_or_create_invoice(cls, customer, date, **kwargs):
         from . import models
+
         invoice, created = models.Invoice.objects.get_or_create(
-            customer=customer,
-            month=date.month,
-            year=date.year,
+            customer=customer, month=date.month, year=date.year,
         )
 
         if created:

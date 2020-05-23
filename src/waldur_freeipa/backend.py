@@ -1,20 +1,18 @@
-from __future__ import unicode_literals
-
 import collections
-import cStringIO
 import csv
+from io import StringIO
 
+import python_freeipa
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
-import python_freeipa
 
-from waldur_core.structure import models as structure_models
 from waldur_core.quotas import models as quota_models
+from waldur_core.structure import models as structure_models
 
 from . import models, utils
 
 
-class GroupSynchronizer(object):
+class GroupSynchronizer:
     """
     This class maps Waldur structure units to FreeIPA groups and memberships.
 
@@ -38,7 +36,8 @@ class GroupSynchronizer(object):
 
     def __init__(self, client):
         self.client = client
-        self.prefix = settings.WALDUR_FREEIPA['GROUPNAME_PREFIX']
+        self.group_prefix = settings.WALDUR_FREEIPA['GROUPNAME_PREFIX']
+        self.user_prefix = settings.WALDUR_FREEIPA['USERNAME_PREFIX']
 
         self.profiles = {
             profile.user_id: profile.username
@@ -56,7 +55,7 @@ class GroupSynchronizer(object):
         self.freeipa_names = dict()
 
     def group_name(self, key):
-        return '%s%s' % (self.prefix, key)
+        return '%s%s' % (self.group_prefix, key)
 
     def project_group_name(self, project):
         return self.group_name('project_%s' % project.uuid)
@@ -65,10 +64,10 @@ class GroupSynchronizer(object):
         return self.group_name('org_%s' % customer.uuid)
 
     def get_group_description(self, name, limit):
-        stream = cStringIO.StringIO()
+        stream = StringIO()
         writer = csv.writer(stream)
-        writer.writerow([name.encode('utf-8'), str(limit)])
-        return stream.getvalue().strip().decode('utf-8')
+        writer.writerow([name, str(limit)])
+        return stream.getvalue().strip()
 
     def add_customer(self, customer, limit):
         group = self.customer_group_name(customer)
@@ -78,7 +77,9 @@ class GroupSynchronizer(object):
     def add_project(self, project, limit):
         project_group = self.project_group_name(project)
         self.groups.add(project_group)
-        self.group_names[project_group] = self.get_group_description(project.name, limit)
+        self.group_names[project_group] = self.get_group_description(
+            project.name, limit
+        )
 
         customer_group = self.customer_group_name(project.customer)
         self.groups.add(customer_group)
@@ -98,10 +99,14 @@ class GroupSynchronizer(object):
             self.group_users[group].add(username)
 
     def collect_waldur_permissions(self):
-        for permission in structure_models.CustomerPermission.objects.filter(is_active=True):
+        for permission in structure_models.CustomerPermission.objects.filter(
+            is_active=True
+        ):
             self.add_customer_user(permission.customer, permission.user)
 
-        for permission in structure_models.ProjectPermission.objects.filter(is_active=True):
+        for permission in structure_models.ProjectPermission.objects.filter(
+            is_active=True
+        ):
             self.add_project_user(permission.project, permission.user)
 
     def get_limits(self, model):
@@ -109,10 +114,7 @@ class GroupSynchronizer(object):
         customer_quotas = quota_models.Quota.objects.filter(
             content_type=ctype, name=utils.QUOTA_NAME
         ).only('object_id', 'limit')
-        return {
-            quota.object_id: quota.limit
-            for quota in customer_quotas
-        }
+        return {quota.object_id: quota.limit for quota in customer_quotas}
 
     def collect_waldur_customers(self):
         limits = self.get_limits(structure_models.Customer)
@@ -130,7 +132,9 @@ class GroupSynchronizer(object):
         self.freeipa_groups.add(groupname)
         if description:
             self.freeipa_names[groupname] = description[0]
-        self.freeipa_children[groupname] = set(child for child in children if child.startswith(self.prefix))
+        self.freeipa_children[groupname] = set(
+            child for child in children if child.startswith(self.group_prefix)
+        )
 
     def add_freeipa_users(self, groupname, users):
         self.freeipa_users[groupname].update(users)
@@ -141,7 +145,7 @@ class GroupSynchronizer(object):
             groupname = group['cn'][0]
 
             # Ignore groups not marked by own prefix
-            if not groupname.startswith(self.prefix):
+            if not groupname.startswith(self.group_prefix):
                 continue
 
             members = group.get('member_user', [])
@@ -175,8 +179,18 @@ class GroupSynchronizer(object):
                 self.client.group_add_member(group, users=new_members, skip_errors=True)
 
             stale_members = list(backend_members - waldur_members)
+
+            # filter out members that have a non-expected name prefix to allow for Freeipa-managed users
+            filtered_stale_members = [
+                member
+                for member in stale_members
+                if member.startswith(self.user_prefix)
+            ]
+
             if stale_members:
-                self.client.group_remove_member(group, users=stale_members, skip_errors=True)
+                self.client.group_remove_member(
+                    group, users=filtered_stale_members, skip_errors=True
+                )
 
     def sync_children(self):
         for group in self.groups:
@@ -186,11 +200,15 @@ class GroupSynchronizer(object):
 
             missing_children = list(waldur_children - freeipa_children)
             if missing_children:
-                self.client.group_add_member(group, groups=missing_children, skip_errors=True)
+                self.client.group_add_member(
+                    group, groups=missing_children, skip_errors=True
+                )
 
             stale_children = list(freeipa_children - waldur_children)
             if stale_children:
-                self.client.group_remove_member(group, groups=stale_children, skip_errors=True)
+                self.client.group_remove_member(
+                    group, groups=stale_children, skip_errors=True
+                )
 
     def delete_stale_groups(self):
         for group in self.freeipa_groups - self.groups:
@@ -214,12 +232,11 @@ class GroupSynchronizer(object):
             utils.release_task_status()
 
 
-class FreeIPABackend(object):
+class FreeIPABackend:
     def __init__(self):
         options = settings.WALDUR_FREEIPA
         self._client = python_freeipa.Client(
-            host=options['HOSTNAME'],
-            verify_ssl=options['VERIFY_SSL']
+            host=options['HOSTNAME'], verify_ssl=options['VERIFY_SSL']
         )
         self._client.login(options['USERNAME'], options['PASSWORD'])
 

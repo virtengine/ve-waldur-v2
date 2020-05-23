@@ -1,6 +1,3 @@
-# -*- coding: utf-8 -*-
-from __future__ import unicode_literals
-
 from django.db import migrations, models
 
 
@@ -29,9 +26,7 @@ class Migration(migrations.Migration):
 
     operations = [
         migrations.AddField(
-            model_name='InvoiceItem',
-            name='name',
-            field=models.TextField(default=''),
+            model_name='InvoiceItem', name='name', field=models.TextField(default=''),
         ),
         migrations.RunPython(init_invoice_item_name),
     ]

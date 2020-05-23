@@ -1,22 +1,24 @@
-from __future__ import unicode_literals
-
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 from django.utils.translation import ugettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
-from rest_framework import viewsets, views, permissions, decorators, response, status, exceptions as rf_exceptions
+from rest_framework import decorators
+from rest_framework import exceptions as rf_exceptions
+from rest_framework import permissions, response, status, views, viewsets
 
+from waldur_core.core import mixins as core_mixins
+from waldur_core.core import permissions as core_permissions
+from waldur_core.core import utils as core_utils
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
-from waldur_core.core import utils as core_utils
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import metadata as structure_metadata
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure import views as structure_views
 
-from . import filters, models, serializers, backend, exceptions, tasks
+from . import backend, exceptions, executors, filters, models, serializers, tasks
 
 
 class CheckExtensionMixin(core_views.CheckExtensionMixin):
@@ -31,7 +33,7 @@ class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
         DjangoFilterBackend,
         filters.IssueResourceFilterBackend,
     )
-    filter_class = filters.IssueFilter
+    filterset_class = filters.IssueFilter
     serializer_class = serializers.IssueSerializer
 
     def is_staff_or_support(request, view, obj=None):
@@ -40,22 +42,33 @@ class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
 
     def check_related_resources(request, view, obj=None):
         if obj and obj.offering_set.exists():
-            raise rf_exceptions.ValidationError(_('Issue has offering. Please remove it first.'))
+            raise rf_exceptions.ValidationError(
+                _('Issue has offering. Please remove it first.')
+            )
 
     def can_create_user(request, view, obj=None):
         if not request.user.email:
-            raise rf_exceptions.ValidationError(_('Current user does not have email, '
-                                                  'therefore he is not allowed to create issues.'))
+            raise rf_exceptions.ValidationError(
+                _(
+                    'Current user does not have email, '
+                    'therefore he is not allowed to create issues.'
+                )
+            )
 
         if not request.user.full_name:
-            raise rf_exceptions.ValidationError(_('Current user does not have full_name, '
-                                                  'therefore he is not allowed to create issues.'))
+            raise rf_exceptions.ValidationError(
+                _(
+                    'Current user does not have full_name, '
+                    'therefore he is not allowed to create issues.'
+                )
+            )
 
     @transaction.atomic()
     def perform_create(self, serializer):
         issue = serializer.save()
         try:
             backend.get_active_backend().create_issue(issue)
+            backend.get_active_backend().create_confirmation_comment(issue)
         except exceptions.SupportUserInactive:
             raise rf_exceptions.ValidationError({'caller': _('Caller is inactive.')})
 
@@ -83,14 +96,18 @@ class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
         # if it's a personal issue
         if not issue.customer and not issue.project and issue.caller == user:
             return
-        if issue.customer and issue.customer.has_user(user, structure_models.CustomerRole.OWNER):
+        if issue.customer and issue.customer.has_user(
+            user, structure_models.CustomerRole.OWNER
+        ):
             return
-        if (issue.project and (issue.project.has_user(user, structure_models.ProjectRole.ADMINISTRATOR) or
-                               issue.project.has_user(user, structure_models.ProjectRole.MANAGER))):
+        if issue.project and (
+            issue.project.has_user(user, structure_models.ProjectRole.ADMINISTRATOR)
+            or issue.project.has_user(user, structure_models.ProjectRole.MANAGER)
+        ):
             return
         raise rf_exceptions.PermissionDenied()
 
-    @decorators.detail_route(methods=['post'])
+    @decorators.action(detail=True, methods=['post'])
     def comment(self, request, uuid=None):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -106,7 +123,7 @@ class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
 class PriorityViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = models.Priority.objects.all()
     serializer_class = serializers.PrioritySerializer
-    filter_class = filters.PriorityFilter
+    filterset_class = filters.PriorityFilter
     lookup_field = 'uuid'
 
 
@@ -118,7 +135,7 @@ class CommentViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
         DjangoFilterBackend,
         filters.CommentIssueResourceFilterBackend,
     )
-    filter_class = filters.CommentFilter
+    filterset_class = filters.CommentFilter
     queryset = models.Comment.objects.all()
 
     @transaction.atomic()
@@ -157,10 +174,13 @@ class IsStaffOrSupportUser(permissions.BasePermission):
 class SupportUserViewSet(CheckExtensionMixin, viewsets.ReadOnlyModelViewSet):
     queryset = models.SupportUser.objects.all()
     lookup_field = 'uuid'
-    permission_classes = (permissions.IsAuthenticated, IsStaffOrSupportUser,)
+    permission_classes = (
+        permissions.IsAuthenticated,
+        IsStaffOrSupportUser,
+    )
     serializer_class = serializers.SupportUserSerializer
     filter_backends = (DjangoFilterBackend,)
-    filter_class = filters.SupportUserFilter
+    filterset_class = filters.SupportUserFilter
 
 
 class WebHookReceiverView(CheckExtensionMixin, views.APIView):
@@ -184,9 +204,9 @@ class OfferingViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
         structure_filters.GenericRoleFilter,
         DjangoFilterBackend,
     )
-    filter_class = filters.OfferingFilter
+    filterset_class = filters.OfferingFilter
 
-    @decorators.list_route()
+    @decorators.action(detail=False)
     def configured(self, request):
         summary_config = {}
         for template in models.OfferingTemplate.objects.all():
@@ -204,45 +224,55 @@ class OfferingViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
         return response.Response(serializer.data, status=status.HTTP_201_CREATED)
 
     create_serializer_class = serializers.OfferingCreateSerializer
-    create_permissions = [structure_permissions.is_owner,
-                          structure_permissions.is_manager,
-                          structure_permissions.is_administrator]
+    create_permissions = [
+        structure_permissions.is_owner,
+        structure_permissions.is_manager,
+        structure_permissions.is_administrator,
+    ]
 
     def offering_is_in_requested_state(offering):
         if offering.state != models.Offering.States.REQUESTED:
-            raise rf_exceptions.ValidationError(_('Offering must be in requested state.'))
+            raise rf_exceptions.ValidationError(
+                _('Offering must be in requested state.')
+            )
 
-    @decorators.detail_route(methods=['post'])
+    @decorators.action(detail=True, methods=['post'])
     def complete(self, request, uuid=None):
         serializer = self.get_serializer(instance=self.get_object(), data=request.data)
         serializer.is_valid(raise_exception=True)
         serializer.save()
-        return response.Response({'status': _('Offering is marked as completed.')}, status=status.HTTP_200_OK)
+        return response.Response(
+            {'status': _('Offering is marked as completed.')}, status=status.HTTP_200_OK
+        )
 
     complete_validators = [offering_is_in_requested_state]
     complete_permissions = [structure_permissions.is_staff]
     complete_serializer_class = serializers.OfferingCompleteSerializer
 
-    @decorators.detail_route(methods=['post'])
+    @decorators.action(detail=True, methods=['post'])
     def terminate(self, request, uuid=None):
         offering = self.get_object()
         offering.state = models.Offering.States.TERMINATED
         offering.terminated_at = timezone.now()
         offering.save()
-        return response.Response({'status': _('Offering is marked as terminated.')}, status=status.HTTP_200_OK)
+        return response.Response(
+            {'status': _('Offering is marked as terminated.')},
+            status=status.HTTP_200_OK,
+        )
 
     terminate_permissions = [structure_permissions.is_staff]
 
     update_permissions = partial_update_permissions = [structure_permissions.is_staff]
 
     destroy_permissions = [structure_permissions.is_staff]
-    destroy_validators = [core_validators.StateValidator(models.Offering.States.TERMINATED)]
+    destroy_validators = [
+        core_validators.StateValidator(models.Offering.States.TERMINATED)
+    ]
 
 
-class AttachmentViewSet(CheckExtensionMixin,
-                        core_views.ActionsViewSet):
+class AttachmentViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
     queryset = models.Attachment.objects.all()
-    filter_class = filters.AttachmentFilter
+    filterset_class = filters.AttachmentFilter
     filter_backends = [DjangoFilterBackend]
     serializer_class = serializers.AttachmentSerializer
     lookup_field = 'uuid'
@@ -282,6 +312,14 @@ class OfferingPlanViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = models.OfferingPlan.objects.all()
     lookup_field = 'uuid'
     serializer_class = serializers.OfferingPlanSerializer
+
+
+class FeedbackViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
+    disabled_actions = ['update', 'partial_update', 'destroy', 'list', 'retrieve']
+    permission_classes = (core_permissions.ActionsPermission,)
+    create_permissions = ()
+    serializer_class = serializers.CreateFeedbackSerializer
+    create_executor = executors.FeedbackExecutor
 
 
 def get_offerings_count(scope):

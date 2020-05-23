@@ -1,11 +1,10 @@
-from __future__ import unicode_literals
-
 from django.db import transaction
 from django.utils.translation import ugettext_lazy as _
 from python_freeipa import exceptions as freeipa_exceptions
 from rest_framework import decorators, exceptions, response, status
 
 from waldur_core.core import views as core_views
+
 from . import backend, filters, models, serializers, tasks
 
 
@@ -15,7 +14,7 @@ class CheckExtensionMixin(core_views.CheckExtensionMixin):
 
 class ProfileViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
     queryset = models.Profile.objects.all()
-    filter_class = filters.ProfileFilter
+    filterset_class = filters.ProfileFilter
     serializer_class = serializers.ProfileSerializer
     disabled_actions = ['destroy']
     lookup_field = 'uuid'
@@ -33,11 +32,11 @@ class ProfileViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
             backend.FreeIPABackend().create_profile(profile)
             tasks.schedule_sync()
         except freeipa_exceptions.DuplicateEntry:
-            raise exceptions.ValidationError({
-                'username': _('Profile with such name already exists.')
-            })
+            raise exceptions.ValidationError(
+                {'username': _('Profile with such name already exists.')}
+            )
 
-    @decorators.detail_route(methods=['post'])
+    @decorators.action(detail=True, methods=['post'])
     def update_ssh_keys(self, request, uuid=None):
         profile = self.get_object()
         try:
@@ -48,14 +47,14 @@ class ProfileViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
         else:
             return response.Response(status=status.HTTP_200_OK)
 
-    @decorators.detail_route(methods=['post'])
+    @decorators.action(detail=True, methods=['post'])
     @transaction.atomic()
     def disable(self, request, uuid=None):
         profile = self.get_object()
         if not profile.is_active:
-            raise exceptions.ValidationError({
-                'detail': _('Profile is already disabled.')
-            })
+            raise exceptions.ValidationError(
+                {'detail': _('Profile is already disabled.')}
+            )
         try:
             backend.FreeIPABackend().disable_profile(profile)
         except freeipa_exceptions.NotFound:
@@ -70,14 +69,14 @@ class ProfileViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
             profile.save(update_fields=['is_active'])
             return response.Response(status=status.HTTP_200_OK)
 
-    @decorators.detail_route(methods=['post'])
+    @decorators.action(detail=True, methods=['post'])
     @transaction.atomic()
     def enable(self, request, uuid=None):
         profile = self.get_object()
         if profile.is_active:
-            raise exceptions.ValidationError({
-                'detail': _('Profile is already enabled.')
-            })
+            raise exceptions.ValidationError(
+                {'detail': _('Profile is already enabled.')}
+            )
         try:
             backend.FreeIPABackend().enable_profile(profile)
         except freeipa_exceptions.NotFound:

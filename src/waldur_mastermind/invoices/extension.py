@@ -1,5 +1,3 @@
-from __future__ import unicode_literals
-
 from datetime import timedelta
 
 from waldur_core.core import WaldurExtension
@@ -15,10 +13,7 @@ class InvoicesExtension(WaldurExtension):
                 'country': 'Estonia',
                 'email': 'info@opennodecloud.com',
                 'postal': '80041',
-                'phone': {
-                    'country_code': '372',
-                    'national_number': '5555555',
-                },
+                'phone': {'country_code': '372', 'national_number': '5555555',},
                 'bank': 'Estonian Bank',
                 'account': '123456789',
                 'vat_code': 'EE123456789',
@@ -29,22 +24,13 @@ class InvoicesExtension(WaldurExtension):
             'INVOICE_REPORTING': {
                 'ENABLE': False,
                 'EMAIL': 'accounting@waldur.example.com',
-                'CSV_PARAMS': {
-                    'delimiter': str(';'),
-                },
+                'CSV_PARAMS': {'delimiter': str(';'),},
                 'USE_SAF': False,
                 'SERIALIZER_EXTRA_KWARGS': {
-                    'start': {
-                        'format': '%d.%m.%Y',
-                    },
-                    'end': {
-                        'format': '%d.%m.%Y',
-                    }
+                    'start': {'format': '%d.%m.%Y',},
+                    'end': {'format': '%d.%m.%Y',},
                 },
-                'SAF_PARAMS': {
-                    'RMAKSULIPP': '20%',
-                    'ARTPROJEKT': 'PROJEKT',
-                }
+                'SAF_PARAMS': {'RMAKSULIPP': '20%', 'ARTPROJEKT': 'PROJEKT',},
             },
             # Default downtime duration may vary from 1 day to 30 days.
             'DOWNTIME_DURATION_MINIMAL': timedelta(days=1),
@@ -61,6 +47,7 @@ class InvoicesExtension(WaldurExtension):
     @staticmethod
     def rest_urls():
         from .urls import register_in
+
         return register_in
 
     @staticmethod
@@ -70,6 +57,7 @@ class InvoicesExtension(WaldurExtension):
     @staticmethod
     def celery_tasks():
         from celery.schedules import crontab
+
         return {
             'waldur-create-invoices': {
                 'task': 'invoices.create_monthly_invoices',
@@ -80,5 +68,5 @@ class InvoicesExtension(WaldurExtension):
                 'task': 'invoices.update_invoices_current_cost',
                 'schedule': timedelta(hours=24),
                 'args': (),
-            }
+            },
         }

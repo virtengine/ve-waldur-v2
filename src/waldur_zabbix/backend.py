@@ -1,23 +1,26 @@
+import logging
 from datetime import date, timedelta
 from decimal import Decimal
-import logging
-import sys
-import warnings
 
-from django.conf import settings as django_settings
-from django.db import connections, DatabaseError
-from django.utils import six, timezone
 import pyzabbix
-import requests
+from django.conf import settings as django_settings
+from django.db import DatabaseError, connections
+from django.utils import timezone
 from requests.exceptions import RequestException
-from requests.packages.urllib3 import exceptions
 
-from waldur_core.core.utils import datetime_to_timestamp, timestamp_to_datetime
-from waldur_core.structure import ServiceBackend, ServiceBackendError, log_backend_action
+from waldur_core.core.utils import (
+    QuietSession,
+    datetime_to_timestamp,
+    timestamp_to_datetime,
+)
+from waldur_core.structure import (
+    ServiceBackend,
+    ServiceBackendError,
+    log_backend_action,
+)
 from waldur_core.structure.utils import update_pulled_fields
 
 from . import models, utils
-
 
 logger = logging.getLogger(__name__)
 sms_settings = getattr(django_settings, 'WALDUR_ZABBIX', {}).get('SMS_SETTINGS', {})
@@ -39,28 +42,6 @@ class ZabbixBackendError(ServiceBackendError):
     pass
 
 
-def reraise(exc):
-    """
-    Reraise ZabbixBackendError while maintaining traceback.
-    """
-    six.reraise(ZabbixBackendError, exc, sys.exc_info()[2])
-
-
-class QuietSession(requests.Session):
-    """Session class that suppresses warning about unsafe TLS sessions and clogging the logs.
-    Inspired by: https://github.com/kennethreitz/requests/issues/2214#issuecomment-110366218
-    """
-    def request(self, *args, **kwargs):
-        if not kwargs.get('verify', self.verify):
-            with warnings.catch_warnings():
-                if hasattr(exceptions, 'InsecurePlatformWarning'):  # urllib3 1.10 and lower does not have this warning
-                    warnings.simplefilter('ignore', exceptions.InsecurePlatformWarning)
-                warnings.simplefilter('ignore', exceptions.InsecureRequestWarning)
-                return super(QuietSession, self).request(*args, **kwargs)
-        else:
-            return super(QuietSession, self).request(*args, **kwargs)
-
-
 class ZabbixBackend(ServiceBackend):
 
     DEFAULTS = {
@@ -75,7 +56,7 @@ class ZabbixBackend(ServiceBackend):
         },
         'interface_parameters': {
             'dns': '',
-            'ip': '0.0.0.0',  # nosec
+            'ip': '0.0.0.0',  # noqa: S104
             'main': 1,
             'port': '10050',
             'type': 1,
@@ -110,9 +91,11 @@ class ZabbixBackend(ServiceBackend):
     @property
     def api(self):
         if not hasattr(self, '_api'):
-            self._api = self._get_api(self.settings.backend_url,
-                                      self.settings.username,
-                                      self.settings.password)
+            self._api = self._get_api(
+                self.settings.backend_url,
+                self.settings.username,
+                self.settings.password,
+            )
         return self._api
 
     def ping(self, raise_exception=False):
@@ -120,7 +103,7 @@ class ZabbixBackend(ServiceBackend):
             self.api.api_version()
         except Exception as e:
             if raise_exception:
-                reraise(e)
+                raise ZabbixBackendError(e)
             return False
         else:
             return True
@@ -165,23 +148,27 @@ class ZabbixBackend(ServiceBackend):
     def update_host(self, host):
         try:
             group_id, _ = self._get_or_create_group_id(host.host_group_name)
-            self.api.host.update({
-                'hostid': host.backend_id,
-                'host': host.name,
-                'name': host.visible_name,
-                'group_id': group_id,
-                'templates': [{'templateid': t.backend_id} for t in host.templates.all()],
-                'status': host.status,
-            })
+            self.api.host.update(
+                {
+                    'hostid': host.backend_id,
+                    'host': host.name,
+                    'name': host.visible_name,
+                    'group_id': group_id,
+                    'templates': [
+                        {'templateid': t.backend_id} for t in host.templates.all()
+                    ],
+                    'status': host.status,
+                }
+            )
         except (pyzabbix.ZabbixAPIException, RequestException) as e:
-            reraise(e)
+            raise ZabbixBackendError(e)
 
     @log_backend_action()
     def delete_host(self, host):
         try:
             self.api.host.delete(host.backend_id)
         except (pyzabbix.ZabbixAPIException, RequestException) as e:
-            reraise(e)
+            raise ZabbixBackendError(e)
 
     @log_backend_action()
     def create_itservice(self, itservice):
@@ -193,18 +180,22 @@ class ZabbixBackend(ServiceBackend):
                 'algorithm': itservice.algorithm,
                 'showsla': self._get_showsla(itservice.algorithm),
                 'sortorder': itservice.sort_order,
-                'goodsla': six.text_type(itservice.agreed_sla),
+                'goodsla': str(itservice.agreed_sla),
                 'triggerid': None,
             }
             if itservice.trigger and itservice.host:
-                creation_kwargs['triggerid'] = self._get_trigger_id(itservice.host.backend_id, itservice.trigger.name)
+                creation_kwargs['triggerid'] = self._get_trigger_id(
+                    itservice.host.backend_id, itservice.trigger.name
+                )
 
             data = self.api.service.create(creation_kwargs)
             service_id = data['serviceids'][0]
         except (pyzabbix.ZabbixAPIException, RequestException) as e:
-            reraise(e)
-        except (IndexError, KeyError) as e:
-            raise ZabbixBackendError('ITService create request returned unexpected response: %s', data)
+            raise ZabbixBackendError(e)
+        except (IndexError, KeyError):
+            raise ZabbixBackendError(
+                'ITService create request returned unexpected response: %s', data
+            )
         else:
             itservice.backend_id = service_id
             itservice.name = name
@@ -218,7 +209,7 @@ class ZabbixBackend(ServiceBackend):
         try:
             self.api.service.delete(itservice.backend_id)
         except (pyzabbix.ZabbixAPIException, RequestException) as e:
-            reraise(e)
+            raise ZabbixBackendError(e)
 
     def pull_templates(self):
         """ Update existing Waldur templates and their items """
@@ -227,7 +218,15 @@ class ZabbixBackend(ServiceBackend):
             zabbix_templates = self.api.template.get(
                 output=['name', 'templateid'],
                 selectTriggers=['description', 'triggerid', 'priority'],
-                selectItems=['itemid', 'name', 'key_', 'value_type', 'units', 'history', 'delay'],
+                selectItems=[
+                    'itemid',
+                    'name',
+                    'key_',
+                    'value_type',
+                    'units',
+                    'history',
+                    'delay',
+                ],
                 selectTemplates=['templateid'],
             )
         except (pyzabbix.ZabbixAPIException, RequestException) as e:
@@ -235,29 +234,37 @@ class ZabbixBackend(ServiceBackend):
 
         # Delete stale templates
         zabbix_templates_ids = set([t['templateid'] for t in zabbix_templates])
-        models.Template.objects.filter(settings=self.settings).exclude(backend_id__in=zabbix_templates_ids).delete()
+        models.Template.objects.filter(settings=self.settings).exclude(
+            backend_id__in=zabbix_templates_ids
+        ).delete()
 
         # Update or create zabbix templates
         for zabbix_template in zabbix_templates:
             nc_template, created = models.Template.objects.get_or_create(
                 backend_id=zabbix_template['templateid'],
                 settings=self.settings,
-                defaults={'name': zabbix_template['name']})
+                defaults={'name': zabbix_template['name']},
+            )
             if not created and nc_template.name != zabbix_template['name']:
                 nc_template.name = zabbix_template['name']
                 nc_template.save()
 
             # Delete stale triggers
-            zabbix_triggers_ids = set([i['triggerid'] for i in zabbix_template['triggers']])
+            zabbix_triggers_ids = set(
+                [i['triggerid'] for i in zabbix_template['triggers']]
+            )
             nc_template.triggers.exclude(backend_id__in=zabbix_triggers_ids).delete()
 
             # Update or create triggers
             for zabbix_trigger in zabbix_template['triggers']:
                 nc_template.triggers.update_or_create(
                     backend_id=zabbix_trigger['triggerid'],
-                    priority=int(zabbix_trigger['priority']),  # according to Zabbix model it must always be integer
+                    priority=int(
+                        zabbix_trigger['priority']
+                    ),  # according to Zabbix model it must always be integer
                     settings=nc_template.settings,
-                    defaults={'name': zabbix_trigger['description']})
+                    defaults={'name': zabbix_trigger['description']},
+                )
 
             # Delete stale items
             zabbix_items_ids = set([i['itemid'] for i in zabbix_template['items']])
@@ -271,11 +278,12 @@ class ZabbixBackend(ServiceBackend):
                     'value_type': int(zabbix_item['value_type']),
                     'units': zabbix_item['units'],
                     'history': utils.parse_time(zabbix_item['history']),
-                    'delay': utils.parse_time(zabbix_item['delay'])
+                    'delay': utils.parse_time(zabbix_item['delay']),
                 }
 
                 nc_item, created = nc_template.items.get_or_create(
-                    backend_id=zabbix_item['itemid'], defaults=defaults)
+                    backend_id=zabbix_item['itemid'], defaults=defaults
+                )
                 if not created:
                     update_fields = []
                     for (name, value) in defaults.items():
@@ -289,22 +297,34 @@ class ZabbixBackend(ServiceBackend):
         for zabbix_template in zabbix_templates:
             if not zabbix_template['templates']:
                 continue
-            nc_template = models.Template.objects.get(settings=self.settings, backend_id=zabbix_template['templateid'])
+            nc_template = models.Template.objects.get(
+                settings=self.settings, backend_id=zabbix_template['templateid']
+            )
             children_ids = [t['templateid'] for t in zabbix_template['templates']]
-            children = models.Template.objects.filter(settings=self.settings, backend_id__in=children_ids)
+            children = models.Template.objects.filter(
+                settings=self.settings, backend_id__in=children_ids
+            )
             nc_template.children.add(*children)
 
-        logger.info('Successfully pulled Zabbix templates for settings %s', self.settings)
+        logger.info(
+            'Successfully pulled Zabbix templates for settings %s', self.settings
+        )
 
     def get_item_last_value(self, host_id, key, **kwargs):
         try:
-            items = self.api.item.get(hostids=host_id, filter={'key_': 'application.status'}, output=['lastvalue'])
+            items = self.api.item.get(
+                hostids=host_id,
+                filter={'key_': 'application.status'},
+                output=['lastvalue'],
+            )
         except pyzabbix.ZabbixAPIException as e:
             raise ZabbixBackendError('Cannot get zabbix items. Exception: %s' % e)
         try:
             return items[0]['lastvalue']
         except IndexError:
-            raise ZabbixBackendError('Cannot find item with key "%s" for host with id %s' % (key, host_id))
+            raise ZabbixBackendError(
+                'Cannot find item with key "%s" for host with id %s' % (key, host_id)
+            )
 
     # XXX: This method should be rewrited - we need to pull only IT services that were connected to hosts.
     def pull_itservices(self):
@@ -320,7 +340,9 @@ class ZabbixBackend(ServiceBackend):
 
         # Delete stale services
         zabbix_services_ids = set(i['serviceid'] for i in zabbix_services)
-        models.ITService.objects.filter(settings=self.settings).exclude(backend_id__in=zabbix_services_ids).delete()
+        models.ITService.objects.filter(settings=self.settings).exclude(
+            backend_id__in=zabbix_services_ids
+        ).delete()
 
         triggers_map = self._get_triggers_map(zabbix_services)
 
@@ -334,12 +356,12 @@ class ZabbixBackend(ServiceBackend):
                 'sort_order': int(zabbix_service['sortorder']),
                 'agreed_sla': Decimal(zabbix_service['goodsla']),
                 'backend_trigger_id': triggerid,
-                'trigger_id': nc_triggerid
+                'trigger_id': nc_triggerid,
             }
             nc_service, created = models.ITService.objects.get_or_create(
                 settings=self.settings,
                 backend_id=zabbix_service['serviceid'],
-                defaults=defaults
+                defaults=defaults,
             )
             if not created:
                 update_fields = []
@@ -350,7 +372,9 @@ class ZabbixBackend(ServiceBackend):
                 if update_fields:
                     nc_service.save(update_fields=update_fields)
 
-        logger.info('Successfully pulled Zabbix IT services for settings %s.', self.settings)
+        logger.info(
+            'Successfully pulled Zabbix IT services for settings %s.', self.settings
+        )
 
     def pull_user_groups(self):
         logger.debug('About to pull Zabbix user groups.')
@@ -361,25 +385,34 @@ class ZabbixBackend(ServiceBackend):
             raise ZabbixBackendError('Cannot pull user groups. Exception: %s' % e)
         # Delete stale
         zabbix_user_group_ids = set(i['usrgrpid'] for i in zabbix_user_groups)
-        models.UserGroup.objects.filter(settings=self.settings).exclude(backend_id__in=zabbix_user_group_ids).delete()
+        models.UserGroup.objects.filter(settings=self.settings).exclude(
+            backend_id__in=zabbix_user_group_ids
+        ).delete()
         # Update or create
         for zabbix_user_group in zabbix_user_groups:
             models.UserGroup.objects.update_or_create(
                 backend_id=zabbix_user_group['usrgrpid'],
                 settings=self.settings,
-                defaults={'name': zabbix_user_group['name']})
-        logger.info('Successfully pulled Zabbix user groups for settings %s.', self.settings)
+                defaults={'name': zabbix_user_group['name']},
+            )
+        logger.info(
+            'Successfully pulled Zabbix user groups for settings %s.', self.settings
+        )
 
     def pull_users(self):
         logger.debug('About to pull Zabbix users.')
 
         try:
-            zabbix_users = self.api.user.get(selectUsrgrps=['name', 'usrgrpid'], output='extend')
+            zabbix_users = self.api.user.get(
+                selectUsrgrps=['name', 'usrgrpid'], output='extend'
+            )
         except (pyzabbix.ZabbixAPIException, RequestException) as e:
             raise ZabbixBackendError('Cannot pull users. Exception: %s' % e)
         # Delete stale
         zabbix_users_ids = set(i['userid'] for i in zabbix_users)
-        models.User.objects.filter(settings=self.settings).exclude(backend_id__in=zabbix_users_ids).delete()
+        models.User.objects.filter(settings=self.settings).exclude(
+            backend_id__in=zabbix_users_ids
+        ).delete()
         # Update or create
         for zabbix_user in zabbix_users:
             groups = []
@@ -387,7 +420,8 @@ class ZabbixBackend(ServiceBackend):
                 group, _ = models.UserGroup.objects.get_or_create(
                     backend_id=zabbix_user_group['usrgrpid'],
                     settings=self.settings,
-                    defaults={'name': zabbix_user_group['name']})
+                    defaults={'name': zabbix_user_group['name']},
+                )
                 groups.append(group)
             user, _ = models.User.objects.update_or_create(
                 backend_id=zabbix_user['userid'],
@@ -398,7 +432,8 @@ class ZabbixBackend(ServiceBackend):
                     'surname': zabbix_user['surname'],
                     'type': int(zabbix_user['type']),
                     'state': models.User.States.OK,
-                })
+                },
+            )
             user.groups.add(*groups)
 
         logger.info('Successfully pulled Zabbix users for settings %s.', self.settings)
@@ -412,9 +447,10 @@ class ZabbixBackend(ServiceBackend):
                 alias=user.alias,
                 type=user.type,
                 passwd=user.password,
-                usrgrps=[{'usrgrpid': group.backend_id for group in user.groups.all()}])
+                usrgrps=[{'usrgrpid': group.backend_id for group in user.groups.all()}],
+            )
         except (pyzabbix.ZabbixAPIException, RequestException) as e:
-            reraise(e)
+            raise ZabbixBackendError(e)
         user.backend_id = zabbix_user['userids'][0]
         user.save(update_fields=['backend_id'])
 
@@ -428,16 +464,17 @@ class ZabbixBackend(ServiceBackend):
                 alias=user.alias,
                 type=user.type,
                 passwd=user.password,
-                usrgrps=[{'usrgrpid': group.backend_id for group in user.groups.all()}])
+                usrgrps=[{'usrgrpid': group.backend_id for group in user.groups.all()}],
+            )
         except (pyzabbix.ZabbixAPIException, RequestException) as e:
-            reraise(e)
+            raise ZabbixBackendError(e)
 
     @log_backend_action()
     def delete_user(self, user):
         try:
             self.api.user.delete(user.backend_id)
         except (pyzabbix.ZabbixAPIException, RequestException) as e:
-            reraise(e)
+            raise ZabbixBackendError(e)
 
     # XXX: This method is hotfix for user group permissions management. We
     #      should create models for permissions. NC-1564.
@@ -447,10 +484,10 @@ class ZabbixBackend(ServiceBackend):
             host_group_id, _ = self._get_or_create_group_id(host_group_name)
             self.api.usergroup.update(
                 usrgrpid=user_group.backend_id,
-                rights=[{'id': host_group_id, 'permission': permission_id}]
+                rights=[{'id': host_group_id, 'permission': permission_id}],
             )
         except (pyzabbix.ZabbixAPIException, RequestException) as e:
-            reraise(e)
+            raise ZabbixBackendError(e)
 
     def _get_triggers_map(self, zabbix_services):
         """
@@ -460,19 +497,25 @@ class ZabbixBackend(ServiceBackend):
 
         zabbix_triggers = []
         try:
-            zabbix_triggers = self.api.trigger.get(triggerids=trigger_ids, output=['triggerid', 'templateid'])
+            zabbix_triggers = self.api.trigger.get(
+                triggerids=trigger_ids, output=['triggerid', 'templateid']
+            )
         except (pyzabbix.ZabbixAPIException, RequestException) as e:
             logger.exception('Unable to fetch Zabbix triggers')
-            reraise(e)
+            raise ZabbixBackendError(e)
 
         template_ids = self._map_keys(zabbix_triggers, 'templateid')
         nc_triggers = models.Trigger.objects.filter(
-            settings=self.settings,
-            backend_id__in=template_ids).only('pk')
-        nc_triggers_map = {trigger.backend_id: trigger.pk for trigger in list(nc_triggers)}
+            settings=self.settings, backend_id__in=template_ids
+        ).only('pk')
+        nc_triggers_map = {
+            trigger.backend_id: trigger.pk for trigger in list(nc_triggers)
+        }
 
-        return {trigger['triggerid']: nc_triggers_map.get(trigger['templateid'])
-                for trigger in zabbix_triggers}
+        return {
+            trigger['triggerid']: nc_triggers_map.get(trigger['templateid'])
+            for trigger in zabbix_triggers
+        }
 
     def _map_keys(self, items, key):
         return list(set(item[key] for item in items))
@@ -481,14 +524,30 @@ class ZabbixBackend(ServiceBackend):
         try:
             exists = self.api.hostgroup.get(filter={'name': group_name})
             if not exists:
-                group_id = self.api.hostgroup.create({'name': group_name})['groupids'][0]
+                group_id = self.api.hostgroup.create({'name': group_name})['groupids'][
+                    0
+                ]
                 return group_id, True
             else:
-                return self.api.hostgroup.get(filter={'name': group_name})[0]['groupid'], False
+                return (
+                    self.api.hostgroup.get(filter={'name': group_name})[0]['groupid'],
+                    False,
+                )
         except (pyzabbix.ZabbixAPIException, IndexError, KeyError) as e:
-            raise ZabbixBackendError('Cannot get or create group with name "%s". Exception: %s' % (group_name, e))
+            raise ZabbixBackendError(
+                'Cannot get or create group with name "%s". Exception: %s'
+                % (group_name, e)
+            )
 
-    def _get_or_create_host_id(self, host_name, visible_name, group_id, templates_ids, interface_parameters, status):
+    def _get_or_create_host_id(
+        self,
+        host_name,
+        visible_name,
+        group_id,
+        templates_ids,
+        interface_parameters,
+        status,
+    ):
         """ Create Zabbix host with given parameters.
 
         Return (<host_id>, <is_created>) tuple as result.
@@ -496,8 +555,14 @@ class ZabbixBackend(ServiceBackend):
         host_id = self._get_host_id(host_name)
         if host_id:
             return host_id, False
-        host_id = self._create_host(host_name, visible_name, group_id, templates_ids,
-                                    interface_parameters, status)
+        host_id = self._create_host(
+            host_name,
+            visible_name,
+            group_id,
+            templates_ids,
+            interface_parameters,
+            status,
+        )
         return host_id, True
 
     def _get_host_id(self, host_name):
@@ -507,10 +572,20 @@ class ZabbixBackend(ServiceBackend):
             if host:
                 return host[0]['hostid']
         except (pyzabbix.ZabbixAPIException, RequestException) as e:
-            logger.error('Cannot get host id by name: %s. Exception: %s', host_name, six.text_type(e))
-            reraise(e)
+            logger.error(
+                'Cannot get host id by name: %s. Exception: %s', host_name, str(e)
+            )
+            raise ZabbixBackendError(e)
 
-    def _create_host(self, host_name, visible_name, group_id, templates_ids, interface_parameters, status):
+    def _create_host(
+        self,
+        host_name,
+        visible_name,
+        group_id,
+        templates_ids,
+        interface_parameters,
+        status,
+    ):
         host_parameters = {
             "host": host_name,
             "name": visible_name,
@@ -524,9 +599,12 @@ class ZabbixBackend(ServiceBackend):
             host = self.api.host.create(host_parameters)
             return host['hostids'][0]
         except (pyzabbix.ZabbixAPIException, RequestException) as e:
-            logger.error('Cannot create host with parameters: %s. Exception: %s',
-                         host_parameters, six.text_type(e))
-            reraise(e)
+            logger.error(
+                'Cannot create host with parameters: %s. Exception: %s',
+                host_parameters,
+                str(e),
+            )
+            raise ZabbixBackendError(e)
 
     def _get_showsla(self, algorithm):
         if algorithm == models.ITService.Algorithm.ANY:
@@ -547,32 +625,53 @@ class ZabbixBackend(ServiceBackend):
             data = self.api.trigger.get(
                 filter={'description': description},
                 hostids=host_id,
-                output=['triggerid'])
+                output=['triggerid'],
+            )
             return data[0]['triggerid']
-        except (pyzabbix.ZabbixAPIException, RequestException, IndexError, KeyError) as e:
-            logger.exception('No trigger for host %s and description %s', host_id, description)
-            reraise(e)
+        except (
+            pyzabbix.ZabbixAPIException,
+            RequestException,
+            IndexError,
+            KeyError,
+        ) as e:
+            logger.exception(
+                'No trigger for host %s and description %s', host_id, description
+            )
+            raise ZabbixBackendError(e)
 
     def get_sla(self, service_id, start_time, end_time):
         try:
             data = self.api.service.getsla(
                 filter={'serviceids': service_id},
-                intervals={'from': start_time, 'to': end_time}
+                intervals={'from': start_time, 'to': end_time},
             )
             return data[service_id]['sla'][0]['sla']
-        except (pyzabbix.ZabbixAPIException, RequestException, IndexError, KeyError) as e:
+        except (
+            pyzabbix.ZabbixAPIException,
+            RequestException,
+            IndexError,
+            KeyError,
+        ) as e:
             message = 'Can not get Zabbix IT service SLA value for service with ID %s. Exception: %s'
             raise ZabbixBackendError(message % (service_id, e))
 
     def get_itservice(self, service_id):
         try:
-            response = self.api.service.get(filter={'serviceid': service_id}, output='extend')
+            response = self.api.service.get(
+                filter={'serviceid': service_id}, output='extend'
+            )
         except (pyzabbix.ZabbixAPIException, RequestException) as e:
-            raise ZabbixBackendError('Can not get status of Zabbix IT service with ID %s. Exception: %s',
-                                     service_id, e)
+            raise ZabbixBackendError(
+                'Can not get status of Zabbix IT service with ID %s. Exception: %s',
+                service_id,
+                e,
+            )
         if len(response) != 1:
-            raise ZabbixBackendError('Zabbix IT service with ID %s is not found. '
-                                     'Response is %s', service_id, response)
+            raise ZabbixBackendError(
+                'Zabbix IT service with ID %s is not found. ' 'Response is %s',
+                service_id,
+                response,
+            )
         return response[0]
 
     def get_sla_range(self, serviceid):
@@ -583,7 +682,10 @@ class ZabbixBackend(ServiceBackend):
         query = 'SELECT min(clock), max(clock) FROM service_alarms WHERE serviceid = %s'
         cursor = self._execute_query(query, [serviceid])
         min_timestamp, max_timestamp = cursor.fetchone()
-        return date.fromtimestamp(int(min_timestamp)), date.fromtimestamp(int(max_timestamp))
+        return (
+            date.fromtimestamp(int(min_timestamp)),
+            date.fromtimestamp(int(max_timestamp)),
+        )
 
     def get_trigger_events(self, trigger_id, start_time, end_time):
         try:
@@ -593,7 +695,8 @@ class ZabbixBackend(ServiceBackend):
                 time_from=start_time,
                 time_till=end_time,
                 sortfield=["clock"],
-                sortorder="ASC")
+                sortorder="ASC",
+            )
         except (pyzabbix.ZabbixAPIException, RequestException) as e:
             message = 'Can not get events for trigger with ID %s. Exception: %s'
             raise ZabbixBackendError(message % (trigger_id, e))
@@ -617,19 +720,29 @@ class ZabbixBackend(ServiceBackend):
             history_table = 'history_uint'
             trend_table = 'trends_uint'
         else:
-            raise ZabbixBackendError('Cannot get statistics for non-numerical item %s' % item.key)
+            raise ZabbixBackendError(
+                'Cannot get statistics for non-numerical item %s' % item.key
+            )
 
         history_retention_days = item.history
         history_delay_seconds = item.delay or self.HISTORY_DELAY_SECONDS
         trend_delay_seconds = self.TREND_DELAY_SECONDS
 
-        trends_start_date = datetime_to_timestamp(timezone.now() - timedelta(days=history_retention_days))
+        trends_start_date = datetime_to_timestamp(
+            timezone.now() - timedelta(days=history_retention_days)
+        )
 
         points = points[::-1]
         history_cursor = self._get_history(
-            item.key, hostid, history_table, points[-1] - history_delay_seconds, points[0])
+            item.key,
+            hostid,
+            history_table,
+            points[-1] - history_delay_seconds,
+            points[0],
+        )
         trends_cursor = self._get_history(
-            item.key, hostid, trend_table, points[-1] - trend_delay_seconds, points[0])
+            item.key, hostid, trend_table, points[-1] - trend_delay_seconds, points[0]
+        )
 
         values = []
         if points[0] > trends_start_date:
@@ -663,7 +776,9 @@ class ZabbixBackend(ServiceBackend):
             values.append(value)
         return values[::-1]
 
-    def get_items_aggregated_values(self, host, items, start_timestamp, end_timestamp, method='MAX'):
+    def get_items_aggregated_values(
+        self, host, items, start_timestamp, end_timestamp, method='MAX'
+    ):
         """
         Get aggregate values for host items.
 
@@ -674,8 +789,12 @@ class ZabbixBackend(ServiceBackend):
                 ...
             }
         """
-        int_items = [item for item in items if item.value_type == models.Item.ValueTypes.INTEGER]
-        float_items = [item for item in items if item.value_type == models.Item.ValueTypes.FLOAT]
+        int_items = [
+            item for item in items if item.value_type == models.Item.ValueTypes.INTEGER
+        ]
+        float_items = [
+            item for item in items if item.value_type == models.Item.ValueTypes.FLOAT
+        ]
 
         # Get aggregated data from DB
         db_data = tuple()
@@ -732,13 +851,15 @@ class ZabbixBackend(ServiceBackend):
             'hostid': hostid,
             'start_timestamp': start_timestamp,
             'end_timestamp': end_timestamp,
-            'value_path': table.startswith('history') and 'value' or 'value_avg'
+            'value_path': table.startswith('history') and 'value' or 'value_avg',
         }
         query = query % parameters
 
         return self._execute_query(query)
 
-    def _get_aggregated_values(self, hostid, item_keys, start_timestamp, end_timestamp, table, method='MAX'):
+    def _get_aggregated_values(
+        self, hostid, item_keys, start_timestamp, end_timestamp, table, method='MAX'
+    ):
         """
         Execute query to zabbix DB to get item aggregated historical value.
         """
@@ -780,7 +901,7 @@ class ZabbixBackend(ServiceBackend):
                 'HOST': host,
                 'PORT': port,
                 'USER': user,
-                'PASSWORD': password
+                'PASSWORD': password,
             }
         return connections[key]
 
@@ -792,19 +913,23 @@ class ZabbixBackend(ServiceBackend):
             return cursor
         except DatabaseError as e:
             logger.exception('Can not execute query the Zabbix DB.')
-            reraise(e)
+            raise ZabbixBackendError(e)
 
     def import_host(self, host_backend_id, service_project_link=None, save=True):
         if save and not service_project_link:
             raise AttributeError('Cannot save imported host if SPL is not defined.')
         try:
             backend_host = self.api.host.get(
-                filter={'hostid': host_backend_id}, selectGroups=True,
-                output=['host', 'name', 'description', 'error', 'status', 'groups'])[0]
+                filter={'hostid': host_backend_id},
+                selectGroups=True,
+                output=['host', 'name', 'description', 'error', 'status', 'groups'],
+            )[0]
         except IndexError:
-            raise ZabbixBackendError('Host with id %s does not exist at backend' % host_backend_id)
+            raise ZabbixBackendError(
+                'Host with id %s does not exist at backend' % host_backend_id
+            )
         except (pyzabbix.ZabbixAPIException, RequestException) as e:
-            reraise(e)
+            raise ZabbixBackendError(e)
 
         host = models.Host()
         host.name = backend_host['host']
@@ -815,7 +940,7 @@ class ZabbixBackend(ServiceBackend):
         host.backend_id = host_backend_id
         if backend_host.get('groups'):
             # Host groups list is serialized as in following example:
-            # [{u'internal': u'0', u'flags': u'0', u'groupid': u'15', u'name': u'waldur'}]
+            # [{'internal': '0', 'flags': '0', 'groupid': '15', 'name': 'waldur'}]
             host.host_group_name = backend_host['groups'][0]['name']
         else:
             host.host_group_name = ''
@@ -829,12 +954,15 @@ class ZabbixBackend(ServiceBackend):
 
     def get_host_templates(self, host):
         try:
-            backend_templates = self.api.template.get(hostids=[host.backend_id], output=['templateid'])
+            backend_templates = self.api.template.get(
+                hostids=[host.backend_id], output=['templateid']
+            )
         except (pyzabbix.ZabbixAPIException, RequestException) as e:
-            reraise(e)
+            raise ZabbixBackendError(e)
         return models.Template.objects.filter(
             backend_id__in=[t['templateid'] for t in backend_templates],
-            settings=host.service_project_link.service.settings)
+            settings=host.service_project_link.service.settings,
+        )
 
     @log_backend_action()
     def pull_host(self, host):
@@ -844,7 +972,14 @@ class ZabbixBackend(ServiceBackend):
 
         host.refresh_from_db()
         if host.modified < import_time:
-            update_fields = ('name', 'visible_name', 'description', 'error', 'status', 'host_group_name')
+            update_fields = (
+                'name',
+                'visible_name',
+                'description',
+                'error',
+                'status',
+                'host_group_name',
+            )
             update_pulled_fields(host, imported_host, update_fields)
 
         host_templates = set(host.templates.all())
@@ -906,11 +1041,13 @@ class ZabbixBackend(ServiceBackend):
             backend_events = None
             if get_events_count:
                 objectids = map(lambda t: t['triggerid'], backend_triggers)
-                backend_events = self.api.event.get(objectids=objectids,
-                                                    acknowledged=0,
-                                                    countOutput=True,
-                                                    groupCount=True,
-                                                    value='1')  # 1 means that trigger has a problem
+                backend_events = self.api.event.get(
+                    objectids=objectids,
+                    acknowledged=0,
+                    countOutput=True,
+                    groupCount=True,
+                    value='1',
+                )  # 1 means that trigger has a problem
                 # https://www.zabbix.com/documentation/3.4/manual/api/reference/event/object
 
             trigger_hosts = None
@@ -921,12 +1058,14 @@ class ZabbixBackend(ServiceBackend):
             triggers = []
 
             for trigger in backend_triggers:
-                triggers.append(self._parse_trigger(trigger, backend_events, trigger_hosts))
+                triggers.append(
+                    self._parse_trigger(trigger, backend_events, trigger_hosts)
+                )
 
             return triggers
         except (pyzabbix.ZabbixAPIException, RequestException) as e:
             logger.exception('Unable to fetch Zabbix triggers')
-            reraise(e)
+            raise ZabbixBackendError(e)
 
     def _parse_trigger(self, backend_trigger, backend_events=None, trigger_hosts=None):
         trigger = {}
@@ -953,7 +1092,9 @@ class ZabbixBackend(ServiceBackend):
 
         trigger['event_count'] = None
         if backend_events is not None:
-            events = filter(lambda e: e['objectid'] == trigger['backend_id'], backend_events)
+            events = filter(
+                lambda e: e['objectid'] == trigger['backend_id'], backend_events
+            )
             trigger['event_count'] = 0 if not events else events[0]['rowscount']
 
         return trigger
@@ -964,4 +1105,4 @@ class ZabbixBackend(ServiceBackend):
             return int(self.api.trigger.get(countOutput=True, **request))
         except (pyzabbix.ZabbixAPIException, RequestException) as e:
             logger.exception('Unable to fetch Zabbix triggers')
-            reraise(e)
+            raise ZabbixBackendError(e)

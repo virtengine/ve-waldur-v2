@@ -1,12 +1,14 @@
-from __future__ import unicode_literals
-
 import datetime
+
 from django.conf import settings
 from rest_framework import serializers
 from rest_framework.reverse import reverse
 
 from waldur_core.core import serializers as core_serializers
+from waldur_core.core import signals as core_signals
 from waldur_core.core import utils as core_utils
+from waldur_core.structure import permissions as structure_permissions
+from waldur_core.structure import serializers as structure_serializers
 from waldur_mastermind.common.utils import quantize_price
 
 from . import models, utils
@@ -20,11 +22,25 @@ class InvoiceItemSerializer(serializers.HyperlinkedModelSerializer):
     scope_type = serializers.SerializerMethodField()
     scope_uuid = serializers.SerializerMethodField()
 
-    class Meta(object):
+    class Meta:
         model = models.InvoiceItem
-        fields = ('name', 'price', 'tax', 'total', 'unit_price', 'unit', 'factor',
-                  'start', 'end', 'product_code', 'article_code', 'project_name', 'project_uuid',
-                  'scope_type', 'scope_uuid',)
+        fields = (
+            'name',
+            'price',
+            'tax',
+            'total',
+            'unit_price',
+            'unit',
+            'factor',
+            'start',
+            'end',
+            'product_code',
+            'article_code',
+            'project_name',
+            'project_uuid',
+            'scope_type',
+            'scope_uuid',
+        )
 
     def get_scope_type(self, item):
         # It should be implemented by inherited class
@@ -40,7 +56,11 @@ class GenericItemSerializer(InvoiceItemSerializer):
 
     class Meta(InvoiceItemSerializer.Meta):
         model = models.InvoiceItem
-        fields = InvoiceItemSerializer.Meta.fields + ('quantity', 'details', 'usage_days',)
+        fields = InvoiceItemSerializer.Meta.fields + (
+            'quantity',
+            'details',
+            'usage_days',
+        )
 
     def get_scope_type(self, item):
         try:
@@ -54,8 +74,9 @@ class GenericItemSerializer(InvoiceItemSerializer):
         return item.details.get('scope_uuid')
 
 
-class InvoiceSerializer(core_serializers.RestrictedSerializerMixin,
-                        serializers.HyperlinkedModelSerializer):
+class InvoiceSerializer(
+    core_serializers.RestrictedSerializerMixin, serializers.HyperlinkedModelSerializer
+):
     price = serializers.DecimalField(max_digits=15, decimal_places=7)
     tax = serializers.DecimalField(max_digits=15, decimal_places=7)
     total = serializers.DecimalField(max_digits=15, decimal_places=7)
@@ -65,12 +86,26 @@ class InvoiceSerializer(core_serializers.RestrictedSerializerMixin,
     due_date = serializers.DateField()
     file = serializers.SerializerMethodField()
 
-    class Meta(object):
+    class Meta:
         model = models.Invoice
         fields = (
-            'url', 'uuid', 'number', 'customer', 'price', 'tax', 'total',
-            'state', 'year', 'month', 'issuer_details', 'invoice_date', 'due_date',
-            'customer', 'customer_details', 'items', 'file',
+            'url',
+            'uuid',
+            'number',
+            'customer',
+            'price',
+            'tax',
+            'total',
+            'state',
+            'year',
+            'month',
+            'issuer_details',
+            'invoice_date',
+            'due_date',
+            'customer',
+            'customer_details',
+            'items',
+            'file',
         )
         extra_kwargs = {
             'url': {'lookup_field': 'uuid'},
@@ -97,9 +132,11 @@ class InvoiceSerializer(core_serializers.RestrictedSerializerMixin,
         if not obj.has_file():
             return None
 
-        return reverse('invoice-pdf',
-                       kwargs={'uuid': obj.uuid},
-                       request=self.context['request'])
+        return reverse(
+            'invoice-pdf',
+            kwargs={'uuid': obj.uuid.hex},
+            request=self.context['request'],
+        )
 
     def get_items(self, invoice):
         items = utils.filter_invoice_items(invoice.items.all())
@@ -117,60 +154,67 @@ class InvoiceItemReportSerializer(serializers.ModelSerializer):
     customer_uuid = serializers.ReadOnlyField(source='invoice.customer.uuid')
     customer_name = serializers.ReadOnlyField(source='invoice.customer.name')
 
-    class Meta(object):
+    class Meta:
         model = models.InvoiceItem
         fields = (
-            'customer_uuid', 'customer_name',
-            'project_uuid', 'project_name',
-            'invoice_uuid', 'invoice_number',
-            'invoice_year', 'invoice_month',
-            'invoice_date', 'due_date',
-            'invoice_price', 'invoice_tax', 'invoice_total',
-            'name', 'article_code', 'product_code',
-            'price', 'tax', 'total', 'unit_price', 'unit',
-            'start', 'end',
+            'customer_uuid',
+            'customer_name',
+            'project_uuid',
+            'project_name',
+            'invoice_uuid',
+            'invoice_number',
+            'invoice_year',
+            'invoice_month',
+            'invoice_date',
+            'due_date',
+            'invoice_price',
+            'invoice_tax',
+            'invoice_total',
+            'name',
+            'article_code',
+            'product_code',
+            'price',
+            'tax',
+            'total',
+            'unit_price',
+            'unit',
+            'start',
+            'end',
         )
         decimal_fields = (
-            'price', 'tax', 'total', 'unit_price',
-            'invoice_price', 'invoice_tax', 'invoice_total'
+            'price',
+            'tax',
+            'total',
+            'unit_price',
+            'invoice_price',
+            'invoice_tax',
+            'invoice_total',
         )
         decimal_fields_extra_kwargs = {
-            'invoice_price': {
-                'source': 'invoice.price',
-            },
-            'invoice_tax': {
-                'source': 'invoice.tax',
-            },
-            'invoice_total': {
-                'source': 'invoice.total',
-            },
+            'invoice_price': {'source': 'invoice.price',},
+            'invoice_tax': {'source': 'invoice.tax',},
+            'invoice_total': {'source': 'invoice.total',},
         }
 
     def build_field(self, field_name, info, model_class, nested_depth):
         if field_name in self.Meta.decimal_fields:
             field_class = serializers.DecimalField
-            field_kwargs = dict(
-                max_digits=20,
-                decimal_places=2,
-                coerce_to_string=True,
-            )
+            field_kwargs = dict(max_digits=20, decimal_places=2, coerce_to_string=True,)
             default_kwargs = self.Meta.decimal_fields_extra_kwargs.get(field_name)
             if default_kwargs:
                 field_kwargs.update(default_kwargs)
             return field_class, field_kwargs
 
-        return super(InvoiceItemReportSerializer, self).build_field(field_name, info, model_class, nested_depth)
+        return super(InvoiceItemReportSerializer, self).build_field(
+            field_name, info, model_class, nested_depth
+        )
 
     def get_extra_kwargs(self):
         extra_kwargs = super(InvoiceItemReportSerializer, self).get_extra_kwargs()
-        extra_kwargs.update(settings.WALDUR_INVOICES['INVOICE_REPORTING']['SERIALIZER_EXTRA_KWARGS'])
+        extra_kwargs.update(
+            settings.WALDUR_INVOICES['INVOICE_REPORTING']['SERIALIZER_EXTRA_KWARGS']
+        )
         return extra_kwargs
-
-
-class GenericItemReportSerializer(InvoiceItemReportSerializer):
-    class Meta(InvoiceItemReportSerializer.Meta):
-        model = models.InvoiceItem
-        fields = InvoiceItemReportSerializer.Meta.fields + ('quantity',)
 
 
 # SAF is accounting soft from Estonia: www.sysdec.ee/safsaf.htm
@@ -188,14 +232,29 @@ class SAFReportSerializer(serializers.Serializer):
     RMAKSULIPP = serializers.SerializerMethodField(method_name='get_vat')
     ARTPROJEKT = serializers.SerializerMethodField(method_name='get_project')
     ARTNIMI = serializers.ReadOnlyField(source='name')
-    VALI = serializers.SerializerMethodField(method_name='get_empty_field')
+    VALI = serializers.SerializerMethodField(method_name='get_vali_field')
     U_KONEDEARV = serializers.SerializerMethodField(method_name='get_empty_field')
     H_PERIOOD = serializers.SerializerMethodField(method_name='get_covered_period')
 
-    class Meta(object):
-        fields = ('DOKNR', 'KUUPAEV', 'VORMKUUP', 'MAKSEAEG', 'YKSUS', 'PARTNER',
-                  'ARTIKKEL', 'KOGUS', 'SUMMA', 'RMAKSUSUM', 'RMAKSULIPP',
-                  'ARTPROJEKT', 'ARTNIMI', 'VALI', 'U_KONEDEARV', 'H_PERIOOD')
+    class Meta:
+        fields = (
+            'DOKNR',
+            'KUUPAEV',
+            'VORMKUUP',
+            'MAKSEAEG',
+            'YKSUS',
+            'PARTNER',
+            'ARTIKKEL',
+            'KOGUS',
+            'SUMMA',
+            'RMAKSUSUM',
+            'RMAKSULIPP',
+            'ARTPROJEKT',
+            'ARTNIMI',
+            'VALI',
+            'U_KONEDEARV',
+            'H_PERIOOD',
+        )
 
     def format_date(self, date):
         if date:
@@ -235,6 +294,9 @@ class SAFReportSerializer(serializers.Serializer):
     def get_vat(self, invoice_item):
         return settings.WALDUR_INVOICES['INVOICE_REPORTING']['SAF_PARAMS']['RMAKSULIPP']
 
+    def get_vali_field(self, invoice_item):
+        return 'Record no %s' % invoice_item.invoice.number
+
     def get_empty_field(self, invoice_item):
         return ''
 
@@ -242,3 +304,53 @@ class SAFReportSerializer(serializers.Serializer):
         first_day = self.get_first_day(invoice_item)
         last_day = core_utils.month_end(first_day)
         return '%s-%s' % (self.format_date(first_day), self.format_date(last_day))
+
+
+class PaymentProfileSerializer(serializers.HyperlinkedModelSerializer):
+    organization_uuid = serializers.ReadOnlyField(source='organization.uuid')
+    payment_type_display = serializers.ReadOnlyField(source='get_payment_type_display')
+
+    class Meta:
+        model = models.PaymentProfile
+        fields = (
+            'uuid',
+            'url',
+            'name',
+            'organization_uuid',
+            'organization',
+            'attributes',
+            'payment_type',
+            'payment_type_display',
+            'is_active',
+        )
+        extra_kwargs = {
+            'url': {'view_name': 'payment-profile-detail', 'lookup_field': 'uuid',},
+            'organization': {'view_name': 'customer-detail', 'lookup_field': 'uuid',},
+        }
+
+
+def get_payment_profiles(serializer, customer):
+    user = serializer.context['request'].user
+    if user.is_staff or user.is_support:
+        return PaymentProfileSerializer(
+            customer.paymentprofile_set.all(),
+            many=True,
+            context={'request': serializer.context['request']},
+        ).data
+
+    if structure_permissions._has_owner_access(user, customer):
+        return PaymentProfileSerializer(
+            customer.paymentprofile_set.filter(is_active=True),
+            many=True,
+            context={'request': serializer.context['request']},
+        ).data
+
+
+def add_payment_profile(sender, fields, **kwargs):
+    fields['payment_profiles'] = serializers.SerializerMethodField()
+    setattr(sender, 'get_payment_profiles', get_payment_profiles)
+
+
+core_signals.pre_serializer_fields.connect(
+    sender=structure_serializers.CustomerSerializer, receiver=add_payment_profile,
+)

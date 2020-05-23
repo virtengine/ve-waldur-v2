@@ -1,17 +1,15 @@
 """ Custom loggers that allows to store logs in DB """
 
-from __future__ import unicode_literals
-
-from collections import defaultdict
 import datetime
 import decimal
 import importlib
 import logging
 import types
 import uuid
+from collections import defaultdict
 
 from django.apps import apps
-import six
+from django.core.exceptions import ObjectDoesNotExist
 
 from waldur_core.logging import models
 from waldur_core.logging.log import EventLoggerAdapter
@@ -28,7 +26,7 @@ class EventLoggerError(AttributeError):
     pass
 
 
-class BaseLogger(object):
+class BaseLogger:
     def __init__(self, logger_name=__name__):
         self._meta = getattr(self, 'Meta', None)
         self.supported_types = self.get_supported_types()
@@ -43,7 +41,7 @@ class BaseLogger(object):
         return getattr(self._meta, 'nullable_fields', [])
 
     def get_field_model(self, model):
-        if not isinstance(model, six.string_types):
+        if not isinstance(model, str):
             return model
 
         try:
@@ -58,18 +56,20 @@ class BaseLogger(object):
 
     def compile_message(self, message_template, context):
         try:
-            msg = six.text_type(message_template).format(**context)
+            msg = str(message_template).format(**context)
         except KeyError as e:
             raise LoggerError(
-                "Cannot find %s context field. Choices are: %s" % (
-                    six.text_type(e), ', '.join(context.keys())))
+                "Cannot find %s context field. Choices are: %s"
+                % (str(e), ', '.join(context.keys()))
+            )
         return msg
 
     def validate_logging_type(self, logging_type):
         if self.supported_types and logging_type not in self.supported_types:
             raise EventLoggerError(
-                "Unsupported logging type '%s'. Choices are: %s" % (
-                    logging_type, ', '.join(self.supported_types)))
+                "Unsupported logging type '%s'. Choices are: %s"
+                % (logging_type, ', '.join(self.supported_types))
+            )
 
     def compile_context(self, **kwargs):
         # Get a list of fields here in order to be sure all models already loaded.
@@ -77,11 +77,19 @@ class BaseLogger(object):
             self.fields = {
                 k: self.get_field_model(v)
                 for k, v in self.__class__.__dict__.items()
-                if (not k.startswith('_') and
-                    not isinstance(v, types.FunctionType) and
-                    not isinstance(v, staticmethod) and k != 'Meta')}
+                if (
+                    not k.startswith('_')
+                    and not isinstance(v, types.FunctionType)
+                    and not isinstance(v, staticmethod)
+                    and k != 'Meta'
+                )
+            }
 
-        missed = set(self.fields.keys()) - set(self.get_nullable_fields()) - set(kwargs.keys())
+        missed = (
+            set(self.fields.keys())
+            - set(self.get_nullable_fields())
+            - set(kwargs.keys())
+        )
         if missed:
             raise LoggerError("Missed fields in event context: %s" % ', '.join(missed))
 
@@ -92,35 +100,46 @@ class BaseLogger(object):
             context.update(event_context)
             username = event_context.get('user_username')
             if 'user' in self.fields and username:
-                logger.warning("User is passed directly to event context. "
-                               "Currently authenticated user %s is ignored.", username)
+                logger.warning(
+                    "User is passed directly to event context. "
+                    "Currently authenticated user %s is ignored.",
+                    username,
+                )
 
-        for entity_name, entity in six.iteritems(kwargs):
+        for entity_name, entity in kwargs.items():
             if entity_name in self.fields:
                 entity_class = self.fields[entity_name]
                 if entity is None and entity_name in self.get_nullable_fields():
                     continue
                 if not isinstance(entity, entity_class):
                     raise LoggerError(
-                        "Field '%s' must be an instance of %s but %s received" % (
-                            entity_name, entity_class.__name__, entity.__class__.__name__))
+                        "Field '%s' must be an instance of %s but %s received"
+                        % (
+                            entity_name,
+                            entity_class.__name__,
+                            entity.__class__.__name__,
+                        )
+                    )
             else:
                 logger.error(
                     "Field '%s' cannot be used in logging context for %s",
-                    entity_name, self.__class__.__name__)
+                    entity_name,
+                    self.__class__.__name__,
+                )
                 continue
 
             if isinstance(entity, LoggableMixin):
                 context.update(entity._get_log_context(entity_name))
-            elif isinstance(entity, (int, float, six.string_types, dict, tuple, list, bool)):
+            elif isinstance(entity, (int, float, str, dict, tuple, list, bool)):
                 context[entity_name] = entity
             elif entity is None:
                 pass
             else:
-                context[entity_name] = six.text_type(entity)
+                context[entity_name] = str(entity)
                 logger.warning(
                     "Cannot properly serialize '%s' context field. "
-                    "Must be inherited from LoggableMixin." % entity_name)
+                    "Must be inherited from LoggableMixin." % entity_name
+                )
 
         return context
 
@@ -145,7 +164,7 @@ class EventLogger(BaseLogger):
                 tenant = Tenant
                 project = 'structure.Project'
                 threshold = float
-                quota_type = six.string_types
+                quota_type = str
 
                 class Meta:
                     event_types = 'quota_threshold_reached',
@@ -194,7 +213,9 @@ class EventLogger(BaseLogger):
     def debug(self, *args, **kwargs):
         self.process('debug', *args, **kwargs)
 
-    def process(self, level, message_template, event_type='undefined', event_context=None):
+    def process(
+        self, level, message_template, event_type='undefined', event_context=None
+    ):
         self.validate_logging_type(event_type)
 
         if not event_context:
@@ -206,9 +227,7 @@ class EventLogger(BaseLogger):
         log(msg, extra={'event_type': event_type, 'event_context': context})
 
         event = models.Event.objects.create(
-            event_type=event_type,
-            message=msg,
-            context=context,
+            event_type=event_type, message=msg, context=context,
         )
         if event_context:
             for scope in self.get_scopes(event_context) or []:
@@ -216,7 +235,7 @@ class EventLogger(BaseLogger):
                     models.Feed.objects.create(scope=scope, event=event)
 
 
-class LoggableMixin(object):
+class LoggableMixin:
     """ Mixin to serialize model in logs.
         Extends django model or custom class with fields extraction method.
     """
@@ -228,10 +247,26 @@ class LoggableMixin(object):
 
         context = {}
         for field in self.get_log_fields():
-            if not hasattr(self, field):
-                continue
+            field_class = None
+            try:
+                if not hasattr(self, field):
+                    continue
+            except ObjectDoesNotExist:
+                # the related object has been deleted
+                # a hack to check if the id reference exists to field_id, which means that object is soft-deleted
+                id_field = "%s_id" % field
+                if hasattr(self.__class__, id_field):
+                    field_class = getattr(self.__class__, field).field.related_model
+                else:
+                    continue
 
-            value = getattr(self, field)
+            if field_class is not None:
+                # XXX: Consider a better approach. Or figure out why
+                # XXX: isinstance(field_class, SoftDeletableModel) doesn't work.
+                # assume that field_class is instance of SoftDeletableModel
+                value = field_class.all_objects.get(id=getattr(self, id_field))
+            else:
+                value = getattr(self, field)
 
             if entity_name:
                 name = "{}_{}".format(entity_name, field)
@@ -250,7 +285,7 @@ class LoggableMixin(object):
             elif callable(value):
                 context[name] = value()
             else:
-                context[name] = six.text_type(value)
+                context[name] = str(value)
 
         return context
 
@@ -259,8 +294,7 @@ class LoggableMixin(object):
         return cls.objects.none()
 
 
-class BaseLoggerRegistry(object):
-
+class BaseLoggerRegistry:
     def get_loggers(self):
         raise NotImplementedError('Method "get_loggers" is not implemented.')
 
@@ -294,7 +328,6 @@ class BaseLoggerRegistry(object):
 
 
 class EventLoggerRegistry(BaseLoggerRegistry):
-
     def get_loggers(self):
         return [l for l in self.__dict__.values() if isinstance(l, EventLogger)]
 
@@ -319,6 +352,7 @@ class CustomEventLogger(EventLogger):
     """
     Logger for custom events e.g. created by staff user
     """
+
     scope = LoggableMixin
 
     class Meta:

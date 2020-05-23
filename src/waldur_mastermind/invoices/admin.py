@@ -1,8 +1,8 @@
-from __future__ import unicode_literals
-
 from django.conf.urls import url
 from django.contrib import admin
-from django.forms import ModelForm, ModelChoiceField
+from django.forms import ModelChoiceField
+from django.forms.models import ModelForm
+from django.forms.widgets import CheckboxInput
 from django.http import HttpResponse
 from django.shortcuts import redirect
 from django.urls import reverse
@@ -10,20 +10,23 @@ from django.utils.html import format_html
 from django.utils.translation import ugettext_lazy as _
 
 from waldur_core.core import admin as core_admin
-from waldur_core.core.admin_filters import RelatedOnlyDropdownFilter
-from waldur_mastermind.packages import models as package_models
+from waldur_core.core.admin import JsonWidget
 
 from . import executors, models, tasks
 
 
-class GenericItemInline(core_admin.UpdateOnlyModelAdmin, admin.TabularInline):
+class GenericItemInline(core_admin.UpdateOnlyModelAdmin, admin.StackedInline):
     model = models.InvoiceItem
     readonly_fields = (
-        'name', 'price', 'unit_price', 'unit', 'start', 'end',
-        'project_name', 'project_uuid', 'product_code', 'article_code',
-        'format_details', 'quantity'
+        'price',
+        'unit_price',
+        'unit',
+        'project_name',
+        'project_uuid',
+        'get_factor',
+        'quantity',
     )
-    exclude = ('details', 'project', 'content_type', 'object_id')
+    exclude = ('project', 'content_type', 'object_id')
 
     def format_details(self, obj):
         return core_admin.format_json_field(obj.details)
@@ -32,17 +35,55 @@ class GenericItemInline(core_admin.UpdateOnlyModelAdmin, admin.TabularInline):
     format_details.short_description = _('Details')
 
 
-class InvoiceAdmin(core_admin.ExtraActionsMixin,
-                   core_admin.UpdateOnlyModelAdmin,
-                   admin.ModelAdmin):
+class PaymentTypeFilter(admin.SimpleListFilter):
+    title = _('Payment type')
+    parameter_name = 'payment_type'
+
+    def lookups(self, request, model_admin):
+        return models.PaymentType.CHOICES
+
+    def queryset(self, request, queryset):
+        payment_type = self.value()
+
+        if payment_type:
+            customer_ids = models.PaymentProfile.objects.filter(
+                payment_type=payment_type, is_active=True
+            ).values_list('id', flat=True)
+            return queryset.filter(customer_id__in=customer_ids)
+        else:
+            return queryset
+
+
+class InvoiceAdmin(
+    core_admin.ExtraActionsMixin, core_admin.UpdateOnlyModelAdmin, admin.ModelAdmin
+):
     inlines = [GenericItemInline]
-    fields = ['tax_percent', 'invoice_date', 'customer', 'state', 'total', 'year', 'month', 'pdf_file']
+    fields = [
+        'tax_percent',
+        'invoice_date',
+        'customer',
+        'state',
+        'total',
+        'year',
+        'month',
+        'pdf_file',
+    ]
     readonly_fields = ('customer', 'total', 'year', 'month', 'pdf_file')
-    list_display = ('customer', 'total', 'year', 'month', 'state')
-    list_filter = ('state', 'customer')
+    list_display = ('customer', 'total', 'year', 'month', 'state', 'payment_type')
+    list_filter = ('state', 'customer', PaymentTypeFilter)
     search_fields = ('customer__name', 'uuid')
     date_hierarchy = 'invoice_date'
     actions = ('create_pdf',)
+
+    def payment_type(self, obj):
+        if obj.customer.paymentprofile_set.filter(is_active=True).exists():
+            return obj.customer.paymentprofile_set.get(
+                is_active=True
+            ).get_payment_type_display()
+
+        return ''
+
+    payment_type.short_description = _('Payment type')
 
     class CreatePDFAction(core_admin.ExecutorAdminAction):
         executor = executors.InvoicePDFCreateExecutor
@@ -52,7 +93,10 @@ class InvoiceAdmin(core_admin.ExtraActionsMixin,
 
     def get_urls(self):
         my_urls = [
-            url(r'^(.+)/change/pdf_file/$', self.admin_site.admin_view(self.pdf_file_view)),
+            url(
+                r'^(.+)/change/pdf_file/$',
+                self.admin_site.admin_view(self.pdf_file_view),
+            ),
         ]
         return my_urls + super(InvoiceAdmin, self).get_urls()
 
@@ -60,7 +104,9 @@ class InvoiceAdmin(core_admin.ExtraActionsMixin,
         invoice = models.Invoice.objects.get(id=pk)
         file_response = HttpResponse(invoice.file, content_type='application/pdf')
         filename = invoice.get_filename()
-        file_response['Content-Disposition'] = 'attachment; filename="{filename}"'.format(filename=filename)
+        file_response[
+            'Content-Disposition'
+        ] = 'attachment; filename="{filename}"'.format(filename=filename)
         return file_response
 
     def pdf_file(self, obj):
@@ -108,55 +154,72 @@ class PackageChoiceField(ModelChoiceField):
         return '%s > %s > %s' % (
             obj.tenant.service_project_link.project.customer,
             obj.tenant.service_project_link.project.name,
-            obj.tenant.name
+            obj.tenant.name,
         )
-
-
-class ServiceDowntimeForm(ModelForm):
-    package = PackageChoiceField(
-        queryset=package_models.OpenStackPackage.objects.order_by(
-            'tenant__service_project_link__project__customer__name',
-            'tenant__service_project_link__project__name',
-            'tenant__name',
-        )
-    )
 
 
 class ServiceDowntimeAdmin(admin.ModelAdmin):
-    list_display = ('get_customer', 'get_project', 'get_name', 'start', 'end')
-    list_display_links = ('get_name',)
-    list_filter = (
-        ('package__tenant__service_project_link__project__customer', RelatedOnlyDropdownFilter),
-        ('package__tenant__service_project_link__project', RelatedOnlyDropdownFilter),
+    list_display = (
+        'get_customer',
+        'get_project',
+        'offering',
+        'resource',
+        'get_package',
+        'start',
+        'end',
     )
-    search_fields = ('package__tenant__name',)
+    list_display_links = ('get_customer',)
+    search_fields = ('offering__name', 'resource__name')
     date_hierarchy = 'start'
-    form = ServiceDowntimeForm
 
     def get_readonly_fields(self, request, obj=None):
         # Downtime record is protected from modifications
         if obj is not None:
-            return self.readonly_fields + ('start', 'end', 'package')
+            return self.readonly_fields + ('start', 'end', 'offering', 'resource')
         return self.readonly_fields
 
     def get_customer(self, downtime):
-        return downtime.package.tenant.service_project_link.project.customer
+        if downtime.offering:
+            return downtime.offering.customer
+
+        if downtime.resource:
+            return downtime.resource.customer
+
+        if downtime.package:
+            return downtime.package.tenant.service_project_link.project.customer
 
     get_customer.short_description = _('Organization')
-    get_customer.admin_order_field = 'package__tenant__service_project_link__project__customer'
 
     def get_project(self, downtime):
-        return downtime.package.tenant.service_project_link.project
+        if downtime.resource:
+            return downtime.resource.project
+
+        if downtime.package:
+            return downtime.package.tenant.service_project_link.project
 
     get_project.short_description = _('Project')
-    get_project.admin_order_field = 'package__tenant__service_project_link__project'
 
-    def get_name(self, downtime):
-        return downtime.package.tenant.name
+    def get_package(self, downtime):
+        if downtime.package:
+            return downtime.package.tenant.name
 
-    get_name.short_description = _('Resource')
-    get_name.admin_order_field = 'package__tenant__name'
+    get_package.short_description = _('Package')
+
+
+class PaymentProfileAdminForm(ModelForm):
+    class Meta:
+        widgets = {
+            'attributes': JsonWidget(),
+            'is_active': CheckboxInput(),
+        }
+
+
+class PaymentProfileAdmin(admin.ModelAdmin):
+    form = PaymentProfileAdminForm
+    list_display = ('organization', 'payment_type', 'is_active')
+    search_fields = ('organization__name',)
 
 
 admin.site.register(models.Invoice, InvoiceAdmin)
 admin.site.register(models.ServiceDowntime, ServiceDowntimeAdmin)
+admin.site.register(models.PaymentProfile, PaymentProfileAdmin)

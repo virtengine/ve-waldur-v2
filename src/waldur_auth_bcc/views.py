@@ -1,5 +1,3 @@
-from __future__ import unicode_literals
-
 from django.conf import settings
 from rest_framework import views
 from rest_framework.exceptions import ValidationError
@@ -9,7 +7,6 @@ from . import client, serializers
 
 
 class UserDetailsViewSet(views.APIView):
-
     def get(self, request, *args, **kwargs):
         if not settings.WALDUR_AUTH_BCC['ENABLED']:
             raise ValidationError('This feature is disabled.')

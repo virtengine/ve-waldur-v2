@@ -4,7 +4,6 @@ from . import models
 
 
 class TenantCreateErrorTask(core_tasks.ErrorStateTransitionTask):
-
     def execute(self, tenant):
         super(TenantCreateErrorTask, self).execute(tenant)
         # Delete network and subnet if they were not created on backend,
@@ -22,13 +21,16 @@ class TenantCreateErrorTask(core_tasks.ErrorStateTransitionTask):
 
 
 class TenantCreateSuccessTask(core_tasks.StateTransitionTask):
-
     def execute(self, tenant):
         network = tenant.networks.first()
         subnet = network.subnets.first()
         self.state_transition(network, 'set_ok')
         self.state_transition(subnet, 'set_ok')
         self.state_transition(tenant, 'set_ok')
+
+        from . import executors
+
+        executors.TenantPullExecutor.execute(tenant)
         return super(TenantCreateSuccessTask, self).execute(tenant)
 
 
@@ -40,5 +42,6 @@ class TenantPullQuotas(core_tasks.BackgroundTask):
 
     def run(self):
         from . import executors
+
         for tenant in models.Tenant.objects.filter(state=models.Tenant.States.OK):
             executors.TenantPullQuotasExecutor.execute(tenant)

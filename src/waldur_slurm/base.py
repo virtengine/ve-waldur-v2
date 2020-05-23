@@ -1,14 +1,10 @@
-from __future__ import absolute_import
-
 import abc
 import logging
-import subprocess  # nosec
+import subprocess  # noqa: S404
 
 from django.utils.functional import cached_property
-import six
 
 from .structures import Quotas
-
 
 logger = logging.getLogger(__name__)
 
@@ -17,9 +13,7 @@ class BatchError(Exception):
     pass
 
 
-@six.add_metaclass(abc.ABCMeta)
-class BaseBatchClient(object):
-
+class BaseBatchClient(metaclass=abc.ABCMeta):
     def __init__(self, hostname, key_path, username='root', port=22, use_sudo=False):
         self.hostname = hostname
         self.key_path = key_path
@@ -124,11 +118,24 @@ class BaseBatchClient(object):
             account_command = []
 
         account_command.extend(command)
-        ssh_command = ['ssh', '-o', 'UserKnownHostsFile=/dev/null', '-o', 'StrictHostKeyChecking=no',
-                       server, '-p', port, '-i', self.key_path, ' '.join(account_command)]
+        ssh_command = [
+            'ssh',
+            '-o',
+            'UserKnownHostsFile=/dev/null',
+            '-o',
+            'StrictHostKeyChecking=no',
+            server,
+            '-p',
+            port,
+            '-i',
+            self.key_path,
+            ' '.join(account_command),
+        ]
         try:
             logger.debug('Executing SSH command: %s', ' '.join(ssh_command))
-            return subprocess.check_output(ssh_command, stderr=subprocess.STDOUT)  # nosec
+            return subprocess.check_output(  # noqa: S603
+                ssh_command, stderr=subprocess.STDOUT, encoding='utf-8'
+            )
         except subprocess.CalledProcessError as e:
             logger.exception('Failed to execute command "%s".', ssh_command)
             stdout = e.output or ''
@@ -136,11 +143,10 @@ class BaseBatchClient(object):
             if len(lines) > 0 and lines[0].startswith('Warning: Permanently added'):
                 lines = lines[1:]
             stdout = '\n'.join(lines)
-            six.reraise(BatchError, stdout)
+            raise BatchError(stdout)
 
 
-@six.add_metaclass(abc.ABCMeta)
-class BaseReportLine(object):
+class BaseReportLine(metaclass=abc.ABCMeta):
     @abc.abstractproperty
     def account(self):
         pass
@@ -179,5 +185,5 @@ class BaseReportLine(object):
             self.cpu * self.duration * self.node,
             self.gpu * self.duration * self.node,
             self.ram * self.duration * self.node,
-            self.charge
+            self.charge,
         )

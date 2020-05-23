@@ -8,13 +8,13 @@ class SupportInvoicesConfig(AppConfig):
 
     def ready(self):
         from waldur_mastermind.invoices import registrators
+        from waldur_mastermind.invoices import models as invoices_models
         from waldur_mastermind.support import models as support_models
         from waldur_mastermind.marketplace import models as marketplace_models
         from . import handlers, registrators as support_registrators
 
         registrators.RegistrationManager.add_registrator(
-            support_models.Offering,
-            support_registrators.OfferingRegistrator
+            support_models.Offering, support_registrators.OfferingRegistrator
         )
 
         signals.post_save.connect(
@@ -57,4 +57,10 @@ class SupportInvoicesConfig(AppConfig):
             handlers.update_invoice_on_offering_deletion,
             sender=support_models.Offering,
             dispatch_uid='waldur_mastermind.invoices.update_invoice_on_offering_deletion',
+        )
+
+        signals.post_save.connect(
+            handlers.create_recurring_usage_if_invoice_has_been_created,
+            sender=invoices_models.Invoice,
+            dispatch_uid='waldur_mastermind.invoices.create_recurring_usage_if_invoice_has_been_created',
         )

@@ -1,5 +1,3 @@
-from __future__ import unicode_literals
-
 from datetime import timedelta
 
 from waldur_core.core import WaldurExtension
@@ -13,16 +11,24 @@ class MarketplaceExtension(WaldurExtension):
             'OWNER_CAN_APPROVE_ORDER': True,
             'MANAGER_CAN_APPROVE_ORDER': False,
             'ADMIN_CAN_APPROVE_ORDER': False,
+            'ANONYMOUS_USER_CAN_VIEW_OFFERINGS': False,
             'NOTIFY_STAFF_ABOUT_APPROVALS': False,
             'NOTIFY_ABOUT_RESOURCE_CHANGE': True,
             'DISABLE_SENDING_NOTIFICATIONS_ABOUT_RESOURCE_UPDATE': True,
             'OWNER_CAN_REGISTER_SERVICE_PROVIDER': False,
             'ORDER_LINK_TEMPLATE': 'https://www.example.com/#/projects/'
-                                   '{project_uuid}/marketplace-order-list/',
+            '{project_uuid}/marketplace-order-list/',
             'ORDER_ITEM_LINK_TEMPLATE': 'https://www.example.com/#/projects/{project_uuid}/'
-                                        'marketplace-order-item-details/{order_item_uuid}/',
+            'marketplace-order-item-details/{order_item_uuid}/',
             'PUBLIC_RESOURCES_LINK_TEMPLATE': 'https://www.example.com/#/organizations/{organization_uuid}/'
-                                        'marketplace-public-resources/'
+            'marketplace-public-resources/',
+            'PLAN_TEMPLATE': 'Plan: {{ plan.name }}'
+            '{% for component in components %}\n'
+            '{{component.name}}; '
+            'amount: {{component.amount}}; '
+            'price: {{component.price|floatformat }};'
+            '{% endfor %}',
+            'OFFERING_LINK_TEMPLATE': 'https://www.example.com/#/marketplace-offering-public/{offering_uuid}/',
         }
 
     @staticmethod
@@ -45,16 +51,19 @@ class MarketplaceExtension(WaldurExtension):
     @staticmethod
     def django_urls():
         from .urls import urlpatterns
+
         return urlpatterns
 
     @staticmethod
     def rest_urls():
         from .urls import register_in
+
         return register_in
 
     @staticmethod
     def celery_tasks():
         from celery.schedules import crontab
+
         return {
             'waldur-marketplace-calculate-usage': {
                 'task': 'waldur_mastermind.marketplace.calculate_usage_for_current_month',
@@ -65,5 +74,5 @@ class MarketplaceExtension(WaldurExtension):
                 'task': 'waldur_mastermind.marketplace.send_notifications_about_usages',
                 'schedule': crontab(minute=0, hour=15, day_of_month='23'),
                 'args': (),
-            }
+            },
         }

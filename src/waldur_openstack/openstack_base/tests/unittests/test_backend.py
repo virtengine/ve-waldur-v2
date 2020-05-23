@@ -1,10 +1,8 @@
-import pickle
-import six
-
+import pickle  # noqa: S403
 from unittest import TestCase
 
 from cinderclient import exceptions as cinder_exceptions
-from ddt import ddt, data
+from ddt import data, ddt
 from glanceclient import exc as glance_exceptions
 from keystoneclient import exceptions as keystone_exceptions
 from neutronclient.client import exceptions as neutron_exceptions
@@ -29,12 +27,12 @@ class TestOpenStackBackendError(TestCase):
             raise test_exception
         except test_exception.__class__ as e:
             try:
-                six.reraise(OpenStackBackendError, e)
+                raise OpenStackBackendError(e)
             except OpenStackBackendError as e:
                 self._test_exception_is_serializable(e)
 
     def _test_exception_is_serializable(self, exc):
         try:
-            pickle.loads(pickle.dumps(exc))
+            pickle.loads(pickle.dumps(exc))  # noqa: S301
         except Exception as e:
             self.fail('Reraised exception is not serializable: %s' % str(e))

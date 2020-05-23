@@ -1,15 +1,17 @@
-from __future__ import unicode_literals
+from unittest import mock
 
 from ddt import data, ddt
-import mock
 from rest_framework import status, test
 
 from waldur_core.core import utils as core_utils
+from waldur_core.structure import models as structure_models
 from waldur_core.structure.tests import fixtures
+from waldur_core.structure.tests.factories import UserFactory
 from waldur_mastermind.support.tests.base import override_support_settings
 
-from . import factories, utils as test_utils
-from .. import callbacks, models, tasks, log, utils, plugins
+from .. import callbacks, log, models, plugins, tasks, utils
+from . import factories
+from . import utils as test_utils
 
 
 class ResourceGetTest(test.APITransactionTestCase):
@@ -19,13 +21,13 @@ class ResourceGetTest(test.APITransactionTestCase):
         self.plan = factories.PlanFactory()
         self.offering = self.plan.offering
         self.resource = models.Resource.objects.create(
-            project=self.project,
-            offering=self.offering,
-            plan=self.plan,
+            project=self.project, offering=self.offering, plan=self.plan,
         )
 
-    def get_resource(self):
-        self.client.force_authenticate(self.fixture.owner)
+    def get_resource(self, user=None):
+        if not user:
+            user = self.fixture.owner
+        self.client.force_authenticate(user)
         url = factories.ResourceFactory.get_url(self.resource)
         return self.client.get(url)
 
@@ -39,6 +41,25 @@ class ResourceGetTest(test.APITransactionTestCase):
 
     def test_resource_is_not_usage_based(self):
         self.assertFalse(self.get_resource().data['is_usage_based'])
+
+    def test_project_manager_can_get_resource_data(self):
+        response = self.get_resource(self.fixture.manager)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_customer_owner_can_get_resource_data(self):
+        response = self.get_resource(self.fixture.owner)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_service_provider_can_get_resource_data(self):
+        owner = UserFactory()
+        self.offering.customer.add_user(owner, structure_models.CustomerRole.OWNER)
+
+        response = self.get_resource()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_other_user_can_not_get_resource_data(self):
+        response = self.get_resource(UserFactory())
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
 
 class ResourceSwitchPlanTest(test.APITransactionTestCase):
@@ -55,9 +76,7 @@ class ResourceSwitchPlanTest(test.APITransactionTestCase):
             state=models.Resource.States.OK,
         )
         self.resource2 = models.Resource.objects.create(
-            project=self.project,
-            offering=self.offering,
-            plan=self.plan2,
+            project=self.project, offering=self.offering, plan=self.plan2,
         )
 
     def switch_plan(self, user, resource, plan):
@@ -104,7 +123,9 @@ class ResourceSwitchPlanTest(test.APITransactionTestCase):
 
     def test_plan_switch_is_not_available_if_plan_is_related_to_another_offering(self):
         # Act
-        response = self.switch_plan(self.fixture.owner, self.resource1, factories.PlanFactory())
+        response = self.switch_plan(
+            self.fixture.owner, self.resource1, factories.PlanFactory()
+        )
 
         # Assert
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -120,24 +141,19 @@ class ResourceSwitchPlanTest(test.APITransactionTestCase):
         # Assert
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
 
-    def test_plan_switch_is_not_available_if_user_is_not_authorized(self):
-        # Act
-        response = self.switch_plan(self.fixture.global_support, self.resource1, self.plan2)
-
-        # Assert
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-
     def test_order_item_is_created(self):
         # Act
         response = self.switch_plan(self.fixture.owner, self.resource1, self.plan2)
 
         # Assert
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        self.assertTrue(models.OrderItem.objects.filter(
-            type=models.OrderItem.Types.UPDATE,
-            plan=self.plan2,
-            resource=self.resource1,
-        ).exists())
+        self.assertTrue(
+            models.OrderItem.objects.filter(
+                type=models.OrderItem.Types.UPDATE,
+                plan=self.plan2,
+                resource=self.resource1,
+            ).exists()
+        )
 
     def test_order_is_created(self):
         # Act
@@ -145,9 +161,11 @@ class ResourceSwitchPlanTest(test.APITransactionTestCase):
 
         # Assert
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        self.assertTrue(models.Order.objects.filter(
-            project=self.project, created_by=self.fixture.owner
-        ).exists())
+        self.assertTrue(
+            models.Order.objects.filter(
+                project=self.project, created_by=self.fixture.owner
+            ).exists()
+        )
 
     def test_order_is_approved_implicitly_for_authorized_user(self):
         # Act
@@ -158,9 +176,13 @@ class ResourceSwitchPlanTest(test.APITransactionTestCase):
         self.assertEqual(order.state, models.Order.States.EXECUTING)
         self.assertEqual(order.approved_by, self.fixture.staff)
 
-    def test_plan_switch_is_not_allowed_if_pending_order_item_for_resource_already_exists(self):
+    def test_plan_switch_is_not_allowed_if_pending_order_item_for_resource_already_exists(
+        self,
+    ):
         # Arrange
-        factories.OrderItemFactory(resource=self.resource1, state=models.OrderItem.States.PENDING)
+        factories.OrderItemFactory(
+            resource=self.resource1, state=models.OrderItem.States.PENDING
+        )
 
         # Act
         response = self.switch_plan(self.fixture.staff, self.resource1, self.plan2)
@@ -187,12 +209,13 @@ class ResourceSwitchPlanTest(test.APITransactionTestCase):
         order = models.Order.objects.get(uuid=response.data['order_uuid'])
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         mock_task.delay.assert_called_once_with(
-            'marketplace.order:%s' % order.id,
-            'core.user:%s' % self.fixture.owner.id
+            'marketplace.order:%s' % order.id, 'core.user:%s' % self.fixture.owner.id
         )
 
     @mock.patch('waldur_mastermind.marketplace.views.tasks')
-    def test_order_has_not_been_approved_if_user_has_not_got_permissions(self, mock_tasks):
+    def test_order_has_not_been_approved_if_user_has_not_got_permissions(
+        self, mock_tasks
+    ):
         # Arrange
         self.plan2.max_amount = 10
         self.plan2.save()
@@ -211,17 +234,35 @@ class ResourceTerminateTest(test.APITransactionTestCase):
         self.fixture = fixtures.ServiceFixture()
         self.project = self.fixture.project
         self.plan = factories.PlanFactory()
+        self.offering = self.plan.offering
         self.resource = models.Resource.objects.create(
             project=self.project,
-            offering=self.plan.offering,
+            offering=self.offering,
             plan=self.plan,
             state=models.Resource.States.OK,
         )
 
-    def terminate(self, user):
+    def terminate(self, user, attributes=None):
+        attributes = attributes or {}
         self.client.force_authenticate(user)
         url = factories.ResourceFactory.get_url(self.resource, 'terminate')
-        return self.client.post(url)
+        if attributes:
+            return self.client.post(url, {'attributes': attributes})
+        else:
+            return self.client.post(url)
+
+    @mock.patch('waldur_mastermind.marketplace.tasks.notify_order_approvers.delay')
+    def test_service_provider_can_terminate_resource(self, mocked_approve):
+        # Arrange
+        owner = UserFactory()
+        self.offering.customer.add_user(owner, structure_models.CustomerRole.OWNER)
+
+        # Act
+        response = self.terminate(owner)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        mocked_approve.assert_not_called()
 
     def test_order_item_is_created_when_user_submits_termination_request(self):
         # Act
@@ -232,8 +273,14 @@ class ResourceTerminateTest(test.APITransactionTestCase):
         order = models.Order.objects.get(uuid=response.data['order_uuid'])
         self.assertEqual(order.project, self.project)
 
-    @data(models.Resource.States.CREATING, models.Resource.States.UPDATING, models.Resource.States.TERMINATING)
-    def test_termination_request_is_not_accepted_if_resource_is_not_ok_or_erred(self, state):
+    @data(
+        models.Resource.States.CREATING,
+        models.Resource.States.UPDATING,
+        models.Resource.States.TERMINATING,
+    )
+    def test_termination_request_is_not_accepted_if_resource_is_not_ok_or_erred(
+        self, state
+    ):
         # Arrange
         self.resource.state = state
         self.resource.save()
@@ -256,13 +303,6 @@ class ResourceTerminateTest(test.APITransactionTestCase):
         # Assert
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-    def test_termination_request_is_not_accepted_if_user_is_not_authorized(self):
-        # Act
-        response = self.terminate(self.fixture.global_support)
-
-        # Assert
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-
     def test_order_is_approved_implicitly_for_authorized_user(self):
         # Act
         response = self.terminate(self.fixture.staff)
@@ -272,9 +312,13 @@ class ResourceTerminateTest(test.APITransactionTestCase):
         self.assertEqual(order.state, models.Order.States.EXECUTING)
         self.assertEqual(order.approved_by, self.fixture.staff)
 
-    def test_plan_switch_is_not_allowed_if_pending_order_item_for_resource_already_exists(self):
+    def test_plan_switch_is_not_allowed_if_pending_order_item_for_resource_already_exists(
+        self,
+    ):
         # Arrange
-        factories.OrderItemFactory(resource=self.resource, state=models.OrderItem.States.PENDING)
+        factories.OrderItemFactory(
+            resource=self.resource, state=models.OrderItem.States.PENDING
+        )
 
         # Act
         response = self.terminate(self.fixture.staff)
@@ -287,6 +331,17 @@ class ResourceTerminateTest(test.APITransactionTestCase):
         self.fixture.customer.save()
         response = self.terminate(self.fixture.owner)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_delete_options_can_be_passed_if_resource_is_terminated(self):
+        # Act
+        response = self.terminate(self.fixture.staff, {'param': True})
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        order = models.Order.objects.get(uuid=response.data['order_uuid'])
+        self.assertEqual(order.project, self.project)
+        item = order.items.first()
+        self.assertTrue(item.attributes.get('param'))
 
 
 class PlanUsageTest(test.APITransactionTestCase):
@@ -330,7 +385,9 @@ class PlanUsageTest(test.APITransactionTestCase):
     def test_count_plans_for_ok_resources(self):
         response = self.get_stats()
         self.assertEqual(response.data[0]['offering_uuid'], self.offering.uuid)
-        self.assertEqual(response.data[0]['customer_provider_uuid'], self.offering.customer.uuid)
+        self.assertEqual(
+            response.data[0]['customer_provider_uuid'], self.offering.customer.uuid
+        )
         self.assertEqual(response.data[0]['plan_uuid'], self.plan1.uuid)
         self.assertEqual(response.data[0]['usage'], 3)
 
@@ -391,14 +448,17 @@ class PlanUsageTest(test.APITransactionTestCase):
             state=models.Resource.States.OK,
         )
 
-        response = self.get_stats({'customer_provider_uuid': plan.offering.customer.uuid.hex})
+        response = self.get_stats(
+            {'customer_provider_uuid': plan.offering.customer.uuid.hex}
+        )
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]['usage'], 4)
-        self.assertEqual(response.data[0]['customer_provider_uuid'], plan.offering.customer.uuid)
+        self.assertEqual(
+            response.data[0]['customer_provider_uuid'], plan.offering.customer.uuid
+        )
 
 
 class ResourceCostEstimateTest(test.APITransactionTestCase):
-
     @override_support_settings(
         ENABLED=True,
         ACTIVE_BACKEND='waldur_mastermind.support.backend.basic:BasicBackend',
@@ -412,7 +472,7 @@ class ResourceCostEstimateTest(test.APITransactionTestCase):
         order_item = factories.OrderItemFactory(
             offering=offering,
             plan=plan,
-            attributes={'name': 'item_name', 'description': 'Description'}
+            attributes={'name': 'item_name', 'description': 'Description'},
         )
 
         # Act
@@ -430,22 +490,23 @@ class ResourceCostEstimateTest(test.APITransactionTestCase):
         one_time_offering_component = factories.OfferingComponentFactory(
             offering=offering,
             billing_type=models.OfferingComponent.BillingTypes.ONE_TIME,
-            type='signup'
+            type='signup',
         )
         usage_offering_component = factories.OfferingComponentFactory(
             offering=offering,
             billing_type=models.OfferingComponent.BillingTypes.USAGE,
-            type='cpu'
+            type='cpu',
         )
 
         plan = factories.PlanFactory()
-        factories.PlanComponentFactory(plan=plan, component=one_time_offering_component, price=100)
-        factories.PlanComponentFactory(plan=plan, component=usage_offering_component, price=10)
-
-        order_item = factories.OrderItemFactory(
-            offering=offering,
-            plan=plan,
+        factories.PlanComponentFactory(
+            plan=plan, component=one_time_offering_component, price=100
         )
+        factories.PlanComponentFactory(
+            plan=plan, component=usage_offering_component, price=10
+        )
+
+        order_item = factories.OrderItemFactory(offering=offering, plan=plan,)
         order_item.init_cost()
         self.assertEqual(order_item.cost, 100)
 
@@ -475,22 +536,24 @@ class ResourceCostEstimateTest(test.APITransactionTestCase):
         switch_offering_component = factories.OfferingComponentFactory(
             offering=offering,
             billing_type=models.OfferingComponent.BillingTypes.ON_PLAN_SWITCH,
-            type='plan_switch'
+            type='plan_switch',
         )
         usage_offering_component = factories.OfferingComponentFactory(
             offering=offering,
             billing_type=models.OfferingComponent.BillingTypes.USAGE,
-            type='cpu'
+            type='cpu',
         )
 
         plan = factories.PlanFactory()
-        factories.PlanComponentFactory(plan=plan, component=switch_offering_component, price=50)
-        factories.PlanComponentFactory(plan=plan, component=usage_offering_component, price=10)
+        factories.PlanComponentFactory(
+            plan=plan, component=switch_offering_component, price=50
+        )
+        factories.PlanComponentFactory(
+            plan=plan, component=usage_offering_component, price=10
+        )
 
         order_item = factories.OrderItemFactory(
-            offering=offering,
-            plan=plan,
-            type=models.OrderItem.Types.UPDATE,
+            offering=offering, plan=plan, type=models.OrderItem.Types.UPDATE,
         )
         order_item.init_cost()
         self.assertEqual(order_item.cost, 50)
@@ -498,12 +561,14 @@ class ResourceCostEstimateTest(test.APITransactionTestCase):
 
 @ddt
 class ResourceNotificationTest(test.APITransactionTestCase):
-    @data('log_resource_creation_succeeded',
-          'log_resource_creation_failed',
-          'log_resource_update_succeeded',
-          'log_resource_update_failed',
-          'log_resource_terminate_succeeded',
-          'log_resource_terminate_failed', )
+    @data(
+        'log_resource_creation_succeeded',
+        'log_resource_creation_failed',
+        'log_resource_update_succeeded',
+        'log_resource_update_failed',
+        'log_resource_terminate_succeeded',
+        'log_resource_terminate_failed',
+    )
     @mock.patch('waldur_mastermind.marketplace.log.tasks')
     def test_notify_about_resource_change(self, log_func_name, mock_tasks):
         resource = factories.ResourceFactory()
@@ -517,9 +582,11 @@ class ResourceNotificationTest(test.APITransactionTestCase):
 
 class ResourceUpdateLimitsTest(test.APITransactionTestCase):
     def setUp(self):
-        plugins.manager.register(offering_type='TEST_TYPE',
-                                 create_resource_processor=test_utils.TestCreateProcessor,
-                                 update_resource_processor=test_utils.TestUpdateProcessor)
+        plugins.manager.register(
+            offering_type='TEST_TYPE',
+            create_resource_processor=test_utils.TestCreateProcessor,
+            update_resource_processor=test_utils.TestUpdateProcessor,
+        )
 
         self.fixture = fixtures.ServiceFixture()
         self.resource = factories.ResourceFactory()
@@ -553,23 +620,17 @@ class ResourceUpdateLimitsTest(test.APITransactionTestCase):
         # Assert
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
 
-    def test_update_limits_is_not_available_if_user_is_not_authorized(self):
-        # Act
-        response = self.update_limits(self.fixture.global_support, self.resource)
-
-        # Assert
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-
     def test_order_item_is_created(self):
         # Act
         response = self.update_limits(self.fixture.owner, self.resource)
 
         # Assert
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        self.assertTrue(models.OrderItem.objects.filter(
-            type=models.OrderItem.Types.UPDATE,
-            resource=self.resource,
-        ).exists())
+        self.assertTrue(
+            models.OrderItem.objects.filter(
+                type=models.OrderItem.Types.UPDATE, resource=self.resource,
+            ).exists()
+        )
 
     def test_order_is_created(self):
         # Act
@@ -577,9 +638,11 @@ class ResourceUpdateLimitsTest(test.APITransactionTestCase):
 
         # Assert
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        self.assertTrue(models.Order.objects.filter(
-            project=self.resource.project, created_by=self.fixture.owner
-        ).exists())
+        self.assertTrue(
+            models.Order.objects.filter(
+                project=self.resource.project, created_by=self.fixture.owner
+            ).exists()
+        )
 
     def test_order_is_approved_implicitly_for_authorized_user(self):
         # Act
@@ -590,9 +653,13 @@ class ResourceUpdateLimitsTest(test.APITransactionTestCase):
         self.assertEqual(order.state, models.Order.States.EXECUTING)
         self.assertEqual(order.approved_by, self.fixture.staff)
 
-    def test_update_limits_is_not_allowed_if_pending_order_item_for_resource_already_exists(self):
+    def test_update_limits_is_not_allowed_if_pending_order_item_for_resource_already_exists(
+        self,
+    ):
         # Arrange
-        factories.OrderItemFactory(resource=self.resource, state=models.OrderItem.States.PENDING)
+        factories.OrderItemFactory(
+            resource=self.resource, state=models.OrderItem.States.PENDING
+        )
 
         # Act
         response = self.update_limits(self.fixture.owner, self.resource)
@@ -616,12 +683,13 @@ class ResourceUpdateLimitsTest(test.APITransactionTestCase):
         order = models.Order.objects.get(uuid=response.data['order_uuid'])
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         mock_task.delay.assert_called_once_with(
-            'marketplace.order:%s' % order.id,
-            'core.user:%s' % self.fixture.staff.id
+            'marketplace.order:%s' % order.id, 'core.user:%s' % self.fixture.staff.id
         )
 
     @mock.patch('waldur_mastermind.marketplace.views.tasks')
-    def test_order_has_not_been_approved_if_user_has_not_got_permissions(self, mock_tasks):
+    def test_order_has_not_been_approved_if_user_has_not_got_permissions(
+        self, mock_tasks
+    ):
         # Act
         response = self.update_limits(self.fixture.owner, self.resource)
 
@@ -633,8 +701,7 @@ class ResourceUpdateLimitsTest(test.APITransactionTestCase):
         response = self.update_limits(self.fixture.staff, self.resource)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         order_item = models.OrderItem.objects.get(
-            type=models.OrderItem.Types.UPDATE,
-            resource=self.resource,
+            type=models.OrderItem.Types.UPDATE, resource=self.resource,
         )
         utils.process_order_item(order_item, self.fixture.staff)
         self.resource.refresh_from_db()

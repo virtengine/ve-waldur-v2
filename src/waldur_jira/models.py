@@ -1,14 +1,11 @@
-from __future__ import unicode_literals
-
 import re
-import urlparse
+from urllib.parse import urljoin
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
-from django.utils.encoding import python_2_unicode_compatible
 from django.utils.translation import ugettext_lazy as _
 from model_utils import FieldTracker
 from model_utils.models import TimeStampedModel
@@ -20,7 +17,10 @@ from waldur_core.structure import models as structure_models
 
 class JiraService(structure_models.Service):
     projects = models.ManyToManyField(
-        structure_models.Project, related_name='jira_services', through='JiraServiceProjectLink')
+        structure_models.Project,
+        related_name='jira_services',
+        through='JiraServiceProjectLink',
+    )
 
     @classmethod
     def get_url_name(cls):
@@ -28,31 +28,38 @@ class JiraService(structure_models.Service):
 
 
 class JiraServiceProjectLink(structure_models.ServiceProjectLink):
-    service = models.ForeignKey(JiraService)
+    service = models.ForeignKey(on_delete=models.CASCADE, to=JiraService)
 
     @classmethod
     def get_url_name(cls):
         return 'jira-spl'
 
 
-class ProjectTemplate(core_models.UiDescribableMixin, structure_models.GeneralServiceProperty):
+class ProjectTemplate(
+    core_models.UiDescribableMixin, structure_models.GeneralServiceProperty
+):
     @classmethod
     def get_url_name(cls):
         return 'jira-project-templates'
 
     @classmethod
     def get_backend_fields(cls):
-        return super(ProjectTemplate, cls).get_backend_fields() + ('icon_url', 'description')
+        return super(ProjectTemplate, cls).get_backend_fields() + (
+            'icon_url',
+            'description',
+        )
 
 
 class Project(structure_models.NewResource, core_models.RuntimeStateMixin):
-
     class Permissions(structure_models.NewResource.Permissions):
         pass
 
     service_project_link = models.ForeignKey(
-        JiraServiceProjectLink, related_name='projects', on_delete=models.PROTECT)
-    template = models.ForeignKey(ProjectTemplate, blank=True, null=True)
+        JiraServiceProjectLink, related_name='projects', on_delete=models.PROTECT
+    )
+    template = models.ForeignKey(
+        on_delete=models.CASCADE, to=ProjectTemplate, blank=True, null=True
+    )
     action = models.CharField(max_length=50, blank=True)
     action_details = JSONField(default=dict)
 
@@ -61,7 +68,7 @@ class Project(structure_models.NewResource, core_models.RuntimeStateMixin):
 
     def get_access_url(self):
         base_url = self.service_project_link.service.settings.backend_url
-        return urlparse.urljoin(base_url, 'projects/' + self.backend_id)
+        return urljoin(base_url, 'projects/' + self.backend_id)
 
     @classmethod
     def get_url_name(cls):
@@ -69,22 +76,27 @@ class Project(structure_models.NewResource, core_models.RuntimeStateMixin):
 
     @property
     def priorities(self):
-        return Priority.objects.filter(settings=self.service_project_link.service.settings)
+        return Priority.objects.filter(
+            settings=self.service_project_link.service.settings
+        )
 
 
-class JiraPropertyIssue(core_models.UuidMixin, core_models.StateMixin, TimeStampedModel):
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, null=True)
+class JiraPropertyIssue(
+    core_models.UuidMixin, core_models.StateMixin, TimeStampedModel
+):
+    user = models.ForeignKey(
+        on_delete=models.CASCADE, to=settings.AUTH_USER_MODEL, null=True
+    )
     backend_id = models.CharField(max_length=255, null=True)
 
-    class Permissions(object):
+    class Permissions:
         customer_path = 'project__service_project_link__project__customer'
         project_path = 'project__service_project_link__project'
 
-    class Meta(object):
+    class Meta:
         abstract = True
 
 
-@python_2_unicode_compatible
 class IssueType(core_models.UiDescribableMixin, structure_models.ServiceProperty):
     projects = models.ManyToManyField(Project, related_name='issue_types')
     subtask = models.BooleanField(default=False)
@@ -103,13 +115,14 @@ class IssueType(core_models.UiDescribableMixin, structure_models.ServiceProperty
     @classmethod
     def get_backend_fields(cls):
         return super(IssueType, cls).get_backend_fields() + (
-            'icon_url', 'description', 'subtask', 'projects'
+            'icon_url',
+            'description',
+            'subtask',
+            'projects',
         )
 
 
-@python_2_unicode_compatible
 class Priority(core_models.UiDescribableMixin, structure_models.ServiceProperty):
-
     class Meta(structure_models.ServiceProperty.Meta):
         verbose_name = _('Priority')
         verbose_name_plural = _('Priorities')
@@ -126,13 +139,15 @@ class Priority(core_models.UiDescribableMixin, structure_models.ServiceProperty)
         return super(Priority, cls).get_backend_fields() + ('icon_url', 'description')
 
 
-@python_2_unicode_compatible
-class Issue(structure_models.StructureLoggableMixin,
-            JiraPropertyIssue):
+class Issue(structure_models.StructureLoggableMixin, JiraPropertyIssue):
 
-    type = models.ForeignKey(IssueType)
-    parent = models.ForeignKey('Issue', blank=True, null=True)
-    project = models.ForeignKey(Project, related_name='issues')
+    type = models.ForeignKey(on_delete=models.CASCADE, to=IssueType)
+    parent = models.ForeignKey(
+        on_delete=models.CASCADE, to='Issue', blank=True, null=True
+    )
+    project = models.ForeignKey(
+        on_delete=models.CASCADE, to=Project, related_name='issues'
+    )
     summary = models.CharField(max_length=255)
     description = models.TextField(blank=True)
     creator_name = models.CharField(blank=True, max_length=255)
@@ -146,11 +161,17 @@ class Issue(structure_models.StructureLoggableMixin,
     assignee_username = models.CharField(blank=True, max_length=255)
     resolution = models.CharField(blank=True, max_length=255)
     resolution_date = models.CharField(blank=True, null=True, max_length=255)
-    priority = models.ForeignKey(Priority)
+    priority = models.ForeignKey(on_delete=models.CASCADE, to=Priority)
     status = models.CharField(max_length=255)
     updated = models.DateTimeField(auto_now_add=True)
 
-    resource_content_type = models.ForeignKey(ContentType, blank=True, null=True, related_name='jira_issues')
+    resource_content_type = models.ForeignKey(
+        on_delete=models.CASCADE,
+        to=ContentType,
+        blank=True,
+        null=True,
+        related_name='jira_issues',
+    )
     resource_object_id = models.PositiveIntegerField(blank=True, null=True)
     resource = GenericForeignKey('resource_content_type', 'resource_object_id')
 
@@ -158,7 +179,7 @@ class Issue(structure_models.StructureLoggableMixin,
 
     tracker = FieldTracker()
 
-    class Meta(object):
+    class Meta:
         unique_together = ('project', 'backend_id')
 
     def get_backend(self):
@@ -182,7 +203,7 @@ class Issue(structure_models.StructureLoggableMixin,
 
     def get_access_url(self):
         base_url = self.project.service_project_link.service.settings.backend_url
-        return urlparse.urljoin(base_url, 'browse/' + (self.backend_id or ''))
+        return urljoin(base_url, 'browse/' + (self.backend_id or ''))
 
     def get_log_fields(self):
         return ('uuid', 'issue_user', 'key', 'summary', 'status', 'issue_project')
@@ -195,26 +216,25 @@ class Issue(structure_models.StructureLoggableMixin,
         return self.description
 
     def __str__(self):
-        return '{}: {}'.format(self.uuid, self.backend_id or '???')
+        return '{}: {}'.format(self.uuid.hex, self.backend_id or '???')
 
 
 class JiraSubPropertyIssue(JiraPropertyIssue):
-
-    class Permissions(object):
+    class Permissions:
         customer_path = 'issue__project__service_project_link__project__customer'
         project_path = 'issue__project__service_project_link__project'
 
-    class Meta(object):
+    class Meta:
         abstract = True
 
 
-@python_2_unicode_compatible
-class Comment(structure_models.StructureLoggableMixin,
-              JiraSubPropertyIssue):
-    issue = models.ForeignKey(Issue, related_name='comments')
+class Comment(structure_models.StructureLoggableMixin, JiraSubPropertyIssue):
+    issue = models.ForeignKey(
+        on_delete=models.CASCADE, to=Issue, related_name='comments'
+    )
     message = models.TextField(blank=True)
 
-    class Meta(object):
+    class Meta:
         unique_together = ('issue', 'backend_id')
 
     def get_backend(self):
@@ -238,7 +258,9 @@ class Comment(structure_models.StructureLoggableMixin,
 
         User = get_user_model()
         template = re.sub(r'([\^~*?:\(\)\[\]|+])', r'\\\1', template)
-        pattern = template.format(body='', user=User(full_name=r'(.+?)', username=r'([\w.@+-]+)'))
+        pattern = template.format(
+            body='', user=User(full_name=r'(.+?)', username=r'([\w.@+-]+)')
+        )
         match = re.search(pattern, message)
 
         if match:
@@ -246,7 +268,7 @@ class Comment(structure_models.StructureLoggableMixin,
                 self.user = User.objects.get(username=match.group(2))
             except User.DoesNotExist:
                 pass
-            self.message = message[:match.start()]
+            self.message = message[: match.start()]
         else:
             self.message = message
 
@@ -266,11 +288,15 @@ class Comment(structure_models.StructureLoggableMixin,
 
 
 class Attachment(JiraSubPropertyIssue):
-    issue = models.ForeignKey(Issue, related_name='attachments')
+    issue = models.ForeignKey(
+        on_delete=models.CASCADE, to=Issue, related_name='attachments'
+    )
     file = models.FileField(upload_to='jira_attachments')
-    thumbnail = models.FileField(upload_to='jira_attachments_thumbnails', blank=True, null=True)
+    thumbnail = models.FileField(
+        upload_to='jira_attachments_thumbnails', blank=True, null=True
+    )
 
-    class Meta(object):
+    class Meta:
         unique_together = ('issue', 'backend_id')
 
     def get_backend(self):

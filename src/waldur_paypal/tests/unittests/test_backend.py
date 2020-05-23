@@ -1,5 +1,7 @@
+from unittest import mock
+
+import responses
 from django.test import TestCase
-import mock
 
 from waldur_paypal.backend import PaypalBackend, PayPalError
 
@@ -7,7 +9,6 @@ from .. import factories, fixtures
 
 
 class BaseBackendTest(TestCase):
-
     def setUp(self):
         self.fixture = fixtures.PayPalFixture()
         self.backend = PaypalBackend()
@@ -15,7 +16,6 @@ class BaseBackendTest(TestCase):
 
 
 class CreateInvoiceTest(BaseBackendTest):
-
     def setUp(self):
         super(CreateInvoiceTest, self).setUp()
         self.invoice.backend_id = ''
@@ -56,7 +56,6 @@ class CreateInvoiceTest(BaseBackendTest):
 
 
 class DownloadInvoicePDFTest(BaseBackendTest):
-
     def setUp(self):
         super(DownloadInvoicePDFTest, self).setUp()
 
@@ -66,21 +65,23 @@ class DownloadInvoicePDFTest(BaseBackendTest):
 
         self.assertRaises(PayPalError, self.backend.download_invoice_pdf, self.invoice)
 
-    @mock.patch('waldur_paypal.backend.urllib2.urlopen')
-    def test_pdf_is_downloaded(self, urlopen_mock):
-        response = mock.Mock()
-        response.read.return_value = 'PDF file content'
-        urlopen_mock.return_value = response
+    @responses.activate
+    def test_pdf_is_downloaded(self):
+        # Arrange
+        url = self.invoice.get_backend().get_payment_view_url(
+            self.invoice.backend_id, {'printPdfMode': 'true'}
+        )
+        responses.add(responses.GET, url, body='PDF file content')
         self.assertFalse(self.invoice.pdf)
 
+        # Act
         self.backend.download_invoice_pdf(self.invoice)
 
+        # Assert
         self.assertTrue(self.invoice.pdf)
-        urlopen_mock.assert_called_once()
 
 
 class SendInvoiceTest(BaseBackendTest):
-
     @mock.patch('waldur_paypal.backend.paypal.Invoice')
     def test_draft_invoice_is_sent(self, invoice_mock):
         self.invoice.items.add(factories.InvoiceItemFactory())

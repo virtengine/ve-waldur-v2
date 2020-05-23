@@ -1,28 +1,30 @@
 import json
+from unittest import mock
 
-import mock
-from ddt import ddt, data
-from rest_framework import status
+from ddt import data, ddt
+from django.conf import settings
 from jira import Issue, User
-from jira.resources import RequestType, IssueType
+from jira.resources import IssueType, RequestType
+from rest_framework import status
 
 from waldur_core.structure.tests import factories as structure_factories
-from django.conf import settings
-
 from waldur_mastermind.marketplace.tests.factories import ResourceFactory
-from waldur_mastermind.support.tests.base import override_support_settings
-from waldur_mastermind.support.tests.base import load_resource
 from waldur_mastermind.support.backend.atlassian import ServiceDeskBackend
+from waldur_mastermind.support.tests.base import (
+    load_resource,
+    override_support_settings,
+)
 
-from . import factories, base
 from .. import models
+from . import base, factories
 
 
 @ddt
 class IssueRetrieveTest(base.BaseTest):
-
     @data('staff', 'global_support', 'owner')
-    def test_user_can_access_customer_issue_if_he_has_customer_level_permission(self, user):
+    def test_user_can_access_customer_issue_if_he_has_customer_level_permission(
+        self, user
+    ):
         self.client.force_authenticate(getattr(self.fixture, user))
         issue = factories.IssueFactory(customer=self.fixture.customer)
 
@@ -39,18 +41,26 @@ class IssueRetrieveTest(base.BaseTest):
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     @data('staff', 'global_support', 'owner', 'admin', 'manager')
-    def test_user_can_access_project_issue_if_he_has_project_level_permission(self, user):
+    def test_user_can_access_project_issue_if_he_has_project_level_permission(
+        self, user
+    ):
         self.client.force_authenticate(getattr(self.fixture, user))
-        issue = factories.IssueFactory(customer=self.fixture.customer, project=self.fixture.project)
+        issue = factories.IssueFactory(
+            customer=self.fixture.customer, project=self.fixture.project
+        )
 
         response = self.client.get(factories.IssueFactory.get_url(issue))
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
     @data('user')
-    def test_user_cannot_access_project_issue_if_he_has_no_project_level_permission(self, user):
+    def test_user_cannot_access_project_issue_if_he_has_no_project_level_permission(
+        self, user
+    ):
         self.client.force_authenticate(getattr(self.fixture, user))
-        issue = factories.IssueFactory(customer=self.fixture.customer, project=self.fixture.project)
+        issue = factories.IssueFactory(
+            customer=self.fixture.customer, project=self.fixture.project
+        )
 
         response = self.client.get(factories.IssueFactory.get_url(issue))
 
@@ -109,11 +119,13 @@ class IssueCreateBaseTest(base.BaseTest):
         self.url = factories.IssueFactory.get_list_url()
         self.caller = structure_factories.UserFactory()
 
-    def _mock_jira(self):
+    def _mock_jira(self, old_jira=False):
         mock.patch.stopall()
         mock_patch = mock.patch('waldur_jira.backend.JIRA')
         self.mock_jira = mock_patch.start()
-        self.mock_jira().fields.return_value = json.loads(load_resource('jira_fields.json'))
+        self.mock_jira().fields.return_value = json.loads(
+            load_resource('jira_fields.json')
+        )
         issue_raw = json.loads(load_resource('jira_issue_raw.json'))
         mock_backend_issue = Issue({'server': ''}, None, raw=issue_raw)
         mock_backend_issue.update = mock.MagicMock()
@@ -121,8 +133,13 @@ class IssueCreateBaseTest(base.BaseTest):
 
         self.mock_jira().create_issue.return_value = mock_backend_issue
 
-        mock_backend_users = [User({'server': ''}, None, raw={'key': 'user_1', 'active': True})]
-        self.mock_jira().search_users.return_value = mock_backend_users
+        mock_backend_users = [
+            User({'server': ''}, None, raw={'key': 'user_1', 'active': True})
+        ]
+        if old_jira:
+            self.mock_jira().search_users.return_value = mock_backend_users
+        else:
+            self.mock_jira().waldur_search_users.return_value = mock_backend_users
 
     def _get_valid_payload(self, **additional):
         is_reported_manually = additional.get('is_reported_manually')
@@ -136,7 +153,9 @@ class IssueCreateBaseTest(base.BaseTest):
         if is_reported_manually:
             payload['is_reported_manually'] = True
         else:
-            payload['caller'] = structure_factories.UserFactory.get_url(user=self.caller)
+            payload['caller'] = structure_factories.UserFactory.get_url(
+                user=self.caller
+            )
 
         payload.update(additional)
         return payload
@@ -154,7 +173,9 @@ class IssueCreateTest(IssueCreateBaseTest):
         self.client.force_authenticate(getattr(self.fixture, user))
 
         priority = factories.PriorityFactory()
-        response = self.client.post(self.url, data=self._get_valid_payload(priority=priority.name))
+        response = self.client.post(
+            self.url, data=self._get_valid_payload(priority=priority.name)
+        )
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data['priority'], priority.name)
@@ -165,7 +186,9 @@ class IssueCreateTest(IssueCreateBaseTest):
         self.client.force_authenticate(getattr(self.fixture, user))
 
         priority = factories.PriorityFactory()
-        response = self.client.post(self.url, data=self._get_valid_payload(priority=priority.name))
+        response = self.client.post(
+            self.url, data=self._get_valid_payload(priority=priority.name)
+        )
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
@@ -179,7 +202,9 @@ class IssueCreateTest(IssueCreateBaseTest):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
     @data('staff', 'global_support')
-    def test_staff_or_support_cannot_create_issue_if_he_does_not_have_support_user(self, user):
+    def test_staff_or_support_cannot_create_issue_if_he_does_not_have_support_user(
+        self, user
+    ):
         self.client.force_authenticate(getattr(self.fixture, user))
 
         response = self.client.post(self.url, data=self._get_valid_payload())
@@ -205,7 +230,9 @@ class IssueCreateTest(IssueCreateBaseTest):
         response = self.client.post(self.url, data=payload)
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertTrue(models.Issue.objects.filter(summary=payload['summary']).exists())
+        self.assertTrue(
+            models.Issue.objects.filter(summary=payload['summary']).exists()
+        )
 
     @data('admin', 'manager', 'user')
     def test_user_without_access_to_customer_cannot_create_customer_issue(self, user):
@@ -218,7 +245,9 @@ class IssueCreateTest(IssueCreateBaseTest):
         response = self.client.post(self.url, data=payload)
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertFalse(models.Issue.objects.filter(summary=payload['summary']).exists())
+        self.assertFalse(
+            models.Issue.objects.filter(summary=payload['summary']).exists()
+        )
 
     @data('staff', 'global_support', 'owner', 'admin', 'manager')
     def test_user_with_access_to_project_can_create_project_issue(self, user):
@@ -231,7 +260,9 @@ class IssueCreateTest(IssueCreateBaseTest):
         response = self.client.post(self.url, data=payload)
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertTrue(models.Issue.objects.filter(summary=payload['summary']).exists())
+        self.assertTrue(
+            models.Issue.objects.filter(summary=payload['summary']).exists()
+        )
 
     @data('user')
     def test_user_without_access_to_project_cannot_create_project_issue(self, user):
@@ -244,39 +275,50 @@ class IssueCreateTest(IssueCreateBaseTest):
         response = self.client.post(self.url, data=payload)
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertFalse(models.Issue.objects.filter(summary=payload['summary']).exists())
+        self.assertFalse(
+            models.Issue.objects.filter(summary=payload['summary']).exists()
+        )
 
     @data('staff', 'global_support', 'owner', 'admin', 'manager')
     def test_user_with_access_to_resource_can_create_resource_issue(self, user):
         self.client.force_authenticate(getattr(self.fixture, user))
         payload = self._get_valid_payload(
-            resource=structure_factories.TestNewInstanceFactory.get_url(self.fixture.resource),
+            resource=structure_factories.TestNewInstanceFactory.get_url(
+                self.fixture.resource
+            ),
             is_reported_manually=True,
         )
 
         response = self.client.post(self.url, data=payload)
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertTrue(models.Issue.objects.filter(summary=payload['summary']).exists())
+        self.assertTrue(
+            models.Issue.objects.filter(summary=payload['summary']).exists()
+        )
 
     @data('user')
     def test_user_without_access_to_resource_cannot_create_resource_issue(self, user):
         self.client.force_authenticate(getattr(self.fixture, user))
         payload = self._get_valid_payload(
-            resource=structure_factories.TestNewInstanceFactory.get_url(self.fixture.resource),
+            resource=structure_factories.TestNewInstanceFactory.get_url(
+                self.fixture.resource
+            ),
             is_reported_manually=True,
         )
 
         response = self.client.post(self.url, data=payload)
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertFalse(models.Issue.objects.filter(summary=payload['summary']).exists())
+        self.assertFalse(
+            models.Issue.objects.filter(summary=payload['summary']).exists()
+        )
 
     def test_project_issue_populates_customer_field_on_creation(self):
         factories.SupportUserFactory(user=self.fixture.staff)
         self.client.force_authenticate(self.fixture.staff)
         payload = self._get_valid_payload(
-            project=structure_factories.ProjectFactory.get_url(self.fixture.project))
+            project=structure_factories.ProjectFactory.get_url(self.fixture.project)
+        )
 
         response = self.client.post(self.url, data=payload)
 
@@ -287,13 +329,20 @@ class IssueCreateTest(IssueCreateBaseTest):
         factories.SupportUserFactory(user=self.fixture.staff)
         self.client.force_authenticate(self.fixture.staff)
         payload = self._get_valid_payload(
-            resource=structure_factories.TestNewInstanceFactory.get_url(self.fixture.resource))
+            resource=structure_factories.TestNewInstanceFactory.get_url(
+                self.fixture.resource
+            )
+        )
 
         response = self.client.post(self.url, data=payload)
 
         issue = models.Issue.objects.get(uuid=json.loads(response.content)['uuid'])
-        self.assertEqual(issue.project, self.fixture.resource.service_project_link.project)
-        self.assertEqual(issue.customer, self.fixture.resource.service_project_link.project.customer)
+        self.assertEqual(
+            issue.project, self.fixture.resource.service_project_link.project
+        )
+        self.assertEqual(
+            issue.customer, self.fixture.resource.service_project_link.project.customer
+        )
 
     @override_support_settings(ENABLED=False)
     def test_user_can_not_create_issue_if_support_extension_is_disabled(self):
@@ -307,13 +356,21 @@ class IssueCreateTest(IssueCreateBaseTest):
         user = self.fixture.staff
         factories.SupportUserFactory(user=user)
         self.client.force_authenticate(user)
-        response = self.client.post(self.url, data=self._get_valid_payload(
-            project=structure_factories.ProjectFactory.get_url(self.fixture.project),
-            resource=structure_factories.TestNewInstanceFactory.get_url(),
-            template=factories.TemplateFactory.get_url()))
+        response = self.client.post(
+            self.url,
+            data=self._get_valid_payload(
+                project=structure_factories.ProjectFactory.get_url(
+                    self.fixture.project
+                ),
+                resource=structure_factories.TestNewInstanceFactory.get_url(),
+                template=factories.TemplateFactory.get_url(),
+            ),
+        )
         issue = response.data
-        kwargs = self.mock_jira().create_customer_request.return_value.update.call_args[1]
-        self.assertEqual(user.organization, kwargs['field105'])
+        kwargs = self.mock_jira().create_customer_request.return_value.update.call_args[
+            1
+        ]
+        self.assertEqual(issue['customer_name'], kwargs['field105'])
         self.assertEqual(issue['project_name'], kwargs['field106'])
         self.assertEqual(issue['resource_name'], kwargs['field107'].name)
         self.assertEqual(issue['template'].name, kwargs['field108'])
@@ -325,18 +382,27 @@ class IssueCreateTest(IssueCreateBaseTest):
         factories.SupportCustomerFactory(user=issue.caller)
         factories.RequestTypeFactory(issue_type_name=issue.type)
         ServiceDeskBackend().create_issue(issue)
-        kwargs = self.mock_jira().create_customer_request.return_value.update.call_args[1]
+        kwargs = self.mock_jira().create_customer_request.return_value.update.call_args[
+            1
+        ]
         self.assertTrue('field105' not in kwargs.keys())
 
     def test_pull_request_types(self):
         self._mock_jira()
         self.mock_jira().request_types.return_value = [
-            RequestType({'server': ''}, None, raw={'name': 'Help', 'id': '1', 'issueTypeId': '10101'})
+            RequestType(
+                {'server': ''},
+                None,
+                raw={'name': 'Help', 'id': '1', 'issueTypeId': '10101'},
+            )
         ]
-        self.mock_jira().issue_type.return_value = IssueType({'server': ''}, None,
-                                                             raw={'name': 'Service Request', 'id': '1'})
+        self.mock_jira().issue_type.return_value = IssueType(
+            {'server': ''}, None, raw={'name': 'Service Request', 'id': '1'}
+        )
 
-        issue = factories.IssueFactory(reporter=None, backend_id=None)
+        issue_type = settings.WALDUR_SUPPORT['ISSUE']['types'][0]
+        factories.RequestTypeFactory(issue_type_name=issue_type)
+        issue = factories.IssueFactory(reporter=None, backend_id=None, type=issue_type)
         factories.SupportCustomerFactory(user=issue.caller)
         ServiceDeskBackend().create_issue(issue)
         self.assertEqual(models.RequestType.objects.count(), 1)
@@ -345,25 +411,61 @@ class IssueCreateTest(IssueCreateBaseTest):
         self._mock_jira()
         factories.SupportUserFactory(user=self.fixture.staff)
         self.client.force_authenticate(self.fixture.staff)
-        mock_backend_users = [User({'server': ''}, None, raw={'key': 'user_1', 'active': False}),
-                              User({'server': ''}, None, raw={'key': 'user_2', 'active': True})]
+        mock_backend_users = [
+            User({'server': ''}, None, raw={'key': 'user_1', 'active': False}),
+            User({'server': ''}, None, raw={'key': 'user_2', 'active': True}),
+        ]
         self.mock_jira().search_users.return_value = mock_backend_users
         response = self.client.post(self.url, data=self._get_valid_payload())
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_create_confirmation_comment_if_template_exists(self):
+        payload = self._get_valid_payload()
+        issue_type = payload['type']
+        factories.TemplateConfirmationCommentFactory(
+            issue_type=issue_type, template='issue_type template'
+        )
+        self._create_confirmation_comment('issue_type template')
+
+    def test_create_confirmation_comment_if_only_default_template_exists(self):
+        factories.TemplateConfirmationCommentFactory(template='default template')
+        self._create_confirmation_comment('default template')
+
+    def test_do_not_create_confirmation_comment_if_template_does_not_exist(self):
+        self._create_confirmation_comment(None)
+
+    def _create_confirmation_comment(self, expected_body):
+        user = self.fixture.staff
+        factories.SupportUserFactory(user=user)
+        mock.patch.stopall()
+        with mock.patch(
+            'waldur_mastermind.support.backend.atlassian.ServiceDeskBackend.create_issue'
+        ):
+            with mock.patch(
+                'waldur_mastermind.support.backend.atlassian.ServiceDeskBackend._add_comment'
+            ) as _add_comment:
+                self.client.force_authenticate(user)
+                self.client.post(self.url, data=self._get_valid_payload())
+                if expected_body:
+                    _add_comment.assert_called_once_with(
+                        None, expected_body, is_internal=False
+                    )
+                else:
+                    _add_comment.assert_not_called()
 
 
 @override_support_settings(USE_OLD_API=True)
 class IssueCreateOldAPITest(IssueCreateBaseTest):
     def setUp(self):
         super(IssueCreateOldAPITest, self).setUp()
-        self._mock_jira()
+        self._mock_jira(old_jira=True)
 
     def test_identification_from_email_if_caller_not_exists(self):
         user = self.fixture.staff
         self.client.force_authenticate(user)
-        self.client.post(self.url, data=self._get_valid_payload(
-            is_reported_manually=True
-        ))
+        self.client.post(
+            self.url, data=self._get_valid_payload(is_reported_manually=True)
+        )
         kwargs = self.mock_jira().create_issue.call_args[1]
         self.assertEqual(user.email, kwargs['field101'][0]['key'])
 
@@ -372,19 +474,23 @@ class IssueCreateOldAPITest(IssueCreateBaseTest):
         backend_id = 'admin'
         factories.SupportUserFactory(user=user, backend_id=backend_id)
         self.client.force_authenticate(user)
-        self.client.post(self.url, data=self._get_valid_payload(
-            caller=structure_factories.UserFactory.get_url(user=user),
-        ))
+        self.client.post(
+            self.url,
+            data=self._get_valid_payload(
+                caller=structure_factories.UserFactory.get_url(user=user),
+            ),
+        )
         kwargs = self.mock_jira().create_issue.call_args[1]
         self.assertEqual(backend_id, kwargs['field101'][0]['key'])
 
 
 @ddt
 class IssueUpdateTest(base.BaseTest):
-
     def setUp(self):
         super(IssueUpdateTest, self).setUp()
-        self.issue = factories.IssueFactory(customer=self.fixture.customer, project=self.fixture.project)
+        self.issue = factories.IssueFactory(
+            customer=self.fixture.customer, project=self.fixture.project
+        )
         self.url = factories.IssueFactory.get_url(self.issue)
 
     @data('staff', 'global_support')
@@ -395,7 +501,9 @@ class IssueUpdateTest(base.BaseTest):
         response = self.client.patch(self.url, data=payload)
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertTrue(models.Issue.objects.filter(summary=payload['summary']).exists())
+        self.assertTrue(
+            models.Issue.objects.filter(summary=payload['summary']).exists()
+        )
 
     @data('owner', 'admin', 'manager')
     def test_nonstaff_user_cannot_edit_issue(self, user):
@@ -405,7 +513,9 @@ class IssueUpdateTest(base.BaseTest):
         response = self.client.patch(self.url, data=payload)
 
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-        self.assertFalse(models.Issue.objects.filter(summary=payload['summary']).exists())
+        self.assertFalse(
+            models.Issue.objects.filter(summary=payload['summary']).exists()
+        )
 
     @override_support_settings(ENABLED=False)
     def test_staff_can_not_update_issue_if_support_extension_is_disabled(self):
@@ -420,10 +530,11 @@ class IssueUpdateTest(base.BaseTest):
 
 @ddt
 class IssueDeleteTest(base.BaseTest):
-
     def setUp(self):
         super(IssueDeleteTest, self).setUp()
-        self.issue = factories.IssueFactory(customer=self.fixture.customer, project=self.fixture.project)
+        self.issue = factories.IssueFactory(
+            customer=self.fixture.customer, project=self.fixture.project
+        )
         self.url = factories.IssueFactory.get_url(self.issue)
 
     @data('staff', 'global_support')
@@ -462,25 +573,41 @@ class IssueCommentTest(base.BaseTest):
     @data('staff', 'global_support', 'owner', 'admin', 'manager')
     def test_user_with_access_to_issue_can_comment(self, user):
         self.client.force_authenticate(getattr(self.fixture, user))
-        issue = factories.IssueFactory(customer=self.fixture.customer, project=self.fixture.project)
+        issue = factories.IssueFactory(
+            customer=self.fixture.customer, project=self.fixture.project
+        )
         payload = self._get_valid_payload()
 
-        response = self.client.post(factories.IssueFactory.get_url(issue, action='comment'), data=payload)
+        response = self.client.post(
+            factories.IssueFactory.get_url(issue, action='comment'), data=payload
+        )
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertTrue(models.Comment.objects.filter(issue=issue, description=payload['description']))
+        self.assertTrue(
+            models.Comment.objects.filter(
+                issue=issue, description=payload['description']
+            )
+        )
 
     @data('owner', 'admin', 'manager', 'user')
-    def test_user_can_comment_on_issue_where_he_is_caller_without_project_and_customer(self, user):
+    def test_user_can_comment_on_issue_where_he_is_caller_without_project_and_customer(
+        self, user
+    ):
         current_user = getattr(self.fixture, user)
         self.client.force_authenticate(current_user)
         issue = factories.IssueFactory(caller=current_user, project=None)
         payload = self._get_valid_payload()
 
-        response = self.client.post(factories.IssueFactory.get_url(issue, action='comment'), data=payload)
+        response = self.client.post(
+            factories.IssueFactory.get_url(issue, action='comment'), data=payload
+        )
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertTrue(models.Comment.objects.filter(issue=issue, description=payload['description']))
+        self.assertTrue(
+            models.Comment.objects.filter(
+                issue=issue, description=payload['description']
+            )
+        )
 
     @data('admin', 'manager', 'user')
     def test_user_without_access_to_instance_cannot_comment(self, user):
@@ -488,10 +615,16 @@ class IssueCommentTest(base.BaseTest):
         issue = factories.IssueFactory(customer=self.fixture.customer)
         payload = self._get_valid_payload()
 
-        response = self.client.post(factories.IssueFactory.get_url(issue, action='comment'), data=payload)
+        response = self.client.post(
+            factories.IssueFactory.get_url(issue, action='comment'), data=payload
+        )
 
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-        self.assertFalse(models.Comment.objects.filter(issue=issue, description=payload['description']))
+        self.assertFalse(
+            models.Comment.objects.filter(
+                issue=issue, description=payload['description']
+            )
+        )
 
     @override_support_settings(ENABLED=False)
     def test_user_can_not_comment_issue_if_support_extension_is_disabled(self):
@@ -499,7 +632,9 @@ class IssueCommentTest(base.BaseTest):
         issue = factories.IssueFactory(customer=self.fixture.customer)
         payload = self._get_valid_payload()
 
-        response = self.client.post(factories.IssueFactory.get_url(issue, action='comment'), data=payload)
+        response = self.client.post(
+            factories.IssueFactory.get_url(issue, action='comment'), data=payload
+        )
         self.assertEqual(response.status_code, status.HTTP_424_FAILED_DEPENDENCY)
 
     def _get_valid_payload(self):

@@ -1,6 +1,6 @@
 import json
-
-from decimal import Decimal, ROUND_UP
+from decimal import ROUND_UP, Decimal
+from urllib.parse import urlencode
 
 from dateutil import parser
 from django.utils.timezone import get_current_timezone
@@ -26,7 +26,7 @@ def get_headers(user):
     return dict(
         content_type='application/json',
         HTTP_AUTHORIZATION='Token %s' % token.key,
-        SERVER_NAME='localhost'
+        SERVER_NAME='localhost',
     )
 
 
@@ -36,15 +36,18 @@ def get_request(view, user, **extra):
     return view(request, **extra)
 
 
-def create_request(view, user, post_data):
+def create_request(view, user, post_data, **kwargs):
     factory = APIRequestFactory()
     request = factory.post('/', data=json.dumps(post_data), **get_headers(user))
-    return view(request)
+    return view(request, **kwargs)
 
 
-def delete_request(view, user, **extra):
+def delete_request(view, user, query_params='', **extra):
     factory = APIRequestFactory()
-    request = factory.delete('', **get_headers(user))
+    path = ''
+    if query_params:
+        path = '?' + urlencode(query_params)
+    request = factory.delete(path, **get_headers(user))
     return view(request, **extra)
 
 
@@ -54,3 +57,8 @@ def parse_datetime(timestr):
 
 def parse_date(timestr):
     return parse_datetime(timestr).date()
+
+
+def mb_to_gb(value):
+    # In marketplace RAM and storage is stored in GB, but in plugin it is stored in MB.
+    return quantize_price(Decimal(value / 1024.0))

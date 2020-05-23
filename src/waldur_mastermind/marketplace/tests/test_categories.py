@@ -1,15 +1,15 @@
 from ddt import data, ddt
-from rest_framework import test, status
+from rest_framework import status, test
 
 from waldur_core.structure.tests import fixtures
 from waldur_mastermind.marketplace import models
+from waldur_mastermind.marketplace.tests.helpers import override_marketplace_settings
 
 from . import factories
 
 
 @ddt
 class CategoryGetTest(test.APITransactionTestCase):
-
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.category = factories.CategoryFactory()
@@ -28,10 +28,22 @@ class CategoryGetTest(test.APITransactionTestCase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
+    @override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=True)
+    def test_anonymous_user_can_see_category_list(self):
+        url = factories.CategoryFactory.get_list_url()
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+
+    @override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=True)
+    def test_anonymous_user_can_see_category_item(self):
+        url = factories.CategoryFactory.get_url(self.category)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
 
 @ddt
 class CategoryCreateTest(test.APITransactionTestCase):
-
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
 
@@ -60,7 +72,6 @@ class CategoryCreateTest(test.APITransactionTestCase):
 
 @ddt
 class CategoryUpdateTest(test.APITransactionTestCase):
-
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
 
@@ -82,9 +93,7 @@ class CategoryUpdateTest(test.APITransactionTestCase):
         self.client.force_authenticate(user)
         url = factories.CategoryFactory.get_url(category)
 
-        response = self.client.patch(url, {
-            'title': 'new_category'
-        })
+        response = self.client.patch(url, {'title': 'new_category'})
         category.refresh_from_db()
 
         return response, category
@@ -92,7 +101,6 @@ class CategoryUpdateTest(test.APITransactionTestCase):
 
 @ddt
 class CategoryDeleteTest(test.APITransactionTestCase):
-
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.category = factories.CategoryFactory(title='category')
@@ -100,7 +108,9 @@ class CategoryDeleteTest(test.APITransactionTestCase):
     @data('staff',)
     def test_authorized_user_can_delete_category(self, user):
         response = self.delete_category(user)
-        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT, response.data)
+        self.assertEqual(
+            response.status_code, status.HTTP_204_NO_CONTENT, response.data
+        )
         self.assertFalse(models.Category.objects.filter(title='category').exists())
 
     @data('owner', 'user', 'customer_support', 'admin', 'manager')
