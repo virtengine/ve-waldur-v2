@@ -1,6 +1,9 @@
 from django.utils import timezone
 
+from waldur_core.core import utils as core_utils
+from waldur_mastermind.invoices import models as invoice_models
 from waldur_mastermind.invoices import registrators
+from waldur_mastermind.slurm_invoices import registrators as slurm_registrators
 
 from . import utils
 
@@ -16,40 +19,31 @@ def terminate_invoice_when_allocation_deleted(sender, instance, **kwargs):
     registrators.RegistrationManager.terminate(instance, timezone.now())
 
 
-def terminate_invoice_when_allocation_cancelled(
-    sender, instance, created=False, **kwargs
-):
-    if created:
-        return
-
-    if instance.tracker.has_changed('is_active') and not instance.is_active:
-        registrators.RegistrationManager.terminate(instance, timezone.now())
-
-
 def update_invoice_item_on_allocation_usage_update(
     sender, instance, created=False, **kwargs
 ):
-    if created:
-        return
-
-    allocation = instance
-    if not allocation.usage_changed():
-        return
-
-    invoice_item = registrators.RegistrationManager.get_item(allocation)
-    if not invoice_item:
-        return
+    allocation_usage = instance
+    allocation = allocation_usage.allocation
 
     package = utils.get_package(allocation)
     if package:
-        invoice_item.unit_price = utils.get_deposit_usage(allocation, package)
-        invoice_item.details = registrators.RegistrationManager.get_details(allocation)
-        invoice_item.name = registrators.RegistrationManager.get_name(allocation)
-        invoice_item.save(update_fields=['name', 'unit_price', 'details'])
+        start = timezone.now()
+        end = core_utils.month_end(start)
+        registrator = slurm_registrators.AllocationRegistrator()
+        customer = registrator.get_customer(allocation)
+        invoice = invoice_models.Invoice.objects.get(
+            customer=customer, month=start.month, year=start.year,
+        )
+
+        registrator.create_or_update_items(
+            allocation, allocation_usage, package, invoice, start, end
+        )
 
 
 def update_allocation_deposit(sender, instance, created=False, **kwargs):
     allocation = instance
+    if allocation.batch_service != 'MOAB':
+        return
 
     package = utils.get_package(allocation)
     if not package:

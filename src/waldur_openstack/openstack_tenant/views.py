@@ -112,6 +112,7 @@ class ImageUsageReporter(UsageReporter):
             self.apply_filters(volumes)
             .values('image_name')
             .annotate(count=Count('image_name'))
+            .order_by()  # remove the extra group by arguments caused by default ordering
         )
         return {row['image_name']: row['count'] for row in rows}
 
@@ -128,6 +129,7 @@ class FlavorUsageReporter(UsageReporter):
             self.apply_filters(instances)
             .values('flavor_name')
             .annotate(count=Count('flavor_name'))
+            .order_by()  # remove the extra group by arguments caused by default ordering
         )
         return {row['flavor_name']: row['count'] for row in rows}
 
@@ -197,6 +199,17 @@ class VolumeViewSet(structure_views.ImportableResourceViewSet):
     update_executor = executors.VolumeUpdateExecutor
     pull_executor = executors.VolumePullExecutor
 
+    def _can_destroy_volume(volume):
+        if volume.state == models.Volume.States.ERRED:
+            return
+        if volume.state != models.Volume.States.OK:
+            raise core_exceptions.IncorrectStateException(
+                _('Volume should be in OK state.')
+            )
+        core_validators.RuntimeStateValidator(
+            'available', 'error', 'error_restoring', 'error_extending', ''
+        )(volume)
+
     def _volume_snapshots_exist(volume):
         if volume.snapshots.exists():
             raise core_exceptions.IncorrectStateException(
@@ -205,13 +218,8 @@ class VolumeViewSet(structure_views.ImportableResourceViewSet):
 
     delete_executor = executors.VolumeDeleteExecutor
     destroy_validators = [
+        _can_destroy_volume,
         _volume_snapshots_exist,
-        core_validators.StateValidator(
-            models.Volume.States.OK, models.Volume.States.ERRED
-        ),
-        core_validators.RuntimeStateValidator(
-            'available', 'error', 'error_restoring', 'error_extending', ''
-        ),
     ]
 
     def _is_volume_bootable(volume):
@@ -652,6 +660,33 @@ class InstanceViewSet(structure_views.ImportableResourceViewSet):
     create_backup_schedule_serializer_class = serializers.BackupScheduleSerializer
 
     @decorators.action(detail=True, methods=['post'])
+    def update_allowed_address_pairs(self, request, uuid=None):
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        subnet = serializer.validated_data['subnet']
+        allowed_address_pairs = serializer.validated_data['allowed_address_pairs']
+        internal_ip = models.InternalIP.objects.get(instance=instance, subnet=subnet)
+
+        executors.InstanceAllowedAddressPairsUpdateExecutor().execute(
+            instance,
+            backend_id=internal_ip.backend_id,
+            allowed_address_pairs=allowed_address_pairs,
+        )
+        return response.Response(
+            {'status': _('Allowed address pairs update was scheduled')},
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+    update_allowed_address_pairs_validators = [
+        core_validators.StateValidator(models.Instance.States.OK)
+    ]
+    update_allowed_address_pairs_serializer_class = (
+        serializers.InstanceAllowedAddressPairsUpdateSerializer
+    )
+
+    @decorators.action(detail=True, methods=['post'])
     def update_internal_ips_set(self, request, uuid=None):
         instance = self.get_object()
         serializer = self.get_serializer(instance, data=request.data)
@@ -688,7 +723,7 @@ class InstanceViewSet(structure_views.ImportableResourceViewSet):
 
         executors.InstanceFloatingIPsUpdateExecutor().execute(instance)
         return response.Response(
-            {'status': _('floating ips update was scheduled')},
+            {'status': _('Floating IPs update was scheduled.')},
             status=status.HTTP_202_ACCEPTED,
         )
 

@@ -1,31 +1,46 @@
+from django.utils import timezone
 from freezegun import freeze_time
-from rest_framework import test
+from rest_framework import status, test
 
+from waldur_core.core import utils as core_utils
 from waldur_core.structure.tests import fixtures as structure_fixtures
+from waldur_mastermind.common.mixins import UnitPriceMixin
 from waldur_mastermind.common.utils import parse_date
+from waldur_mastermind.invoices import models as invoices_models
+from waldur_mastermind.invoices import tasks as invoices_tasks
+from waldur_mastermind.marketplace_openstack import PACKAGE_TYPE
 
-from .. import models, tasks
-from . import factories
+from .. import models, tasks, utils
+from . import factories, helpers
 
 
-@freeze_time('2019-01-22')
-class StatsTest(test.APITransactionTestCase):
+class StatsBaseTest(test.APITransactionTestCase):
     def setUp(self):
-        self.date = parse_date('2019-01-01')
-        fixture = structure_fixtures.ProjectFixture()
-
-        self.customer = fixture.customer
-        self.project = fixture.project
+        self.fixture = structure_fixtures.ProjectFixture()
+        self.customer = self.fixture.customer
+        self.project = self.fixture.project
 
         self.category = factories.CategoryFactory()
         self.category_component = factories.CategoryComponentFactory(
             category=self.category
         )
 
-        self.offering = factories.OfferingFactory(category=self.category)
+        self.offering = factories.OfferingFactory(
+            category=self.category,
+            type=PACKAGE_TYPE,
+            state=models.Offering.States.ACTIVE,
+        )
         self.offering_component = factories.OfferingComponentFactory(
             offering=self.offering, parent=self.category_component
         )
+
+
+@freeze_time('2019-01-22')
+class StatsTest(StatsBaseTest):
+    def setUp(self):
+        super(StatsTest, self).setUp()
+
+        self.date = parse_date('2019-01-01')
 
         self.plan = factories.PlanFactory(offering=self.offering)
         self.plan_component = factories.PlanComponentFactory(
@@ -120,3 +135,263 @@ class StatsTest(test.APITransactionTestCase):
 
         self.assertEqual(project_usage, self.plan_component.amount)
         self.assertEqual(customer_usage, self.plan_component.amount)
+
+    def test_offering_customers_stats(self):
+        url = factories.OfferingFactory.get_url(self.offering, action='customers')
+        self.client.force_authenticate(self.fixture.staff)
+        result = self.client.get(url)
+        self.assertEqual(result.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(result.data), 1)
+        self.assertEqual(
+            result.data[0]['uuid'], self.resource.project.customer.uuid.hex
+        )
+
+
+@freeze_time('2020-01-01')
+class CostsStatsTest(StatsBaseTest):
+    def setUp(self):
+        super(CostsStatsTest, self).setUp()
+        self.url = factories.OfferingFactory.get_url(self.offering, action='costs')
+
+        self.plan = factories.PlanFactory(
+            offering=self.offering, unit=UnitPriceMixin.Units.PER_DAY,
+        )
+        self.plan_component = factories.PlanComponentFactory(
+            plan=self.plan, component=self.offering_component, amount=10
+        )
+
+        self.resource = factories.ResourceFactory(
+            offering=self.offering,
+            state=models.Resource.States.OK,
+            plan=self.plan,
+            limits={'cpu': 1},
+        )
+        invoices_tasks.create_monthly_invoices()
+
+    def test_offering_costs_stats(self):
+        with freeze_time('2020-03-01'):
+            self._check_stats()
+
+    def test_period_filter(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        result = self.client.get(self.url, {'other_param': ''})
+        self.assertEqual(result.status_code, status.HTTP_200_OK)
+
+        result = self.client.get(self.url, {'start': '2020-01'})
+        self.assertEqual(result.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_offering_costs_stats_if_resource_has_been_failed(self):
+        with freeze_time('2020-03-01'):
+            self.resource.state = models.Resource.States.ERRED
+            self.resource.save()
+            self._check_stats()
+
+    def _check_stats(self):
+        self.client.force_authenticate(self.fixture.staff)
+        result = self.client.get(self.url, {'start': '2020-01', 'end': '2020-02'})
+        self.assertEqual(result.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(result.data), 2)
+        self.assertEqual(
+            result.data[0],
+            {
+                'tax': 0,
+                'total': self.plan_component.price * 31,
+                'price': self.plan_component.price * 31,
+                'price_current': self.plan_component.price * 31,
+                'period': '2020-01',
+            },
+        )
+
+    @helpers.override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=True)
+    def test_stat_methods_are_not_available_for_anonymous_users(self):
+        offering_url = factories.OfferingFactory.get_url(self.offering)
+
+        result = self.client.get(offering_url)
+        self.assertEqual(result.status_code, status.HTTP_200_OK)
+
+        offering_list_url = factories.OfferingFactory.get_list_url()
+        result = self.client.get(offering_list_url)
+        self.assertEqual(result.status_code, status.HTTP_200_OK)
+
+        result = self.client.get(self.url)
+        self.assertEqual(result.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        customers_url = factories.OfferingFactory.get_url(
+            self.offering, action='customers'
+        )
+        result = self.client.get(customers_url)
+        self.assertEqual(result.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+@freeze_time('2020-03-01')
+class ComponentStatsTest(StatsBaseTest):
+    def setUp(self):
+        super(ComponentStatsTest, self).setUp()
+        self.url = factories.OfferingFactory.get_url(
+            self.offering, action='component_stats'
+        )
+
+        self.plan = factories.PlanFactory(
+            offering=self.offering, unit=UnitPriceMixin.Units.PER_DAY,
+        )
+        self.plan_component = factories.PlanComponentFactory(
+            plan=self.plan, component=self.offering_component, amount=10
+        )
+
+        self.resource = factories.ResourceFactory(
+            offering=self.offering,
+            state=models.Resource.States.OK,
+            plan=self.plan,
+            limits={'cpu': 1},
+        )
+
+    def _create_item(self):
+        invoices_tasks.create_monthly_invoices()
+        invoice = invoices_models.Invoice.objects.get(
+            year=2020, month=3, customer=self.resource.project.customer
+        )
+        return invoice.items.get(object_id=self.resource.id)
+
+    def test_item_details(self):
+        component = factories.OfferingComponentFactory(
+            offering=self.resource.offering,
+            billing_type=models.OfferingComponent.BillingTypes.USAGE,
+            type='storage',
+        )
+        usage = factories.ComponentUsageFactory(
+            resource=self.resource,
+            billing_period=core_utils.month_start(timezone.now()),
+            component=component,
+        )
+        item = self._create_item()
+        self.assertEqual(
+            item.details,
+            {
+                'limits': self.resource.limits,
+                'usages': {usage.component.type: usage.usage},
+                'scope_uuid': item.scope.uuid.hex,
+                'offering_name': self.offering.name,
+                'offering_type': PACKAGE_TYPE,
+                'offering_uuid': self.offering.uuid.hex,
+            },
+        )
+
+    def test_component_stats(self):
+        component = factories.OfferingComponentFactory(
+            offering=self.resource.offering,
+            billing_type=models.OfferingComponent.BillingTypes.USAGE,
+            type='storage',
+        )
+        usage = factories.ComponentUsageFactory(
+            resource=self.resource,
+            billing_period=core_utils.month_start(timezone.now()),
+            component=component,
+        )
+        self._create_item()
+        self.client.force_authenticate(self.fixture.staff)
+        result = self.client.get(self.url, {'start': '2020-03', 'end': '2020-03'})
+        self.assertEqual(
+            result.data,
+            [
+                {
+                    'period': '2020-03',
+                    'components': {'cpu': 1, usage.component.type: usage.usage},
+                }
+            ],
+        )
+
+    def test_migration(self):
+        item = self._create_item()
+        details = utils.get_offering_details(self.resource.offering)
+        details['scope_uuid'] = self.resource.uuid.hex
+        details['limits'] = self.resource.limits
+        details['usages'] = {}
+        self.assertEqual(item.details, details)
+
+        migration = __import__(
+            'waldur_mastermind.marketplace.migrations.0024_init_invoice_items_details_from_order_item',
+            fromlist=['init_invoice_items_details_from_order_item'],
+        )
+        func = migration.init_invoice_items_details_from_order_item
+
+        class Apps(object):
+            @staticmethod
+            def get_model(app, klass):
+                if klass == 'OrderItem':
+                    return models.OrderItem
+
+                if klass == 'ComponentUsage':
+                    return models.ComponentUsage
+
+                if klass == 'InvoiceItem':
+                    return invoices_models.InvoiceItem
+
+                if klass == 'Resource':
+                    return models.Resource
+
+        mock_apps = Apps()
+        component = factories.OfferingComponentFactory(
+            offering=self.resource.offering,
+            billing_type=models.OfferingComponent.BillingTypes.USAGE,
+            type='storage',
+        )
+        usage = factories.ComponentUsageFactory(
+            resource=item.scope,
+            billing_period=core_utils.month_start(timezone.now()),
+            component=component,
+        )
+        func(mock_apps, None)
+        item.refresh_from_db()
+        details['usages'] = {usage.component.type: usage.usage}
+        self.assertEqual(item.details, details)
+
+    def test_handler(self):
+        component = factories.OfferingComponentFactory(
+            offering=self.resource.offering,
+            billing_type=models.OfferingComponent.BillingTypes.USAGE,
+            type='storage',
+        )
+        self._create_item()
+        usage = factories.ComponentUsageFactory(
+            resource=self.resource,
+            billing_period=core_utils.month_start(timezone.now()),
+            component=component,
+        )
+        self.client.force_authenticate(self.fixture.staff)
+        result = self.client.get(self.url, {'start': '2020-03', 'end': '2020-03'})
+        self.assertEqual(
+            result.data,
+            [
+                {
+                    'period': '2020-03',
+                    'components': {'cpu': 1, usage.component.type: usage.usage},
+                }
+            ],
+        )
+
+    def test_migration_0030_offering_data_to_invoice_item_details(self):
+        item = self._create_item()
+        item.details = {}
+        item.save()
+        details = utils.get_offering_details(self.resource.offering)
+
+        migration = __import__(
+            'waldur_mastermind.marketplace.migrations.0030_offering_data_to_invoice_item_details',
+            fromlist=['offering_data'],
+        )
+        func = migration.offering_data
+
+        class Apps(object):
+            @staticmethod
+            def get_model(app, klass):
+                if klass == 'InvoiceItem':
+                    return invoices_models.InvoiceItem
+
+                if klass == 'Resource':
+                    return models.Resource
+
+        mock_apps = Apps()
+        func(mock_apps, None)
+        item.refresh_from_db()
+        self.assertEqual(item.details, details)

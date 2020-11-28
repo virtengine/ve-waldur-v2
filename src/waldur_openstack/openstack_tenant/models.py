@@ -246,6 +246,8 @@ class Volume(TenantQuotaMixin, structure_models.Volume):
             'instance',
             'availability_zone',
             'image',
+            'image_metadata',
+            'image_name',
         )
 
 
@@ -390,6 +392,7 @@ class Instance(TenantQuotaMixin, structure_models.VirtualMachine):
 
     class Meta:
         unique_together = ('service_project_link', 'backend_id')
+        ordering = ['name', 'created']
 
     @property
     def external_ips(self):
@@ -585,18 +588,13 @@ class Network(core_models.DescribableMixin, structure_models.ServiceProperty):
         return 'openstacktenant-network'
 
 
-class SubNet(core_models.DescribableMixin, structure_models.ServiceProperty):
+class SubNet(
+    openstack_base_models.BaseSubNet,
+    core_models.DescribableMixin,
+    structure_models.ServiceProperty,
+):
     network = models.ForeignKey(
         on_delete=models.CASCADE, to=Network, related_name='subnets'
-    )
-    cidr = models.CharField(max_length=32, blank=True)
-    gateway_ip = models.GenericIPAddressField(protocol='IPv4', null=True)
-    allocation_pools = JSONField(default=dict)
-    ip_version = models.SmallIntegerField(default=4)
-    enable_dhcp = models.BooleanField(default=True)
-    dns_nameservers = JSONField(
-        default=list,
-        help_text=_('List of DNS name servers associated with the subnet.'),
     )
 
     class Meta:

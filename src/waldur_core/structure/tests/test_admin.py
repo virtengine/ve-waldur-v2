@@ -3,6 +3,7 @@ import json
 from datetime import datetime
 
 from django.contrib.admin.sites import AdminSite
+from django.db.models.deletion import ProtectedError
 from django.test import TestCase
 
 from waldur_core.structure import admin as structure_admin
@@ -193,24 +194,24 @@ class ProjectAdminTest(TestCase):
         user2 = factories.UserFactory()
 
         # Act
-        project = self.change_project(support_users=[user1.pk, user2.pk])
+        project = self.change_project(members=[user1.pk, user2.pk])
 
         # Asset
-        self.assertTrue(project.has_user(user1, structure_models.ProjectRole.SUPPORT))
-        self.assertTrue(project.has_user(user2, structure_models.ProjectRole.SUPPORT))
+        self.assertTrue(project.has_user(user1, structure_models.ProjectRole.MEMBER))
+        self.assertTrue(project.has_user(user2, structure_models.ProjectRole.MEMBER))
 
     def test_old_users_are_deleted_and_existing_are_preserved(self):
         # Arrange
         user1 = factories.UserFactory()
         user2 = factories.UserFactory()
-        self.project.add_user(user1, structure_models.ProjectRole.SUPPORT)
+        self.project.add_user(user1, structure_models.ProjectRole.MEMBER)
 
         # Act
-        project = self.change_project(support_users=[user2.pk])
+        project = self.change_project(members=[user2.pk])
 
         # Asset
-        self.assertFalse(project.has_user(user1, structure_models.ProjectRole.SUPPORT))
-        self.assertTrue(project.has_user(user2, structure_models.ProjectRole.SUPPORT))
+        self.assertFalse(project.has_user(user1, structure_models.ProjectRole.MEMBER))
+        self.assertTrue(project.has_user(user2, structure_models.ProjectRole.MEMBER))
 
     def test_user_may_have_only_one_role_in_the_same_project(self):
         # Arrange
@@ -220,7 +221,7 @@ class ProjectAdminTest(TestCase):
         # Act
         with self.assertRaises(ValueError):
             self.change_project(
-                support_users=[user1.pk, user2.pk], managers=[user1.pk, user2.pk]
+                members=[user1.pk, user2.pk], managers=[user1.pk, user2.pk]
             )
 
 
@@ -294,3 +295,26 @@ class CustomerAdminTest(TestCase):
             self.change_customer(
                 support_users=[user1.pk, user2.pk], owners=[user1.pk, user2.pk]
             )
+
+    def test_customer_deleting_is_passable_only_if_related_project_is_removed(self):
+        site = AdminSite()
+        model_admin = structure_admin.CustomerAdmin(structure_models.Customer, site)
+        project = factories.ProjectFactory(customer=self.customer)
+        request = MockRequest()
+        queryset = structure_models.Customer.objects.filter(pk=self.customer.id)
+
+        self.assertRaises(
+            ProtectedError, model_admin.delete_queryset, request, queryset
+        )
+        project_id = project.id
+        project.delete()
+
+        # A project exists in DB because we use soft-delete for projects.
+        self.assertTrue(
+            structure_models.Project.structure_objects.filter(pk=project_id).exists()
+        )
+
+        model_admin.delete_queryset(request, queryset)
+        self.assertRaises(
+            structure_models.Customer.DoesNotExist, self.customer.refresh_from_db
+        )

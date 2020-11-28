@@ -65,6 +65,29 @@ class VolumeTypeFilter(structure_filters.ServicePropertySettingsFilter):
         model = models.VolumeType
 
 
+class RouterFilter(structure_filters.NameFilterSet):
+    tenant_uuid = django_filters.UUIDFilter(field_name='tenant__uuid')
+    tenant = core_filters.URLFilter(
+        view_name='openstack-tenant-detail', field_name='tenant__uuid'
+    )
+
+    class Meta:
+        model = models.Router
+        fields = ('tenant', 'tenant_uuid')
+
+
+class PortFilter(structure_filters.NameFilterSet):
+    tenant_uuid = django_filters.UUIDFilter(field_name='tenant__uuid')
+    tenant = core_filters.URLFilter(
+        view_name='openstack-tenant-detail', field_name='tenant__uuid'
+    )
+    o = django_filters.OrderingFilter(fields=(('network__name', 'network_name'),))
+
+    class Meta:
+        model = models.Port
+        fields = ('tenant', 'tenant_uuid')
+
+
 class NetworkFilter(structure_filters.BaseResourceFilter):
     tenant_uuid = django_filters.UUIDFilter(field_name='tenant__uuid')
     tenant = core_filters.URLFilter(

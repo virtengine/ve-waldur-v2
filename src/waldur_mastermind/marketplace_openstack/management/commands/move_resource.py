@@ -16,6 +16,16 @@ class MoveResourceException(Exception):
 @transaction.atomic
 def move_resource(resource, project):
     old_project = resource.project
+
+    linked_offerings = marketplace_models.Offering.objects.filter(
+        scope=resource.scope, allowed_customers__in=[old_project.customer],
+    )
+
+    offering: marketplace_models.Offering
+    for offering in linked_offerings:
+        offering.allowed_customers.remove(old_project.customer)
+        offering.allowed_customers.add(project.customer)
+
     resource.project = project
     resource.save(update_fields=['project'])
 
@@ -60,8 +70,12 @@ def move_resource(resource, project):
             )
 
         invoice_item.project = project
+        invoice_item.project_uuid = project.uuid.hex
+        invoice_item.project_name = project.name
         invoice_item.invoice = target_invoice
-        invoice_item.save(update_fields=['project', 'invoice'])
+        invoice_item.save(
+            update_fields=['project', 'project_uuid', 'project_name', 'invoice']
+        )
 
         start_invoice.update_current_cost()
         target_invoice.update_current_cost()

@@ -19,13 +19,6 @@ def notify_create_user(sender, instance, password, created=False, **kwargs):
     )
 
 
-def delete_catalog_when_cluster_is_deleted(sender, instance, **kwargs):
-    content_type = ContentType.objects.get_for_model(instance)
-    models.Catalog.objects.filter(
-        content_type=content_type, object_id=instance.id
-    ).delete()
-
-
 def delete_node_if_related_instance_has_been_deleted(sender, instance, **kwargs):
     try:
         content_type = ContentType.objects.get_for_model(instance)
@@ -38,13 +31,15 @@ def delete_node_if_related_instance_has_been_deleted(sender, instance, **kwargs)
 
 def delete_cluster_if_all_related_nodes_have_been_deleted(sender, instance, **kwargs):
     node = instance
-
-    if (
-        node.cluster.state == models.Cluster.States.DELETING
-        and not node.cluster.node_set.count()
-    ):
-        backend = node.cluster.get_backend()
-        backend.delete_cluster(node.cluster)
+    try:
+        if (
+            node.cluster.state == models.Cluster.States.DELETING
+            and not node.cluster.node_set.count()
+        ):
+            backend = node.cluster.get_backend()
+            backend.delete_cluster(node.cluster)
+    except models.Cluster.DoesNotExist:
+        logger.warning('Cluster instance has been removed already.')
 
 
 def set_error_state_for_node_if_related_instance_deleting_is_failed(
@@ -81,3 +76,10 @@ def set_error_state_for_cluster_if_related_node_deleting_is_failed(
             node.cluster.state = models.Cluster.States.ERRED
             node.cluster.error_message = 'Deleting one or a more nodes have failed.'
             node.cluster.save()
+
+
+def delete_catalog_if_scope_has_been_deleted(sender, instance, **kwargs):
+    content_type = ContentType.objects.get_for_model(instance)
+    models.Catalog.objects.filter(
+        object_id=instance.id, content_type=content_type
+    ).delete()

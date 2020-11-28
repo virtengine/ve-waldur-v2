@@ -336,6 +336,10 @@ class Offering(
     report = core_fields.JSONField(blank=True)
     terminated_at = models.DateTimeField(editable=False, blank=True, null=True)
 
+    # For storing unique reference to the resource provided through request-based item.
+    # E.g. ecs s3 namespace name.
+    backend_id = models.CharField(max_length=255, blank=True)
+
     tracker = FieldTracker()
 
     def get_backend(self):
@@ -600,18 +604,22 @@ class Feedback(
     core_models.UuidMixin, TimeStampedModel, core_models.StateMixin,
 ):
     class Evaluation:
-        NEGATIVE = 'negative'
-        NEUTRAL = 'neutral'
-        POSITIVE = 'positive'
+        VERY_NEGATIVE = 1
+        NEGATIVE = 2
+        NEUTRAL = 3
+        POSITIVE = 4
+        VERY_POSITIVE = 5
 
         CHOICES = (
+            (VERY_NEGATIVE, 'Very negative'),
             (NEGATIVE, 'Negative'),
             (NEUTRAL, 'Neutral'),
             (POSITIVE, 'Positive'),
+            (VERY_POSITIVE, 'Very positive'),
         )
 
     issue = models.OneToOneField(Issue, on_delete=models.CASCADE)
-    evaluation = models.CharField(max_length=20, choices=Evaluation.CHOICES)
+    evaluation = models.SmallIntegerField(choices=Evaluation.CHOICES)
     comment = models.TextField(blank=True)
 
     def __str__(self):

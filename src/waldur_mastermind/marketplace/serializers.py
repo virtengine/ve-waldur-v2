@@ -3,6 +3,7 @@ import logging
 
 import jwt
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.db import transaction
 from django.db.models import (
@@ -47,7 +48,7 @@ from waldur_mastermind.marketplace.processors import CreateResourceProcessor
 from waldur_mastermind.support import serializers as support_serializers
 from waldur_pid import models as pid_models
 
-from . import attribute_types, models, permissions, plugins, tasks, utils
+from . import attribute_types, log, models, permissions, plugins, tasks, utils
 
 logger = logging.getLogger(__name__)
 
@@ -364,6 +365,7 @@ FIELD_TYPES = (
     'text',
     'html_text',
     'select_string',
+    'select_string_multi',
     'select_openstack_tenant',
     'select_openstack_instance',
     'select_multiple_openstack_instances',
@@ -412,11 +414,23 @@ class OfferingComponentSerializer(serializers.ModelSerializer):
             'article_code',
             'max_value',
             'min_value',
+            'is_boolean',
+            'default_limit',
             'factor',
         )
         extra_kwargs = {
             'billing_type': {'required': True},
         }
+
+    def validate(self, attrs):
+        if attrs.get('is_boolean'):
+            attrs['min_value'] = 0
+            attrs['max_value'] = 1
+            attrs['limit_period'] = ''
+            attrs['limit_amount'] = None
+            attrs['disable_quotas'] = False
+            attrs['use_limit_for_billing'] = True
+        return attrs
 
     def get_factor(self, offering_component):
         builtin_components = plugins.manager.get_components(
@@ -545,7 +559,6 @@ class ExportImportOfferingSerializer(serializers.ModelSerializer):
             'attributes',
             'options',
             'components',
-            'geolocations',
             'plugin_options',
             'secret_options',
             'state',
@@ -558,6 +571,8 @@ class ExportImportOfferingSerializer(serializers.ModelSerializer):
             'category_id',
             'customer_id',
             'plans',
+            'latitude',
+            'longitude',
         )
 
     def save(self, **kwargs):
@@ -615,10 +630,11 @@ class OfferingDetailsSerializer(
 ):
 
     attributes = serializers.JSONField(required=False)
-    options = serializers.JSONField(required=False)
+    options = serializers.JSONField(
+        required=False, default={'options': {}, 'order': []}
+    )
     secret_options = serializers.JSONField(required=False)
     components = OfferingComponentSerializer(required=False, many=True)
-    geolocations = core_serializers.GeoLocationField(required=False)
     order_item_count = serializers.SerializerMethodField()
     plans = BasePlanSerializer(many=True, required=False)
     screenshots = NestedScreenshotSerializer(many=True, read_only=True)
@@ -648,7 +664,6 @@ class OfferingDetailsSerializer(
             'attributes',
             'options',
             'components',
-            'geolocations',
             'plugin_options',
             'secret_options',
             'state',
@@ -669,6 +684,8 @@ class OfferingDetailsSerializer(
             'paused_reason',
             'datacite_doi',
             'citation_count',
+            'latitude',
+            'longitude',
         )
         related_paths = {
             'customer': ('uuid', 'name'),
@@ -693,6 +710,7 @@ class OfferingDetailsSerializer(
         if method == 'GET':
             fields['components'] = serializers.SerializerMethodField('get_components')
             fields['plans'] = serializers.SerializerMethodField('get_filtered_plans')
+            fields['attributes'] = serializers.SerializerMethodField('get_attributes')
 
         user = self.context['view'].request.user
         if not user.is_authenticated:
@@ -743,6 +761,14 @@ class OfferingDetailsSerializer(
     def get_filtered_plans(self, offering):
         qs = (offering.parent or offering).plans.all()
         return BasePlanSerializer(qs, many=True, context=self.context).data
+
+    def get_attributes(self, offering):
+        func = manager.get_change_attributes_for_view(offering.type)
+
+        if func:
+            return func(offering.attributes)
+
+        return offering.attributes
 
 
 class OfferingComponentLimitSerializer(serializers.Serializer):
@@ -1090,6 +1116,10 @@ class OfferingUpdateSerializer(OfferingModifySerializer):
             'use_limit_for_billing',
             'product_code',
             'article_code',
+            'is_boolean',
+            'default_limit',
+            'min_value',
+            'max_value',
         )
 
         for component_key in updated_components:
@@ -1200,6 +1230,87 @@ class OfferingUpdateSerializer(OfferingModifySerializer):
             instance, validated_data
         )
         return offering
+
+
+class OfferingPermissionSerializer(
+    structure_serializers.PermissionFieldFilteringMixin,
+    structure_serializers.BasePermissionSerializer,
+):
+    offering_name = serializers.ReadOnlyField(source='offering.name')
+
+    class Meta(structure_serializers.BasePermissionSerializer.Meta):
+        model = models.OfferingPermission
+        fields = (
+            'url',
+            'pk',
+            'created',
+            'expiration_time',
+            'created_by',
+            'offering',
+            'offering_uuid',
+            'offering_name',
+        ) + structure_serializers.BasePermissionSerializer.Meta.fields
+        related_paths = dict(
+            offering=('name', 'uuid'),
+            **structure_serializers.BasePermissionSerializer.Meta.related_paths
+        )
+        protected_fields = ('offering', 'user', 'created_by', 'created')
+        extra_kwargs = {
+            'user': {
+                'view_name': 'user-detail',
+                'lookup_field': 'uuid',
+                'queryset': get_user_model().objects.all(),
+            },
+            'created_by': {
+                'view_name': 'user-detail',
+                'lookup_field': 'uuid',
+                'read_only': True,
+            },
+            'offering': {
+                'view_name': 'marketplace-offering-detail',
+                'lookup_field': 'uuid',
+                'queryset': models.Offering.objects.all(),
+            },
+        }
+
+    def validate(self, data):
+        if not self.instance:
+            offering = data['offering']
+            user = data['user']
+
+            if offering.has_user(user):
+                raise serializers.ValidationError(
+                    _('The fields offering and user must make a unique set.')
+                )
+
+        return data
+
+    def create(self, validated_data):
+        offering = validated_data['offering']
+        user = validated_data['user']
+        expiration_time = validated_data.get('expiration_time')
+
+        created_by = self.context['request'].user
+        permission, _ = offering.add_user(
+            user=user, created_by=created_by, expiration_time=expiration_time
+        )
+
+        return permission
+
+    def validate_expiration_time(self, value):
+        if value is not None and value < timezone.now():
+            raise serializers.ValidationError(
+                _('Expiration time should be greater than current time.')
+            )
+        return value
+
+    def get_filtered_field_names(self):
+        return ('offering',)
+
+
+class OfferingPermissionLogSerializer(OfferingPermissionSerializer):
+    class Meta(OfferingPermissionSerializer.Meta):
+        view_name = 'marketplace-offering-permission-log-detail'
 
 
 class ComponentQuotaSerializer(serializers.ModelSerializer):
@@ -1365,6 +1476,8 @@ class OrderItemDetailsSerializer(NestedOrderItemSerializer):
             'old_cost_estimate',
             'new_cost_estimate',
             'can_terminate',
+            'fixed_price',
+            'activation_price',
         )
 
     order_uuid = serializers.ReadOnlyField(source='order.uuid')
@@ -1426,6 +1539,8 @@ class CartItemSerializer(BaseRequestSerializer):
             'project',
             'project_name',
             'project_uuid',
+            'fixed_price',
+            'activation_price',
         )
         protected_fields = BaseRequestSerializer.Meta.protected_fields + ('project',)
 
@@ -1677,10 +1792,12 @@ class ResourceSerializer(BaseItemSerializer):
             'scope',
             'state',
             'resource_uuid',
+            'backend_id',
             'resource_type',
             'project',
             'project_uuid',
             'project_name',
+            'project_description',
             'customer_uuid',
             'customer_name',
             'offering_uuid',
@@ -1691,7 +1808,7 @@ class ResourceSerializer(BaseItemSerializer):
             'current_usages',
             'can_terminate',
         )
-        read_only_fields = ('backend_metadata', 'scope', 'current_usages')
+        read_only_fields = ('backend_metadata', 'scope', 'current_usages', 'backend_id')
 
     state = serializers.ReadOnlyField(source='get_state_display')
     scope = core_serializers.GenericRelatedField()
@@ -1702,6 +1819,7 @@ class ResourceSerializer(BaseItemSerializer):
     )
     project_uuid = serializers.ReadOnlyField(source='project.uuid')
     project_name = serializers.ReadOnlyField(source='project.name')
+    project_description = serializers.ReadOnlyField(source='project.description')
     customer_uuid = serializers.ReadOnlyField(source='project.customer.uuid')
     customer_name = serializers.ReadOnlyField(source='project.customer.name')
     offering_uuid = serializers.ReadOnlyField(source='offering.uuid')
@@ -1772,6 +1890,12 @@ class ResourceUpdateLimitsSerializer(serializers.ModelSerializer):
     limits = serializers.DictField(
         child=serializers.IntegerField(min_value=0), required=True
     )
+
+
+class ResourceOfferingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.Offering
+        fields = ('name', 'uuid')
 
 
 class BaseComponentSerializer(serializers.Serializer):
@@ -1970,7 +2094,7 @@ class ComponentUsageCreateSerializer(serializers.Serializer):
                 resource=resource, component=component, billing_period=billing_period,
             ).update(recurring=False)
 
-            models.ComponentUsage.objects.update_or_create(
+            usage, created = models.ComponentUsage.objects.update_or_create(
                 resource=resource,
                 component=component,
                 plan_period=plan_period,
@@ -1982,6 +2106,22 @@ class ComponentUsageCreateSerializer(serializers.Serializer):
                     'recurring': recurring,
                 },
             )
+            if created:
+                message = 'Usage has been created for %s, component: %s, value: %s' % (
+                    resource,
+                    component.type,
+                    amount,
+                )
+                logger.info(message)
+                log.log_component_usage_creation_succeeded(usage)
+            else:
+                message = 'Usage has been updated for %s, component: %s, value: %s' % (
+                    resource,
+                    component.type,
+                    amount,
+                )
+                logger.info(message)
+                log.log_component_usage_update_succeeded(usage)
 
 
 class OfferingFileSerializer(

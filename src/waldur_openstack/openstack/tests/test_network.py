@@ -67,11 +67,15 @@ class NetworkCreateSubnetActionTest(BaseNetworkTest):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         subnet = models.SubNet.objects.get(uuid=response.data['uuid'])
 
-        core_tasks_mock().si.assert_called_once_with(
-            core_utils.serialize_instance(subnet),
-            'create_subnet',
-            state_transition='begin_creating',
-            enable_default_gateway=False,
+        core_tasks_mock().si.assert_has_calls(
+            [
+                mock.call(
+                    core_utils.serialize_instance(subnet),
+                    'create_subnet',
+                    state_transition='begin_creating',
+                    enable_default_gateway=False,
+                )
+            ]
         )
 
     @mock.patch('waldur_openstack.openstack.executors.SubNetCreateExecutor.execute')
@@ -90,98 +94,6 @@ class NetworkCreateSubnetActionTest(BaseNetworkTest):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(self.fixture.tenant.quotas.get(name=self.quota_name).usage, 0)
         executor_action_mock.assert_not_called()
-
-    def test_metadata(self):
-        self.fixture.network.state = models.Network.States.OK
-        self.fixture.network.save()
-        url = factories.NetworkFactory.get_url(network=self.fixture.network)
-        response = self.client.options(url)
-        actions = dict(response.data['actions'])
-        self.assertEqual(
-            actions,
-            {
-                "create_subnet": {
-                    "title": "Create Subnet",
-                    "url": url + "create_subnet/",
-                    "fields": {
-                        "name": {
-                            "type": "string",
-                            "required": True,
-                            "label": "Name",
-                            "max_length": 150,
-                        },
-                        "description": {
-                            "type": "string",
-                            "required": False,
-                            "label": "Description",
-                            "max_length": 500,
-                        },
-                        "cidr": {"type": "string", "required": False, "label": "CIDR"},
-                        "gateway_ip": {
-                            "type": "string",
-                            "required": False,
-                            "label": "Gateway ip",
-                        },
-                        "disable_gateway": {
-                            "type": "boolean",
-                            "required": False,
-                            "label": "Disable gateway",
-                        },
-                        "enable_default_gateway": {
-                            "type": "boolean",
-                            "required": False,
-                            "label": "Enable default gateway",
-                        },
-                    },
-                    "enabled": True,
-                    "reason": None,
-                    "destructive": False,
-                    "type": "form",
-                    "method": "POST",
-                },
-                "destroy": {
-                    "title": "Destroy",
-                    "url": url,
-                    "enabled": True,
-                    "reason": None,
-                    "destructive": True,
-                    "type": "button",
-                    "method": "DELETE",
-                },
-                "pull": {
-                    "title": "Pull",
-                    "url": url + "pull/",
-                    "enabled": True,
-                    "reason": None,
-                    "destructive": False,
-                    "type": "button",
-                    "method": "POST",
-                },
-                "update": {
-                    "title": "Update",
-                    "url": url,
-                    "fields": {
-                        "name": {
-                            "type": "string",
-                            "required": True,
-                            "label": "Name",
-                            "max_length": 150,
-                        },
-                        "description": {
-                            "type": "string",
-                            "required": False,
-                            "label": "Description",
-                            "max_length": 500,
-                        },
-                    },
-                    "enabled": True,
-                    "reason": None,
-                    "destructive": False,
-                    "type": "form",
-                    "method": "PUT",
-                },
-            },
-        )
 
 
 class NetworkUpdateActionTest(BaseNetworkTest):

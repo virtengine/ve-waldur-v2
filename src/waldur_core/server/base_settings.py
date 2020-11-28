@@ -54,11 +54,13 @@ INSTALLED_APPS = (
     'rest_framework_swagger',
     'django_filters',
 
-    'defender',
+    'axes',
     'django_fsm',
     'reversion',
     'taggit',
     'jsoneditor',
+    'modeltranslation',
+    'import_export',
 )
 INSTALLED_APPS += ADMIN_INSTALLED_APPS  # noqa: F405
 
@@ -72,7 +74,7 @@ MIDDLEWARE = (
     'waldur_core.logging.middleware.CaptureEventContextMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
-    'defender.middleware.FailedLoginMiddleware',
+    'axes.middleware.AxesMiddleware'
 )
 
 REST_FRAMEWORK = {
@@ -102,6 +104,7 @@ REST_FRAMEWORK = {
 }
 
 AUTHENTICATION_BACKENDS = (
+    'axes.backends.AxesBackend',
     'django.contrib.auth.backends.ModelBackend',
     'waldur_core.core.authentication.AuthenticationBackend',
 )
@@ -178,9 +181,6 @@ LANGUAGES = (
 
 USE_TZ = True
 
-# Defender configuration
-DEFENDER_REDIS_URL = 'redis://localhost:6379/0'
-
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/2.2/howto/static-files/
 STATIC_URL = '/static/'
@@ -240,6 +240,11 @@ CELERY_BEAT_SCHEDULE = {
     'structure-set-erred-stuck-resources': {
         'task': 'waldur_core.structure.SetErredStuckResources',
         'schedule': timedelta(hours=1),
+        'args': (),
+    },
+    'create_customer_permission_reviews': {
+        'task': 'waldur_core.structure.create_customer_permission_reviews',
+        'schedule': timedelta(hours=24),
         'args': (),
     },
 }
@@ -354,3 +359,12 @@ SWAGGER_SETTINGS = {
 }
 
 IPSTACK_ACCESS_KEY = ''
+
+USE_PROTECTED_URL = False
+CONVERT_MEDIA_URLS_TO_MASTERMIND_NETLOC = False
+
+IMPORT_EXPORT_USE_TRANSACTIONS = True
+
+AXES_ONLY_USER_FAILURES = True
+AXES_COOLOFF_TIME = timedelta(minutes=10)
+AXES_FAILURE_LIMIT = 5

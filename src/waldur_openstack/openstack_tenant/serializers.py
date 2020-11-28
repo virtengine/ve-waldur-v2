@@ -23,6 +23,7 @@ from waldur_core.structure import serializers as structure_serializers
 from waldur_core.structure.permissions import _has_admin_access
 from waldur_openstack.openstack import models as openstack_models
 from waldur_openstack.openstack import serializers as openstack_serializers
+from waldur_openstack.openstack.serializers import validate_private_cidr
 from waldur_openstack.openstack_base.backend import OpenStackBackendError
 from waldur_openstack.openstack_base.serializers import BaseVolumeTypeSerializer
 from waldur_openstack.openstack_tenant.utils import get_valid_availability_zones
@@ -246,6 +247,13 @@ class SecurityGroupSerializer(structure_serializers.BasePropertySerializer):
                     'from_port': rule.from_port,
                     'to_port': rule.to_port,
                     'cidr': rule.cidr,
+                    'description': rule.description,
+                    'remote_group_name': rule.remote_group
+                    and rule.remote_group.name
+                    or None,
+                    'remote_group_uuid': rule.remote_group
+                    and rule.remote_group.uuid.hex
+                    or None,
                 }
             )
         return rules
@@ -501,10 +509,9 @@ class VolumeExtendSerializer(serializers.Serializer):
     def update(self, instance: models.Volume, validated_data):
         new_size = validated_data.get('disk_size')
 
-        settings = instance.service_project_link.service.settings
-        spl = instance.service_project_link
-
-        for quota_holder in [settings, spl]:
+        for quota_holder in instance.get_quota_scopes():
+            if not quota_holder:
+                continue
             quota_holder.add_quota_usage(
                 quota_holder.Quotas.storage, new_size - instance.size, validate=True
             )
@@ -602,6 +609,25 @@ class VolumeRetypeSerializer(serializers.HyperlinkedModelSerializer):
             raise serializers.ValidationError(_('Volume already has requested type.'))
         return type
 
+    @transaction.atomic
+    def update(self, instance: models.Volume, validated_data):
+        old_type = instance.type
+        new_type = validated_data.get('type')
+
+        for quota_holder in instance.get_quota_scopes():
+            if not quota_holder:
+                continue
+            quota_holder.add_quota_usage(
+                'gigabytes_' + old_type.backend_id,
+                -1 * instance.size / 1024,
+                validate=True,
+            )
+            quota_holder.add_quota_usage(
+                'gigabytes_' + new_type.backend_id, instance.size / 1024, validate=True
+            )
+
+        return super(VolumeRetypeSerializer, self).update(instance, validated_data)
+
 
 class SnapshotRestorationSerializer(
     core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer
@@ -653,6 +679,9 @@ class SnapshotRestorationSerializer(
             description=description,
             size=snapshot.size,
         )
+
+        if snapshot.source_volume:
+            volume.type = snapshot.source_volume.type
 
         volume.save()
         volume.increase_backend_quotas_usage()
@@ -843,9 +872,23 @@ class NestedVolumeSerializer(
 
 
 class NestedSecurityGroupRuleSerializer(serializers.ModelSerializer):
+    remote_group_name = serializers.ReadOnlyField(source='remote_group.name')
+    remote_group_uuid = serializers.ReadOnlyField(source='remote_group.uuid')
+
     class Meta:
         model = models.SecurityGroupRule
-        fields = ('id', 'protocol', 'from_port', 'to_port', 'cidr')
+        fields = (
+            'id',
+            'ethertype',
+            'direction',
+            'protocol',
+            'from_port',
+            'to_port',
+            'cidr',
+            'description',
+            'remote_group_name',
+            'remote_group_uuid',
+        )
 
     def to_internal_value(self, data):
         # Return exist security group as internal value if id is provided
@@ -880,6 +923,8 @@ class NestedSecurityGroupSerializer(
 class NestedInternalIPSerializer(
     core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer
 ):
+    allowed_address_pairs = serializers.JSONField(read_only=True)
+
     class Meta:
         model = models.InternalIP
         fields = (
@@ -890,6 +935,7 @@ class NestedInternalIPSerializer(
             'subnet_name',
             'subnet_description',
             'subnet_cidr',
+            'allowed_address_pairs',
         )
         read_only_fields = (
             'ip4_address',
@@ -898,6 +944,7 @@ class NestedInternalIPSerializer(
             'subnet_name',
             'subnet_description',
             'subnet_cidr',
+            'allowed_address_pairs',
         )
         related_paths = {
             'subnet': ('uuid', 'name', 'description', 'cidr'),
@@ -1041,6 +1088,9 @@ def _validate_instance_floating_ips(
         )
 
     for floating_ip, subnet in floating_ips_with_subnets:
+        if not subnet.is_connected:
+            message = ugettext('SubNet %s is not connected to router.') % subnet
+            raise serializers.ValidationError({'floating_ips': message})
         if subnet not in instance_subnets:
             message = ugettext('SubNet %s is not connected to instance.') % subnet
             raise serializers.ValidationError({'floating_ips': message})
@@ -1542,10 +1592,6 @@ class InstanceFlavorChangeSerializer(
                     _('New flavor is not within the same service settings')
                 )
 
-            if value.disk < self.instance.flavor_disk:
-                raise serializers.ValidationError(
-                    _('New flavor disk should be greater than the previous value')
-                )
         return value
 
     @transaction.atomic
@@ -1633,6 +1679,43 @@ class InstanceSecurityGroupsUpdateSerializer(serializers.Serializer):
             instance.security_groups.clear()
             instance.security_groups.add(*security_groups)
 
+        return instance
+
+
+class AllowedAddressPairSerializer(serializers.Serializer):
+    ip_address = serializers.CharField(
+        validators=[validate_private_cidr],
+        default='192.168.42.0/24',
+        initial='192.168.42.0/24',
+        write_only=True,
+    )
+    mac_address = serializers.CharField(required=False)
+
+
+class InstanceAllowedAddressPairsUpdateSerializer(serializers.Serializer):
+    subnet = serializers.HyperlinkedRelatedField(
+        queryset=models.SubNet.objects.all(),
+        view_name='openstacktenant-subnet-detail',
+        lookup_field='uuid',
+        write_only=True,
+    )
+
+    allowed_address_pairs = AllowedAddressPairSerializer(many=True)
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        subnet = validated_data['subnet']
+        try:
+            internal_ip = models.InternalIP.objects.get(
+                instance=instance, subnet=subnet
+            )
+        except models.InternalIP.DoesNotExist:
+            raise serializers.ValidationError(
+                _('Instance is not connected to subnet "%s" yet.') % subnet
+            )
+
+        internal_ip.allowed_address_pairs = validated_data['allowed_address_pairs']
+        internal_ip.save(update_fields=['allowed_address_pairs'])
         return instance
 
 

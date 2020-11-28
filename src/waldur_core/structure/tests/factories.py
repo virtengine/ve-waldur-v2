@@ -217,6 +217,8 @@ class TestServiceFactory(factory.DjangoModelFactory):
 
 
 class TestServiceProjectLinkFactory(factory.DjangoModelFactory):
+    __test__ = False
+
     class Meta:
         model = test_models.TestServiceProjectLink
 
@@ -238,6 +240,8 @@ class TestServiceProjectLinkFactory(factory.DjangoModelFactory):
 
 
 class TestNewInstanceFactory(factory.DjangoModelFactory):
+    __test__ = False
+
     class Meta:
         model = test_models.TestNewInstance
 
@@ -315,6 +319,19 @@ class DivisionTypeFactory(factory.DjangoModelFactory):
         model = models.DivisionType
 
     name = factory.Sequence(lambda n: 'DivisionType_%s' % n)
+
+    @classmethod
+    def get_url(cls, division_type=None, action=None):
+        if division_type is None:
+            division_type = DivisionTypeFactory()
+        url = 'http://testserver' + reverse(
+            'division-type-detail', kwargs={'uuid': division_type.uuid.hex}
+        )
+        return url if action is None else url + action + '/'
+
+    @classmethod
+    def get_list_url(cls):
+        return 'http://testserver' + reverse('division-type-list')
 
 
 class DivisionFactory(factory.DjangoModelFactory):

@@ -1,16 +1,23 @@
+import logging
+
 from django.conf import settings
 from django.utils.translation import ugettext_lazy as _
+from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import decorators, exceptions, response
 from rest_framework import serializers as rf_serializers
 from rest_framework import status
 
 from waldur_core.core import exceptions as core_exceptions
 from waldur_core.core import validators as core_validators
+from waldur_core.core import views as core_views
+from waldur_core.logging.loggers import event_logger
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure import views as structure_views
 
 from . import executors, filters, models, serializers
+
+logger = logging.getLogger(__name__)
 
 
 class OpenStackServiceViewSet(structure_views.BaseServiceViewSet):
@@ -163,6 +170,9 @@ class SecurityGroupViewSet(structure_views.BaseResourceViewSet):
         + [default_security_group_validator]
     )
     update_executor = executors.SecurityGroupUpdateExecutor
+    partial_update_serializer_class = (
+        update_serializer_class
+    ) = serializers.SecurityGroupUpdateSerializer
 
     destroy_validators = structure_views.ResourceViewSet.destroy_validators + [
         default_security_group_validator
@@ -450,6 +460,59 @@ class TenantViewSet(structure_views.ImportableResourceViewSet):
     pull_quotas_validators = [core_validators.StateValidator(models.Tenant.States.OK)]
 
 
+class RouterViewSet(core_views.ReadOnlyActionsViewSet):
+    lookup_field = 'uuid'
+    queryset = models.Router.objects.all()
+    filter_backends = (DjangoFilterBackend, structure_filters.GenericRoleFilter)
+    filterset_class = filters.RouterFilter
+    serializer_class = serializers.RouterSerializer
+
+    @decorators.action(detail=True, methods=['POST'])
+    def set_routes(self, request, uuid=None):
+        router = self.get_object()
+        serializer = self.get_serializer(router, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        old_routes = router.routes
+        new_routes = serializer.validated_data['routes']
+        router.routes = new_routes
+        router.save(update_fields=['routes'])
+        executors.RouterSetRoutesExecutor().execute(router)
+
+        event_logger.openstack_router.info(
+            'Static routes have been updated.',
+            event_type='openstack_router_updated',
+            event_context={
+                'router': router,
+                'old_routes': old_routes,
+                'new_routes': new_routes,
+                'tenant_backend_id': router.tenant.backend_id,
+            },
+        )
+
+        logger.info(
+            'Static routes have been updated for router %s from %s to %s.',
+            router,
+            old_routes,
+            new_routes,
+        )
+
+        return response.Response(
+            {'status': _('Routes update was successfully scheduled.')},
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+    set_routes_serializer_class = serializers.RouterSetRoutesSerializer
+    set_routes_validators = [core_validators.StateValidator(models.Router.States.OK)]
+
+
+class PortViewSet(core_views.ReadOnlyActionsViewSet):
+    lookup_field = 'uuid'
+    queryset = models.Port.objects.all()
+    filter_backends = (DjangoFilterBackend, structure_filters.GenericRoleFilter)
+    filterset_class = filters.PortFilter
+    serializer_class = serializers.PortSerializer
+
+
 class NetworkViewSet(structure_views.BaseResourceViewSet):
     queryset = models.Network.objects.all()
     serializer_class = serializers.NetworkSerializer
@@ -476,6 +539,17 @@ class NetworkViewSet(structure_views.BaseResourceViewSet):
         core_validators.StateValidator(models.Network.States.OK)
     ]
     create_subnet_serializer_class = serializers.SubNetSerializer
+
+    @decorators.action(detail=True, methods=['post'])
+    def set_mtu(self, request, uuid=None):
+        serializer = self.get_serializer(instance=self.get_object(), data=request.data)
+        serializer.is_valid(raise_exception=True)
+        network = serializer.save()
+        executors.SetMtuExecutor.execute(network)
+        return response.Response(serializer.data, status=status.HTTP_202_ACCEPTED)
+
+    set_mtu_validators = [core_validators.StateValidator(models.Network.States.OK)]
+    set_mtu_serializer_class = serializers.SetMtuSerializer
 
 
 class SubNetViewSet(structure_views.BaseResourceViewSet):

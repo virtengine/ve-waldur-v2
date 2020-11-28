@@ -141,12 +141,18 @@ def import_openstack_service_settings(
             scope=service_settings,
             type=PACKAGE_TYPE,
             name=service_settings.name,
-            geolocations=service_settings.geolocations,
             customer=service_settings.customer or default_customer,
             category=category,
             shared=service_settings.shared,
             state=state,
         )
+
+        if service_settings.geolocations:
+            geolocation = service_settings.geolocations[0]
+            offering.latitude = geolocation['latitude']
+            offering.longitude = geolocation['longitude']
+            offering.save(update_fields=['latitude', 'longitude'])
+
         create_offering_components(offering)
         return offering
 
@@ -585,25 +591,6 @@ def map_limits_to_quotas(limits, offering):
                 'You should either specify general-purpose storage quota '
                 'or volume-type specific storage quota.'
             )
-        snapshot_size_limit_gb = offering.plugin_options.get(
-            'snapshot_size_limit_gb', 0
-        )
-        if not isinstance(snapshot_size_limit_gb, int):
-            logger.warning(
-                'Invalid snapshot_size_limit_gb value %s for offering %s',
-                (snapshot_size_limit_gb, offering.id),
-            )
-            snapshot_size_limit_gb = 0
-
-        snapshot_size_multiplier = offering.plugin_options.get(
-            'snapshot_size_multiplier', 1
-        )
-        if not isinstance(snapshot_size_multiplier, int):
-            logger.warning(
-                'Invalid snapshot_size_multiplier value %s for offering %s',
-                (snapshot_size_multiplier, offering.id),
-            )
-            snapshot_size_multiplier = 1
 
         # Initialize volume type quotas as zero, otherwise they are treated as unlimited
         for volume_type in openstack_models.VolumeType.objects.filter(
@@ -611,10 +598,7 @@ def map_limits_to_quotas(limits, offering):
         ):
             volume_type_quotas.setdefault('gigabytes_' + volume_type.name, 0)
 
-        quotas['storage'] = ServiceBackend.gb2mb(
-            sum(list(volume_type_quotas.values())) * snapshot_size_multiplier
-            + snapshot_size_limit_gb
-        )
+        quotas['storage'] = ServiceBackend.gb2mb(sum(list(volume_type_quotas.values())))
         quotas.update(volume_type_quotas)
 
     # Convert quota value from float to integer because OpenStack API fails otherwise
@@ -699,3 +683,25 @@ def push_tenant_limits(resource):
         _apply_quotas(tenant, quotas)
         for target in structure_models.ServiceSettings.objects.filter(scope=tenant):
             _apply_quotas(target, quotas)
+
+
+def restore_limits(resource):
+    order_item = (
+        marketplace_models.OrderItem.objects.filter(
+            resource=resource,
+            type__in=[
+                marketplace_models.OrderItem.Types.CREATE,
+                marketplace_models.OrderItem.Types.UPDATE,
+            ],
+        )
+        .order_by('-created')
+        .first()
+    )
+
+    if not order_item:
+        return
+
+    if not isinstance(order_item.resource.scope, openstack_models.Tenant):
+        return
+
+    update_limits(order_item)

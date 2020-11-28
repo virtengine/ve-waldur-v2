@@ -1,9 +1,12 @@
 import base64
+import datetime
 import os
 from io import BytesIO
 
 import pdfkit
+from dateutil.relativedelta import relativedelta
 from django.conf import settings
+from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage as storage
@@ -14,7 +17,11 @@ from PIL import Image
 from rest_framework import serializers
 
 from waldur_core.core import models as core_models
+from waldur_core.core import serializers as core_serializers
 from waldur_core.core import utils as core_utils
+from waldur_core.structure import filters as structure_filters
+from waldur_core.structure import models as structure_models
+from waldur_mastermind.invoices import models as invoice_models
 
 from . import models, plugins
 
@@ -147,6 +154,17 @@ def get_service_provider_info(source):
         }
     except models.Resource.DoesNotExist:
         return {}
+
+
+def get_offering_details(offering):
+    if not isinstance(offering, models.Offering):
+        return {}
+
+    return {
+        'offering_type': offering.type,
+        'offering_name': offering.name,
+        'offering_uuid': offering.uuid.hex,
+    }
 
 
 def format_list(resources):
@@ -368,3 +386,113 @@ def add_marketplace_offering(sender, fields, **kwargs):
 
     fields['is_usage_based'] = serializers.SerializerMethodField()
     setattr(sender, 'get_is_usage_based', get_is_usage_based)
+
+
+def get_offering_costs(offering, active_customers, start, end):
+    costs = []
+    date = start
+
+    while date <= end:
+        year = date.year
+        month = date.month
+
+        invoice_items = invoice_models.InvoiceItem.objects.filter(
+            details__offering_uuid=offering.uuid.hex,
+            project__customer__in=active_customers,
+            invoice__year=year,
+            invoice__month=month,
+        )
+
+        stats = {
+            'tax': 0,
+            'total': 0,
+            'price': 0,
+            'price_current': 0,
+            'period': '%s-%02d' % (year, month),
+        }
+        for item in invoice_items:
+            stats['tax'] += item.tax
+            stats['total'] += item.total
+            stats['price'] += item.price
+            stats['price_current'] += item.price_current
+
+        costs.append(stats)
+
+        date += relativedelta(months=1)
+
+    return costs
+
+
+def get_offering_customers(offering, active_customers):
+    resources = models.Resource.objects.filter(
+        offering=offering, project__customer__in=active_customers,
+    )
+    customers_ids = resources.values_list('project__customer_id', flat=True)
+    return structure_models.Customer.objects.filter(id__in=customers_ids)
+
+
+def get_start_and_end_dates_from_request(request):
+    serializer = core_serializers.DateRangeFilterSerializer(data=request.query_params)
+    serializer.is_valid(raise_exception=True)
+    today = datetime.date.today()
+    default_start = datetime.date(year=today.year - 1, month=today.month, day=1)
+    start_year, start_month = serializer.validated_data.get(
+        'start', (default_start.year, default_start.month)
+    )
+    end_year, end_month = serializer.validated_data.get(
+        'end', (today.year, today.month)
+    )
+    end = datetime.date(year=end_year, month=end_month, day=1)
+    start = datetime.date(year=start_year, month=start_month, day=1)
+    return start, end
+
+
+def get_active_customers(request, view):
+    customers = structure_models.Customer.objects.all()
+    return structure_filters.AccountingStartDateFilter().filter_queryset(
+        request, customers, view
+    )
+
+
+def get_offering_component_stats(offering, active_customers, start, end):
+    component_stats = []
+
+    resources = models.Resource.objects.filter(
+        offering=offering, project__customer__in=active_customers,
+    )
+    resources_ids = resources.values_list('id', flat=True)
+    date = start
+
+    while date <= end:
+        year = date.year
+        month = date.month
+
+        invoice_items = invoice_models.InvoiceItem.objects.filter(
+            content_type_id=ContentType.objects.get_for_model(models.Resource).id,
+            object_id__in=resources_ids,
+            invoice__year=year,
+            invoice__month=month,
+        )
+
+        stats = {}
+        for item in invoice_items:
+            limits = item.details.get('limits', {})
+
+            '''If a resource will be deleted then usages will be deleted too.
+            Then statistics will be not available.
+            Therefore we use invoice item details.'''
+            usages = item.details.get('usages', {})
+            limits.update(usages)
+
+            for limit, usage in limits.items():
+                if limit in stats.keys():
+                    stats[limit] += usage
+                else:
+                    stats[limit] = usage
+        component_stats.append(
+            {'period': '%s-%02d' % (year, month), 'components': stats}
+        )
+
+        date += relativedelta(months=1)
+
+    return component_stats

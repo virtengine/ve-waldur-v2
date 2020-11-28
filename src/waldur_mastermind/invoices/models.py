@@ -10,7 +10,7 @@ from django.conf import settings
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.contrib.postgres.fields import JSONField
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.db.models import Q
@@ -34,6 +34,11 @@ from . import managers, utils
 logger = logging.getLogger(__name__)
 
 Units = common_mixins.UnitPriceMixin.Units
+
+
+def get_created_date():
+    now = timezone.now()
+    return datetime.date(now.year, now.month, 1)
 
 
 class Invoice(core_models.UuidMixin, models.Model):
@@ -63,6 +68,7 @@ class Invoice(core_models.UuidMixin, models.Model):
         validators=[MinValueValidator(1), MaxValueValidator(12)],
     )
     year = models.PositiveSmallIntegerField(default=utils.get_current_year)
+    created = models.DateField(null=True, blank=True, default=get_created_date)
     state = models.CharField(
         max_length=30, choices=States.CHOICES, default=States.PENDING
     )
@@ -111,7 +117,7 @@ class Invoice(core_models.UuidMixin, models.Model):
 
     @property
     def price(self):
-        return sum((item.price for item in self.items))
+        return quantize_price(decimal.Decimal(sum((item.price for item in self.items))))
 
     @property
     def tax_current(self):
@@ -232,7 +238,9 @@ class InvoiceItem(common_mixins.ProductCodeMixin, common_mixins.UnitPriceMixin):
         return self.price + self.tax
 
     def _price(self, current=False):
-        return self.unit_price * decimal.Decimal(self.get_factor(current))
+        return quantize_price(
+            self.unit_price * decimal.Decimal(self.get_factor(current))
+        )
 
     def get_factor(self, current=False):
         month_days = monthrange(self.start.year, self.start.month)[1]
@@ -316,7 +324,12 @@ class InvoiceItem(common_mixins.ProductCodeMixin, common_mixins.UnitPriceMixin):
             'details',
         )
 
-        params = {field: getattr(self, field) for field in FIELDS}
+        params = {}
+        for field in FIELDS:
+            try:
+                params[field] = getattr(self, field)
+            except ObjectDoesNotExist:
+                pass  # if a reference was deleted
         params.update(kwargs)
         if params['unit_price'] > 0:
             params['unit_price'] *= -1
@@ -353,10 +366,18 @@ class ServiceDowntime(models.Model):
         editable=False,
     )
     offering = models.ForeignKey(
-        on_delete=models.CASCADE, to=marketplace_models.Offering, blank=True, null=True
+        on_delete=models.CASCADE,
+        to=marketplace_models.Offering,
+        blank=True,
+        null=True,
+        limit_choices_to={'billable': True},
     )
     resource = models.ForeignKey(
-        on_delete=models.CASCADE, to=marketplace_models.Resource, blank=True, null=True
+        on_delete=models.CASCADE,
+        to=marketplace_models.Resource,
+        blank=True,
+        null=True,
+        limit_choices_to={'offering__billable': True},
     )
 
     def clean(self):
@@ -441,7 +462,7 @@ class PaymentProfile(core_models.UuidMixin, core_models.NameMixin, models.Model)
     tracker = FieldTracker()
 
     def __str__(self):
-        return self.organization.name
+        return '%s (%s)' % (self.organization.name, self.payment_type)
 
     class Permissions:
         customer_path = 'organization'
@@ -463,6 +484,27 @@ class PaymentProfile(core_models.UuidMixin, core_models.NameMixin, models.Model)
 
     class Meta:
         unique_together = ('organization', 'is_active')
+
+
+class Payment(core_models.UuidMixin, core_models.TimeStampedModel):
+    profile = models.ForeignKey(
+        PaymentProfile, on_delete=models.PROTECT, null=False, blank=False
+    )
+    sum = models.DecimalField(
+        default=0, max_digits=10, decimal_places=2, null=False, blank=False
+    )
+    date_of_payment = models.DateField(null=False, blank=False,)
+    proof = models.FileField(upload_to='proof_of_payment', null=True, blank=True)
+    invoice = models.ForeignKey(
+        Invoice, on_delete=models.SET_NULL, null=True, blank=True
+    )
+
+    class Permissions:
+        customer_path = 'profile__organization'
+
+    @classmethod
+    def get_url_name(cls):
+        return 'payment'
 
 
 class InvoiceItemAdjuster:

@@ -111,12 +111,22 @@ class Cluster(SettingsMixin, NewResource):
         return self.name
 
 
+class RoleMixin(models.Model):
+    controlplane_role = models.BooleanField(default=False)
+    etcd_role = models.BooleanField(default=False)
+    worker_role = models.BooleanField(default=False)
+
+    class Meta:
+        abstract = True
+
+
 class Node(
     core_models.UuidMixin,
     core_models.NameMixin,
     structure_models.StructureModel,
     core_models.StateMixin,
     BackendMixin,
+    RoleMixin,
     structure_models.StructureLoggableMixin,
     structure_models.TimeStampedModel,
 ):
@@ -133,9 +143,6 @@ class Node(
         'content_type', 'object_id'
     )  # a virtual machine where will deploy k8s node.
     cluster = models.ForeignKey(Cluster, on_delete=models.CASCADE)
-    controlplane_role = models.BooleanField(default=False)
-    etcd_role = models.BooleanField(default=False)
-    worker_role = models.BooleanField(default=False)
     initial_data = JSONField(
         blank=True, default=dict, help_text=_('Initial data for instance creating.')
     )
@@ -192,7 +199,12 @@ class Node(
         return self.name
 
 
-class RancherUser(BackendMixin):
+class RancherUser(
+    core_models.UuidMixin,
+    BackendMixin,
+    structure_models.StructureLoggableMixin,
+    structure_models.StructureModel,
+):
     user = models.ForeignKey(core_models.User, on_delete=models.PROTECT)
     clusters = models.ManyToManyField(Cluster, through='RancherUserClusterLink')
     settings = models.ForeignKey('structure.ServiceSettings', on_delete=models.PROTECT)
@@ -204,6 +216,14 @@ class RancherUser(BackendMixin):
 
     class Meta:
         unique_together = (('user', 'settings'),)
+        ordering = ('user__username',)
+
+    class Permissions:
+        customer_path = 'settings__customer'
+
+    @classmethod
+    def get_url_name(cls):
+        return 'rancher-user'
 
     def __str__(self):
         return self.user.username
@@ -231,6 +251,15 @@ class RancherUserClusterLink(BackendMixin):
 
     class Meta:
         unique_together = (('user', 'cluster', 'role'),)
+
+
+class RancherUserProjectLink(BackendMixin):
+    user = models.ForeignKey(RancherUser, on_delete=models.CASCADE)
+    project = models.ForeignKey('Project', on_delete=models.CASCADE)
+    role = models.CharField(max_length=255, blank=False)
+
+    class Meta:
+        unique_together = (('user', 'project', 'role'),)
 
 
 class Catalog(
@@ -317,6 +346,7 @@ class Namespace(
         return 'rancher-namespace'
 
 
+# Rancher template used for application provisioning
 class Template(
     core_models.UuidMixin,
     core_models.NameMixin,
@@ -349,3 +379,170 @@ class Template(
 
     class Meta:
         ordering = ('name',)
+
+
+class Workload(
+    core_models.UuidMixin,
+    core_models.NameMixin,
+    core_models.RuntimeStateMixin,
+    structure_models.TimeStampedModel,
+    BackendMixin,
+    SettingsMixin,
+):
+    cluster = models.ForeignKey(
+        Cluster, on_delete=models.CASCADE, null=True, related_name='+'
+    )
+    project = models.ForeignKey(
+        Project, on_delete=models.CASCADE, null=True, related_name='+'
+    )
+    namespace = models.ForeignKey(
+        Namespace, on_delete=models.CASCADE, null=True, related_name='+'
+    )
+    scale = models.PositiveSmallIntegerField()
+
+    def __str__(self):
+        return self.name
+
+    class Permissions:
+        customer_path = 'cluster__service_project_link__project__customer'
+        project_path = 'cluster__service_project_link__project'
+        service_path = 'cluster__service_project_link__service'
+
+    class Meta:
+        ordering = ('name',)
+
+    @classmethod
+    def get_url_name(cls):
+        return 'rancher-workload'
+
+
+class HPA(
+    core_models.UuidMixin,
+    core_models.NameMixin,
+    core_models.DescribableMixin,
+    core_models.StateMixin,
+    core_models.RuntimeStateMixin,
+    structure_models.TimeStampedModel,
+    BackendMixin,
+    SettingsMixin,
+):
+    """
+    HPA stands for Horizontal Pod Autoscaler.
+    """
+
+    cluster = models.ForeignKey(
+        Cluster, on_delete=models.CASCADE, null=True, related_name='+'
+    )
+    project = models.ForeignKey(
+        Project, on_delete=models.CASCADE, null=True, related_name='+'
+    )
+    namespace = models.ForeignKey(
+        Namespace, on_delete=models.CASCADE, null=True, related_name='+'
+    )
+    workload = models.ForeignKey(
+        Workload, on_delete=models.CASCADE, null=True, related_name='+'
+    )
+    current_replicas = models.PositiveSmallIntegerField(default=0)
+    desired_replicas = models.PositiveSmallIntegerField(default=0)
+    min_replicas = models.PositiveSmallIntegerField(default=0)
+    max_replicas = models.PositiveSmallIntegerField(default=0)
+    metrics = JSONField()
+
+    def __str__(self):
+        return self.name
+
+    class Permissions:
+        customer_path = 'cluster__service_project_link__project__customer'
+        project_path = 'cluster__service_project_link__project'
+        service_path = 'cluster__service_project_link__service'
+
+    class Meta:
+        ordering = ('name',)
+
+    @classmethod
+    def get_url_name(cls):
+        return 'rancher-hpa'
+
+
+# Waldur template is used for cluster provisioning, it doesn't have counterpart is Rancher
+class ClusterTemplate(
+    core_models.UuidMixin,
+    core_models.NameMixin,
+    core_models.DescribableMixin,
+    structure_models.TimeStampedModel,
+):
+    class Meta:
+        ordering = ('name',)
+
+    @classmethod
+    def get_url_name(cls):
+        return 'rancher-cluster-template'
+
+
+class ClusterTemplateNode(RoleMixin):
+    template = models.ForeignKey(
+        ClusterTemplate, on_delete=models.CASCADE, related_name='nodes'
+    )
+    min_vcpu = models.PositiveSmallIntegerField(verbose_name='Min vCPU (cores)')
+    min_ram = models.PositiveIntegerField(verbose_name='Min RAM (GB)')
+    system_volume_size = models.PositiveIntegerField(
+        verbose_name='System volume size (GB)'
+    )
+    preferred_volume_type = models.CharField(max_length=150, blank=True)
+
+
+class Application(SettingsMixin, core_models.RuntimeStateMixin, NewResource):
+    service_project_link = models.ForeignKey(
+        RancherServiceProjectLink, related_name='+', on_delete=models.PROTECT
+    )
+    cluster = models.ForeignKey(Cluster, on_delete=models.CASCADE)
+    template = models.ForeignKey(Template, on_delete=models.CASCADE)
+    rancher_project = models.ForeignKey(Project, on_delete=models.CASCADE)
+    namespace = models.ForeignKey(Namespace, on_delete=models.CASCADE)
+    version = models.CharField(max_length=100)
+    answers = JSONField(blank=True, default=dict)
+
+    @classmethod
+    def get_url_name(cls):
+        return 'rancher-app'
+
+    def __str__(self):
+        return self.name
+
+    @property
+    def external_url(self):
+        return f'{self.settings.backend_url.strip("/")}/p/{self.project.backend_id}/apps/{self.backend_id}'
+
+
+class Ingress(SettingsMixin, core_models.RuntimeStateMixin, NewResource):
+    service_project_link = models.ForeignKey(
+        RancherServiceProjectLink, related_name='+', on_delete=models.PROTECT
+    )
+    cluster = models.ForeignKey(Cluster, on_delete=models.CASCADE)
+    namespace = models.ForeignKey(Namespace, on_delete=models.CASCADE)
+    rancher_project = models.ForeignKey(Project, on_delete=models.CASCADE)
+    rules = JSONField(blank=True, default=list)
+
+    @classmethod
+    def get_url_name(cls):
+        return 'rancher-ingress'
+
+    def __str__(self):
+        return self.name
+
+
+class Service(SettingsMixin, core_models.RuntimeStateMixin, NewResource):
+    service_project_link = models.ForeignKey(
+        RancherServiceProjectLink, related_name='+', on_delete=models.PROTECT
+    )
+    namespace = models.ForeignKey(Namespace, on_delete=models.CASCADE)
+    cluster_ip = models.GenericIPAddressField(protocol='IPv4', blank=True, null=True)
+    target_workloads = models.ManyToManyField(Workload)
+    selector = JSONField(blank=True, null=True)
+
+    @classmethod
+    def get_url_name(cls):
+        return 'rancher-service'
+
+    def __str__(self):
+        return self.name

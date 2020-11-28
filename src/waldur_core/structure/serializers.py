@@ -357,6 +357,10 @@ class CustomerSerializer(
     display_name = serializers.ReadOnlyField(source='get_display_name')
     division_name = serializers.ReadOnlyField(source='division.name')
     division_uuid = serializers.ReadOnlyField(source='division.uuid')
+    division_parent_name = serializers.ReadOnlyField(source='division.parent.name')
+    division_parent_uuid = serializers.ReadOnlyField(source='division.parent.uuid')
+    division_type_name = serializers.ReadOnlyField(source='division.type.name')
+    division_type_uuid = serializers.ReadOnlyField(source='division.type.uuid')
 
     class Meta:
         model = models.Customer
@@ -370,6 +374,10 @@ class CustomerSerializer(
             'division',
             'division_name',
             'division_uuid',
+            'division_parent_name',
+            'division_parent_uuid',
+            'division_type_name',
+            'division_type_uuid',
             'contact_details',
             'domain',
             'display_name',
@@ -389,7 +397,6 @@ class CustomerSerializer(
             'country_name',
             'vat_code',
             'is_company',
-            'type',
             'postal',
             'address',
             'bank_name',
@@ -399,11 +406,13 @@ class CustomerSerializer(
             'default_tax_percent',
             'accounting_start_date',
         )
-        protected_fields = ('agreement_number',)
-        read_only_fields = (
+        staff_only_fields = (
             'access_subnets',
             'accounting_start_date',
             'default_tax_percent',
+            'agreement_number',
+            'domain',
+            'division',
         )
         extra_kwargs = {
             'url': {'lookup_field': 'uuid'},
@@ -420,8 +429,10 @@ class CustomerSerializer(
             return fields
 
         if not user.is_staff:
-            if 'domain' in fields:
-                fields['domain'].read_only = True
+            for field_name in set(CustomerSerializer.Meta.staff_only_fields) & set(
+                fields.keys()
+            ):
+                fields[field_name].read_only = True
 
         return fields
 
@@ -697,6 +708,36 @@ class CustomerPermissionSerializer(
 class CustomerPermissionLogSerializer(CustomerPermissionSerializer):
     class Meta(CustomerPermissionSerializer.Meta):
         view_name = 'customer_permission_log-detail'
+
+
+class CustomerPermissionReviewSerializer(
+    core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer
+):
+    class Meta:
+        model = models.CustomerPermissionReview
+        view_name = 'customer_permission_review-detail'
+        fields = (
+            'url',
+            'uuid',
+            'reviewer_full_name',
+            'reviewer_uuid',
+            'customer_uuid',
+            'customer_name',
+            'is_pending',
+            'created',
+            'closed',
+        )
+        read_only_fields = (
+            'is_pending',
+            'closed',
+        )
+        related_paths = {
+            'reviewer': ('full_name', 'uuid'),
+            'customer': ('name', 'uuid'),
+        }
+        extra_kwargs = {
+            'url': {'lookup_field': 'uuid'},
+        }
 
 
 class ProjectPermissionSerializer(
@@ -1849,6 +1890,7 @@ class BaseResourceSerializer(
             'customer_abbreviation',
             'tags',
             'error_message',
+            'error_traceback',
             'resource_type',
             'state',
             'created',
@@ -1864,7 +1906,7 @@ class BaseResourceSerializer(
             'project',
             'service_settings',
         )
-        read_only_fields = ('error_message', 'backend_id')
+        read_only_fields = ('error_message', 'error_traceback', 'backend_id')
         extra_kwargs = {
             'url': {'lookup_field': 'uuid'},
         }
@@ -2151,11 +2193,25 @@ class PrivateCloudSerializer(BaseResourceSerializer):
 class DivisionSerializer(serializers.HyperlinkedModelSerializer):
     type = serializers.ReadOnlyField(source='type.name')
     parent_uuid = serializers.ReadOnlyField(source='parent.uuid')
+    parent_name = serializers.ReadOnlyField(source='parent.type.name')
 
     class Meta:
         model = models.Division
-        fields = ('uuid', 'url', 'name', 'type', 'parent_uuid', 'parent')
+        fields = ('uuid', 'url', 'name', 'type', 'parent_uuid', 'parent_name', 'parent')
         extra_kwargs = {
             'url': {'lookup_field': 'uuid'},
             'parent': {'lookup_field': 'uuid'},
+        }
+
+
+class DivisionTypesSerializer(serializers.HyperlinkedModelSerializer):
+    class Meta:
+        model = models.DivisionType
+        fields = (
+            'uuid',
+            'url',
+            'name',
+        )
+        extra_kwargs = {
+            'url': {'lookup_field': 'uuid', 'view_name': 'division-type-detail'},
         }

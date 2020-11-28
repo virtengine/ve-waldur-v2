@@ -8,15 +8,25 @@ from django.urls import resolve, reverse
 from django.utils.html import format_html
 from django.utils.translation import ugettext_lazy as _
 from django.utils.translation import ungettext
+from modeltranslation import admin as modeltranslation_admin
 
 from waldur_core.core import admin as core_admin
 from waldur_core.core import utils as core_utils
-from waldur_core.core.admin import ExecutorAdminAction, JsonWidget, format_json_field
+from waldur_core.core.admin import (
+    ExecutorAdminAction,
+    JsonWidget,
+    PasswordWidget,
+    format_json_field,
+)
 from waldur_core.core.admin_filters import RelatedOnlyDropdownFilter
 from waldur_core.structure.models import (
     PrivateServiceSettings,
     ServiceSettings,
     SharedServiceSettings,
+)
+from waldur_mastermind.google.models import GoogleCredentials
+from waldur_mastermind.marketplace_openstack import (
+    executors as marketplace_openstack_executors,
 )
 from waldur_pid import tasks as pid_tasks
 from waldur_pid import utils as pid_utils
@@ -24,8 +34,23 @@ from waldur_pid import utils as pid_utils
 from . import executors, models, tasks
 
 
+class GoogleCredentialsAdminForm(ModelForm):
+    class Meta:
+        widgets = {
+            'client_secret': PasswordWidget(),
+            'calendar_token': PasswordWidget(),
+            'calendar_refresh_token': PasswordWidget(),
+        }
+
+
+class GoogleCredentialsInline(admin.StackedInline):
+    model = GoogleCredentials
+    form = GoogleCredentialsAdminForm
+
+
 class ServiceProviderAdmin(admin.ModelAdmin):
     list_display = ('uuid', 'customer', 'created')
+    inlines = [GoogleCredentialsInline]
 
 
 class AttributeOptionInline(admin.TabularInline):
@@ -74,7 +99,7 @@ class CategoryComponentInline(admin.TabularInline):
     model = models.CategoryComponent
 
 
-class CategoryAdmin(admin.ModelAdmin):
+class CategoryAdmin(modeltranslation_admin.TranslationAdmin):
     list_display = (
         'title',
         'uuid',
@@ -191,7 +216,6 @@ class OfferingAdminForm(ModelForm):
     class Meta:
         widgets = {
             'attributes': JsonWidget(),
-            'geolocations': JsonWidget(),
             'options': JsonWidget(),
             'secret_options': JsonWidget(),
             'plugin_options': JsonWidget(),
@@ -246,7 +270,6 @@ class OfferingAdmin(admin.ModelAdmin):
         'options',
         'plugin_options',
         'secret_options',
-        'geolocations',
         'shared',
         'billable',
         'allowed_customers',
@@ -256,6 +279,8 @@ class OfferingAdmin(admin.ModelAdmin):
         'paused_reason',
         'datacite_doi',
         'citation_count',
+        'latitude',
+        'longitude',
     )
     readonly_fields = (
         'rating',
@@ -272,6 +297,7 @@ class OfferingAdmin(admin.ModelAdmin):
     actions = [
         'activate',
         'datacite_registration',
+        'datacite_update',
         'link_doi_with_collection',
         'offering_referrals_pull',
     ]
@@ -313,6 +339,24 @@ class OfferingAdmin(admin.ModelAdmin):
         self.message_user(request, message)
 
     datacite_registration.short_description = _('Register in Datacite')
+
+    def datacite_update(self, request, queryset):
+        queryset = queryset.exclude(datacite_doi='')
+
+        for offering in queryset.all():
+            pid_utils.update_doi(offering)
+
+        count = queryset.count()
+        message = ungettext(
+            'One offering has been scheduled for updating Datacite registration data.',
+            '%(count)d offerings have been scheduled for updating Datacite registration data.',
+            count,
+        )
+        message = message % {'count': count}
+
+        self.message_user(request, message)
+
+    datacite_update.short_description = _('Update data of Datacite registration')
 
     def link_doi_with_collection(self, request, queryset):
         queryset = queryset.exclude(datacite_doi='')
@@ -356,7 +400,7 @@ class OfferingAdmin(admin.ModelAdmin):
 
 class OrderItemInline(admin.TabularInline):
     model = models.OrderItem
-    fields = ('offering', 'state', 'attributes', 'cost', 'plan')
+    fields = ('offering', 'state', 'attributes', 'cost', 'plan', 'resource')
     readonly_fields = fields
 
 
@@ -460,7 +504,7 @@ class SharedOfferingFilter(admin.SimpleListFilter):
 
 class ResourceAdmin(admin.ModelAdmin):
     form = ResourceForm
-    list_display = ('name', 'project', 'state', 'category', 'created')
+    list_display = ('uuid', 'name', 'project', 'state', 'category', 'created')
     list_filter = (
         'state',
         ('project', RelatedOnlyDropdownFilter),
@@ -473,6 +517,7 @@ class ResourceAdmin(admin.ModelAdmin):
         'project_link',
         'offering_link',
         'plan_link',
+        'order_item_link',
         'formatted_attributes',
         'formatted_limits',
     )
@@ -503,6 +548,17 @@ class ResourceAdmin(admin.ModelAdmin):
 
     plan_link.short_description = 'Plan'
 
+    def order_item_link(self, obj):
+        order_item = obj.orderitem_set.filter(
+            type=models.OrderItem.Types.CREATE
+        ).first()
+        if order_item:
+            return get_admin_link_for_scope(order_item.order)
+        else:
+            return ''
+
+    order_item_link.short_description = 'Creation order item'
+
     def formatted_attributes(self, obj):
         return format_json_field(obj.attributes)
 
@@ -532,7 +588,19 @@ class ResourceAdmin(admin.ModelAdmin):
             return {'user': request.user}
 
     terminate_resources = TerminateResources()
-    actions = ['terminate_resources']
+
+    class RestoreLimits(ExecutorAdminAction):
+        executor = marketplace_openstack_executors.RestoreTenantLimitsExecutor
+        short_description = 'Restore Openstack limits'
+        confirmation_description = 'Openstack limits will be restored.'
+        confirmation = True
+
+        def validate(self, resource):
+            if resource.state != models.Resource.States.OK:
+                raise ValidationError(_('Resource has to be in OK state.'))
+
+    restore_limits = RestoreLimits()
+    actions = ['terminate_resources', 'restore_limits']
 
 
 admin.site.register(models.ServiceProvider, ServiceProviderAdmin)

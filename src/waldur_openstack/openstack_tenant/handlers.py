@@ -346,10 +346,13 @@ class SecurityGroupHandler(BaseSynchronizationHandler):
     def map_rules(self, security_group, openstack_security_group):
         return [
             models.SecurityGroupRule(
+                ethertype=rule.ethertype,
+                direction=rule.direction,
                 protocol=rule.protocol,
                 from_port=rule.from_port,
                 to_port=rule.to_port,
                 cidr=rule.cidr,
+                description=rule.description,
                 backend_id=rule.backend_id,
                 security_group=security_group,
             )
@@ -393,6 +396,7 @@ class SubNetHandler(BaseSynchronizationHandler):
         'dns_nameservers',
         'enable_dhcp',
         'ip_version',
+        'is_connected',
     )
 
     def get_tenant(self, resource):
@@ -561,7 +565,8 @@ def update_service_settings(sender, instance, created=False, **kwargs):
     tenant = instance
 
     if created or not (
-        set(['external_network_id', 'name']) & set(tenant.tracker.changed())
+        set(['external_network_id', 'name', 'backend_id'])
+        & set(tenant.tracker.changed())
     ):
         return
 
@@ -575,6 +580,7 @@ def update_service_settings(sender, instance, created=False, **kwargs):
         return
     else:
         service_settings.options['external_network_id'] = tenant.external_network_id
+        service_settings.options['tenant_id'] = tenant.backend_id
         service_settings.name = tenant.name
         service_settings.save()
 
@@ -595,3 +601,42 @@ def sync_private_settings_quotas_with_tenant_quotas(
     Quota.objects.filter(scope__in=private_settings, name=quota.name).update(
         limit=quota.limit, usage=quota.usage
     )
+
+
+def propagate_volume_type_quotas_from_tenant_to_private_service_settings(
+    sender, instance, created=False, **kwargs
+):
+    quota = instance
+
+    if not created:
+        return
+
+    if not quota.name.startswith('gigabytes_'):
+        return
+
+    if not isinstance(quota.scope, openstack_models.Tenant):
+        return
+
+    tenant = quota.scope
+    private_settings = structure_models.ServiceSettings.objects.filter(scope=tenant)
+    for service_settings in private_settings:
+        Quota.objects.update_or_create(
+            content_type=ContentType.objects.get_for_model(service_settings),
+            object_id=service_settings.id,
+            name=quota.name,
+            defaults=dict(limit=quota.limit, usage=quota.usage,),
+        )
+
+
+def delete_volume_type_quotas_from_private_service_settings(sender, instance, **kwargs):
+    quota = instance
+
+    if not quota.name.startswith('gigabytes_'):
+        return
+
+    if not isinstance(quota.scope, openstack_models.Tenant):
+        return
+
+    tenant = quota.scope
+    private_settings = structure_models.ServiceSettings.objects.filter(scope=tenant)
+    Quota.objects.filter(scope__in=private_settings, name=quota.name).delete()

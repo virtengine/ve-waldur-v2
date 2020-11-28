@@ -1,0 +1,113 @@
+include:
+  - project: "waldur/waldur-pipelines"
+    file: "/templates/stages.yml"
+  - project: "waldur/waldur-pipelines"
+    file: "/templates/test/check-merge-compatibility.yml"
+  - project: "waldur/waldur-pipelines"
+    file: "/templates/release/publish.yml"
+  - project: "waldur/waldur-pipelines"
+    file: "/templates/release/sync-to-github.yml"
+  - project: "waldur/waldur-pipelines"
+    file: "/templates/validate/docker-compose-trigger.yml"
+  - project: "waldur/waldur-pipelines"
+    file: "/templates/test/lint-docker-image.yaml"
+
+variables:
+  GITHUB_OPENNODE_REPO_URL: "git@github.com:opennode/waldur-mastermind.git"
+  GITHUB_WALDUR_REPO_URL: "git@github.com:waldur/waldur-mastermind.git"
+
+before_script:
+  - export
+
+Run linters:
+  image: "$CI_REGISTRY/waldur/waldur-pipelines/python:3.8"
+  stage: test
+  interruptible: true
+  rules:
+    # Skip tests if said so
+    - if: '$SKIP_TESTS == "true" || $SKIP_TESTS == "yes"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "master"'
+    # If tagged release
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+    # If event is related to a created merge request
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    - pip install pre-commit
+    - pre-commit run --all
+
+Run unit tests:
+  image: $CI_REGISTRY/$WALDUR_MASTERMIND_TEST_IMAGE
+  stage: test
+  interruptible: true
+  rules:
+    # Skip tests if said so
+    - if: '$SKIP_TESTS == "true" || $SKIP_TESTS == "yes"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "master"'
+    # If tagged release
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+    # If event is related to a created merge request
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  services:
+    - name: "$CI_REGISTRY/waldur/waldur-pipelines/postgres:12-alpine"
+      alias: postgres
+      command:
+        [
+          "postgres",
+          "-cfsync=off",
+          "-cfull_page_writes=off",
+          "-cmax_connections=1000",
+          "-cshared_buffers=1GB",
+          "-ceffective_cache_size=4GB",
+          "-cwork_mem=32MB",
+          "-cmaintenance_work_mem=32MB",
+          "-ctemp_buffers=16MB",
+          "-cwal_buffers=48MB",
+        ]
+  variables:
+    POSTGRES_DB: test_waldur
+    POSTGRES_USER: runner
+    POSTGRES_PASSWORD: waldur
+  script:
+    - |
+      # Check merge compatibility only it is not a tagged release
+      if [ "$CI_PIPELINE_SOURCE" == "merge_request_event" ]; then
+        echo "[+] Add dummy user $GIT_USER_NAME ($GIT_USER_EMAIL)"
+        git config user.name $GIT_USER_NAME
+        git config user.email $GIT_USER_EMAIL
+        echo "[+] Merging branches $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME and origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+        git merge --no-ff origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+      fi
+    - gitlab-ci-test/waldur-test
+  parallel: 10
+
+Build docker image for tests:
+  stage: build
+  interruptible: true
+  rules:
+    # If scheduled pipeline for 'develop' branch is set up
+    - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "schedule"'
+  services:
+    - name: "$CI_REGISTRY/waldur/waldur-pipelines/docker:19.03.12-dind"
+      alias: docker
+      command: ["--mtu=1400"]
+  script:
+    - echo $CI_COMMIT_SHA > docker/rootfs/COMMIT
+    - cat docker/rootfs/COMMIT
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker pull $CI_REGISTRY/$WALDUR_MASTERMIND_TEST_IMAGE || true
+    - docker build . -f gitlab-ci-test/Dockerfile -t $CI_REGISTRY/$WALDUR_MASTERMIND_TEST_IMAGE --cache-from $CI_REGISTRY/$WALDUR_MASTERMIND_TEST_IMAGE
+    - docker push $CI_REGISTRY/$WALDUR_MASTERMIND_TEST_IMAGE
+
+Lint docker image:
+  extends: .Lint docker image template
+  variables:
+    IMAGE: opennode/waldur-mastermind:latest
+
+Lint docker image for tests:
+  extends: .Lint docker image template
+  before_script:
+    - export IMAGE=$WALDUR_MASTERMIND_TEST_IMAGE

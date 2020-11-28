@@ -27,12 +27,6 @@ class SlurmInvoicesConfig(AppConfig):
             dispatch_uid='waldur_slurm.handlers.update_allocation_deposit',
         )
 
-        signals.post_save.connect(
-            handlers.terminate_invoice_when_allocation_cancelled,
-            sender=slurm_models.Allocation,
-            dispatch_uid='waldur_slurm.handlers.terminate_invoice_when_allocation_cancelled',
-        )
-
         signals.pre_delete.connect(
             handlers.terminate_invoice_when_allocation_deleted,
             sender=slurm_models.Allocation,
@@ -41,6 +35,6 @@ class SlurmInvoicesConfig(AppConfig):
 
         signals.post_save.connect(
             handlers.update_invoice_item_on_allocation_usage_update,
-            sender=slurm_models.Allocation,
+            sender=slurm_models.AllocationUsage,
             dispatch_uid='waldur_slurm.handlers.update_invoice_item_on_allocation_usage_update',
         )

@@ -49,6 +49,17 @@ class SlurmBackend(ServiceBackend):
         else:
             return True
 
+    def add_new_users(self, allocation):
+        freeipa_profiles = {
+            profile.user: profile.username
+            for profile in freeipa_models.Profile.objects.all()
+        }
+
+        for user in allocation.service_project_link.project.customer.get_users():
+            username = freeipa_profiles.get(user)
+            if username:
+                self.add_user(allocation, username.lower())
+
     def create_allocation(self, allocation):
         project = allocation.service_project_link.project
         customer_account = self.get_customer_name(project.customer)
@@ -70,19 +81,16 @@ class SlurmBackend(ServiceBackend):
         allocation.save()
 
         self.set_resource_limits(allocation)
-
-        freeipa_profiles = {
-            profile.user: profile.username
-            for profile in freeipa_models.Profile.objects.all()
-        }
-
-        for user in allocation.service_project_link.project.customer.get_users():
-            username = freeipa_profiles.get(user)
-            if username:
-                self.add_user(allocation, username.lower())
+        self.add_new_users(allocation)
 
     def delete_allocation(self, allocation):
         account = allocation.backend_id
+
+        if not account.strip():
+            raise ServiceBackendError(
+                'Empty backend_id for allocation: %s' % allocation
+            )
+
         if self.client.get_account(account):
             self.client.delete_account(account)
 
@@ -103,6 +111,12 @@ class SlurmBackend(ServiceBackend):
         Create association between user and SLURM account if it does not exist yet.
         """
         account = allocation.backend_id
+
+        if not account.strip():
+            raise ServiceBackendError(
+                'Empty backend_id for allocation: %s' % allocation
+            )
+
         default_account = self.settings.options.get('default_account')
         if not self.client.get_association(username, account):
             self.client.create_association(username, account, default_account)
@@ -112,6 +126,12 @@ class SlurmBackend(ServiceBackend):
         Delete association between user and SLURM account if it exists.
         """
         account = allocation.backend_id
+
+        if not account.strip():
+            raise ServiceBackendError(
+                'Empty backend_id for allocation: %s' % allocation
+            )
+
         if self.client.get_association(username, account):
             self.client.delete_association(username, account)
 
@@ -127,21 +147,11 @@ class SlurmBackend(ServiceBackend):
 
         self.client.set_resource_limits(allocation.backend_id, quotas)
 
-    def cancel_allocation(self, allocation):
-        allocation.cpu_limit = allocation.cpu_usage
-        allocation.gpu_limit = allocation.gpu_usage
-        allocation.ram_limit = allocation.ram_usage
-        allocation.deposit_limit = allocation.deposit_usage
-
-        self.set_resource_limits(allocation)
-
-        allocation.is_active = False
-        allocation.save()
-
     def sync_usage(self):
         waldur_allocations = {
             allocation.backend_id: allocation
             for allocation in self.get_allocation_queryset()
+            if allocation.backend_id
         }
 
         report = self.get_usage_report(waldur_allocations.keys())
@@ -157,14 +167,16 @@ class SlurmBackend(ServiceBackend):
 
     def pull_allocation(self, allocation):
         account = allocation.backend_id
+
+        if not account.strip():
+            raise ServiceBackendError(
+                'Empty backend_id for allocation: %s' % allocation
+            )
+
         report = self.get_usage_report([account])
         usage = report.get(account)
         if not usage:
-            logger.debug(
-                'Skipping usage report for account %s because it is not managed under Waldur',
-                account,
-            )
-            return
+            usage = {'TOTAL_ACCOUNT_USAGE': Quotas()}
         self._update_quotas(allocation, usage)
         limits = self.get_allocation_limits(account)
         self._update_limits(allocation, limits)
@@ -185,12 +197,18 @@ class SlurmBackend(ServiceBackend):
         return report
 
     def get_allocation_limits(self, account):
-        output = self.client.get_limits(account)
-        limits = Quotas(cpu=output.cpu, gpu=output.gpu, ram=output.ram)
-
-        return limits
+        lines = self.client.get_resource_limits(account)
+        correct_lines = [
+            association for association in lines if association.resource_limits
+        ]
+        if len(correct_lines) > 0:
+            line = correct_lines[0]
+            limits = Quotas(cpu=line.cpu, gpu=line.gpu, ram=line.ram)
+            return limits
 
     def _update_limits(self, allocation, limits):
+        if not limits:
+            return
         allocation.cpu_limit = limits.cpu
         allocation.gpu_limit = limits.gpu
         allocation.ram_limit = limits.ram
@@ -276,8 +294,11 @@ class SlurmBackend(ServiceBackend):
         prefix = django_settings.WALDUR_SLURM['ALLOCATION_PREFIX']
         name = allocation.name
         hexpart = allocation.uuid.hex[:5]
-        result_name = "%s%s_%s" % (prefix, name, hexpart)
-        return self.sanitize_allocation_name(result_name)
+        raw_name = "%s%s_%s" % (prefix, hexpart, name)
+        result_name = self.sanitize_allocation_name(raw_name)[
+            : models.SLURM_ALLOCATION_NAME_MAX_LEN
+        ]
+        return result_name.lower()
 
     def get_account_name(self, prefix, object_or_uuid):
         key = (

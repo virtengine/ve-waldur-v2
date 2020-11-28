@@ -2,6 +2,8 @@ import json
 
 import django_filters
 from django.conf import settings
+from django.contrib.contenttypes.models import ContentType
+from django.db.models import Q
 from django.utils.translation import ugettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
 from django_filters.widgets import BooleanWidget
@@ -12,6 +14,7 @@ from waldur_core.core import filters as core_filters
 from waldur_core.core.utils import is_uuid_like
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import models as structure_models
+from waldur_mastermind.marketplace.plugins import manager
 from waldur_pid import models as pid_models
 
 from . import models
@@ -103,16 +106,76 @@ class OfferingCustomersFilterBackend(DjangoFilterBackend):
 class OfferingImportableFilterBackend(DjangoFilterBackend):
     def filter_queryset(self, request, queryset, view):
         if 'importable' in request.query_params:
-            return queryset.filter_importable(request.user)
+            user = request.user
+
+            if user.is_staff:
+                return queryset
+
+            used_offerings_ids = []
+
+            queryset = queryset.filter(shared=False)
+
+            owned_customers = set(
+                structure_models.Customer.objects.all()
+                .filter(
+                    permissions__user=user,
+                    permissions__is_active=True,
+                    permissions__role=structure_models.CustomerRole.OWNER,
+                )
+                .distinct()
+            )
+
+            owned_offerings_ids = list(
+                queryset.filter(
+                    Q(allowed_customers__in=owned_customers)
+                    | Q(customer__in=owned_customers)
+                ).values_list('id', flat=True)
+            )
+
+            # Import private offerings must be available for admins and managers
+            projects_ids = list(
+                structure_models.ProjectPermission.objects.filter(
+                    is_active=True,
+                    user_id=user.id,
+                    role__in=(
+                        structure_models.ProjectRole.ADMINISTRATOR,
+                        structure_models.ProjectRole.MANAGER,
+                    ),
+                ).values_list('project_id', flat=True)
+            )
+
+            for offering in queryset.all():
+                if (
+                    offering.scope
+                    and offering.scope.scope
+                    and offering.scope.scope.service_project_link
+                    and offering.scope.scope.service_project_link.project.id
+                    in projects_ids
+                ):
+                    used_offerings_ids.append(offering.id)
+
+            return queryset.filter(
+                id__in=list(owned_offerings_ids + used_offerings_ids)
+            )
         return queryset
 
 
-class ScreenshotFilter(django_filters.FilterSet):
-    offering = core_filters.URLFilter(
-        view_name='marketplace-offering-detail', field_name='offering__uuid'
+class OfferingFilterMixin:
+    offering = django_filters.UUIDFilter(field_name='offering__uuid')
+    offering_uuid = core_filters.URLFilter(
+        view_name='marketplace-offering-detail', field_name='offering__uuid',
     )
-    offering_uuid = django_filters.UUIDFilter(field_name='offering__uuid')
 
+
+class OfferingPermissionFilter(
+    OfferingFilterMixin, structure_filters.UserPermissionFilter
+):
+    class Meta:
+        model = models.OfferingPermission
+        fields = []
+
+
+class ScreenshotFilter(OfferingFilterMixin, django_filters.FilterSet):
     o = django_filters.OrderingFilter(fields=('name', 'created'))
 
     class Meta:
@@ -163,11 +226,7 @@ class OrderFilter(django_filters.FilterSet):
         fields = []
 
 
-class OrderItemFilter(django_filters.FilterSet):
-    offering = core_filters.URLFilter(
-        view_name='marketplace-offering-detail', field_name='offering__uuid'
-    )
-    offering_uuid = django_filters.UUIDFilter(field_name='offering__uuid')
+class OrderItemFilter(OfferingFilterMixin, django_filters.FilterSet):
     project_uuid = django_filters.UUIDFilter(field_name='order__project__uuid')
     category_uuid = django_filters.UUIDFilter(field_name='offering__category__uuid')
     provider_uuid = django_filters.UUIDFilter(field_name='offering__customer__uuid')
@@ -211,14 +270,10 @@ class OrderItemFilter(django_filters.FilterSet):
         fields = []
 
 
-class ResourceFilter(django_filters.FilterSet):
+class ResourceFilter(OfferingFilterMixin, django_filters.FilterSet):
     name = django_filters.CharFilter(lookup_expr='icontains')
     name_exact = django_filters.CharFilter(field_name='name')
     query = django_filters.CharFilter(method='filter_query')
-    offering = core_filters.URLFilter(
-        view_name='marketplace-offering-detail', field_name='offering__uuid'
-    )
-    offering_uuid = django_filters.UUIDFilter(field_name='offering__uuid')
     offering_type = django_filters.CharFilter(field_name='offering__type')
     offering_billable = django_filters.UUIDFilter(field_name='offering__billable')
     project_uuid = django_filters.UUIDFilter(field_name='project__uuid')
@@ -226,6 +281,7 @@ class ResourceFilter(django_filters.FilterSet):
     customer_uuid = django_filters.UUIDFilter(field_name='project__customer__uuid')
     category_uuid = django_filters.UUIDFilter(field_name='offering__category__uuid')
     provider_uuid = django_filters.UUIDFilter(field_name='offering__customer__uuid')
+    backend_id = django_filters.CharFilter(method='filter_backend_id')
     state = core_filters.MappedMultipleChoiceFilter(
         choices=[
             (representation, representation)
@@ -248,6 +304,25 @@ class ResourceFilter(django_filters.FilterSet):
         else:
             return queryset.filter(name__icontains=value)
 
+    def filter_backend_id(self, queryset, name, value):
+        resource_models = [
+            b['resource_model']
+            for b in manager.backends.values()
+            if 'resource_model' in b.keys()
+        ]
+        for resource_model in resource_models:
+            resources_ids = resource_model.objects.filter(backend_id=value).values_list(
+                'id', flat=True
+            )
+
+            if not resources_ids:
+                continue
+
+            ct = ContentType.objects.get_for_model(resource_model)
+            return queryset.filter(content_type=ct, object_id__in=resources_ids)
+
+        return queryset.none()
+
 
 class ResourceScopeFilterBackend(core_filters.GenericKeyFilterBackend):
     def get_related_models(self):
@@ -257,12 +332,7 @@ class ResourceScopeFilterBackend(core_filters.GenericKeyFilterBackend):
         return 'scope'
 
 
-class PlanFilter(django_filters.FilterSet):
-    offering = core_filters.URLFilter(
-        view_name='marketplace-offering-detail', field_name='offering__uuid'
-    )
-    offering_uuid = django_filters.UUIDFilter(field_name='offering__uuid')
-
+class PlanFilter(OfferingFilterMixin, django_filters.FilterSet):
     class Meta:
         model = models.Plan
         fields = []
@@ -325,12 +395,7 @@ class OfferingReferralScopeFilterBackend(core_filters.GenericKeyFilterBackend):
         return 'scope'
 
 
-class OfferingFileFilter(django_filters.FilterSet):
-    offering = core_filters.URLFilter(
-        view_name='marketplace-offering-detail', field_name='offering__uuid'
-    )
-    offering_uuid = django_filters.UUIDFilter(field_name='offering__uuid')
-
+class OfferingFileFilter(OfferingFilterMixin, django_filters.FilterSet):
     o = django_filters.OrderingFilter(fields=('name', 'created'))
 
     class Meta:
@@ -364,7 +429,21 @@ class ServiceProviderOfferingFilter(BaseFilterBackend):
         return queryset
 
 
+class CustomerServiceProviderFilter(core_filters.BaseFilterBackend):
+    def filter_queryset(self, request, queryset, view):
+        is_service_provider = request.query_params.get('is_service_provider')
+        if is_service_provider in ['true', 'True']:
+            customers = models.ServiceProvider.objects.values_list(
+                'customer_id', flat=True
+            )
+            return queryset.filter(pk__in=customers)
+        return queryset
+
+
 structure_filters.ExternalCustomerFilterBackend.register(CustomerResourceFilter())
 structure_filters.ExternalCustomerFilterBackend.register(
     ServiceProviderOfferingFilter()
+)
+structure_filters.ExternalCustomerFilterBackend.register(
+    CustomerServiceProviderFilter()
 )

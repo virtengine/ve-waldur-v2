@@ -31,6 +31,7 @@ def backend_internal_ip_to_internal_ip(backend_internal_ip, **kwargs):
         backend_id=backend_internal_ip['id'],
         mac_address=backend_internal_ip['mac_address'],
         ip4_address=backend_internal_ip['fixed_ips'][0]['ip_address'],
+        allowed_address_pairs=backend_internal_ip.get('allowed_address_pairs', []),
     )
 
     for field, value in kwargs.items():
@@ -584,35 +585,38 @@ class OpenStackTenantBackend(BaseOpenStackBackend):
 
         tenant = volume.service_project_link.service.settings.scope
 
-        if volume.type:
-            kwargs['volume_type'] = volume.type.backend_id
-        else:
-            volume_type_name = tenant and tenant.default_volume_type_name
-            if volume_type_name:
-                try:
-                    volume_type = models.VolumeType.objects.get(
-                        name=volume_type_name,
-                        settings=volume.service_project_link.service.settings,
-                    )
-                    volume.type = volume_type
-                    kwargs['volume_type'] = volume_type.backend_id
-                except models.VolumeType.DoesNotExist:
-                    logger.error(
-                        'Volume type is not set as volume type with name %s is not found. Settings UUID: %s'
-                        % (
-                            volume_type_name,
-                            volume.service_project_link.service.settings.uuid.hex,
+        # there is an issue in RHOS13 that doesn't allow to restore a snapshot to a volume if also a volume type ID is provided
+        # a workaround is to avoid setting volume type in this case at all
+        if not volume.source_snapshot:
+            if volume.type:
+                kwargs['volume_type'] = volume.type.backend_id
+            else:
+                volume_type_name = tenant and tenant.default_volume_type_name
+                if volume_type_name:
+                    try:
+                        volume_type = models.VolumeType.objects.get(
+                            name=volume_type_name,
+                            settings=volume.service_project_link.service.settings,
                         )
-                    )
-                except models.VolumeType.MultipleObjectsReturned:
-                    logger.error(
-                        'Volume type is not set as multiple volume types with name %s are found.'
-                        'Service settings UUID: %s'
-                        % (
-                            volume_type_name,
-                            volume.service_project_link.service.settings.uuid.hex,
+                        volume.type = volume_type
+                        kwargs['volume_type'] = volume_type.backend_id
+                    except models.VolumeType.DoesNotExist:
+                        logger.error(
+                            'Volume type is not set as volume type with name %s is not found. Settings UUID: %s'
+                            % (
+                                volume_type_name,
+                                volume.service_project_link.service.settings.uuid.hex,
+                            )
                         )
-                    )
+                    except models.VolumeType.MultipleObjectsReturned:
+                        logger.error(
+                            'Volume type is not set as multiple volume types with name %s are found.'
+                            'Service settings UUID: %s'
+                            % (
+                                volume_type_name,
+                                volume.service_project_link.service.settings.uuid.hex,
+                            )
+                        )
 
         if volume.availability_zone:
             kwargs['availability_zone'] = volume.availability_zone.name
@@ -782,6 +786,9 @@ class OpenStackTenantBackend(BaseOpenStackBackend):
                     )
             except models.Image.DoesNotExist:
                 pass
+
+            volume.image_name = volume.image_metadata.get('image_name', '')
+
         # In our setup volume could be attached only to one instance.
         if getattr(backend_volume, 'attachments', False):
             if 'device' in backend_volume.attachments[0]:
@@ -1682,6 +1689,18 @@ class OpenStackTenantBackend(BaseOpenStackBackend):
         internal_ip.delete()
 
     @log_backend_action()
+    def push_instance_allowed_address_pairs(
+        self, instance, backend_id, allowed_address_pairs
+    ):
+        neutron = self.neutron_client
+        try:
+            neutron.update_port(
+                backend_id, {'port': {'allowed_address_pairs': allowed_address_pairs}}
+            )
+        except neutron_exceptions.NeutronClientException as e:
+            raise OpenStackBackendError(e)
+
+    @log_backend_action()
     def pull_instance_security_groups(self, instance):
         nova = self.nova_client
         server_id = instance.backend_id
@@ -1876,6 +1895,9 @@ class OpenStackTenantBackend(BaseOpenStackBackend):
         except nova_exceptions.ClientException as e:
             raise OpenStackBackendError(e)
 
+    def _get_current_volume_types(self):
+        return self._get_current_properties(models.VolumeType)
+
     def pull_volume_types(self):
         try:
             volume_types = self.cinder_client.volume_types.list()
@@ -1891,7 +1913,7 @@ class OpenStackTenantBackend(BaseOpenStackBackend):
             raise OpenStackBackendError(e)
 
         with transaction.atomic():
-            cur_volume_types = self._get_current_properties(models.VolumeType)
+            cur_volume_types = self._get_current_volume_types()
             for backend_type in volume_types:
                 cur_volume_types.pop(backend_type.id, None)
                 models.VolumeType.objects.update_or_create(

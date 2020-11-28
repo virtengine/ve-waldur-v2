@@ -1,3 +1,5 @@
+import logging
+
 from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.db.models import (
@@ -17,28 +19,33 @@ from django.views.decorators.csrf import csrf_exempt
 from django_filters.rest_framework import DjangoFilterBackend
 from django_fsm import TransitionNotAllowed
 from rest_framework import exceptions as rf_exceptions
+from rest_framework import mixins
 from rest_framework import permissions as rf_permissions
 from rest_framework import status, views
 from rest_framework import viewsets as rf_viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
+from rest_framework.generics import ListAPIView
 from rest_framework.response import Response
 from rest_framework.reverse import reverse
 
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
 from waldur_core.core.mixins import EagerLoadMixin
-from waldur_core.core.utils import month_start, order_with_nulls
+from waldur_core.core.utils import is_uuid_like, month_start, order_with_nulls
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
+from waldur_core.structure import serializers as structure_serializers
 from waldur_core.structure import utils as structure_utils
 from waldur_core.structure import views as structure_views
 from waldur_core.structure.permissions import _has_owner_access
 from waldur_core.structure.signals import resource_imported
 from waldur_pid import models as pid_models
 
-from . import filters, models, permissions, plugins, serializers, tasks
+from . import filters, models, permissions, plugins, serializers, tasks, utils
+
+logger = logging.getLogger(__name__)
 
 
 class BaseMarketplaceView(core_views.ActionsViewSet):
@@ -51,7 +58,9 @@ class BaseMarketplaceView(core_views.ActionsViewSet):
 
 class PublicViewsetMixin:
     def get_permissions(self):
-        if settings.WALDUR_MARKETPLACE['ANONYMOUS_USER_CAN_VIEW_OFFERINGS']:
+        if settings.WALDUR_MARKETPLACE[
+            'ANONYMOUS_USER_CAN_VIEW_OFFERINGS'
+        ] and self.action in ['list', 'retrieve']:
             return [rf_permissions.AllowAny()]
         else:
             return super(PublicViewsetMixin, self).get_permissions()
@@ -114,7 +123,12 @@ def can_update_offering(request, view, obj=None):
         return
 
     if offering.state == models.Offering.States.DRAFT:
-        structure_permissions.is_owner(request, view, offering)
+        if offering.has_user(request.user) or _has_owner_access(
+            request.user, offering.customer
+        ):
+            return
+        else:
+            raise rf_exceptions.PermissionDenied()
     else:
         structure_permissions.is_staff(request, view)
 
@@ -156,6 +170,10 @@ class OfferingViewSet(PublicViewsetMixin, BaseMarketplaceView):
     @action(detail=True, methods=['post'])
     def activate(self, request, uuid=None):
         return self._update_state('activate')
+
+    @action(detail=True, methods=['post'])
+    def draft(self, request, uuid=None):
+        return self._update_state('draft')
 
     @action(detail=True, methods=['post'])
     def pause(self, request, uuid=None):
@@ -289,6 +307,42 @@ class OfferingViewSet(PublicViewsetMixin, BaseMarketplaceView):
 
         return Response(data=resource_serializer.data, status=status.HTTP_201_CREATED)
 
+    @action(detail=True)
+    def customers(self, request, uuid):
+        offering = self.get_object()
+        active_customers = utils.get_active_customers(request, self)
+        customer_queryset = utils.get_offering_customers(offering, active_customers)
+        serializer_class = structure_serializers.CustomerSerializer
+        serializer = serializer_class(
+            instance=customer_queryset, many=True, context=self.get_serializer_context()
+        )
+        page = self.paginate_queryset(serializer.data)
+        return self.get_paginated_response(page)
+
+    customers_permissions = [structure_permissions.is_owner]
+
+    @action(detail=True)
+    def costs(self, request, uuid):
+        offering = self.get_object()
+        active_customers = utils.get_active_customers(request, self)
+        start, end = utils.get_start_and_end_dates_from_request(request)
+        costs = utils.get_offering_costs(offering, active_customers, start, end)
+        page = self.paginate_queryset(costs)
+        return self.get_paginated_response(page)
+
+    costs_permissions = [structure_permissions.is_owner]
+
+    @action(detail=True)
+    def component_stats(self, request, uuid):
+        offering = self.get_object()
+        active_customers = utils.get_active_customers(request, self)
+        start, end = utils.get_start_and_end_dates_from_request(request)
+        stats = utils.get_offering_component_stats(
+            offering, active_customers, start, end
+        )
+        page = self.paginate_queryset(stats)
+        return self.get_paginated_response(page)
+
 
 class OfferingReferralsViewSet(PublicViewsetMixin, rf_viewsets.ReadOnlyModelViewSet):
     queryset = pid_models.DataciteReferral.objects.all()
@@ -300,6 +354,31 @@ class OfferingReferralsViewSet(PublicViewsetMixin, rf_viewsets.ReadOnlyModelView
         DjangoFilterBackend,
     )
     filterset_class = filters.OfferingReferralFilter
+
+
+class OfferingPermissionViewSet(structure_views.BasePermissionViewSet):
+    queryset = models.OfferingPermission.objects.filter(is_active=True).order_by(
+        '-created'
+    )
+    serializer_class = serializers.OfferingPermissionSerializer
+    filter_backends = (
+        structure_filters.GenericRoleFilter,
+        DjangoFilterBackend,
+    )
+    filterset_class = filters.OfferingPermissionFilter
+    scope_field = 'offering'
+
+
+class OfferingPermissionLogViewSet(
+    mixins.RetrieveModelMixin, mixins.ListModelMixin, rf_viewsets.GenericViewSet
+):
+    queryset = models.OfferingPermission.objects.filter(is_active=None)
+    serializer_class = serializers.OfferingPermissionLogSerializer
+    filter_backends = (
+        structure_filters.GenericRoleFilter,
+        DjangoFilterBackend,
+    )
+    filterset_class = filters.OfferingPermissionFilter
 
 
 class PlanUsageReporter:
@@ -546,6 +625,80 @@ class OrderItemViewSet(BaseMarketplaceView):
     ]
 
     @action(detail=True, methods=['post'])
+    def reject(self, request, uuid=None):
+        order_item = self.get_object()
+        if (
+            not order_item.offering.customer.has_user(
+                request.user, structure_models.CustomerRole.OWNER
+            )
+            and not request.user.is_staff
+        ):
+            return Response(
+                {
+                    'details': 'Order item could not be rejected because user is not owner of service provider.'
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        try:
+            order_item.set_state_terminated()
+            order_item.save()
+
+            if (
+                order_item.state == models.OrderItem.Types.CREATE
+                and order_item.resource
+            ):
+                order_item.resource.set_state_terminated()
+                order_item.resource.save()
+        except TransitionNotAllowed:
+            return Response(
+                {
+                    'details': 'Order item could not be rejected because it has been already processed.'
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(
+            {'details': 'Order item has been rejected.'}, status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, uuid=None):
+        order_item = self.get_object()
+        if (
+            not order_item.offering.customer.has_user(
+                request.user, structure_models.CustomerRole.OWNER
+            )
+            and not request.user.is_staff
+        ):
+            return Response(
+                {
+                    'details': 'Order item could not be approved because user is not owner of service provider.'
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        try:
+            order_item.set_state_done()
+            order_item.save()
+
+            if (
+                order_item.state == models.OrderItem.Types.CREATE
+                and order_item.resource
+            ):
+                order_item.resource.set_state_ok()
+                order_item.resource.save()
+        except TransitionNotAllowed:
+            return Response(
+                {
+                    'details': 'Order item could not be approved because it has been already processed.'
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(
+            {'details': 'Order item has been approved.'}, status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=['post'])
     def terminate(self, request, uuid=None):
         order_item = self.get_object()
         if not plugins.manager.can_terminate_order_item(order_item.offering.type):
@@ -732,6 +885,36 @@ class ResourceViewSet(core_views.ReadOnlyActionsViewSet):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
+class ProjectChoicesViewSet(ListAPIView):
+    def get_project(self):
+        project_uuid = self.kwargs['project_uuid']
+        if not is_uuid_like(project_uuid):
+            return Response(
+                status=status.HTTP_400_BAD_REQUEST, data='Project UUID is invalid.'
+            )
+        return get_object_or_404(structure_models.Project, uuid=project_uuid)
+
+    def get_category(self):
+        category_uuid = self.kwargs['category_uuid']
+        if not is_uuid_like(category_uuid):
+            return Response(
+                status=status.HTTP_400_BAD_REQUEST, data='Category UUID is invalid.'
+            )
+        return get_object_or_404(models.Category, uuid=category_uuid)
+
+
+class ResourceOfferingsViewSet(ProjectChoicesViewSet):
+    serializer_class = serializers.ResourceOfferingSerializer
+
+    def get_queryset(self):
+        project = self.get_project()
+        category = self.get_category()
+        offerings = models.Resource.objects.filter(
+            project=project, offering__category=category
+        ).values_list('offering_id', flat=True)
+        return models.Offering.objects.filter(pk__in=offerings)
+
+
 class CategoryComponentUsageViewSet(core_views.ReadOnlyActionsViewSet):
     queryset = models.CategoryComponentUsage.objects.all().order_by(
         '-date', 'component__type'
@@ -755,10 +938,12 @@ class ComponentUsageViewSet(core_views.ReadOnlyActionsViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         resource = serializer.validated_data['plan_period'].resource
-        if not _has_owner_access(request.user, resource.offering.customer):
+        if not _has_owner_access(
+            request.user, resource.offering.customer
+        ) and not resource.offering.has_user(request.user):
             raise PermissionDenied(
                 _(
-                    'Only staff and service provider owner is allowed '
+                    'Only staff, service provider owner and service manager are allowed '
                     'to submit usage data for marketplace resource.'
                 )
             )

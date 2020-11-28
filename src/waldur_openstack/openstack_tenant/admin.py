@@ -31,7 +31,16 @@ class FloatingIPAdmin(structure_admin.BackendModelAdmin):
 
 class SecurityGroupRule(admin.TabularInline):
     model = models.SecurityGroupRule
-    fields = ('protocol', 'from_port', 'to_port', 'cidr', 'backend_id')
+    fields = (
+        'ethertype',
+        'direction',
+        'protocol',
+        'from_port',
+        'to_port',
+        'cidr',
+        'backend_id',
+        'description',
+    )
     readonly_fields = fields
     extra = 0
     can_delete = False
@@ -81,10 +90,31 @@ class ActionDetailsMixin(admin.ModelAdmin):
     format_action_details.short_description = _('Action details')
 
 
+class VolumeChangeForm(forms.ModelForm):
+    class Meta:
+        model = models.Volume
+        fields = '__all__'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.instance.pk:
+            self.fields['type'].queryset = models.VolumeType.objects.filter(
+                settings=self.instance.service_project_link.service.settings,
+            )
+            self.fields['instance'].queryset = models.Instance.objects.filter(
+                service_project_link=self.instance.service_project_link,
+            )
+            self.fields['source_snapshot'].queryset = models.Snapshot.objects.filter(
+                service_project_link=self.instance.service_project_link,
+            )
+
+
 class VolumeAdmin(
     MetadataMixin, ImageMetadataMixin, ActionDetailsMixin, structure_admin.ResourceAdmin
 ):
     exclude = ('metadata', 'image_metadata', 'action_details')
+
+    form = VolumeChangeForm
 
     class Pull(ExecutorAdminAction):
         executor = executors.VolumePullExecutor
@@ -129,6 +159,21 @@ class InternalIpInline(admin.TabularInline):
         )
 
 
+class InstanceChangeForm(forms.ModelForm):
+    class Meta:
+        model = models.Instance
+        fields = '__all__'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.instance.pk:
+            self.fields[
+                'security_groups'
+            ].queryset = models.SecurityGroup.objects.filter(
+                settings=self.instance.service_project_link.service.settings,
+            )
+
+
 class InstanceAdmin(ActionDetailsMixin, structure_admin.VirtualMachineAdmin):
     actions = structure_admin.VirtualMachineAdmin.actions + ['pull']
     exclude = ('action_details',)
@@ -139,6 +184,7 @@ class InstanceAdmin(ActionDetailsMixin, structure_admin.VirtualMachineAdmin):
         'backend_id',
         'runtime_state',
     )
+    form = InstanceChangeForm
 
     class Pull(ExecutorAdminAction):
         executor = executors.InstancePullExecutor
@@ -156,8 +202,8 @@ class InstanceAdmin(ActionDetailsMixin, structure_admin.VirtualMachineAdmin):
 
 class BackupAdmin(MetadataMixin, admin.ModelAdmin):
     readonly_fields = ('created', 'kept_until')
-    list_filter = ('uuid', 'state')
-    list_display = ('uuid', 'instance', 'state', 'project')
+    list_filter = ('state', 'instance')
+    list_display = ('uuid', 'name', 'instance', 'state', 'project')
     exclude = ('metadata',)
 
     def project(self, obj):
@@ -189,6 +235,7 @@ class BaseScheduleAdmin(structure_admin.ResourceAdmin):
 
 class BackupScheduleAdmin(BaseScheduleAdmin):
     list_display = BaseScheduleAdmin.list_display + ('instance',)
+    list_filter = ('instance',) + BaseScheduleAdmin.list_filter
 
 
 class SnapshotScheduleAdmin(BaseScheduleAdmin):

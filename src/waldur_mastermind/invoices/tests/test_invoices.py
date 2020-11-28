@@ -1,21 +1,30 @@
+import datetime
 from decimal import Decimal
 from unittest import mock
 
 from ddt import data, ddt
+from django.contrib.contenttypes.models import ContentType
 from django.core import mail
 from django.test import override_settings
 from freezegun import freeze_time
 from rest_framework import status, test
 
 from waldur_core.core.tests.helpers import override_waldur_core_settings
+from waldur_core.media.utils import dummy_image
 from waldur_core.structure.tests import factories as structure_factories
+from waldur_mastermind.common.mixins import UnitPriceMixin
+from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.tests import factories as marketplace_factories
+from waldur_mastermind.marketplace_openstack import PACKAGE_TYPE
 from waldur_mastermind.packages.tests import fixtures as packages_fixtures
 from waldur_mastermind.packages.tests.utils import override_plugin_settings
 from waldur_mastermind.slurm_invoices.tests import factories as slurm_factories
+from waldur_mastermind.support import models as support_models
+from waldur_mastermind.support.tests import factories as support_factories
 from waldur_mastermind.support.tests import fixtures as support_fixtures
 from waldur_slurm.tests import fixtures as slurm_fixtures
 
-from .. import models, utils
+from .. import models, tasks, utils
 from . import factories, fixtures
 from . import utils as test_utils
 
@@ -197,27 +206,32 @@ class InvoiceItemTest(test.APITransactionTestCase):
         )
         self.invoice = factories.InvoiceFactory(customer=self.fixture.customer)
         self.scope = self.fixture.allocation
-        self.item = models.InvoiceItem.objects.filter(scope=self.scope).get()
-        self.item.unit = models.InvoiceItem.Units.QUANTITY
-        self.item.quantity = 10
-        self.item.unit_price = 10
-        self.item.save()
+        self.usage = self.fixture.allocation_usage
+        self.items = models.InvoiceItem.objects.filter(scope=self.scope)
+        for item in self.items:
+            item.unit = models.InvoiceItem.Units.QUANTITY
+            item.quantity = 10
+            item.unit_price = 10
+            item.save()
 
     def check_output(self):
         self.client.force_authenticate(self.fixture.owner)
-        response = self.client.get(factories.InvoiceFactory.get_url(self.item.invoice))
-
-        item = response.data['items'][0]
-        self.assertEqual(item['scope_type'], 'SLURM.Allocation')
-        self.assertEqual(item['scope_uuid'], self.scope.uuid.hex)
-        self.assertEqual(item['name'], self.scope.name)
+        invoice = self.items[0].invoice
+        response = self.client.get(factories.InvoiceFactory.get_url(invoice))
+        response_items = response.data['items']
+        self.assertNotEqual(len(response_items), 0)
+        for response_item in response_items:
+            self.assertEqual(response_item['scope_type'], 'SLURM.Allocation')
+            self.assertEqual(response_item['scope_uuid'], self.scope.uuid.hex)
+            self.assertTrue(self.scope.name in response_item['name'])
 
     def test_details_are_rendered_if_scope_exists(self):
         self.check_output()
 
     def test_details_are_rendered_if_scope_has_been_deleted(self):
         self.scope.delete()
-        self.item.refresh_from_db()
+        for item in self.items:
+            item.refresh_from_db()
         self.check_output()
 
     def test_scope_type_is_rendered_for_support_request(self):
@@ -236,6 +250,163 @@ class InvoiceItemTest(test.APITransactionTestCase):
         response = self.client.get(url)
         item = response.data['items'][0]
         self.assertEqual(item['scope_type'], 'Support.Offering')
+
+
+class InvoiceStatsTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.provider = marketplace_factories.ServiceProviderFactory()
+        self.provider_2 = marketplace_factories.ServiceProviderFactory()
+
+        self.offering = marketplace_factories.OfferingFactory(
+            type=PACKAGE_TYPE, customer=self.provider.customer
+        )
+
+        self.offering_component = marketplace_factories.OfferingComponentFactory(
+            offering=self.offering
+        )
+        self.plan = marketplace_factories.PlanFactory(
+            offering=self.offering, unit=UnitPriceMixin.Units.PER_DAY,
+        )
+        self.component = marketplace_factories.PlanComponentFactory(
+            component=self.offering_component, price=Decimal(5), plan=self.plan
+        )
+
+        self.offering_2 = marketplace_factories.OfferingFactory(
+            type=PACKAGE_TYPE, customer=self.provider_2.customer
+        )
+
+        self.offering_component_2 = marketplace_factories.OfferingComponentFactory(
+            offering=self.offering_2
+        )
+        self.plan_2 = marketplace_factories.PlanFactory(
+            offering=self.offering_2, unit=UnitPriceMixin.Units.PER_DAY,
+        )
+        self.component_2 = marketplace_factories.PlanComponentFactory(
+            component=self.offering_component_2, price=Decimal(7), plan=self.plan_2
+        )
+
+        self.resource_1 = marketplace_factories.ResourceFactory(
+            state=marketplace_models.Resource.States.OK,
+            offering=self.offering,
+            plan=self.plan,
+            limits={'cpu': 1},
+        )
+
+        self.resource_2 = marketplace_factories.ResourceFactory(
+            state=marketplace_models.Resource.States.OK,
+            offering=self.offering,
+            project=self.resource_1.project,
+            plan=self.plan,
+            limits={'cpu': 1},
+        )
+
+        self.resource_3 = marketplace_factories.ResourceFactory(
+            state=marketplace_models.Resource.States.OK,
+            offering=self.offering_2,
+            project=self.resource_1.project,
+            plan=self.plan_2,
+            limits={'cpu': 1},
+        )
+
+        self.customer = self.resource_1.project.customer
+
+        self.support_template = support_factories.OfferingTemplateFactory()
+        self.support_plan = support_factories.OfferingPlanFactory(
+            template=self.support_template, unit_price=7,
+        )
+        self.support_offering = support_factories.OfferingFactory(
+            project=self.resource_1.project,
+            template=self.support_template,
+            plan=self.support_plan,
+            state=support_models.Offering.States.OK,
+        )
+
+    @freeze_time('2019-01-01')
+    def test_invoice_stats(self):
+        tasks.create_monthly_invoices()
+        invoice = models.Invoice.objects.get(customer=self.customer, year=2019, month=1)
+        url = factories.InvoiceFactory.get_url(invoice=invoice, action='stats')
+        self.client.force_authenticate(structure_factories.UserFactory(is_staff=True))
+        result = self.client.get(url)
+        self.assertEqual(len(result.data), 3)
+        self.assertEqual(
+            {d['uuid'] for d in result.data},
+            {
+                self.offering.uuid.hex,
+                self.support_template.uuid.hex,
+                self.offering_2.uuid.hex,
+            },
+        )
+
+        self.assertEqual(
+            list(filter(lambda x: x['uuid'] == self.offering.uuid.hex, result.data))[0],
+            {
+                'uuid': self.offering.uuid.hex,
+                'offering_name': self.offering.name,
+                'aggregated_cost': sum(
+                    [
+                        item.total
+                        for item in models.InvoiceItem.objects.filter(
+                            invoice=invoice,
+                            object_id__in=[self.resource_1.id, self.resource_2.id],
+                            content_type=ContentType.objects.get_for_model(
+                                marketplace_models.Resource
+                            ),
+                        )
+                    ]
+                ),
+                'service_category_title': self.offering.category.title,
+                'service_provider_name': self.offering.customer.name,
+                'service_provider_uuid': self.provider.uuid.hex,
+            },
+        )
+
+        self.assertEqual(
+            list(filter(lambda x: x['uuid'] == self.offering_2.uuid.hex, result.data))[
+                0
+            ],
+            {
+                'uuid': self.offering_2.uuid.hex,
+                'offering_name': self.offering_2.name,
+                'aggregated_cost': sum(
+                    [
+                        item.total
+                        for item in models.InvoiceItem.objects.filter(
+                            invoice=invoice,
+                            object_id__in=[self.resource_3.id],
+                            content_type=ContentType.objects.get_for_model(
+                                marketplace_models.Resource
+                            ),
+                        )
+                    ]
+                ),
+                'service_category_title': self.offering_2.category.title,
+                'service_provider_name': self.offering_2.customer.name,
+                'service_provider_uuid': self.provider_2.uuid.hex,
+            },
+        )
+
+        self.assertEqual(
+            list(
+                filter(
+                    lambda x: x['uuid'] == self.support_template.uuid.hex, result.data
+                )
+            )[0],
+            {
+                'uuid': self.support_template.uuid.hex,
+                'offering_name': self.support_template.name,
+                'aggregated_cost': models.InvoiceItem.objects.get(
+                    invoice=invoice,
+                    object_id=self.support_offering.id,
+                    content_type=ContentType.objects.get_for_model(
+                        support_models.Offering
+                    ),
+                ).price,
+                'service_category_title': 'Request',
+                'service_provider_name': '',
+                'service_provider_uuid': '',
+            },
+        )
 
 
 class DeleteCustomerWithInvoiceTest(test.APITransactionTestCase):
@@ -325,3 +496,71 @@ class InvoicePDFTest(test.APITransactionTestCase):
             factories.InvoiceItemFactory(invoice=invoice, unit_price=Decimal(10))
             invoice.update_current_cost()
             self.assertEqual(mock_tasks.create_invoice_pdf.delay.call_count, 2)
+
+
+@ddt
+class InvoicePaidTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.InvoiceFixture()
+        self.invoice = self.fixture.invoice
+        self.invoice.state = models.Invoice.States.CREATED
+        self.invoice.save()
+        self.url = factories.InvoiceFactory.get_url(self.invoice, 'paid')
+
+    def test_staff_can_mark_invoice_as_paid(self):
+        self.client.force_authenticate(getattr(self.fixture, 'staff'))
+        response = self.client.post(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.invoice.refresh_from_db()
+        self.assertEqual(self.invoice.state, models.Invoice.States.PAID)
+
+    @data('owner', 'manager', 'admin', 'user')
+    def test_other_users_cannot_mark_invoice_as_paid(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.post(self.url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_staff_cannot_mark_invoice_as_paid_if_current_state_is_not_created(self):
+        self.invoice.state = models.Invoice.States.PENDING
+        self.invoice.save()
+        self.client.force_authenticate(getattr(self.fixture, 'staff'))
+        response = self.client.post(self.url)
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+
+    def test_create_payment_if_payment_data_has_been_passed(self):
+        profile = factories.PaymentProfileFactory(
+            organization=self.invoice.customer, is_active=True
+        )
+
+        self.client.force_authenticate(getattr(self.fixture, 'staff'))
+        date = datetime.date.today()
+        response = self.client.post(
+            self.url, data={'date': date, 'proof': dummy_image()}, format='multipart'
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.invoice.refresh_from_db()
+        self.assertEqual(self.invoice.state, models.Invoice.States.PAID)
+        self.assertEqual(
+            models.Payment.objects.filter(
+                date_of_payment=date, profile=profile
+            ).count(),
+            1,
+        )
+
+    def test_do_not_create_payment_if_profile_does_not_exist(self):
+        self.client.force_authenticate(getattr(self.fixture, 'staff'))
+        date = datetime.date.today()
+        response = self.client.post(
+            self.url, data={'date': date, 'proof': dummy_image()}, format='multipart'
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_proof_is_not_required_for_payment_of_invoice(self):
+        factories.PaymentProfileFactory(
+            organization=self.invoice.customer, is_active=True
+        )
+
+        self.client.force_authenticate(getattr(self.fixture, 'staff'))
+        date = datetime.date.today()
+        response = self.client.post(self.url, data={'date': date}, format='multipart')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)

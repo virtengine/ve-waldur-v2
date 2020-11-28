@@ -1,5 +1,7 @@
+import logging
+
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Avg, Count, Q
 from django.utils import timezone
 from django.utils.translation import ugettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
@@ -19,6 +21,9 @@ from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure import views as structure_views
 
 from . import backend, exceptions, executors, filters, models, serializers, tasks
+from .log import event_logger
+
+logger = logging.getLogger(__name__)
 
 
 class CheckExtensionMixin(core_views.CheckExtensionMixin):
@@ -269,6 +274,39 @@ class OfferingViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
         core_validators.StateValidator(models.Offering.States.TERMINATED)
     ]
 
+    @decorators.action(detail=True, methods=['post'])
+    def set_backend_id(self, request, uuid=None):
+        offering = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        new_backend_id = serializer.validated_data['backend_id']
+        old_backend_id = offering.backend_id
+        offering.backend_id = serializer.validated_data['backend_id']
+        offering.save()
+        logger.info(
+            '%s has changed backend_id from %s to %s',
+            request.user.full_name,
+            old_backend_id,
+            new_backend_id,
+        )
+        event_logger.waldur_offering_backend_id.info(
+            '{full_name} has changed backend_id from {old_backend_id} to {new_backend_id}',
+            event_type='offering_backend_id_changed',
+            event_context={
+                'old_backend_id': old_backend_id,
+                'new_backend_id': new_backend_id,
+                'full_name': request.user.full_name,
+            },
+        )
+
+        return response.Response(
+            {'status': _('Offering backend_id has been changed.')},
+            status=status.HTTP_200_OK,
+        )
+
+    set_backend_id_permissions = [structure_permissions.is_staff]
+    set_backend_id_serializer_class = serializers.OfferingSetBackendIDSerializer
+
 
 class AttachmentViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
     queryset = models.Attachment.objects.all()
@@ -320,6 +358,34 @@ class FeedbackViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
     create_permissions = ()
     serializer_class = serializers.CreateFeedbackSerializer
     create_executor = executors.FeedbackExecutor
+
+
+class FeedbackReportViewSet(views.APIView):
+    permission_classes = [permissions.IsAuthenticated, core_permissions.IsSupport]
+
+    def get(self, request, format=None):
+        result = {
+            dict(models.Feedback.Evaluation.CHOICES).get(count['evaluation']): count[
+                'id__count'
+            ]
+            for count in models.Feedback.objects.values('evaluation').annotate(
+                Count('id')
+            )
+        }
+        return response.Response(result, status=status.HTTP_200_OK)
+
+
+class FeedbackAverageReportViewSet(views.APIView):
+    permission_classes = [permissions.IsAuthenticated, core_permissions.IsSupport]
+
+    def get(self, request, format=None):
+        avg = models.Feedback.objects.aggregate(Avg('evaluation'))['evaluation__avg']
+
+        if avg:
+            result = round(avg, 2)
+        else:
+            result = None
+        return response.Response(result, status=status.HTTP_200_OK)
 
 
 def get_offerings_count(scope):

@@ -18,10 +18,34 @@ class VolumeDeleteTest(test.APITransactionTestCase):
         self.volume = self.fixture.volume
         self.spl = self.fixture.spl
 
+    def destroy_volume(self):
+        url = factories.VolumeFactory.get_url(self.volume)
+        self.client.force_authenticate(self.fixture.staff)
+        return self.client.delete(url)
+
     def test_spl_quota_updated_by_signal_handler_when_volume_is_removed(self):
         self.volume.delete()
         Quotas = models.OpenStackTenantServiceProjectLink.Quotas
         self.assertEqual(self.spl.quotas.get(name=Quotas.storage).usage, 0)
+
+    def test_erred_volume_can_be_destroyed(self):
+        self.volume.state = models.Volume.States.ERRED
+        self.volume.save()
+        response = self.destroy_volume()
+        self.assertEqual(response.status_code, 202)
+
+    def test_attached_volume_can_not_be_destroyed(self):
+        self.volume.state = models.Volume.States.OK
+        self.volume.runtime_state = 'in-use'
+        self.volume.save()
+        response = self.destroy_volume()
+        self.assertEqual(response.status_code, 409)
+
+    def test_pending_volume_can_not_be_destroyed(self):
+        self.volume.state = models.Volume.States.CREATING
+        self.volume.save()
+        response = self.destroy_volume()
+        self.assertEqual(response.status_code, 409)
 
 
 @ddt
@@ -59,13 +83,12 @@ class VolumeExtendTestCase(test.APITransactionTestCase):
         response = self.extend_disk(self.admin, new_size)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_user_can_not_extend_volume_if_quota_usage_becomes_greater_than_limit_in_service_project_link(
+    def test_user_can_not_extend_volume_if_quota_usage_becomes_greater_than_limit(
         self,
     ):
-        self.volume.service_project_link.set_quota_usage('storage', self.volume.size)
-        self.volume.service_project_link.set_quota_limit(
-            'storage', self.volume.size + 512
-        )
+        scope = self.volume.service_project_link.service.settings
+        scope.set_quota_usage('storage', self.volume.size)
+        scope.set_quota_limit('storage', self.volume.size + 512)
 
         new_size = self.volume.size + 1024
         response = self.extend_disk(self.admin, new_size)
@@ -89,17 +112,20 @@ class VolumeExtendTestCase(test.APITransactionTestCase):
 
     def test_when_volume_is_extended_volume_type_quota_is_updated(self):
         # Arrange
-        scope = self.volume.service_project_link.service.settings
+        private_settings = self.volume.service_project_link.service.settings
+        shared_tenant = private_settings.scope
         key = 'gigabytes_' + self.volume.type.backend_id
-        scope.set_quota_usage(key, self.volume.size / 1024)
+
+        private_settings.set_quota_usage(key, self.volume.size / 1024)
+        shared_tenant.set_quota_usage(key, self.volume.size / 1024)
 
         # Act
         new_size = self.volume.size + 1024
         self.extend_disk(self.staff, new_size)
 
         # Assert
-        new_usage = scope.quotas.get(name=key).usage
-        self.assertEqual(new_size / 1024, new_usage)
+        self.assertEqual(new_size / 1024, private_settings.quotas.get(name=key).usage)
+        self.assertEqual(new_size / 1024, shared_tenant.quotas.get(name=key).usage)
 
 
 class VolumeAttachTestCase(test.APITransactionTestCase):
@@ -478,7 +504,9 @@ class VolumeNameCreateTest(BaseVolumeCreateTest):
 class VolumeTypeCreateTest(BaseVolumeCreateTest):
     def setUp(self):
         super(VolumeTypeCreateTest, self).setUp()
-        self.type = factories.VolumeTypeFactory(settings=self.settings)
+        self.type = factories.VolumeTypeFactory(
+            settings=self.settings, backend_id='ssd'
+        )
         self.type_url = factories.VolumeTypeFactory.get_url(self.type)
 
     def test_type_populated_on_volume_creation(self):
@@ -497,6 +525,15 @@ class VolumeTypeCreateTest(BaseVolumeCreateTest):
         key = 'gigabytes_' + self.type.backend_id
         usage = self.settings.quotas.get(name=key).usage
         self.assertEqual(usage, 10)
+
+    def test_user_can_not_create_volume_if_resulting_quota_usage_is_greater_than_limit(
+        self,
+    ):
+        self.settings.set_quota_usage('gigabytes_ssd', 0)
+        self.settings.set_quota_limit('gigabytes_ssd', 0)
+
+        response = self.create_volume(type=self.type_url, size=1024)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
 class VolumeAvailabilityZoneCreateTest(BaseVolumeCreateTest):
@@ -536,3 +573,81 @@ class VolumeAvailabilityZoneCreateTest(BaseVolumeCreateTest):
     ):
         response = self.create_volume()
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+
+@ddt
+class VolumeRetypeTestCase(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.OpenStackTenantFixture()
+        self.admin = self.fixture.admin
+        self.manager = self.fixture.manager
+        self.staff = self.fixture.staff
+        self.volume = self.fixture.volume
+        self.volume.runtime_state = 'available'
+        self.volume.save()
+        self.new_type = factories.VolumeTypeFactory(
+            settings=self.fixture.openstack_tenant_service_settings,
+        )
+
+    def retype_volume(self, user, new_type):
+        url = factories.VolumeFactory.get_url(self.volume, action='retype')
+        self.client.force_authenticate(user)
+        return self.client.post(
+            url, {'type': factories.VolumeTypeFactory.get_url(new_type)}
+        )
+
+    @data('admin', 'manager')
+    def test_user_can_resize_size_of_volume_he_has_access_to(self, user):
+        response = self.retype_volume(getattr(self, user), self.new_type)
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
+
+        self.volume.refresh_from_db()
+        self.assertEqual(self.volume.type, self.new_type)
+
+    def test_user_can_not_extend_volume_if_volume_operation_is_performed(self):
+        self.volume.state = models.Volume.States.UPDATING
+        self.volume.save()
+
+        response = self.retype_volume(self.admin, self.new_type)
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+
+    def test_user_can_not_extend_volume_if_volume_is_in_erred_state(self):
+        self.volume.state = models.Instance.States.ERRED
+        self.volume.save()
+
+        response = self.retype_volume(self.admin, self.new_type)
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+
+    def test_when_volume_is_retyped_volume_type_quota_is_updated(self):
+        # Arrange
+        scope = self.volume.service_project_link.service.settings
+        old_type_key = 'gigabytes_' + self.volume.type.backend_id
+        new_type_key = 'gigabytes_' + self.new_type.backend_id
+        scope.set_quota_usage(old_type_key, self.volume.size / 1024)
+
+        # Act
+        self.retype_volume(self.admin, self.new_type)
+
+        # Assert
+        self.assertEqual(0, scope.quotas.get(name=old_type_key).usage)
+        self.assertEqual(
+            self.volume.size / 1024, scope.quotas.get(name=new_type_key).usage
+        )
+
+    def test_when_volume_is_extended_volume_type_quota_for_shared_tenant_is_updated(
+        self,
+    ):
+        # Arrange
+        scope = self.volume.service_project_link.service.settings.scope
+        old_type_key = 'gigabytes_' + self.volume.type.backend_id
+        new_type_key = 'gigabytes_' + self.new_type.backend_id
+        scope.set_quota_usage(old_type_key, self.volume.size / 1024)
+
+        # Act
+        self.retype_volume(self.admin, self.new_type)
+
+        # Assert
+        self.assertEqual(0, scope.quotas.get(name=old_type_key).usage)
+        self.assertEqual(
+            self.volume.size / 1024, scope.quotas.get(name=new_type_key).usage
+        )

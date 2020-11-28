@@ -1,11 +1,13 @@
 import datetime
 
+import mock
 from ddt import data, ddt
 from django.utils import timezone
 from freezegun import freeze_time
 from rest_framework import status, test
 
 from waldur_core.core import utils as core_utils
+from waldur_core.logging import models as logging_models
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.common.mixins import UnitPriceMixin
 from waldur_mastermind.common.utils import parse_datetime
@@ -68,9 +70,18 @@ class SubmitUsageTest(test.APITransactionTestCase):
         self.offering_component = factories.OfferingComponentFactory(
             offering=self.offering,
             billing_type=models.OfferingComponent.BillingTypes.USAGE,
+            type='cpu',
+        )
+        self.offering_component2 = factories.OfferingComponentFactory(
+            offering=self.offering,
+            billing_type=models.OfferingComponent.BillingTypes.USAGE,
+            type='ram',
         )
         self.component = factories.PlanComponentFactory(
             plan=self.plan, component=self.offering_component
+        )
+        self.component2 = factories.PlanComponentFactory(
+            plan=self.plan, component=self.offering_component2
         )
         self.resource = models.Resource.objects.create(
             offering=self.offering, plan=self.plan, project=self.fixture.project,
@@ -143,7 +154,7 @@ class SubmitUsageTest(test.APITransactionTestCase):
         description = 'My first usage report'
         response = self.submit_usage(**self.get_valid_payload(description=description))
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        report = models.ComponentUsage.objects.get(resource=self.resource)
+        report = models.ComponentUsage.objects.filter(resource=self.resource).first()
         self.assertEqual(report.description, description)
 
     def test_plan_period_linking(self):
@@ -178,6 +189,49 @@ class SubmitUsageTest(test.APITransactionTestCase):
                 date=date,
                 billing_period=billing_period,
             ).exists()
+        )
+        self.assertTrue(
+            models.ComponentUsage.objects.filter(
+                resource=self.resource,
+                component=self.offering_component2,
+                date=date,
+                billing_period=billing_period,
+            ).exists()
+        )
+
+    @mock.patch('waldur_mastermind.marketplace.serializers.logger')
+    def test_event_log_is_created_if_component_usage_has_been_created(
+        self, mock_logger
+    ):
+        self.client.force_authenticate(self.fixture.staff)
+        usage_data = self.get_usage_data()
+        response = self.client.post(
+            '/api/marketplace-component-usages/set_usage/', usage_data
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        mock_logger.info.assert_called_with(
+            'Usage has been created for %s, component: ram, value: 5' % self.resource
+        )
+
+        date = timezone.now()
+        billing_period = core_utils.month_start(date)
+        component_usage = models.ComponentUsage.objects.get(
+            resource=self.resource,
+            component=self.offering_component,
+            date=date,
+            billing_period=billing_period,
+        )
+
+        logging_models.Event.objects.get(
+            message='Marketplace component usage %s has been created.'
+            % component_usage.uuid
+        )
+        usage_data['usages'][0]['amount'] = 8
+        self.client.post('/api/marketplace-component-usages/set_usage/', usage_data)
+
+        logging_models.Event.objects.get(
+            message='Marketplace component usage %s has been updated.'
+            % component_usage.uuid
         )
 
     @data('admin', 'manager', 'user')
@@ -351,6 +405,7 @@ class SubmitUsageTest(test.APITransactionTestCase):
         return {
             'plan_period': self.plan_period.uuid.hex,
             'usages': [
-                {'type': component_type, 'amount': amount, 'description': description,}
+                {'type': component_type, 'amount': amount, 'description': description,},
+                {'type': 'ram', 'amount': amount, 'description': description,},
             ],
         }

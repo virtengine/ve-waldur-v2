@@ -42,7 +42,7 @@ class DescribableMixin(models.Model):
     class Meta:
         abstract = True
 
-    description = models.CharField(_('description'), max_length=500, blank=True)
+    description = models.CharField(_('description'), max_length=2000, blank=True)
 
 
 class NameMixin(models.Model):
@@ -80,13 +80,14 @@ class UuidMixin(models.Model):
 
 class ErrorMessageMixin(models.Model):
     """
-    Mixin to add a standardized "error_message" field.
+    Mixin to add a standardized "error_message" and "error_traceback" fields.
     """
 
     class Meta:
         abstract = True
 
     error_message = models.TextField(blank=True)
+    error_traceback = models.TextField(blank=True)
 
 
 class ScheduleMixin(models.Model):

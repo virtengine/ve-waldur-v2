@@ -14,6 +14,7 @@ from waldur_core.structure.signals import resource_imported
 from waldur_mastermind.common import utils as common_utils
 from waldur_openstack.openstack_tenant import models as openstack_tenant_models
 from waldur_openstack.openstack_tenant.views import InstanceViewSet
+from waldur_rancher.enums import LONGHORN_NAME, LONGHORN_NAMESPACE
 from waldur_rancher.utils import SyncUser
 
 from . import exceptions, models, utils
@@ -33,7 +34,7 @@ class CreateNodeTask(core_tasks.Task):
         data_volumes = node.initial_data.get('data_volumes', [])
         image = node.initial_data['image']
         subnet = node.initial_data['subnet']
-        group = node.initial_data['group']
+        security_groups = node.initial_data['security_groups']
         tenant_spl = node.initial_data['tenant_service_project_link']
         user = auth.get_user_model().objects.get(pk=user_id)
         ssh_public_key = node.initial_data.get('ssh_public_key')
@@ -64,6 +65,7 @@ class CreateNodeTask(core_tasks.Task):
             ],
             'security_groups': [
                 {'url': reverse('openstacktenant-sgp-detail', kwargs={'uuid': group})}
+                for group in security_groups
             ],
             'internal_ips_set': [
                 {
@@ -212,3 +214,36 @@ def sync_users():
     if settings.WALDUR_RANCHER['READ_ONLY_MODE']:
         return
     SyncUser.run()
+
+
+class PollLonghornApplicationTask(core_tasks.Task):
+    max_retries = 600
+    default_retry_delay = 10
+
+    @classmethod
+    def get_description(cls, cluster, *args, **kwargs):
+        cluster = core_utils.deserialize_instance(cluster)
+        return 'Poll Longhorn application runtime state for cluster "%s"' % cluster.name
+
+    def execute(self, cluster):
+        app = models.Application.objects.get(
+            cluster=cluster, name=LONGHORN_NAME, namespace__name=LONGHORN_NAMESPACE
+        )
+        backend = app.get_backend()
+        backend.check_application_state(app)
+        if app.runtime_state == 'active':
+            app.state = models.Application.States.OK
+            app.save()
+        elif app.runtime_state == 'error':
+            app.state = models.Application.States.ERRED
+            app.save()
+
+        if app.runtime_state not in ('active', 'error'):
+            self.retry()
+        elif app.runtime_state == 'error':
+            raise RuntimeStateException(
+                '%s (PK: %s) runtime state become erred: %s'
+                % (app.__class__.__name__, app.pk, app.runtime_state)
+            )
+
+        return app

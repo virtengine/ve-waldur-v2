@@ -2,6 +2,7 @@ from celery import chain
 
 from waldur_core.core import executors as core_executors
 from waldur_core.core import tasks as core_tasks
+from waldur_core.core import utils as core_utils
 from waldur_core.core.models import StateMixin
 
 from . import models, tasks
@@ -9,7 +10,7 @@ from . import models, tasks
 
 class ClusterCreateExecutor(core_executors.CreateExecutor):
     @classmethod
-    def get_task_signature(cls, instance, serialized_instance, user):
+    def get_task_signature(cls, instance, serialized_instance, user, install_longhorn):
         _tasks = [
             core_tasks.BackendMethodTask().si(
                 serialized_instance, 'create_cluster', state_transition='begin_creating'
@@ -25,8 +26,21 @@ class ClusterCreateExecutor(core_executors.CreateExecutor):
             )
         ]
         _tasks += [
-            core_tasks.BackendMethodTask().si(serialized_instance, 'pull_cluster',)
+            # NB: countdown is needed for synchronization: wait until cluster will get ready for usage
+            core_tasks.BackendMethodTask()
+            .si(serialized_instance, 'pull_cluster',)
+            .set(countdown=120)
         ]
+        if install_longhorn:
+            _tasks += [
+                core_tasks.BackendMethodTask().si(
+                    serialized_instance, 'install_longhorn_to_cluster'
+                ),
+                tasks.PollLonghornApplicationTask().si(serialized_instance),
+                core_tasks.BackendMethodTask().si(
+                    serialized_instance, 'pull_cluster_workloads',
+                ),
+            ]
         return chain(*_tasks)
 
     @classmethod
@@ -120,3 +134,65 @@ class NodePullExecutor(core_executors.ActionExecutor):
         return core_tasks.BackendMethodTask().si(
             serialized_node, 'pull_node', state_transition='begin_updating'
         )
+
+
+class HPACreateExecutor(core_executors.CreateExecutor):
+    @classmethod
+    def get_task_signature(cls, instance, serialized_instance):
+        return core_tasks.BackendMethodTask().si(
+            serialized_instance, 'create_hpa', state_transition='begin_creating'
+        )
+
+
+class HPAUpdateExecutor(core_executors.UpdateExecutor):
+    @classmethod
+    def get_task_signature(cls, instance, serialized_instance, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_instance, 'update_hpa', state_transition='begin_updating'
+        )
+
+
+class HPADeleteExecutor(core_executors.DeleteExecutor):
+    @classmethod
+    def get_task_signature(cls, instance, serialized_instance, **kwargs):
+        if instance.backend_id:
+            return core_tasks.BackendMethodTask().si(
+                serialized_instance, 'delete_hpa', state_transition='begin_deleting'
+            )
+        else:
+            return core_tasks.StateTransitionTask().si(
+                serialized_instance, state_transition='begin_deleting'
+            )
+
+
+class ApplicationCreateExecutor(core_executors.CreateExecutor):
+    @classmethod
+    def get_task_signature(cls, instance, serialized_instance):
+        return chain(
+            core_tasks.BackendMethodTask().si(
+                serialized_instance, 'create_app', state_transition='begin_creating'
+            ),
+            core_tasks.PollRuntimeStateTask().si(
+                serialized_instance,
+                backend_pull_method='check_application_state',
+                success_state='active',
+                erred_state='error',
+            ),
+            core_tasks.BackendMethodTask().si(
+                core_utils.serialize_instance(instance.rancher_project),
+                'pull_project_workloads',
+            ),
+        )
+
+
+class ApplicationDeleteExecutor(core_executors.DeleteExecutor):
+    @classmethod
+    def get_task_signature(cls, instance, serialized_instance, **kwargs):
+        if instance.backend_id:
+            return core_tasks.BackendMethodTask().si(
+                serialized_instance, 'delete_app', state_transition='begin_deleting'
+            )
+        else:
+            return core_tasks.StateTransitionTask().si(
+                serialized_instance, state_transition='begin_deleting'
+            )

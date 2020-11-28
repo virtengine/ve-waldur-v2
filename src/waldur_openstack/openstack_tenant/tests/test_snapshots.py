@@ -24,7 +24,7 @@ class SnapshotRestoreTest(test.APITransactionTestCase):
         response = self.client.post(url, request_data)
         return response
 
-    @data('global_support', 'customer_support', 'project_support')
+    @data('global_support', 'customer_support', 'member')
     def test_user_cannot_restore_snapshot_if_he_has_not_admin_access(self, user):
         self.client.force_authenticate(user=getattr(self.fixture, user))
 
@@ -143,6 +143,22 @@ class SnapshotRestoreTest(test.APITransactionTestCase):
         response = self._make_restore_request()
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_restore_cannot_be_made_if_volume_exceeds_volume_type_quota(self):
+        self.client.force_authenticate(self.fixture.owner)
+        snapshot = self.fixture.snapshot
+        snapshot.service_project_link.service.settings.set_quota_limit(
+            f'gigabytes_{snapshot.source_volume.type.backend_id}', 0
+        )
+        expected_volumes_amount = models.Volume.objects.count()
+
+        url = factories.SnapshotFactory.get_url(snapshot=snapshot, action='restore')
+        response = self.client.post(url, {'name': 'My Volume'})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        snapshot.refresh_from_db()
+        self.assertEqual(snapshot.state, snapshot.States.OK)
+        self.assertEqual(expected_volumes_amount, models.Volume.objects.count())
 
 
 @ddt

@@ -8,6 +8,7 @@ from waldur_core.structure.tests.factories import SshPublicKeyFactory
 from waldur_openstack.openstack_tenant.tests import (
     factories as openstack_tenant_factories,
 )
+from waldur_rancher import utils as rancher_utils
 
 from .. import models, tasks
 from . import factories, fixtures, test_cluster, utils
@@ -102,6 +103,59 @@ class NodeCreateTest(test_cluster.BaseClusterCreateTest):
         node = self.fixture.cluster.node_set.exclude(name='').get()
         self.assertEqual(len(node.initial_data['data_volumes']), 1)
 
+    @utils.override_plugin_settings(MOUNT_POINT_CHOICE_IS_MANDATORY=False)
+    @mock.patch('waldur_rancher.executors.tasks')
+    def test_use_data_volumes_without_mount_point(self, mock_tasks):
+        volume_type = openstack_tenant_factories.VolumeTypeFactory(
+            settings=self.fixture.tenant_spl.service.settings
+        )
+        self.payload = {
+            'cluster': factories.ClusterFactory.get_url(self.fixture.cluster),
+            'subnet': openstack_tenant_factories.SubNetFactory.get_url(self.subnet),
+            'system_volume_size': 1024,
+            'memory': 1,
+            'cpu': 1,
+            'roles': ['controlplane', 'etcd', 'worker'],
+            'data_volumes': [
+                {
+                    'size': 12 * 1024,
+                    'volume_type': openstack_tenant_factories.VolumeTypeFactory.get_url(
+                        volume_type
+                    ),
+                }
+            ],
+        }
+        response = self.create_node(self.fixture.staff)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(self.fixture.cluster.node_set.count(), 2)
+        node = self.fixture.cluster.node_set.exclude(name='').get()
+        self.assertEqual(len(node.initial_data['data_volumes']), 1)
+
+    @utils.override_plugin_settings(MOUNT_POINT_CHOICE_IS_MANDATORY=True)
+    @mock.patch('waldur_rancher.executors.tasks')
+    def test_if_mount_point_is_required(self, mock_tasks):
+        volume_type = openstack_tenant_factories.VolumeTypeFactory(
+            settings=self.fixture.tenant_spl.service.settings
+        )
+        self.payload = {
+            'cluster': factories.ClusterFactory.get_url(self.fixture.cluster),
+            'subnet': openstack_tenant_factories.SubNetFactory.get_url(self.subnet),
+            'system_volume_size': 1024,
+            'memory': 1,
+            'cpu': 1,
+            'roles': ['controlplane', 'etcd', 'worker'],
+            'data_volumes': [
+                {
+                    'size': 12 * 1024,
+                    'volume_type': openstack_tenant_factories.VolumeTypeFactory.get_url(
+                        volume_type
+                    ),
+                }
+            ],
+        }
+        response = self.create_node(self.fixture.staff)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
     @mock.patch('waldur_rancher.executors.tasks')
     def test_poll_node_after_it_has_been_created(self, mock_tasks):
         response = self.create_node(self.fixture.staff)
@@ -193,6 +247,49 @@ class NodeCreateTest(test_cluster.BaseClusterCreateTest):
         self.assertEqual(self.fixture.cluster.node_set.count(), 2)
         node = self.fixture.cluster.node_set.exclude(name='').get()
         self.assertEqual(node.initial_data['ssh_public_key'], ssh_public_key.uuid.hex)
+
+    def test_node_config_formatting(self):
+        template = '''
+                #cloud-config
+                  packages:
+                    - curl
+                  runcmd:
+                    - curl -fsSL https://get.docker.com -o get-docker.sh; sh get-docker.sh
+                    - sudo systemctl start docker
+                    - sudo systemctl enable docker
+                    - [ sh, -c, "{command}" ]
+                '''
+        service_settings = factories.RancherServiceSettingsFactory(
+            options={'cloud_init_template': template}
+        )
+        service = factories.RancherServiceFactory(settings=service_settings)
+        spl = factories.RancherServiceProjectLinkFactory(service=service)
+        cluster = factories.ClusterFactory(
+            settings=self.fixture.settings, service_project_link=spl
+        )
+        node = factories.NodeFactory(
+            cluster=cluster, initial_data={'data_volumes': [{'mount_point': 'path'}]}
+        )
+        result = rancher_utils.format_node_cloud_config(node)
+        expected_config = """
+            fs_setup:
+                - device: /dev/vdb
+                filesystem: ext4
+                mounts:
+                    - /dev/vdb
+                    - path
+                packages:
+                    - curl
+                runcmd:
+                    - curl -fsSL https://get.docker.com -o get-docker.sh; sh get-docker.sh
+                    - sudo systemctl start docker
+                    - sudo systemctl enable docker
+                    - - sh
+                      - -c
+                      - ' '
+        """
+
+        self.assertTrue(expected_config, result)
 
 
 class NodePullTest(test.APITransactionTestCase):
@@ -382,3 +479,51 @@ class NodeUnlinkTest(test_cluster.BaseClusterCreateTest):
         self.client.force_authenticate(self.fixture.staff)
         response = self.client.post(self.url)
         self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+
+class NodeActionsTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.RancherFixture()
+        self.node = self.fixture.node
+
+        self.url = factories.NodeFactory.get_url(self.node, action=self.action)
+        self.mock_path = mock.patch(
+            'waldur_openstack.openstack_tenant.backend.OpenStackTenantBackend.%s'
+            % self.backend_method
+        )
+        self.mock_console = self.mock_path.start()
+        self.mock_console.return_value = self.backend_return_value
+
+        mock_path = mock.patch('waldur_rancher.utils.InstanceViewSet')
+        mock_instance_view_set = mock_path.start()
+        self.mock_check_permissions = mock.MagicMock()
+        mock_instance_view_set.console_permissions = [self.mock_check_permissions]
+        mock_instance_view_set.console_log_permissions = [self.mock_check_permissions]
+
+    def tearDown(self):
+        super(NodeActionsTest, self).tearDown()
+        mock.patch.stopall()
+
+
+class NodeConsoleTest(NodeActionsTest):
+    action = 'console'
+    backend_method = 'get_console_url'
+    backend_return_value = 'url'
+
+    def test_check_of_permissions_is_the_same_as_openstack_tenant_view(self):
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(self.mock_check_permissions.called)
+
+
+class NodeConsoleLogTest(NodeActionsTest):
+    action = 'console_log'
+    backend_method = 'get_console_output'
+    backend_return_value = 'openstack-vm login: '
+
+    def test_check_of_permissions_is_the_same_as_openstack_tenant_view(self):
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(self.mock_check_permissions.called)

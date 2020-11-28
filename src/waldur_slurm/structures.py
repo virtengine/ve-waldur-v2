@@ -18,3 +18,14 @@ class Quotas:
             self.ram + other.ram,
             self.deposit + other.deposit,
         )
+
+    def __str__(self):
+        return "Quotas: CPU=%s, GPU=%s, RAM=%s, Deposit=%s" % (
+            self.cpu,
+            self.gpu,
+            self.ram,
+            self.deposit,
+        )
+
+    def __repr__(self) -> str:
+        return self.__str__()

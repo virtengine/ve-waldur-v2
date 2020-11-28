@@ -224,14 +224,14 @@ class SAFReportSerializer(serializers.Serializer):
     VORMKUUP = serializers.SerializerMethodField(method_name='get_invoice_date')
     MAKSEAEG = serializers.SerializerMethodField(method_name='get_due_date')
     YKSUS = serializers.ReadOnlyField(source='invoice.customer.agreement_number')
-    PARTNER = serializers.ReadOnlyField(source='invoice.customer.agreement_number')
+    PARTNER = serializers.SerializerMethodField(method_name='get_partner')
     ARTIKKEL = serializers.ReadOnlyField(source='article_code')
     KOGUS = serializers.SerializerMethodField(method_name='get_quantity')
     SUMMA = serializers.SerializerMethodField(method_name='get_total')
     RMAKSUSUM = serializers.SerializerMethodField(method_name='get_tax')
     RMAKSULIPP = serializers.SerializerMethodField(method_name='get_vat')
     ARTPROJEKT = serializers.SerializerMethodField(method_name='get_project')
-    ARTNIMI = serializers.ReadOnlyField(source='name')
+    ARTNIMI = serializers.SerializerMethodField(method_name='get_artnimi_field')
     VALI = serializers.SerializerMethodField(method_name='get_vali_field')
     U_KONEDEARV = serializers.SerializerMethodField(method_name='get_empty_field')
     H_PERIOOD = serializers.SerializerMethodField(method_name='get_covered_period')
@@ -260,6 +260,13 @@ class SAFReportSerializer(serializers.Serializer):
         if date:
             return date.strftime('%d.%m.%Y')
         return ''
+
+    def get_partner(self, invoice_item):
+        customer = invoice_item.invoice.customer
+        if customer.sponsor_number:
+            return customer.sponsor_number
+        else:
+            return customer.agreement_number
 
     def get_first_day(self, invoice_item):
         year = invoice_item.invoice.year
@@ -300,6 +307,12 @@ class SAFReportSerializer(serializers.Serializer):
     def get_empty_field(self, invoice_item):
         return ''
 
+    def get_artnimi_field(self, invoice_item):
+        if 'plan_name' in invoice_item.details.keys():
+            return f'{invoice_item.name} / {invoice_item.details["plan_name"]}'
+        else:
+            return invoice_item.name
+
     def get_covered_period(self, invoice_item):
         first_day = self.get_first_day(invoice_item)
         last_day = core_utils.month_end(first_day)
@@ -327,6 +340,56 @@ class PaymentProfileSerializer(serializers.HyperlinkedModelSerializer):
             'url': {'view_name': 'payment-profile-detail', 'lookup_field': 'uuid',},
             'organization': {'view_name': 'customer-detail', 'lookup_field': 'uuid',},
         }
+
+
+class PaymentSerializer(
+    structure_serializers.ProtectedMediaSerializerMixin,
+    serializers.HyperlinkedModelSerializer,
+):
+    profile = serializers.HyperlinkedRelatedField(
+        view_name='payment-profile-detail',
+        lookup_field='uuid',
+        queryset=models.PaymentProfile.objects.filter(is_active=True),
+    )
+    invoice = serializers.HyperlinkedRelatedField(
+        view_name='invoice-detail', lookup_field='uuid', read_only=True,
+    )
+    invoice_uuid = serializers.ReadOnlyField(source='invoice.uuid')
+    invoice_period = serializers.SerializerMethodField(method_name='get_invoice_period')
+
+    def get_invoice_period(self, payment):
+        if payment.invoice:
+            return '%02d-%s' % (payment.invoice.month, payment.invoice.year)
+
+    class Meta:
+        model = models.Payment
+        fields = (
+            'uuid',
+            'url',
+            'profile',
+            'date_of_payment',
+            'sum',
+            'proof',
+            'invoice',
+            'invoice_uuid',
+            'invoice_period',
+        )
+        extra_kwargs = {
+            'url': {'view_name': 'payment-detail', 'lookup_field': 'uuid'},
+        }
+
+
+class PaidSerializer(serializers.Serializer):
+    date = serializers.DateField(required=True)
+    proof = serializers.FileField(required=False)
+
+
+class LinkToInvoiceSerializer(serializers.Serializer):
+    invoice = serializers.HyperlinkedRelatedField(
+        view_name='invoice-detail',
+        lookup_field='uuid',
+        queryset=models.Invoice.objects.filter(state=models.Invoice.States.PAID),
+    )
 
 
 def get_payment_profiles(serializer, customer):

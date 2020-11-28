@@ -12,16 +12,14 @@ class DivisionListTest(test.APITransactionTestCase):
         self.division_2 = factories.DivisionFactory()
         self.url = factories.DivisionFactory.get_list_url()
 
-    @data('staff', 'user')
-    def test_authorized_user_can_list_divisions(self, user):
-        self.client.force_authenticate(user=getattr(self.fixture, user))
+    @data('staff', 'user', None)
+    def test_user_can_list_divisions(self, user):
+        if user:
+            self.client.force_authenticate(user=getattr(self.fixture, user))
+
         response = self.client.get(self.url)
         self.assertEqual(status.HTTP_200_OK, response.status_code)
         self.assertEqual(len(response.data), 2)
-
-    def test_anonymous_user_cannot_list_divisions(self):
-        response = self.client.get(self.url)
-        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
     def test_list_filters(self):
         """Test of divisions' list filter by name, type and parent UUID."""
@@ -59,3 +57,69 @@ class DivisionListTest(test.APITransactionTestCase):
             else:
                 self.assertEqual(status.HTTP_200_OK, response.status_code)
                 self.assertEqual(len(response.data), 0)
+
+
+@ddt
+class DivisionChangeTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.CustomerFixture()
+        self.division_1 = factories.DivisionFactory()
+        self.division_2 = factories.DivisionFactory()
+        self.fixture.customer.division = self.division_1
+        self.fixture.customer.save()
+        self.url = factories.CustomerFactory.get_url(self.fixture.customer)
+
+    @data('staff',)
+    def test_staff_can_change_customer_division(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
+        new_division_url = factories.DivisionFactory.get_url(self.division_2)
+        response = self.client.patch(self.url, {'division': new_division_url})
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self.fixture.customer.refresh_from_db()
+        self.assertEqual(self.fixture.customer.division, self.division_2)
+
+    @data('owner',)
+    def test_other_can_not_change_customer_division(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
+        new_division_url = factories.DivisionFactory.get_url(self.division_2)
+        response = self.client.patch(self.url, {'division': new_division_url})
+        self.assertEqual(status.HTTP_403_FORBIDDEN, response.status_code)
+
+
+@ddt
+class DivisionTypeListTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.UserFixture()
+        self.type_1 = factories.DivisionTypeFactory()
+        self.type_2 = factories.DivisionTypeFactory()
+        self.url = factories.DivisionTypeFactory.get_list_url()
+
+    @data('staff', 'user', None)
+    def test_user_can_list_division_types(self, user):
+        if user:
+            self.client.force_authenticate(user=getattr(self.fixture, user))
+
+        response = self.client.get(self.url)
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self.assertEqual(len(response.data), 2)
+
+    def test_list_filters(self):
+
+        rows = [
+            {'name': 'name', 'valid': self.type_1.name[2:], 'invalid': 'AAA'},
+            {
+                'name': 'name_exact',
+                'valid': self.type_1.name,
+                'invalid': self.type_1.name[2:],
+            },
+        ]
+        self.client.force_authenticate(user=self.fixture.staff)
+
+        for row in rows:
+            response = self.client.get(self.url, data={row['name']: row['valid']})
+            self.assertEqual(status.HTTP_200_OK, response.status_code)
+            self.assertEqual(len(response.data), 1)
+
+            response = self.client.get(self.url, data={row['name']: row['invalid']})
+            self.assertEqual(status.HTTP_200_OK, response.status_code)
+            self.assertEqual(len(response.data), 0)

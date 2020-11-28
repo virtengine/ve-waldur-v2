@@ -10,7 +10,7 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.template import Context, Template
 from django.utils import timezone
-from jira import Comment
+from jira import Comment, JIRAError
 from jira.utils import json_loads
 
 from waldur_core.structure import ServiceBackendError
@@ -21,7 +21,6 @@ from waldur_mastermind.support.exceptions import SupportUserInactive
 from . import SupportBackend
 
 logger = logging.getLogger(__name__)
-
 
 Settings = collections.namedtuple(
     'Settings', ['backend_url', 'username', 'password', 'email', 'token']
@@ -44,6 +43,11 @@ class ServiceDeskBackend(JiraBackend, SupportBackend):
         )
         self.verify = settings.WALDUR_SUPPORT.get('CREDENTIALS', {}).get('verify_ssl')
         self.project_settings = settings.WALDUR_SUPPORT.get('PROJECT', {})
+        # allow to define reference by ID as older SD cannot properly resolve
+        # TODO drop once transition to request API is complete
+        self.service_desk_reference = self.project_settings.get(
+            'key_id', self.project_settings['key']
+        )
         self.issue_settings = settings.WALDUR_SUPPORT.get('ISSUE', {})
         self.use_old_api = settings.WALDUR_SUPPORT.get('USE_OLD_API', False)
         self.use_teenage_api = settings.WALDUR_SUPPORT.get('USE_TEENAGE_API', False)
@@ -98,12 +102,9 @@ class ServiceDeskBackend(JiraBackend, SupportBackend):
 
         self.create_user(issue.caller)
 
-        if self.use_old_api:
-            return super(ServiceDeskBackend, self).create_issue(issue)
-
         args = self._issue_to_dict(issue)
         args['serviceDeskId'] = self.manager.waldur_service_desk(
-            self.project_settings['key']
+            self.service_desk_reference
         )
         if not models.RequestType.objects.filter(issue_type_name=issue.type).count():
             self.pull_request_types()
@@ -118,11 +119,17 @@ class ServiceDeskBackend(JiraBackend, SupportBackend):
             .first()
             .backend_id
         )
-        backend_issue = self.manager.create_customer_request(args)
+        backend_issue = self.manager.waldur_create_customer_request(
+            args, use_old_api=self.use_old_api
+        )
         args = self._get_custom_fields(issue)
 
-        # Update an issue, because create_customer_request doesn't allow setting custom fields.
-        backend_issue.update(**args)
+        try:
+            # Update an issue, because create_customer_request doesn't allow setting custom fields.
+            backend_issue.update(**args)
+        except JIRAError as e:
+            logger.error('Error when setting custom field via JIRA API: %s' % e)
+
         self._backend_issue_to_issue(backend_issue, issue)
         issue.save()
 
@@ -149,7 +156,7 @@ class ServiceDeskBackend(JiraBackend, SupportBackend):
 
     def create_user(self, user):
         # Temporary workaround as JIRA returns 500 error if user already exists
-        if self.use_old_api:
+        if self.use_old_api or self.use_teenage_api:
             # old API has a bug that causes user active status to be set to False if includeInactive is passed as True
             existing_support_user = self.manager.search_users(user.email)
         else:
@@ -171,19 +178,13 @@ class ServiceDeskBackend(JiraBackend, SupportBackend):
             backend_customer = active_user[0]
         else:
             if self.use_old_api:
-                # add_user method returns boolean value therefore we need to fetch user object to find its key
-                self.manager.add_user(
-                    user.email,
-                    user.email,
-                    fullname=user.full_name,
-                    ignore_existing=True,
+                backend_customer = self.manager.waldur_create_customer(
+                    user.email, user.full_name
                 )
-                backend_customer = self.manager.search_users(user.email)[0]
             else:
                 backend_customer = self.manager.create_customer(
                     user.email, user.full_name
                 )
-
         try:
             user.supportcustomer
         except ObjectDoesNotExist:
@@ -237,30 +238,6 @@ class ServiceDeskBackend(JiraBackend, SupportBackend):
     def _issue_to_dict(self, issue):
         parser = HTMLParser()
 
-        if self.use_old_api:
-            parser = HTMLParser()
-            args = {
-                'project': self.project_settings['key'],
-                'summary': parser.unescape(issue.summary),
-                'description': parser.unescape(issue.description),
-                'issuetype': {'name': issue.type},
-            }
-            args.update(self._get_custom_fields(issue))
-
-            try:
-                support_user = models.SupportUser.objects.get(user=issue.caller)
-                key = support_user.backend_id or issue.caller.email
-            except models.SupportUser.DoesNotExist:
-                key = issue.caller.email
-
-            args[self.get_field_id_by_name(self.issue_settings['caller_field'])] = [
-                {
-                    "name": issue.caller.supportcustomer.backend_id,  # will be equal to username
-                    "key": key,
-                }
-            ]
-            return args
-
         args = {
             'requestFieldValues': {
                 'summary': parser.unescape(issue.summary),
@@ -271,24 +248,8 @@ class ServiceDeskBackend(JiraBackend, SupportBackend):
         if issue.priority:
             args['requestFieldValues']['priority'] = {'name': issue.priority}
 
-        if self.use_teenage_api:
-            # XXX (Ilja): There are issues with setting the request participants field using email
-            # Potentially if there are existing support customers with the same email as jira users
-            # experimentally the same method can be used for referring to users as when using old API
-            # this is not sustainable if we want to migrate to Request APIs, but for the moment this is known
-            # to work with both cloud version and 4.7. Approaching Atlassian to clarify this.
-
-            # XXX (Ilja) Temporary workaround for the request participant reference.
-            try:
-                support_user = models.SupportUser.objects.get(user=issue.caller)
-                key = support_user.backend_id or issue.caller.email
-            except models.SupportUser.DoesNotExist:
-                key = issue.caller.email
-
-            args['requestParticipants'] = [key]
-        else:
-            support_customer = issue.caller.supportcustomer
-            args['requestParticipants'] = [support_customer.backend_id]
+        support_customer = issue.caller.supportcustomer
+        args['requestParticipants'] = [support_customer.backend_id]
 
         return args
 
@@ -344,7 +305,10 @@ class ServiceDeskBackend(JiraBackend, SupportBackend):
 
     def get_user_id(self, user):
         try:
-            return user.key
+            if self.use_old_api:
+                return user.name  # alias for username
+            else:
+                return user.key
         except AttributeError:
             return user.accountId
         except TypeError:
@@ -353,10 +317,17 @@ class ServiceDeskBackend(JiraBackend, SupportBackend):
     def _backend_comment_to_comment(self, backend_comment, comment):
         comment.update_message(backend_comment.body)
         comment.author = self.get_or_create_support_user(backend_comment.author)
-        internal = self._get_property(
-            'comment', backend_comment.id, 'sd.public.comment'
-        )
-        comment.is_public = not internal.get('value', {}).get('internal', False)
+        try:
+            internal = self._get_property(
+                'comment', backend_comment.id, 'sd.public.comment'
+            )
+            comment.is_public = not internal.get('value', {}).get('internal', False)
+        except JIRAError:
+            # workaround for backbone-issue-sync-for-jira plugin
+            external = self._get_property(
+                'comment', backend_comment.id, 'sd.allow.public.comment'
+            )
+            comment.is_public = external.get('value', {}).get('allow', False)
 
     def _backend_attachment_to_attachment(self, backend_attachment, attachment):
         attachment.mime_type = getattr(backend_attachment, 'mimeType', '')
@@ -366,8 +337,11 @@ class ServiceDeskBackend(JiraBackend, SupportBackend):
 
     @reraise_exceptions
     def pull_request_types(self):
-        service_desk_id = self.manager.waldur_service_desk(self.project_settings['key'])
-        backend_request_types = self.manager.request_types(service_desk_id)
+        service_desk_id = self.manager.waldur_service_desk(self.service_desk_reference)
+        # backend_request_types = self.manager.request_types(service_desk_id)
+        backend_request_types = self.manager.waldur_request_types(
+            service_desk_id, self.project_settings['key'], self.strange_setting
+        )
 
         with transaction.atomic():
             backend_request_type_map = {
@@ -438,7 +412,9 @@ class ServiceDeskBackend(JiraBackend, SupportBackend):
 
     def create_feedback(self, feedback):
         if feedback.comment:
-            support_user = models.SupportUser.objects.get(user=feedback.issue.caller)
+            support_user, _ = models.SupportUser.objects.get_or_create_from_user(
+                feedback.issue.caller
+            )
             comment = models.Comment.objects.create(
                 issue=feedback.issue,
                 description=feedback.comment,

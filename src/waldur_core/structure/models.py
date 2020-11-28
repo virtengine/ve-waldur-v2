@@ -228,10 +228,7 @@ class PermissionMixin:
             - None - check whether user has permanent role in entity.
             - Datetime object - check whether user will have role in entity at specific timestamp.
         """
-        permissions = self.permissions.filter(user=user, is_active=True)
-
-        if role is not None:
-            permissions = permissions.filter(role=role)
+        permissions = self.get_active_permissions(user, role)
 
         if timestamp is None:
             permissions = permissions.filter(expiration_time=None)
@@ -243,20 +240,20 @@ class PermissionMixin:
         return permissions.exists()
 
     @transaction.atomic()
-    def add_user(self, user, role, created_by=None, expiration_time=None):
-        permission = self.permissions.filter(
-            user=user, role=role, is_active=True
-        ).first()
+    def add_user(self, user, role=None, created_by=None, expiration_time=None):
+        permission = self.get_active_permissions(user, role).first()
         if permission:
             return permission, False
 
-        permission = self.permissions.create(
+        kwargs = dict(
             user=user,
-            role=role,
             is_active=True,
             created_by=created_by,
             expiration_time=expiration_time,
         )
+        if role:
+            kwargs['role'] = role
+        permission = self.permissions.create(**kwargs)
 
         structure_role_granted.send(
             sender=self.__class__,
@@ -270,16 +267,20 @@ class PermissionMixin:
 
     @transaction.atomic()
     def remove_user(self, user, role=None, removed_by=None):
-        permissions = self.permissions.all().filter(user=user, is_active=True)
-
-        if role is not None:
-            permissions = permissions.filter(role=role)
+        permissions = self.get_active_permissions(user, role)
 
         affected_permissions = list(permissions)
         permissions.update(is_active=None, expiration_time=timezone.now())
 
         for permission in affected_permissions:
             self.log_role_revoked(permission, removed_by)
+
+    def get_active_permissions(self, user, role=None):
+        permissions = self.permissions.filter(user=user, is_active=True)
+
+        if role is not None:
+            permissions = permissions.filter(role=role)
+        return permissions
 
     @transaction.atomic()
     def remove_all_users(self):
@@ -292,9 +293,23 @@ class PermissionMixin:
             sender=self.__class__,
             structure=self,
             user=permission.user,
-            role=permission.role,
+            role=getattr(permission, 'role', None),
             removed_by=removed_by,
         )
+
+    def can_manage_role(self, user, role=None, timestamp=False):
+        """
+        Checks whether user can grant/update/revoke permissions for specific role.
+        `timestamp` can have following values:
+            - False - check whether user can manage permissions at the moment.
+            - None - check whether user can permanently manage permissions.
+            - Datetime object - check whether user will be able to manage permissions at specific timestamp.
+        """
+        raise NotImplementedError
+
+    def get_users(self, role=None):
+        """ Return all connected to scope users """
+        raise NotImplementedError
 
 
 class CustomerRole(models.CharField):
@@ -352,6 +367,10 @@ class DivisionType(core_models.UuidMixin, core_models.NameMixin, models.Model):
         verbose_name = _('division type')
         ordering = ('name',)
 
+    @classmethod
+    def get_url_name(cls):
+        return 'division-type'
+
     def __str__(self):
         return self.name
 
@@ -402,7 +421,14 @@ class Customer(
     native_name = models.CharField(max_length=160, default='', blank=True)
     abbreviation = models.CharField(max_length=12, blank=True)
     contact_details = models.TextField(blank=True, validators=[MaxLengthValidator(500)])
+
     agreement_number = models.PositiveIntegerField(null=True, blank=True)
+    sponsor_number = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=_('External ID of the sponsor covering the costs'),
+    )
+
     email = models.EmailField(_('email address'), max_length=75, blank=True)
     phone_number = models.CharField(_('phone number'), max_length=255, blank=True)
     access_subnets = models.TextField(
@@ -423,7 +449,6 @@ class Customer(
     homepage = models.URLField(max_length=255, blank=True)
     domain = models.CharField(max_length=255, blank=True)
 
-    type = models.CharField(blank=True, max_length=150)
     address = models.CharField(blank=True, max_length=300)
     postal = models.CharField(blank=True, max_length=20)
     bank_name = models.CharField(blank=True, max_length=150)
@@ -506,7 +531,7 @@ class Customer(
             customerpermission__role=CustomerRole.SUPPORT,
         )
 
-    def get_users(self):
+    def get_users(self, role=None):
         """ Return all connected to customer users """
         return (
             get_user_model()
@@ -525,13 +550,6 @@ class Customer(
         return user.is_staff
 
     def can_manage_role(self, user, role=None, timestamp=False):
-        """
-        Checks whether user can grant/update/revoke customer permissions.
-        `timestamp` can have following values:
-            - False - check whether user can manage permissions at the moment.
-            - None - check whether user can permanently manage permissions.
-            - Datetime object - check whether user will be able to manage permissions at specific timestamp.
-        """
         return user.is_staff or (
             self.has_user(user, CustomerRole.OWNER, timestamp)
             and settings.WALDUR_CORE['OWNERS_CAN_MANAGE_OWNERS']
@@ -585,12 +603,12 @@ class Customer(
 class ProjectRole(models.CharField):
     ADMINISTRATOR = 'admin'
     MANAGER = 'manager'
-    SUPPORT = 'support'
+    MEMBER = 'member'
 
     CHOICES = (
         (ADMINISTRATOR, 'Administrator'),
         (MANAGER, 'Manager'),
-        (SUPPORT, 'Support'),
+        (MEMBER, 'Member'),
     )
 
     def __init__(self, *args, **kwargs):
@@ -764,14 +782,7 @@ class Project(
     def can_user_update_quotas(self, user):
         return user.is_staff or self.customer.has_user(user, CustomerRole.OWNER)
 
-    def can_manage_role(self, user, role, timestamp=False):
-        """
-        Checks whether user can grant/update/revoke project permissions for specific role.
-        `timestamp` can have following values:
-            - False - check whether user can manage permissions at the moment.
-            - None - check whether user can permanently manage permissions.
-            - Datetime object - check whether user will be able to manage permissions at specific timestamp.
-        """
+    def can_manage_role(self, user, role=None, timestamp=False):
         if user.is_staff:
             return True
         if self.customer.has_user(user, CustomerRole.OWNER, timestamp):
@@ -797,6 +808,34 @@ class Project(
 
     class Meta:
         base_manager_name = 'objects'
+
+
+class CustomerPermissionReview(core_models.UuidMixin):
+    class Permissions:
+        customer_path = 'customer'
+
+    customer = models.ForeignKey(
+        Customer,
+        verbose_name=_('organization'),
+        related_name='reviews',
+        on_delete=models.CASCADE,
+    )
+    is_pending = models.BooleanField(default=True)
+    created = AutoCreatedField()
+    closed = models.DateTimeField(null=True, blank=True)
+    reviewer = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True
+    )
+
+    @classmethod
+    def get_url_name(cls):
+        return 'customer_permission_review'
+
+    def close(self, user):
+        self.is_pending = False
+        self.closed = timezone.now()
+        self.reviewer = user
+        self.save()
 
 
 class ServiceCertification(core_models.UuidMixin, core_models.DescribableMixin):
@@ -1224,11 +1263,6 @@ class ResourceMixin(
 
     def get_backend(self, **kwargs):
         return self.service_project_link.get_backend(**kwargs)
-
-    def get_cost(self, start_date, end_date):
-        raise NotImplementedError(
-            "Please refer to waldur_core.billing.tasks.debit_customers while implementing it"
-        )
 
     def get_access_url(self):
         # default behaviour. Override in subclasses if applicable

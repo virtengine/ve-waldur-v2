@@ -182,7 +182,10 @@ class UUIDField(models.UUIDField):
     def _parse_uuid(self, value):
         if not value:
             return None
-        return StringUUID(smart_text(value))
+        try:
+            return StringUUID(smart_text(value))
+        except ValueError:
+            return None
 
     def from_db_value(self, value, expression, connection, context):
         return self._parse_uuid(value)
@@ -237,3 +240,18 @@ class JSONField(models.TextField):
             return copy.deepcopy(self.default)
         # If the field doesn't have a default, then we punt to models.Field.
         return super(JSONField, self).get_default()
+
+
+class YearMonthField(serializers.CharField):
+    """ Field that support yearmonth representation in format YYYY-MM """
+
+    def to_internal_value(self, value):
+        try:
+            year, month = [int(el) for el in value.split('-')]
+        except ValueError:
+            raise serializers.ValidationError(
+                _('Value "%s" should be in valid format YYYY-MM') % value
+            )
+        if not 0 < month < 13:
+            raise serializers.ValidationError(_('Month has to be from 1 to 12.'))
+        return year, month

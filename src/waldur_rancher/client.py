@@ -1,10 +1,11 @@
 import logging
+from typing import List
 
 import requests
 
 from waldur_core.core.utils import QuietSession
 
-from .exceptions import RancherException
+from .exceptions import NotFound, RancherException
 
 logger = logging.getLogger(__name__)
 
@@ -40,11 +41,12 @@ class RancherClient:
             raise RancherException(e)
 
         data = response.content
-        content_type = response.headers['Content-Type'].lower()
-        if data and content_type == 'application/json':
-            data = response.json()
-        elif content_type == 'text/plain':
-            data = data.decode('utf-8')
+        if data:
+            content_type = response.headers['Content-Type'].lower()
+            if content_type == 'application/json':
+                data = response.json()
+            elif content_type == 'text/plain':
+                data = data.decode('utf-8')
 
         status_code = response.status_code
         if status_code in (
@@ -54,11 +56,10 @@ class RancherClient:
             requests.codes.no_content,
         ):
             return data
+        elif status_code == requests.codes.not_found:
+            raise NotFound(data)
         else:
-            if 'message' in data:
-                raise RancherException(data['message'])
-            else:
-                raise RancherException(data)
+            raise RancherException(data)
 
     def _get(self, endpoint, **kwargs):
         return self._request('get', endpoint, **kwargs)
@@ -74,6 +75,14 @@ class RancherClient:
 
     def _put(self, endpoint, **kwargs):
         return self._request('put', endpoint, **kwargs)
+
+    def _get_yaml(self, endpoint: str):
+        return self._get(endpoint, headers={'accept': 'application/yaml'},)
+
+    def _put_yaml(self, endpoint: str, yaml: str):
+        return self._put(
+            endpoint, data=yaml, headers={'content-type': 'application/yaml'},
+        )
 
     def login(self, access_key, secret_key):
         """
@@ -166,6 +175,8 @@ class RancherClient:
                 'mustChangePassword': mustChangePassword,
                 'password': password,
                 'username': username,
+                'type': 'user',
+                'enabled': True,
             },
         )
 
@@ -194,6 +205,20 @@ class RancherClient:
             'projectroletemplatebindings',
             json={'roleTemplateId': role, 'projectId': project_id, 'userId': user_id,},
         )
+
+    def create_project(self, cluster_id, project_name):
+        return self._post(
+            'project',
+            json={
+                'name': project_name,
+                'clusterId': cluster_id,
+                'type': 'project',
+                'enableProjectMonitoring': False,
+            },
+        )
+
+    def get_projects_roles(self):
+        return self._get('projectroletemplatebindings')['data']
 
     def delete_user(self, user_id):
         return self._delete('users/{0}'.format(user_id))
@@ -298,11 +323,13 @@ class RancherClient:
         namespace_id: str,
         name: str,
         answers: dict = None,
+        wait: bool = False,
+        timeout: int = 300,
     ):
         payload = {
             'prune': False,
-            'timeout': 300,
-            'wait': False,
+            'timeout': timeout,
+            'wait': wait,
             'type': 'app',
             'name': name,
             'targetNamespace': namespace_id,
@@ -332,5 +359,151 @@ class RancherClient:
     def list_project_secrets(self, project_id):
         return self._get(f'project/{project_id}/secrets', params={'limit': -1})['data']
 
+    def get_application(self, project_id, app_id):
+        return self._get(f'/project/{project_id}/apps/{app_id}')
+
     def destroy_application(self, project_id, app_id):
         return self._delete(f'/project/{project_id}/apps/{app_id}')
+
+    def list_workloads(self, project_id: str):
+        return self._get(f'project/{project_id}/workloads', params={'limit': -1})[
+            'data'
+        ]
+
+    def redeploy_workload(self, project_id: str, workload_id: str):
+        return self._post(
+            f'project/{project_id}/workloads/{workload_id}',
+            params={'action': 'redeploy'},
+        )
+
+    def delete_workload(self, project_id: str, workload_id: str):
+        return self._delete(f'project/{project_id}/workloads/{workload_id}')
+
+    def get_workload_yaml(self, project_id: str, workload_id: str):
+        return self._get_yaml(f'project/{project_id}/workloads/{workload_id}/yaml',)
+
+    def put_workload_yaml(self, project_id: str, workload_id: str, yaml: str):
+        return self._put_yaml(
+            f'project/{project_id}/workloads/{workload_id}/yaml', yaml,
+        )
+
+    def list_hpas(self, project_id: str):
+        """
+        List all horizontal pod autoscalers in project.
+        """
+        return self._get(
+            f'project/{project_id}/horizontalpodautoscalers', params={'limit': -1}
+        )['data']
+
+    def create_hpa(
+        self,
+        project_id: str,
+        namespace_id: str,
+        workload_id: str,
+        name: str,
+        description: str,
+        min_replicas: int,
+        max_replicas: int,
+        metrics: List[dict],
+    ):
+        """
+        Create horizontal pod autoscaler.
+        """
+        return self._post(
+            f'projects/{project_id}/horizontalpodautoscalers',
+            json={
+                'name': name,
+                'description': description,
+                'namespaceId': namespace_id,
+                'workloadId': workload_id,
+                'minReplicas': min_replicas,
+                'maxReplicas': max_replicas,
+                'metrics': metrics,
+            },
+        )
+
+    def update_hpa(
+        self,
+        project_id: str,
+        hpa_id: str,
+        namespace_id: str,
+        workload_id: str,
+        name: str,
+        description: str,
+        min_replicas: int,
+        max_replicas: int,
+        metrics: List[dict],
+    ):
+        """
+        Update horizontal pod autoscaler.
+        """
+        return self._put(
+            f'projects/{project_id}/horizontalpodautoscalers/{hpa_id}',
+            json={
+                'name': name,
+                'description': description,
+                'namespaceId': namespace_id,
+                'workloadId': workload_id,
+                'minReplicas': min_replicas,
+                'maxReplicas': max_replicas,
+                'metrics': metrics,
+            },
+        )
+
+    def delete_hpa(self, project_id: str, hpa_id: str):
+        """
+        Delete horizontal pod autoscaler.
+        """
+        return self._delete(f'projects/{project_id}/horizontalpodautoscalers/{hpa_id}')
+
+    def get_hpa_yaml(self, project_id: str, hpa_id: str):
+        return self._get_yaml(
+            f'projects/{project_id}/horizontalpodautoscalers/{hpa_id}/yaml',
+        )
+
+    def put_hpa_yaml(self, project_id: str, hpa_id: str, yaml: str):
+        return self._put_yaml(
+            f'projects/{project_id}/horizontalpodautoscalers/{hpa_id}/yaml', yaml,
+        )
+
+    def list_ingresses(self, project_id: str):
+        return self._get(f'project/{project_id}/ingresses', params={'limit': -1})[
+            'data'
+        ]
+
+    def get_ingress_yaml(self, project_id: str, ingress_id: str):
+        return self._get_yaml(f'project/{project_id}/ingresses/{ingress_id}/yaml',)
+
+    def put_ingress_yaml(self, project_id: str, ingress_id: str, yaml: str):
+        return self._put_yaml(
+            f'project/{project_id}/ingresses/{ingress_id}/yaml', yaml,
+        )
+
+    def delete_ingress(self, project_id: str, ingress_id: str):
+        return self._delete(f'project/{project_id}/ingresses/{ingress_id}')
+
+    def list_services(self, project_id: str):
+        return self._get(f'project/{project_id}/services', params={'limit': -1})['data']
+
+    def get_service_yaml(self, project_id: str, service_id: str):
+        return self._get_yaml(f'project/{project_id}/services/{service_id}/yaml',)
+
+    def put_service_yaml(self, project_id: str, service_id: str, yaml: str):
+        return self._put_yaml(f'project/{project_id}/services/{service_id}/yaml', yaml,)
+
+    def delete_service(self, project_id: str, service_id: str):
+        return self._delete(f'project/{project_id}/services/{service_id}')
+
+    def import_yaml(
+        self,
+        cluster_id: str,
+        yaml: str,
+        default_namespace_id: str = None,
+        namespace_id: str = None,
+    ):
+        payload = {'yaml': yaml}
+        if default_namespace_id:
+            payload['defaultNamespace'] = default_namespace_id
+        if namespace_id:
+            payload['namespace'] = namespace_id
+        return self._post(f'clusters/{cluster_id}?action=importYaml', json=payload)

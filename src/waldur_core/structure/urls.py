@@ -18,6 +18,11 @@ def register_in(router):
         basename='customer_permission_log',
     )
     router.register(
+        r'customer-permissions-reviews',
+        views.CustomerPermissionReviewViewSet,
+        basename='customer_permission_review',
+    )
+    router.register(
         r'project-permissions',
         views.ProjectPermissionViewSet,
         basename='project_permission',
@@ -40,6 +45,9 @@ def register_in(router):
         basename='service-certification',
     )
     router.register(r'divisions', views.DivisionViewSet, basename='division')
+    router.register(
+        r'division-types', views.DivisionTypesViewSet, basename='division-type'
+    )
 
 
 urlpatterns = [

@@ -1,5 +1,6 @@
 import io
 import logging
+import time
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -14,8 +15,13 @@ from waldur_core.structure import ServiceBackend
 from waldur_core.structure.models import ServiceSettings
 from waldur_core.structure.utils import update_pulled_fields
 from waldur_mastermind.common.utils import parse_datetime
-from waldur_rancher.enums import ClusterRoles, GlobalRoles
-from waldur_rancher.exceptions import RancherException
+from waldur_rancher.enums import (
+    LONGHORN_NAME,
+    LONGHORN_NAMESPACE,
+    ClusterRoles,
+    GlobalRoles,
+)
+from waldur_rancher.exceptions import NotFound, RancherException
 
 from . import client, models, signals, utils
 
@@ -33,7 +39,7 @@ class RancherBackend(ServiceBackend):
         '  - sudo systemctl start docker\n'
         '  - sudo systemctl enable docker\n'
         '  - [ sh, -c, "{command}" ]\n',
-        'default_mtu': 1440,
+        'default_mtu': 1400,
         'private_registry_url': None,
         'private_registry_user': None,
         'private_registry_password': None,
@@ -59,11 +65,39 @@ class RancherBackend(ServiceBackend):
         return self.settings.backend_url.strip('/')
 
     def pull_service_properties(self):
+        self.pull_clusters()
         self.pull_projects()
         self.pull_namespaces()
         self.pull_catalogs()
         self.pull_templates()
         self.pull_template_icons()
+        self.pull_workloads()
+        self.pull_hpas()
+        self.pull_apps()
+        self.pull_ingresses()
+        self.pull_services()
+
+    def pull_clusters(self):
+        """
+        Mark stale clusters as erred.
+        """
+        remote_clusters = self.client.list_clusters()
+        remote_clusters_map = {item['id']: item for item in remote_clusters}
+
+        local_clusters_map = {
+            cluster.backend_id: cluster
+            for cluster in models.Cluster.objects.filter(settings=self.settings)
+        }
+
+        stale_ids = set(local_clusters_map.keys()) - set(remote_clusters_map.keys())
+
+        # exclude not yet created clusters
+        stale_clusters = models.Cluster.objects.filter(
+            settings=self.settings, backend_id__in=stale_ids
+        ).exclude(backend_id='')
+        stale_clusters.update(
+            state=models.Cluster.States.ERRED, error_message='Resource is gone.'
+        )
 
     def get_kubeconfig_file(self, cluster):
         return self.client.get_kubeconfig_file(cluster.backend_id)
@@ -87,6 +121,8 @@ class RancherBackend(ServiceBackend):
             cluster.name, mtu=mtu, private_registry=private_registry
         )
         self._backend_cluster_to_cluster(backend_cluster, cluster)
+        # as rancher API is not transactional, give it 2s to write cluster state to etcd
+        time.sleep(2)
         self.client.create_cluster_registration_token(cluster.backend_id)
         cluster.node_command = self.client.get_node_command(cluster.backend_id)
         cluster.save()
@@ -95,13 +131,10 @@ class RancherBackend(ServiceBackend):
         if cluster.backend_id:
             try:
                 self.client.delete_cluster(cluster.backend_id)
-            except RancherException as e:
-                if 'status' in e.args[0] and e.args[0]['status'] == 404:
-                    logger.warning(
-                        'Cluster %s is not present in the backend ' % cluster.backend_id
-                    )
-                else:
-                    raise RancherException(e.args[0])
+            except NotFound:
+                logger.debug(
+                    'Cluster %s is not present in the backend ' % cluster.backend_id
+                )
 
         cluster.delete()
 
@@ -109,13 +142,8 @@ class RancherBackend(ServiceBackend):
         if node.backend_id:
             try:
                 self.client.delete_node(node.backend_id)
-            except RancherException as e:
-                if 'status' in e.args[0] and e.args[0]['status'] == 404:
-                    logger.warning(
-                        'Node %s is not present in the backend ' % node.backend_id
-                    )
-                else:
-                    raise RancherException(e.args[0])
+            except NotFound:
+                logger.debug('Node %s is not present in the backend ' % node.backend_id)
         node.delete()
 
     def update_cluster(self, cluster):
@@ -151,6 +179,10 @@ class RancherBackend(ServiceBackend):
 
     def import_cluster(self, backend_id, service_project_link):
         backend_cluster = self.client.get_cluster(backend_id)
+
+        if not backend_cluster.get('state', '') == models.Cluster.RuntimeStates.ACTIVE:
+            raise RancherException('Cannot import K8s cluster in non-active state.')
+
         cluster = models.Cluster(
             backend_id=backend_id,
             service_project_link=service_project_link,
@@ -172,6 +204,10 @@ class RancherBackend(ServiceBackend):
         self.pull_namespaces_for_cluster(cluster)
         self.pull_catalogs_for_cluster(cluster)
         self.pull_templates_for_cluster(cluster)
+        self.pull_cluster_workloads(cluster)
+        self.pull_cluster_hpas(cluster)
+        self.pull_cluster_apps(cluster)
+        self.pull_cluster_ingresses(cluster)
 
     def pull_cluster_details(self, cluster, backend_cluster=None):
         backend_cluster = backend_cluster or self.client.get_cluster(cluster.backend_id)
@@ -357,7 +393,12 @@ class RancherBackend(ServiceBackend):
 
     def delete_cluster_role(self, link):
         if link.backend_id:
-            self.client.delete_cluster_role(cluster_role_id=link.backend_id)
+            try:
+                self.client.delete_cluster_role(cluster_role_id=link.backend_id)
+            except NotFound:
+                logger.debug(
+                    'Cluster role %s is not present in the backend ' % link.backend_id
+                )
 
         link.delete()
 
@@ -393,8 +434,8 @@ class RancherBackend(ServiceBackend):
 
     def pull_project_catalogs(self):
         remote_catalogs = self.client.list_project_catalogs()
-        for cluster in models.Project.objects.filter(settings=self.settings):
-            self.pull_catalogs_for_scope(remote_catalogs, cluster)
+        for project in models.Project.objects.filter(settings=self.settings):
+            self.pull_catalogs_for_scope(remote_catalogs, project)
 
     def pull_catalogs_for_scope(self, remote_catalogs, scope):
         content_type = ContentType.objects.get_for_model(scope)
@@ -469,13 +510,10 @@ class RancherBackend(ServiceBackend):
                 return self.client.delete_cluster_catalog(catalog.backend_id)
             else:
                 return self.client.delete_project_catalog(catalog.backend_id)
-        except RancherException as e:
-            if 'status' in e.args[0] and e.args[0]['status'] == 404:
-                logger.warning(
-                    'Catalog %s is not present in the backend ', catalog.backend_id
-                )
-            else:
-                raise RancherException(e.args[0])
+        except NotFound:
+            logger.debug(
+                'Catalog %s is not present in the backend ', catalog.backend_id
+            )
 
     def get_catalog_spec(self, catalog):
         spec = {
@@ -744,7 +782,7 @@ class RancherBackend(ServiceBackend):
 
     def _get_external_template_icon(self, icon_url):
         try:
-            response = requests.get(icon_url)
+            response = requests.get(icon_url, timeout=3)
         except requests.RequestException as e:
             logger.debug(f"Failed to get {icon_url}: {e}")
             return None
@@ -784,27 +822,649 @@ class RancherBackend(ServiceBackend):
     def list_project_secrets(self, project):
         return self.client.list_project_secrets(project.backend_id)
 
-    def list_cluster_applications(self, cluster):
-        applications = []
+    def pull_cluster_workloads(self, cluster):
         for project in models.Project.objects.filter(cluster=cluster):
-            for app in self.client.get_project_applications(project.backend_id):
-                parts = urlparse(app['externalId'])
-                params = parse_qs(parts.query)
-                project_id = app['projectId']
-                app_id = app['id']
-                applications.append(
-                    {
-                        'name': app['name'],
-                        'state': app['state'],
-                        'created': app['created'],
-                        'id': app_id,
-                        'answers': app.get('answers'),
-                        'project': project.name,
-                        'catalog': params['catalog'][0],
-                        'template': params['template'][0],
-                        'version': params['version'][0],
-                        'url': f'{self.host}/p/{project_id}/apps/{app_id}',
-                        'project_uuid': project.uuid.hex,
-                    }
+            self.pull_project_workloads(project)
+
+    def pull_workloads(self):
+        local_clusters = models.Cluster.objects.filter(settings=self.settings)
+        for cluster in local_clusters:
+            if cluster.state == models.Cluster.States.OK:
+                self.pull_cluster_workloads(cluster)
+            else:
+                logger.debug(
+                    'Skipping workload pulling for cluster with backend ID %s'
+                    'because otherwise one failed cluster leads to provider failure',
+                    cluster.backend_id,
                 )
-        return applications
+
+    def pull_project_workloads(self, project):
+        remote_workloads = self.client.list_workloads(project.backend_id)
+        local_workloads = models.Workload.objects.filter(project=project)
+        local_namespaces = models.Namespace.objects.filter(project=project)
+
+        local_namespaces_map = {
+            namespace.backend_id: namespace for namespace in local_namespaces
+        }
+        remote_workload_map = {
+            workload['id']: self.remote_workload_to_local(
+                workload, project, local_namespaces_map
+            )
+            for workload in remote_workloads
+        }
+        local_workload_map = {
+            workload.backend_id: workload for workload in local_workloads
+        }
+        remote_workload_ids = set(remote_workload_map.keys())
+        local_workload_ids = set(local_workload_map.keys())
+
+        stale_workloads = local_workload_ids - remote_workload_ids
+
+        new_workloads = [
+            remote_workload_map[workload_id]
+            for workload_id in remote_workload_ids - local_workload_ids
+        ]
+
+        existing_workloads = remote_workload_ids & local_workload_ids
+        pulled_fields = {
+            'name',
+            'runtime_state',
+            'scale',
+        }
+        for workload_id in existing_workloads:
+            local_workload = local_workload_map[workload_id]
+            remote_workload = remote_workload_map[workload_id]
+            update_pulled_fields(local_workload, remote_workload, pulled_fields)
+
+        models.Workload.objects.bulk_create(new_workloads)
+        local_workloads.filter(backend_id__in=stale_workloads).delete()
+
+    def remote_workload_to_local(self, remote_workload, project, local_namespaces_map):
+        return models.Workload(
+            backend_id=remote_workload['id'],
+            name=remote_workload['name'],
+            created=parse_datetime(remote_workload['created']),
+            runtime_state=remote_workload['state'],
+            project=project,
+            cluster=project.cluster,
+            settings=self.settings,
+            namespace=local_namespaces_map.get(remote_workload['namespaceId']),
+            scale=remote_workload.get('scale', 0),
+        )
+
+    def redeploy_workload(self, workload: models.Workload):
+        self.client.redeploy_workload(workload.project.backend_id, workload.backend_id)
+
+    def delete_workload(self, workload: models.Workload):
+        self.client.delete_workload(workload.project.backend_id, workload.backend_id)
+
+    def get_workload_yaml(self, workload: models.Workload):
+        return self.client.get_workload_yaml(
+            workload.project.backend_id, workload.backend_id
+        )
+
+    def put_workload_yaml(self, workload: models.Workload, yaml: str):
+        return self.client.put_workload_yaml(
+            workload.project.backend_id, workload.backend_id, yaml
+        )
+
+    def pull_cluster_hpas(self, cluster):
+        for project in models.Project.objects.filter(cluster=cluster):
+            self.pull_project_hpas(project)
+
+    def pull_hpas(self):
+        local_clusters = models.Cluster.objects.filter(settings=self.settings)
+        for cluster in local_clusters:
+            if cluster.state == models.Cluster.States.OK:
+                self.pull_cluster_hpas(cluster)
+            else:
+                logger.debug(
+                    'Skipping HPA pulling for cluster with backend ID %s'
+                    'because otherwise one failed cluster leads to provider failure',
+                    cluster.backend_id,
+                )
+
+    def pull_project_hpas(self, project):
+        local_workloads = models.Workload.objects.filter(project=project)
+        local_workloads_map = {
+            workload.backend_id: workload for workload in local_workloads
+        }
+
+        local_hpas = models.HPA.objects.filter(project=project)
+        local_hpa_map = {hpa.backend_id: hpa for hpa in local_hpas}
+
+        remote_hpas = self.client.list_hpas(project.backend_id)
+        remote_hpa_map = {
+            hpa['id']: self.remote_hpa_to_local(hpa, local_workloads_map)
+            for hpa in remote_hpas
+        }
+
+        remote_hpa_ids = set(remote_hpa_map.keys())
+        local_hpa_ids = set(local_hpa_map.keys())
+
+        stale_hpas = local_hpa_ids - remote_hpa_ids
+
+        new_hpas = [remote_hpa_map[hpa_id] for hpa_id in remote_hpa_ids - local_hpa_ids]
+
+        existing_hpas = remote_hpa_ids & local_hpa_ids
+        pulled_fields = {
+            'name',
+            'runtime_state',
+            'current_replicas',
+            'desired_replicas',
+            'min_replicas',
+            'max_replicas',
+            'metrics',
+        }
+        for hpa_id in existing_hpas:
+            local_hpa = local_hpa_map[hpa_id]
+            remote_hpa = remote_hpa_map[hpa_id]
+            update_pulled_fields(local_hpa, remote_hpa, pulled_fields)
+
+        models.HPA.objects.bulk_create(new_hpas)
+        local_hpas.filter(backend_id__in=stale_hpas).delete()
+
+    def remote_hpa_to_local(self, remote_hpa, local_workloads_map):
+        workload = local_workloads_map[remote_hpa['workloadId']]
+        return models.HPA(
+            backend_id=remote_hpa['id'],
+            name=remote_hpa['name'],
+            created=parse_datetime(remote_hpa['created']),
+            runtime_state=remote_hpa['state'],
+            project=workload.project,
+            cluster=workload.cluster,
+            settings=self.settings,
+            namespace=workload.namespace,
+            current_replicas=remote_hpa['currentReplicas'],
+            desired_replicas=remote_hpa['desiredReplicas'],
+            min_replicas=remote_hpa['minReplicas'],
+            max_replicas=remote_hpa['maxReplicas'],
+            metrics=remote_hpa['metrics'],
+            state=models.HPA.States.OK,
+        )
+
+    def create_hpa(self, hpa):
+        remote_hpa = self.client.create_hpa(
+            hpa.project.backend_id,
+            hpa.namespace.backend_id,
+            hpa.workload.backend_id,
+            hpa.name,
+            hpa.description,
+            hpa.min_replicas,
+            hpa.max_replicas,
+            hpa.metrics,
+        )
+        hpa.backend_id = remote_hpa['id']
+        hpa.runtime_state = remote_hpa['state']
+        hpa.save(update_fields=['backend_id', 'runtime_state'])
+
+    def update_hpa(self, hpa):
+        self.client.update_hpa(
+            hpa.project.backend_id,
+            hpa.backend_id,
+            hpa.namespace.backend_id,
+            hpa.workload.backend_id,
+            hpa.name,
+            hpa.description,
+            hpa.min_replicas,
+            hpa.max_replicas,
+            hpa.metrics,
+        )
+
+    def delete_hpa(self, hpa):
+        try:
+            self.client.delete_hpa(hpa.project.backend_id, hpa.backend_id)
+        except NotFound:
+            logger.debug('HPA %s is not present in the backend.' % hpa.backend_id)
+
+    def get_hpa_yaml(self, hpa: models.HPA):
+        return self.client.get_hpa_yaml(hpa.project.backend_id, hpa.backend_id)
+
+    def put_hpa_yaml(self, hpa: models.HPA, yaml: str):
+        return self.client.put_hpa_yaml(hpa.project.backend_id, hpa.backend_id, yaml)
+
+    def pull_apps(self):
+        local_clusters = models.Cluster.objects.filter(settings=self.settings)
+        for cluster in local_clusters:
+            if cluster.state == models.Cluster.States.OK:
+                self.pull_cluster_apps(cluster)
+            else:
+                logger.debug(
+                    'Skipping apps pulling for cluster with backend ID %s'
+                    'because otherwise one failed cluster leads to provider failure',
+                    cluster.backend_id,
+                )
+
+    def pull_cluster_apps(self, cluster: models.Cluster):
+        for project in models.Project.objects.filter(cluster=cluster):
+            self.pull_project_apps(project)
+
+    def pull_project_apps(self, project: models.Project):
+        local_namespaces = models.Namespace.objects.filter(project=project)
+        local_namespaces_map = {
+            namespace.backend_id: namespace for namespace in local_namespaces
+        }
+
+        local_apps = models.Application.objects.filter(rancher_project=project)
+        local_app_map = {app.backend_id: app for app in local_apps}
+
+        remote_apps = self.client.get_project_applications(project.backend_id)
+        remote_app_map = {
+            app['id']: self.remote_app_to_local(app, project, local_namespaces_map)
+            for app in remote_apps
+        }
+
+        remote_app_ids = set(remote_app_map.keys())
+        local_app_ids = set(local_app_map.keys())
+
+        stale_apps = local_app_ids - remote_app_ids
+
+        new_apps = [remote_app_map[app_id] for app_id in remote_app_ids - local_app_ids]
+
+        existing_apps = remote_app_ids & local_app_ids
+        pulled_fields = {
+            'name',
+            'runtime_state',
+            'answers',
+        }
+        for app_id in existing_apps:
+            local_app = local_app_map[app_id]
+            remote_app = remote_app_map[app_id]
+            update_pulled_fields(local_app, remote_app, pulled_fields)
+
+        models.Application.objects.bulk_create(new_apps)
+        local_apps.filter(backend_id__in=stale_apps).delete()
+
+    def remote_app_to_local(self, remote_app, rancher_project, local_namespaces_map):
+        parts = urlparse(remote_app['externalId'])
+        params = parse_qs(parts.query)
+
+        template = models.Template.objects.get(
+            settings=self.settings,
+            name=params['template'][0],
+            catalog__name=params['catalog'][0],
+        )
+
+        return models.Application(
+            settings=self.settings,
+            service_project_link=rancher_project.cluster.service_project_link,
+            rancher_project=rancher_project,
+            cluster=rancher_project.cluster,
+            namespace=local_namespaces_map.get(remote_app['targetNamespace']),
+            template=template,
+            name=remote_app['name'],
+            runtime_state=remote_app['state'],
+            created=remote_app['created'],
+            backend_id=remote_app['id'],
+            answers=remote_app.get('answers', {}),
+            version=params['version'][0],
+        )
+
+    def create_app(self, app: models.Application):
+        if not app.namespace.backend_id:
+            remote_response = self.client.create_namespace(
+                app.rancher_project.cluster.backend_id,
+                app.rancher_project.backend_id,
+                app.namespace.name,
+            )
+            app.namespace.backend_id = remote_response['id']
+            app.namespace.save()
+
+        remote_app = self.client.create_application(
+            app.template.catalog.backend_id,
+            app.template.name,
+            app.version,
+            app.rancher_project.backend_id,
+            app.namespace.backend_id,
+            app.name,
+            app.answers,
+        )
+        app.backend_id = remote_app['id']
+        app.runtime_state = remote_app['state']
+        app.save()
+
+    def check_application_state(self, app):
+        remote_app = self.client.get_application(
+            app.rancher_project.backend_id, app.backend_id
+        )
+        app.runtime_state = remote_app['state']
+        app.save()
+
+    def delete_app(self, app):
+        try:
+            self.client.destroy_application(
+                app.rancher_project.backend_id, app.backend_id
+            )
+        except NotFound:
+            logger.debug('App %s is not present in the backend.' % app.backend_id)
+
+    def install_longhorn_to_cluster(self, cluster):
+        catalog_name = 'library'
+
+        system_project = models.Project.objects.filter(
+            cluster=cluster, name='System'
+        ).first()
+        if not system_project:
+            raise RancherException(
+                "There is no system project in cluster %s" % cluster.backend_id
+            )
+
+        available_templates = models.Template.objects.filter(
+            name=LONGHORN_NAME, catalog__name=catalog_name
+        )
+        available_templates_count = len(available_templates)
+        if available_templates_count != 1:
+            if available_templates_count == 0:
+                message = "There are no templates with name=%s, catalog.name=%s" % (
+                    LONGHORN_NAME,
+                    catalog_name,
+                )
+            else:
+                message = (
+                    "There are more than one template for name=%s, catalog.name=%s"
+                    % (LONGHORN_NAME, catalog_name)
+                )
+            logger.info(message)
+            raise RancherException(message)
+
+        logger.info(
+            'Starting longhorn installation for cluster %s (name=%s, backend_id=%s)',
+            cluster,
+            cluster.name,
+            cluster.backend_id,
+        )
+        template = available_templates.first()
+
+        try:
+            namespace = models.Namespace.objects.get(
+                name=LONGHORN_NAMESPACE, project=system_project
+            )
+        except models.Namespace.DoesNotExist:
+            logger.info(
+                'Creating namespace %s for cluster %s (name=%s, backend_id=%s)',
+                LONGHORN_NAMESPACE,
+                cluster,
+                cluster.name,
+                cluster.backend_id,
+            )
+            namespace_response = self.client.create_namespace(
+                cluster.backend_id, system_project.backend_id, LONGHORN_NAMESPACE
+            )
+            namespace = models.Namespace.objects.create(
+                name=LONGHORN_NAMESPACE,
+                backend_id=namespace_response['id'],
+                settings=system_project.settings,
+                project=system_project,
+            )
+
+        logger.info(
+            'Creating application %s for cluster %s (name=%s, backend_id=%s) in namespace %s (backend_id=%s)',
+            LONGHORN_NAMESPACE,
+            cluster,
+            cluster.name,
+            cluster.backend_id,
+            namespace.name,
+            namespace.backend_id,
+        )
+        worker_node_count = cluster.node_set.filter(worker_role=True).count()
+        replica_count = min(3, worker_node_count)
+        application = self.client.create_application(
+            catalog_id=template.catalog.backend_id,
+            template_id=template.name,
+            version=template.default_version,
+            project_id=system_project.backend_id,
+            namespace_id=namespace.backend_id,
+            name=LONGHORN_NAME,
+            answers={'persistence.defaultClassReplicaCount': replica_count},
+            wait=True,
+            timeout=1200,
+        )
+
+        models.Application.objects.create(
+            settings=self.settings,
+            service_project_link=cluster.service_project_link,
+            rancher_project=system_project,
+            cluster=cluster,
+            namespace=namespace,
+            template=template,
+            name=LONGHORN_NAME,
+            state=models.Application.States.CREATING,
+            runtime_state=application['state'],
+            created=application['created'],
+            backend_id=application['id'],
+            answers=application.get('answers'),
+            version=template.default_version,
+        )
+
+        logger.info(
+            'Application %s for cluster %s (name=%s, backend_id=%s) was created',
+            application,
+            cluster,
+            cluster.name,
+            cluster.backend_id,
+        )
+
+    def pull_ingresses(self):
+        local_clusters = models.Cluster.objects.filter(settings=self.settings)
+        for cluster in local_clusters:
+            if cluster.state == models.Cluster.States.OK:
+                self.pull_cluster_ingresses(cluster)
+            else:
+                logger.debug(
+                    'Skipping ingresses pulling for cluster with backend ID %s'
+                    'because otherwise one failed cluster leads to provider failure',
+                    cluster.backend_id,
+                )
+
+    def pull_cluster_ingresses(self, cluster: models.Cluster):
+        for project in models.Project.objects.filter(cluster=cluster):
+            self.pull_project_ingresses(project)
+
+    def pull_project_ingresses(self, project):
+        remote_ingresses = self.client.list_ingresses(project.backend_id)
+        local_ingresses = models.Ingress.objects.filter(rancher_project=project)
+        local_namespaces = models.Namespace.objects.filter(project=project)
+
+        local_namespaces_map = {
+            namespace.backend_id: namespace for namespace in local_namespaces
+        }
+        remote_ingress_map = {
+            ingress['id']: self.remote_ingress_to_local(
+                ingress, project, local_namespaces_map
+            )
+            for ingress in remote_ingresses
+        }
+        local_ingress_map = {ingress.backend_id: ingress for ingress in local_ingresses}
+        remote_ingress_ids = set(remote_ingress_map.keys())
+        local_ingress_ids = set(local_ingress_map.keys())
+
+        stale_ingresses = local_ingress_ids - remote_ingress_ids
+
+        new_ingresses = [
+            remote_ingress_map[ingress_id]
+            for ingress_id in remote_ingress_ids - local_ingress_ids
+        ]
+
+        existing_ingresses = remote_ingress_ids & local_ingress_ids
+        pulled_fields = {
+            'name',
+            'runtime_state',
+            'rules',
+        }
+        for ingress_id in existing_ingresses:
+            local_ingress = local_ingress_map[ingress_id]
+            remote_ingress = remote_ingress_map[ingress_id]
+            update_pulled_fields(local_ingress, remote_ingress, pulled_fields)
+
+        models.Ingress.objects.bulk_create(new_ingresses)
+        local_ingresses.filter(backend_id__in=stale_ingresses).delete()
+
+    def remote_ingress_to_local(self, remote_ingress, project, local_namespaces_map):
+        namespace = local_namespaces_map.get(remote_ingress['namespaceId'])
+        return models.Ingress(
+            backend_id=remote_ingress['id'],
+            name=remote_ingress['name'],
+            created=parse_datetime(remote_ingress['created']),
+            runtime_state=remote_ingress['state'],
+            settings=self.settings,
+            service_project_link=namespace.project.cluster.service_project_link,
+            namespace=namespace,
+            cluster=namespace.project.cluster,
+            rancher_project=namespace.project,
+            rules=remote_ingress['rules'],
+            state=models.Ingress.States.OK,
+        )
+
+    def get_ingress_yaml(self, ingress: models.Ingress):
+        return self.client.get_ingress_yaml(
+            ingress.rancher_project.backend_id, ingress.backend_id
+        )
+
+    def put_ingress_yaml(self, ingress: models.Ingress, yaml: str):
+        return self.client.put_ingress_yaml(
+            ingress.rancher_project.backend_id, ingress.backend_id, yaml
+        )
+
+    def delete_ingress(self, ingress: models.Ingress):
+        return self.client.delete_ingress(
+            ingress.rancher_project.backend_id, ingress.backend_id
+        )
+
+    def pull_services(self):
+        local_clusters = models.Cluster.objects.filter(settings=self.settings)
+        for cluster in local_clusters:
+            if cluster.state == models.Cluster.States.OK:
+                self.pull_cluster_services(cluster)
+            else:
+                logger.debug(
+                    'Skipping services pulling for cluster with backend ID %s'
+                    'because otherwise one failed cluster leads to provider failure',
+                    cluster.backend_id,
+                )
+
+    def pull_cluster_services(self, cluster: models.Cluster):
+        for project in models.Project.objects.filter(cluster=cluster):
+            self.pull_project_services(project)
+
+    def pull_project_services(self, project):
+        remote_services = self.client.list_services(project.backend_id)
+        local_services = models.Service.objects.filter(namespace__project=project)
+        local_namespaces = models.Namespace.objects.filter(project=project)
+        local_workloads = models.Workload.objects.filter(project=project)
+
+        local_namespaces_map = {
+            namespace.backend_id: namespace for namespace in local_namespaces
+        }
+        local_workloads_map = {
+            workload.backend_id: workload for workload in local_workloads
+        }
+        remote_service_map = {service['id']: service for service in remote_services}
+        local_service_map = {service.backend_id: service for service in local_services}
+        remote_service_ids = set(remote_service_map.keys())
+        local_service_ids = set(local_service_map.keys())
+
+        stale_services = local_service_ids - remote_service_ids
+
+        new_services = [
+            remote_service_map[service_id]
+            for service_id in remote_service_ids - local_service_ids
+        ]
+
+        existing_services = remote_service_ids & local_service_ids
+        for service_id in existing_services:
+            local_service = local_service_map[service_id]
+            remote_service = remote_service_map[service_id]
+            update_fields = set()
+            if remote_service['name'] != local_service.name:
+                local_service.name = remote_service['name']
+                update_fields.add('name')
+            if remote_service['state'] != local_service.runtime_state:
+                local_service.runtime_state = remote_service['state']
+                update_fields.add('runtime_state')
+            if remote_service.get('selector') != local_service.selector:
+                local_service.selector = remote_service.get('selector')
+                update_fields.add('selector')
+            if remote_service['clusterIp'] != local_service.cluster_ip:
+                local_service.cluster_ip = remote_service['clusterIp']
+                update_fields.add('cluster_ip')
+            if update_fields:
+                local_service.save(update_fields=update_fields)
+
+            local_service_workload_map = {
+                workload.backend_id: workload
+                for workload in local_service.target_workloads.all()
+            }
+
+            remote_service_workload_map = {
+                workload_id: local_workloads_map[workload_id]
+                for workload_id in remote_service.get('targetWorkloadIds', [])
+            }
+
+            local_service_workload_ids = set(local_service_workload_map.keys())
+            remote_service_workload_ids = set(remote_service_workload_map.keys())
+
+            stale_service_workload_ids = (
+                local_service_workload_ids - remote_service_workload_ids
+            )
+            for workload_id in stale_service_workload_ids:
+                workload = local_workloads_map[workload_id]
+                local_service.target_workloads.remove(workload)
+
+            new_service_workload_ids = (
+                remote_service_workload_ids - local_service_workload_ids
+            )
+            for workload_id in new_service_workload_ids:
+                workload = local_workloads_map[workload_id]
+                local_service.target_workloads.add(workload)
+
+        for remote_service in new_services:
+            namespace = local_namespaces_map.get(remote_service['namespaceId'])
+            local_service = models.Service(
+                backend_id=remote_service['id'],
+                name=remote_service['name'],
+                created=parse_datetime(remote_service['created']),
+                runtime_state=remote_service['state'],
+                settings=self.settings,
+                service_project_link=namespace.project.cluster.service_project_link,
+                namespace=namespace,
+                cluster_ip=remote_service['clusterIp'],
+                selector=remote_service.get('selector'),
+                state=models.Service.States.OK,
+            )
+            local_service.save()
+            workloads = [
+                local_workloads_map[workload_id]
+                for workload_id in remote_service.get('targetWorkloadIds', [])
+            ]
+            local_service.target_workloads.set(workloads)
+
+        local_services.filter(backend_id__in=stale_services).delete()
+
+    def get_service_yaml(self, service: models.Service):
+        return self.client.get_service_yaml(
+            service.namespace.project.backend_id, service.backend_id
+        )
+
+    def put_service_yaml(self, service: models.Service, yaml: str):
+        return self.client.put_service_yaml(
+            service.namespace.project.backend_id, service.backend_id, yaml
+        )
+
+    def delete_service(self, service: models.Service):
+        return self.client.delete_service(
+            service.namespace.project.backend_id, service.backend_id
+        )
+
+    def import_yaml(
+        self,
+        cluster: models.Cluster,
+        yaml: str,
+        default_namespace: models.Namespace = None,
+        namespace: models.Namespace = None,
+    ):
+        return self.client.import_yaml(
+            cluster.backend_id,
+            yaml,
+            default_namespace and default_namespace.backend_id,
+            namespace and namespace.backend_id,
+        )

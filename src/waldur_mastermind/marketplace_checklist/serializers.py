@@ -1,14 +1,24 @@
 from rest_framework import serializers
 
+from waldur_core.media.serializers import ProtectedMediaSerializerMixin
+
 from . import models
 
 
-class CategorySerializer(serializers.ModelSerializer):
+class CategorySerializer(
+    ProtectedMediaSerializerMixin, serializers.HyperlinkedModelSerializer
+):
     checklists_count = serializers.ReadOnlyField(source='checklists.count')
 
     class Meta:
         model = models.Category
-        fields = ('uuid', 'name', 'description', 'checklists_count')
+        fields = ('uuid', 'icon', 'url', 'name', 'description', 'checklists_count')
+        extra_kwargs = {
+            'url': {
+                'lookup_field': 'uuid',
+                'view_name': 'marketplace-checklists-category-detail',
+            },
+        }
 
 
 class ChecklistSerializer(serializers.ModelSerializer):
@@ -47,3 +57,9 @@ class AnswerListSerializer(serializers.ModelSerializer):
 class AnswerSubmitSerializer(serializers.Serializer):
     question_uuid = serializers.UUIDField()
     value = serializers.NullBooleanField()
+
+
+class CustomerChecklistUpdateSerializer(serializers.ListSerializer):
+    child = serializers.SlugRelatedField(
+        slug_field='uuid', write_only=True, queryset=models.Checklist.objects.all(),
+    )

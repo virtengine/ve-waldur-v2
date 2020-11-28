@@ -39,11 +39,13 @@ def render_issue_template(config_name, issue):
 class NestedFeedbackSerializer(serializers.HyperlinkedModelSerializer):
     state = serializers.ReadOnlyField(source='get_state_display')
     evaluation = serializers.ReadOnlyField(source='get_evaluation_display')
+    evaluation_number = serializers.ReadOnlyField(source='evaluation')
 
     class Meta:
         model = models.Feedback
         fields = (
             'evaluation',
+            'evaluation_number',
             'comment',
             'state',
         )
@@ -241,11 +243,12 @@ class IssueSerializer(
             or project.customer.has_user(user, structure_models.CustomerRole.OWNER)
             or project.has_user(user, structure_models.ProjectRole.MANAGER)
             or project.has_user(user, structure_models.ProjectRole.ADMINISTRATOR)
+            or project.has_user(user, structure_models.ProjectRole.MEMBER)
         ):
             return project
         raise serializers.ValidationError(
             _(
-                'Only customer owner, project manager, project admin, staff or support can report such issue.'
+                'Only customer owner, project manager, project admin, project support, staff or support can report such issue.'
             )
         )
 
@@ -312,6 +315,7 @@ class CommentSerializer(
     )
 
     author_uuid = serializers.ReadOnlyField(source='author.user.uuid')
+    author_email = serializers.ReadOnlyField(source='author.user.email')
 
     class Meta:
         model = models.Comment
@@ -325,6 +329,7 @@ class CommentSerializer(
             'author_name',
             'author_uuid',
             'author_user',
+            'author_email',
             'backend_id',
             'created',
         )
@@ -455,6 +460,7 @@ class OfferingSerializer(
             'article_code',
             'report',
             'error_message',
+            'backend_id',
         )
         read_only_fields = (
             'type_label',
@@ -464,6 +470,7 @@ class OfferingSerializer(
             'state',
             'product_code',
             'article_code',
+            'backend_id',
         )
         protected_fields = ('project', 'type', 'template', 'plan')
         extra_kwargs = dict(
@@ -639,6 +646,10 @@ class OfferingCompleteSerializer(serializers.Serializer):
         instance.state = models.Offering.States.OK
         instance.save(update_fields=['state', 'unit_price', 'unit'])
         return instance
+
+
+class OfferingSetBackendIDSerializer(serializers.Serializer):
+    backend_id = serializers.CharField()
 
 
 class AttachmentSerializer(

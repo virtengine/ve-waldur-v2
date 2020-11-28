@@ -23,6 +23,18 @@ def check_availability_of_auto_approving(items, user, project):
     if all(item.offering.is_private for item in items):
         return structure_permissions._has_admin_access(user, project)
 
+    # Skip approval of public offering belonging to the same organization under which the request is done
+    if all(
+        item.offering.shared
+        and item.offering.customer == project.customer
+        and item.offering.plugin_options.get(
+            'auto_approve_in_service_provider_projects'
+        )
+        is True
+        for item in items
+    ):
+        return True
+
     # Service provider is not required to approve termination order
     if (
         len(items) == 1
@@ -98,6 +110,26 @@ def user_can_list_importable_resources(request, view, offering=None):
             'Import is limited to staff for shared offerings.'
         )
 
+    # Import private offerings must be available for admins and managers
+    if (
+        offering.scope
+        and offering.scope.scope
+        and offering.scope.scope.service_project_link
+    ):
+        project = offering.scope.scope.service_project_link.project
+        if (
+            project.get_users(structure_models.ProjectRole.ADMINISTRATOR)
+            .filter(pk=user.pk)
+            .exists()
+        ):
+            return
+        if (
+            project.get_users(structure_models.ProjectRole.MANAGER)
+            .filter(pk=user.pk)
+            .exists()
+        ):
+            return
+
     owned_customers = set(
         structure_models.Customer.objects.all()
         .filter(
@@ -108,8 +140,10 @@ def user_can_list_importable_resources(request, view, offering=None):
         .distinct()
     )
 
+    allowed_customers = set(offering.allowed_customers.all())
+
     if offering.customer not in owned_customers and not (
-        offering.allowed_customers & owned_customers
+        allowed_customers & owned_customers
     ):
         raise exceptions.PermissionDenied(
             'Import is limited to owners for private offerings.'

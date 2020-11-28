@@ -1,5 +1,4 @@
 import base64
-import json
 import logging
 import uuid
 
@@ -12,6 +11,7 @@ from rest_framework import generics, response, status, views
 from rest_framework.authtoken.models import Token
 from rest_framework.exceptions import APIException, ValidationError
 
+from waldur_core.core.models import SshPublicKey
 from waldur_core.core.views import RefreshTokenMixin, validate_authentication_method
 
 from . import tasks
@@ -22,12 +22,22 @@ from .serializers import ActivationSerializer, AuthSerializer, RegistrationSeria
 logger = logging.getLogger(__name__)
 
 auth_social_settings = getattr(settings, 'WALDUR_AUTH_SOCIAL', {})
-GOOGLE_SECRET = auth_social_settings.get('GOOGLE_SECRET')
 FACEBOOK_SECRET = auth_social_settings.get('FACEBOOK_SECRET')
 SMARTIDEE_SECRET = auth_social_settings.get('SMARTIDEE_SECRET')
+
 TARA_CLIENT_ID = auth_social_settings.get('TARA_CLIENT_ID')
 TARA_SECRET = auth_social_settings.get('TARA_SECRET')
 TARA_SANDBOX = auth_social_settings.get('TARA_SANDBOX')
+
+KEYCLOAK_CLIENT_ID = auth_social_settings.get('KEYCLOAK_CLIENT_ID')
+KEYCLOAK_SECRET = auth_social_settings.get('KEYCLOAK_SECRET')
+KEYCLOAK_TOKEN_URL = auth_social_settings.get('KEYCLOAK_TOKEN_URL')
+KEYCLOAK_USERINFO_URL = auth_social_settings.get('KEYCLOAK_USERINFO_URL')
+
+EDUTEAMS_CLIENT_ID = auth_social_settings.get('EDUTEAMS_CLIENT_ID')
+EDUTEAMS_SECRET = auth_social_settings.get('EDUTEAMS_SECRET')
+EDUTEAMS_TOKEN_URL = auth_social_settings.get('EDUTEAMS_TOKEN_URL')
+EDUTEAMS_USERINFO_URL = auth_social_settings.get('EDUTEAMS_USERINFO_URL')
 
 validate_social_signup = validate_authentication_method('SOCIAL_SIGNUP')
 validate_local_signup = validate_authentication_method('LOCAL_SIGNUP')
@@ -53,23 +63,6 @@ class FacebookException(AuthException):
         return self.message
 
 
-class GoogleException(AuthException):
-    def __init__(self, google_error):
-        if isinstance(google_error, str):
-            self.message = google_error
-        else:
-            self.message_text = google_error.get('message', 'Undefined')
-            self.message_code = google_error.get('code', 'Undefined')
-            self.message = 'Google error (code:{}): {}'.format(
-                self.message_code, self.message_text
-            )
-
-        super(GoogleException, self).__init__(detail=self.message)
-
-    def __str__(self):
-        return self.message
-
-
 class SmartIDeeException(AuthException):
     def __init__(self, error_message, error_description=None):
         self.message = 'SmartIDee error: %s' % error_message
@@ -87,6 +80,28 @@ class TARAException(AuthException):
         if error_description:
             self.message = '%s (%s)' % (self.message, error_description)
         super(TARAException, self).__init__(detail=self.message)
+
+    def __str__(self):
+        return self.message
+
+
+class KeycloakException(AuthException):
+    def __init__(self, error_message, error_description=None):
+        self.message = 'Keycloak error: %s' % error_message
+        if error_description:
+            self.message = '%s (%s)' % (self.message, error_description)
+        super(KeycloakException, self).__init__(detail=self.message)
+
+    def __str__(self):
+        return self.message
+
+
+class EduteamsException(AuthException):
+    def __init__(self, error_message, error_description=None):
+        self.message = 'Eduteams error: %s' % error_message
+        if error_description:
+            self.message = '%s (%s)' % (self.message, error_description)
+        super(EduteamsException, self).__init__(detail=self.message)
 
     def __str__(self):
         return self.message
@@ -156,43 +171,6 @@ class BaseAuthView(RefreshTokenMixin, views.APIView):
                 profile.user.full_name = user_name
                 profile.user.save()
             return profile.user, False
-
-
-class GoogleView(BaseAuthView):
-
-    provider = 'google'
-
-    def get_backend_user(self, validated_data):
-        access_token_url = 'https://www.googleapis.com/oauth2/v3/token'
-        people_api_url = 'https://www.googleapis.com/plus/v1/people/me/openIdConnect'
-
-        payload = dict(
-            client_id=validated_data['client_id'],
-            redirect_uri=validated_data['redirect_uri'],
-            client_secret=GOOGLE_SECRET,
-            code=validated_data['code'],
-            grant_type='authorization_code',
-        )
-
-        # Step 1. Exchange authorization code for access token.
-        r = requests.post(access_token_url, data=payload)
-
-        token = json.loads(r.text)
-        self._assert_response_valid(token)
-        headers = {'Authorization': 'Bearer {0}'.format(token['access_token'])}
-
-        # Step 2. Retrieve information about the current user.
-        r = requests.get(people_api_url, headers=headers)
-        response_data = json.loads(r.text)
-
-        # Step 3. Check is response valid.
-        self._assert_response_valid(response_data)
-
-        return {'id': response_data['sub'], 'name': response_data['name']}
-
-    def _assert_response_valid(self, response_data):
-        if 'error' in response_data:
-            raise GoogleException(response_data['error'])
 
 
 class FacebookView(BaseAuthView):
@@ -394,6 +372,185 @@ class TARAView(BaseAuthView):
             if user.details != details:
                 user.details = details
                 user.save()
+        return user, created
+
+
+class KeycloakView(BaseAuthView):
+    provider = 'keycloak'
+
+    def get_access_token(self, validated_data):
+        data = {
+            'grant_type': 'authorization_code',
+            'redirect_uri': validated_data['redirect_uri'],
+            'code': validated_data['code'],
+            'client_id': KEYCLOAK_CLIENT_ID,
+            'client_secret': KEYCLOAK_SECRET,
+        }
+
+        try:
+            response = requests.post(KEYCLOAK_TOKEN_URL, data=data)
+        except requests.exceptions.RequestException as e:
+            logger.warning('Unable to send authentication request. Error is %s', e)
+            raise KeycloakException('Unable to send authentication request.')
+        self.check_response(response)
+
+        try:
+            return response.json()['access_token']
+        except (ValueError, TypeError):
+            raise KeycloakException('Unable to parse JSON in authentication response.')
+        except KeyError:
+            raise KeycloakException('Authentication response does not contain token.')
+
+    def get_user_info(self, access_token):
+        headers = {'Authorization': f'Bearer {access_token}'}
+        try:
+            response = requests.get(KEYCLOAK_USERINFO_URL, headers=headers)
+        except requests.exceptions.RequestException as e:
+            logger.warning('Unable to send user info request. Error is %s', e)
+            raise KeycloakException('Unable to send user info request.')
+        self.check_response(response)
+
+        try:
+            return response.json()
+        except (ValueError, TypeError):
+            raise KeycloakException('Unable to parse JSON in user info response.')
+
+    def get_backend_user(self, validated_data):
+        access_token = self.get_access_token(validated_data)
+        return self.get_user_info(access_token)
+
+    def check_response(self, r, valid_response=requests.codes.ok):
+        if r.status_code != valid_response:
+            try:
+                data = r.json()
+                error_message = data['error']
+                error_description = data.get('error_description', '')
+            except Exception:
+                values = (r.reason, r.status_code)
+                error_message = 'Message: %s, status code: %s' % values
+                error_description = ''
+            raise KeycloakException(error_message, error_description)
+
+    def create_or_update_user(self, backend_user):
+        # Preferred username is not unique. Sub in UUID.
+        username = f'keycloak_f{backend_user["sub"]}'
+        email = backend_user.get('email')
+        full_name = backend_user.get('name', '')
+        try:
+            user = User.objects.get(username=username)
+            created = False
+        except User.DoesNotExist:
+            created = True
+            user = User.objects.create_user(
+                username=username,
+                registration_method=self.provider,
+                email=email,
+                full_name=full_name,
+            )
+            user.set_unusable_password()
+            user.save()
+        return user, created
+
+
+class EduteamsView(BaseAuthView):
+    provider = 'eduteams'
+
+    def get_access_token(self, validated_data):
+        data = {
+            'grant_type': 'authorization_code',
+            'redirect_uri': validated_data['redirect_uri'],
+            'code': validated_data['code'],
+            'client_id': EDUTEAMS_CLIENT_ID,
+            'client_secret': EDUTEAMS_SECRET,
+        }
+
+        try:
+            response = requests.post(EDUTEAMS_TOKEN_URL, data=data)
+        except requests.exceptions.RequestException as e:
+            logger.warning('Unable to send authentication request. Error is %s', e)
+            raise EduteamsException('Unable to send authentication request.')
+        self.check_response(response)
+
+        try:
+            return response.json()['access_token']
+        except (ValueError, TypeError):
+            raise EduteamsException('Unable to parse JSON in authentication response.')
+        except KeyError:
+            raise EduteamsException('Authentication response does not contain token.')
+
+    def get_user_info(self, access_token):
+        headers = {'Authorization': f'Bearer {access_token}'}
+        try:
+            response = requests.get(EDUTEAMS_USERINFO_URL, headers=headers)
+        except requests.exceptions.RequestException as e:
+            logger.warning('Unable to send user info request. Error is %s', e)
+            raise EduteamsException('Unable to send user info request.')
+        self.check_response(response)
+
+        try:
+            return response.json()
+        except (ValueError, TypeError):
+            raise EduteamsException('Unable to parse JSON in user info response.')
+
+    def get_backend_user(self, validated_data):
+        access_token = self.get_access_token(validated_data)
+        return self.get_user_info(access_token)
+
+    def check_response(self, r, valid_response=requests.codes.ok):
+        if r.status_code != valid_response:
+            try:
+                data = r.json()
+                error_message = data['error']
+                error_description = data.get('error_description', '')
+            except Exception:
+                values = (r.reason, r.status_code)
+                error_message = 'Message: %s, status code: %s' % values
+                error_description = ''
+            raise EduteamsException(error_message, error_description)
+
+    def create_or_update_user(self, backend_user):
+        username = backend_user["sub"]
+        email = backend_user.get('email')
+        full_name = backend_user.get('name', '')
+        # https://wiki.geant.org/display/eduTEAMS/Attributes+available+to+Relying+Parties#AttributesavailabletoRelyingParties-Assurance
+        details = {'eduperson_assurance': backend_user.get('eduperson_assurance', [])}
+        try:
+            user = User.objects.get(username=username)
+            if user.details != details:
+                user.details = details
+                user.save(update_fields=['details'])
+            created = False
+        except User.DoesNotExist:
+            created = True
+            user = User.objects.create_user(
+                username=username,
+                registration_method=self.provider,
+                email=email,
+                full_name=full_name,
+                details=details,
+            )
+            user.set_unusable_password()
+            user.save()
+
+        existing_keys_map = {
+            key.public_key: key
+            for key in SshPublicKey.objects.filter(
+                user=user, name__startswith='eduteams_'
+            )
+        }
+        eduteams_keys = backend_user.get('ssh_public_key', [])
+
+        new_keys = set(eduteams_keys) - set(existing_keys_map.keys())
+        stale_keys = set(existing_keys_map.keys()) - set(eduteams_keys)
+
+        for key in new_keys:
+            name = 'eduteams_key_{}'.format(uuid.uuid4().hex[:10])
+            new_key = SshPublicKey(user=user, name=name, public_key=key)
+            new_key.save()
+
+        for key in stale_keys:
+            existing_keys_map[key].delete()
+
         return user, created
 
 

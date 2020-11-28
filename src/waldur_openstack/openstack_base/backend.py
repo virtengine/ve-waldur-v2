@@ -2,6 +2,7 @@ import datetime
 import hashlib
 import json
 import logging
+import re
 
 from cinderclient import exceptions as cinder_exceptions
 from cinderclient.v2 import client as cinder_client
@@ -26,6 +27,12 @@ from waldur_core.structure.exceptions import SerializableBackendError
 from waldur_openstack.openstack.models import Tenant
 
 logger = logging.getLogger(__name__)
+
+VALID_VOLUME_TYPE_NAME_PATTERN = re.compile(r'^gigabytes_[a-z]+[-_a-z]+$')
+
+
+def is_valid_volume_type_name(name):
+    return re.match(VALID_VOLUME_TYPE_NAME_PATTERN, name)
 
 
 class OpenStackBackendError(SerializableBackendError):
@@ -176,6 +183,8 @@ class BaseOpenStackBackend(ServiceBackend):
         self.tenant_id = tenant_id
 
     def _get_cached_session_key(self, admin):
+        if not admin and not self.tenant_id:
+            raise OpenStackBackendError('Either admin or tenant_id should be defined.')
         key = (
             'OPENSTACK_ADMIN_SESSION'
             if admin
@@ -246,7 +255,7 @@ class BaseOpenStackBackend(ServiceBackend):
 
     def ping(self, raise_exception=False):
         try:
-            self.keystone_client
+            self.keystone_admin_client
         except keystone_exceptions.ClientException as e:
             if raise_exception:
                 raise OpenStackBackendError(e)
@@ -263,15 +272,18 @@ class BaseOpenStackBackend(ServiceBackend):
             return True
 
     def _pull_tenant_quotas(self, backend_id, scope):
-        for quota_name, limit in self.get_tenant_quotas_limits(backend_id).items():
+        # Cinder volumes and snapshots manager does not implement filtering by tenant_id.
+        # Therefore we need to assume that tenant_id field is set up in backend settings.
+        backend = BaseOpenStackBackend(self.settings, backend_id)
+        for quota_name, limit in backend.get_tenant_quotas_limits(backend_id).items():
             scope.set_quota_limit(quota_name, limit)
-        for quota_name, usage in self.get_tenant_quotas_usage(backend_id).items():
+        for quota_name, usage in backend.get_tenant_quotas_usage(backend_id).items():
             scope.set_quota_usage(quota_name, usage)
 
-    def get_tenant_quotas_limits(self, tenant_backend_id):
-        nova = self.nova_client
-        neutron = self.neutron_client
-        cinder = self.cinder_client
+    def get_tenant_quotas_limits(self, tenant_backend_id, admin=False):
+        nova = self.get_client('nova', admin)
+        neutron = self.get_client('neutron', admin)
+        cinder = self.get_client('cinder', admin)
 
         try:
             nova_quotas = nova.quotas.get(tenant_id=tenant_backend_id)
@@ -301,74 +313,67 @@ class BaseOpenStackBackend(ServiceBackend):
         }
 
         for name, value in cinder_quotas._info.items():
-            if name.startswith('gigabytes_'):
+            if is_valid_volume_type_name(name):
                 quotas[name] = value
 
         return quotas
 
-    def get_tenant_quotas_usage(self, tenant_backend_id):
-        nova = self.nova_client
-        neutron = self.neutron_client
-        cinder = self.cinder_client
+    def get_tenant_quotas_usage(self, tenant_backend_id, admin=False):
+        nova = self.get_client('nova', admin)
+        neutron = self.get_client('neutron', admin)
+        cinder = self.get_client('cinder', admin)
+
         try:
+            nova_quotas = nova.quotas.get(
+                tenant_id=tenant_backend_id, detail=True
+            )._info
+            neutron_quotas = neutron.show_quota_details(tenant_backend_id)['quota']
+            # There are no cinder quotas for total volumes and snapshots size.
+            # Therefore we need to compute them manually by fetching list of volumes and snapshots in the tenant.
+            # Also `list` method in volume and snapshots does not implement filtering by tenant ID.
+            # That's why we need to assume that tenant_id field is set up in backend settings.
             volumes = cinder.volumes.list()
             snapshots = cinder.volume_snapshots.list()
-            instances = nova.servers.list()
-            security_groups = neutron.list_security_groups(tenant_id=tenant_backend_id)[
-                'security_groups'
-            ]
-            floating_ips = neutron.list_floatingips(tenant_id=tenant_backend_id)[
-                'floatingips'
-            ]
-            networks = neutron.list_networks(tenant_id=tenant_backend_id)['networks']
-            subnets = neutron.list_subnets(tenant_id=tenant_backend_id)['subnets']
-
-            flavors = {flavor.id: flavor for flavor in nova.flavors.list()}
-
-            ram, vcpu = 0, 0
-            for flavor_id in (instance.flavor['id'] for instance in instances):
-                try:
-                    flavor = flavors.get(flavor_id, nova.flavors.get(flavor_id))
-                except nova_exceptions.NotFound:
-                    logger.warning('Cannot find flavor with id %s', flavor_id)
-                    continue
-
-                ram += getattr(flavor, 'ram', 0)
-                vcpu += getattr(flavor, 'vcpus', 0)
-
+            cinder_quotas = cinder.quotas.get(
+                tenant_id=tenant_backend_id, usage=True
+            )._info
         except (
             nova_exceptions.ClientException,
-            cinder_exceptions.ClientException,
             neutron_exceptions.NeutronClientException,
+            cinder_exceptions.ClientException,
         ) as e:
             raise OpenStackBackendError(e)
 
+        # Cinder quotas for volumes and snapshots size are not available in REST API
+        # therefore we need to calculate them manually
         volumes_size = sum(self.gb2mb(v.size) for v in volumes)
         snapshots_size = sum(self.gb2mb(v.size) for v in snapshots)
-        storage = volumes_size + snapshots_size
 
         quotas = {
-            Tenant.Quotas.ram: ram,
-            Tenant.Quotas.vcpu: vcpu,
-            Tenant.Quotas.storage: storage,
+            # Nova quotas
+            Tenant.Quotas.ram: nova_quotas['ram']['in_use'],
+            Tenant.Quotas.vcpu: nova_quotas['cores']['in_use'],
+            Tenant.Quotas.instances: nova_quotas['instances']['in_use'],
+            # Neutron quotas
+            Tenant.Quotas.security_group_count: neutron_quotas['security_group'][
+                'used'
+            ],
+            Tenant.Quotas.security_group_rule_count: neutron_quotas[
+                'security_group_rule'
+            ]['used'],
+            Tenant.Quotas.floating_ip_count: neutron_quotas['floatingip']['used'],
+            Tenant.Quotas.network_count: neutron_quotas['network']['used'],
+            Tenant.Quotas.subnet_count: neutron_quotas['subnet']['used'],
+            # Cinder quotas
+            Tenant.Quotas.storage: self.gb2mb(cinder_quotas['gigabytes']['in_use']),
             Tenant.Quotas.volumes: len(volumes),
             Tenant.Quotas.volumes_size: volumes_size,
             Tenant.Quotas.snapshots: len(snapshots),
             Tenant.Quotas.snapshots_size: snapshots_size,
-            Tenant.Quotas.instances: len(instances),
-            Tenant.Quotas.security_group_count: len(security_groups),
-            Tenant.Quotas.security_group_rule_count: len(
-                sum([sg['security_group_rules'] for sg in security_groups], [])
-            ),
-            Tenant.Quotas.floating_ip_count: len(floating_ips),
-            Tenant.Quotas.network_count: len(networks),
-            Tenant.Quotas.subnet_count: len(subnets),
         }
 
-        for name, value in cinder.quotas.get(
-            tenant_id=tenant_backend_id, usage=True
-        )._info.items():
-            if name.startswith('gigabytes_'):
+        for name, value in cinder_quotas.items():
+            if is_valid_volume_type_name(name):
                 quotas[name] = value['in_use']
 
         return quotas
@@ -376,9 +381,6 @@ class BaseOpenStackBackend(ServiceBackend):
     def _normalize_security_group_rule(self, rule):
         if rule['protocol'] is None:
             rule['protocol'] = ''
-
-        if rule['remote_ip_prefix'] is None:
-            rule['remote_ip_prefix'] = '0.0.0.0/0'
 
         if rule['port_range_min'] is None:
             rule['port_range_min'] = -1
@@ -392,18 +394,18 @@ class BaseOpenStackBackend(ServiceBackend):
         backend_rules = backend_security_group['security_group_rules']
         cur_rules = {rule.backend_id: rule for rule in security_group.rules.all()}
         for backend_rule in backend_rules:
-            # TODO: Currently we support only rules for incoming traffic
-            if backend_rule['direction'] != 'ingress':
-                continue
             cur_rules.pop(backend_rule['id'], None)
             backend_rule = self._normalize_security_group_rule(backend_rule)
             security_group.rules.update_or_create(
                 backend_id=backend_rule['id'],
                 defaults={
+                    'ethertype': backend_rule['ethertype'],
+                    'direction': backend_rule['direction'],
                     'from_port': backend_rule['port_range_min'],
                     'to_port': backend_rule['port_range_max'],
                     'protocol': backend_rule['protocol'],
                     'cidr': backend_rule['remote_ip_prefix'],
+                    'description': backend_rule['description'] or '',
                 },
             )
         security_group.rules.filter(backend_id__in=cur_rules.keys()).delete()
@@ -411,8 +413,8 @@ class BaseOpenStackBackend(ServiceBackend):
     def _get_current_properties(self, model):
         return {p.backend_id: p for p in model.objects.filter(settings=self.settings)}
 
-    def _pull_images(self, model_class, filter_function=None):
-        glance = self.glance_client
+    def _pull_images(self, model_class, filter_function=None, admin=False):
+        glance = self.get_client('glance', admin)
         try:
             images = glance.images.list()
         except glance_exceptions.ClientException as e:
@@ -454,3 +456,11 @@ class BaseOpenStackBackend(ServiceBackend):
             )
         except neutron_exceptions.NeutronClientException as e:
             raise OpenStackBackendError(e)
+
+    def _get_current_volume_types(self):
+        """
+        It is expected that this method is implemented in inherited backend classes
+        so that it would be possible to avoid circular dependency between base and openstack_tenant
+        applications.
+        """
+        return []

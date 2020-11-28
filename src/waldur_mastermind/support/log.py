@@ -8,10 +8,14 @@ from . import models
 def get_issue_scopes(issue):
     result = set()
     if issue.resource:
-        project = _get_project(issue.resource)
+        try:
+            project = _get_project(issue.resource)
+            result.add(project)
+            result.add(project.customer)
+        except Project.DoesNotExist:
+            # Project was deleted, soft-deleted projects will be handled below
+            pass
         result.add(issue.resource)
-        result.add(project)
-        result.add(project.customer)
     if issue.project_id:
         project = Project.all_objects.get(
             id=issue.project_id
@@ -83,6 +87,19 @@ class OfferingEventLogger(EventLogger):
         return {offering, project, project.customer}
 
 
+class OfferingBackendIDEventLogger(EventLogger):
+    full_name = str
+    old_backend_id = str
+    new_backend_id = str
+
+    class Meta:
+        event_types = ('offering_backend_id_changed',)
+        event_groups = {
+            'support': event_types,
+        }
+
+
 event_logger.register('waldur_issue', IssueEventLogger)
 event_logger.register('waldur_attachment', AttachmentEventLogger)
 event_logger.register('waldur_offering', OfferingEventLogger)
+event_logger.register('waldur_offering_backend_id', OfferingBackendIDEventLogger)

@@ -4,7 +4,7 @@ from itertools import groupby
 from typing import Dict
 
 from cinderclient import exceptions as cinder_exceptions
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 from django.utils.crypto import get_random_string
 from django.utils.decorators import method_decorator
@@ -27,6 +27,13 @@ from waldur_openstack.openstack_base.backend import (
 from . import models
 
 logger = logging.getLogger(__name__)
+
+
+VALID_ROUTER_INTERFACE_OWNERS = (
+    'network:router_interface',
+    'network:router_interface_distributed',
+    'network:ha_router_replicated_interface',
+)
 
 
 class OpenStackBackend(BaseOpenStackBackend):
@@ -58,6 +65,8 @@ class OpenStackBackend(BaseOpenStackBackend):
         self.pull_floating_ips()
         self.pull_networks()
         self.pull_subnets()
+        self.pull_routers()
+        self.pull_ports()
 
     def pull_tenants(self):
         keystone = self.keystone_admin_client
@@ -108,6 +117,10 @@ class OpenStackBackend(BaseOpenStackBackend):
         logger.info('Deleted ssh public key %s from backend', key_name)
 
     def _are_rules_equal(self, backend_rule, nc_rule):
+        if backend_rule['ethertype'] != nc_rule.ethertype:
+            return False
+        if backend_rule['direction'] != nc_rule.direction:
+            return False
         if backend_rule['port_range_min'] != nc_rule.from_port:
             return False
         if backend_rule['port_range_max'] != nc_rule.to_port:
@@ -115,6 +128,12 @@ class OpenStackBackend(BaseOpenStackBackend):
         if backend_rule['protocol'] != nc_rule.protocol:
             return False
         if backend_rule['remote_ip_prefix'] != nc_rule.cidr:
+            return False
+        if backend_rule['remote_group_id'] != (
+            nc_rule.remote_group.backend_id if nc_rule.remote_group else None
+        ):
+            return False
+        if backend_rule['description'] != nc_rule.description:
             return False
         return True
 
@@ -158,16 +177,21 @@ class OpenStackBackend(BaseOpenStackBackend):
             models.Flavor.objects.filter(backend_id__in=cur_flavors.keys()).delete()
 
     def pull_images(self):
-        self._pull_images(models.Image, lambda image: image['visibility'] == 'public')
+        self._pull_images(
+            models.Image, lambda image: image['visibility'] == 'public', admin=True
+        )
+
+    def _get_current_volume_types(self):
+        return self._get_current_properties(models.VolumeType)
 
     def pull_volume_types(self):
         try:
-            volume_types = self.cinder_client.volume_types.list(is_public=True)
+            volume_types = self.cinder_admin_client.volume_types.list(is_public=True)
         except cinder_exceptions.ClientException as e:
             raise OpenStackBackendError(e)
 
         with transaction.atomic():
-            cur_volume_types = self._get_current_properties(models.VolumeType)
+            cur_volume_types = self._get_current_volume_types()
             for backend_type in volume_types:
                 cur_volume_types.pop(backend_type.id, None)
                 models.VolumeType.objects.update_or_create(
@@ -257,7 +281,7 @@ class OpenStackBackend(BaseOpenStackBackend):
         for tenant_id, floating_ips in groupby(
             backend_floating_ips, lambda x: x['tenant_id']
         ):
-            tenant_floating_ips[tenant_mappings[tenant_id]] = floating_ips
+            tenant_floating_ips[tenant_mappings[tenant_id]] = list(floating_ips)
 
         with transaction.atomic():
             for tenant, floating_ips in tenant_floating_ips.items():
@@ -360,7 +384,7 @@ class OpenStackBackend(BaseOpenStackBackend):
         for tenant_id, security_groups in groupby(
             backend_security_groups, lambda x: x['tenant_id']
         ):
-            tenant_security_groups[tenant_mappings[tenant_id]] = security_groups
+            tenant_security_groups[tenant_mappings[tenant_id]] = list(security_groups)
 
         with transaction.atomic():
             for tenant, security_groups in tenant_security_groups.items():
@@ -402,7 +426,6 @@ class OpenStackBackend(BaseOpenStackBackend):
         stale_ips.delete()
 
     def _update_tenant_security_groups(self, tenant, backend_security_groups):
-        security_group_uuids = []
         for backend_security_group in backend_security_groups:
             imported_security_group = self._backend_security_group_to_security_group(
                 backend_security_group,
@@ -425,8 +448,30 @@ class OpenStackBackend(BaseOpenStackBackend):
                 )
                 handle_resource_update_success(security_group)
 
-            security_group_uuids.append(security_group.uuid)
             self._extract_security_group_rules(security_group, backend_security_group)
+
+        self._update_remote_security_groups(tenant, backend_security_groups)
+
+    def _update_remote_security_groups(self, tenant, backend_security_groups):
+        security_group_map = {
+            security_group.backend_id: security_group
+            for security_group in models.SecurityGroup.objects.filter(tenant=tenant)
+        }
+        security_group_rule_map = {
+            security_group_rule.backend_id: security_group_rule
+            for security_group_rule in models.SecurityGroupRule.objects.filter(
+                security_group__tenant=tenant
+            )
+        }
+        for backend_security_group in backend_security_groups:
+            for backend_rule in backend_security_group['security_group_rules']:
+                security_group_rule = security_group_rule_map.get(backend_rule['id'])
+                remote_group = security_group_map.get(backend_rule['remote_group_id'])
+                if not security_group_rule:
+                    continue
+                if security_group_rule.remote_group != remote_group:
+                    security_group_rule.remote_group = remote_group
+                    security_group_rule.save(update_fields=['remote_group'])
 
     def _backend_security_group_to_security_group(
         self, backend_security_group, **kwargs
@@ -442,6 +487,110 @@ class OpenStackBackend(BaseOpenStackBackend):
             setattr(security_group, field, value)
 
         return security_group
+
+    def pull_routers(self):
+        for tenant in models.Tenant.objects.filter(
+            state=models.Tenant.States.OK,
+            service_project_link__service__settings=self.settings,
+        ):
+            self.pull_tenant_routers(tenant)
+
+    def pull_tenant_routers(self, tenant):
+        neutron = self.neutron_admin_client
+
+        try:
+            backend_routers = neutron.list_routers(tenant_id=tenant.backend_id)[
+                'routers'
+            ]
+        except neutron_exceptions.NeutronClientException as e:
+            raise OpenStackBackendError(e)
+
+        for backend_router in backend_routers:
+            backend_id = backend_router['id']
+            try:
+                ports = neutron.list_ports(device_id=backend_id)['ports']
+                fixed_ips = []
+                for port in ports:
+                    for fixed_ip in port['fixed_ips']:
+                        fixed_ips.append(fixed_ip['ip_address'])
+            except neutron_exceptions.NeutronClientException as e:
+                raise OpenStackBackendError(e)
+
+            defaults = {
+                'name': backend_router['name'],
+                'description': backend_router['description'],
+                'routes': backend_router['routes'],
+                'fixed_ips': fixed_ips,
+                'service_project_link': tenant.service_project_link,
+                'state': models.Router.States.OK,
+            }
+            try:
+                models.Router.objects.update_or_create(
+                    tenant=tenant, backend_id=backend_id, defaults=defaults
+                )
+            except IntegrityError:
+                logger.warning(
+                    'Could not create router with backend ID %s '
+                    'and tenant %s due to concurrent update.',
+                    backend_id,
+                    tenant,
+                )
+
+        remote_ids = {ip['id'] for ip in backend_routers}
+        stale_routers = models.Router.objects.filter(tenant=tenant).exclude(
+            backend_id__in=remote_ids
+        )
+        stale_routers.delete()
+
+    def pull_ports(self):
+        for tenant in models.Tenant.objects.filter(
+            state=models.Tenant.States.OK,
+            service_project_link__service__settings=self.settings,
+        ):
+            self.pull_tenant_ports(tenant)
+
+    def pull_tenant_ports(self, tenant):
+        neutron = self.neutron_admin_client
+
+        try:
+            backend_ports = neutron.list_ports(tenant_id=tenant.backend_id)['ports']
+        except neutron_exceptions.NeutronClientException as e:
+            raise OpenStackBackendError(e)
+
+        networks = models.Network.objects.filter(tenant=tenant)
+        network_mappings = {network.backend_id: network for network in networks}
+
+        for backend_port in backend_ports:
+            backend_id = backend_port['id']
+            defaults = {
+                'name': backend_port['name'],
+                'description': backend_port['description'],
+                'service_project_link': tenant.service_project_link,
+                'state': models.Port.States.OK,
+                'mac_address': backend_port['mac_address'],
+                'ip4_address': backend_port['fixed_ips'][0]['ip_address']
+                if len(backend_port['fixed_ips']) > 0
+                else '',
+                'allowed_address_pairs': backend_port.get('allowed_address_pairs', []),
+                'network': network_mappings.get(backend_port['network_id']),
+            }
+            try:
+                models.Port.objects.update_or_create(
+                    tenant=tenant, backend_id=backend_id, defaults=defaults
+                )
+            except IntegrityError:
+                logger.warning(
+                    'Could not create or update port with backend ID %s '
+                    'and tenant %s due to concurrent update.',
+                    backend_id,
+                    tenant,
+                )
+
+        remote_ids = {ip['id'] for ip in backend_ports}
+        stale_ports = models.Port.objects.filter(tenant=tenant).exclude(
+            backend_id__in=remote_ids
+        )
+        stale_ports.delete()
 
     def pull_networks(self):
         tenants = (
@@ -506,7 +655,7 @@ class OpenStackBackend(BaseOpenStackBackend):
 
     @method_decorator(create_batch_fetcher)
     def list_networks(self, tenants):
-        neutron = self.neutron_client
+        neutron = self.neutron_admin_client
         try:
             return neutron.list_networks(tenant_id=tenants)['networks']
         except neutron_exceptions.NeutronClientException as e:
@@ -518,6 +667,7 @@ class OpenStackBackend(BaseOpenStackBackend):
             description=backend_network['description'],
             is_external=backend_network['router:external'],
             runtime_state=backend_network['status'],
+            mtu=backend_network.get('mtu'),
             backend_id=backend_network['id'],
             state=models.Network.States.OK,
         )
@@ -532,7 +682,7 @@ class OpenStackBackend(BaseOpenStackBackend):
         return network
 
     def pull_subnets(self, tenant=None, network=None):
-        neutron = self.neutron_client
+        neutron = self.neutron_admin_client
 
         if tenant:
             networks = tenant.networks.all()
@@ -613,6 +763,7 @@ class OpenStackBackend(BaseOpenStackBackend):
             enable_dhcp=backend_subnet['enable_dhcp'],
             gateway_ip=backend_subnet.get('gateway_ip'),
             dns_nameservers=backend_subnet['dns_nameservers'],
+            host_routes=backend_subnet.get('host_routes', []),
             backend_id=backend_subnet['id'],
             state=models.SubNet.States.OK,
         )
@@ -819,11 +970,10 @@ class OpenStackBackend(BaseOpenStackBackend):
             raise OpenStackBackendError(e)
 
         for port in ports.get('ports', []):
-            if 'device_id' in port and port['device_owner'] in [
-                'network:router_interface',
-                'network:router_interface_distributed',
-                'network:ha_router_replicated_interface',
-            ]:
+            if (
+                'device_id' in port
+                and port['device_owner'] in VALID_ROUTER_INTERFACE_OWNERS
+            ):
                 logger.info(
                     "Deleting port %s interface_router from tenant %s",
                     port['id'],
@@ -853,6 +1003,34 @@ class OpenStackBackend(BaseOpenStackBackend):
                     port['id'],
                     tenant.backend_id,
                 )
+            except neutron_exceptions.NeutronClientException as e:
+                raise OpenStackBackendError(e)
+
+    @log_backend_action()
+    def delete_tenant_routes(self, tenant):
+        if not tenant.backend_id:
+            # This method will remove all routers if tenant `backend_id` is not defined.
+            raise OpenStackBackendError(
+                'This method should not be called if tenant has no backend_id'
+            )
+
+        neutron = self.neutron_admin_client
+
+        try:
+            routers = neutron.list_routers(tenant_id=tenant.backend_id)
+        except neutron_exceptions.NeutronClientException as e:
+            raise OpenStackBackendError(e)
+
+        for router in routers.get('routers', []):
+            if not router['routes']:
+                continue
+            logger.info(
+                "Deleting routes for router %s from tenant %s",
+                router['id'],
+                tenant.backend_id,
+            )
+            try:
+                neutron.update_router(router['id'], {'router': {'routes': []}})
             except neutron_exceptions.NeutronClientException as e:
                 raise OpenStackBackendError(e)
 
@@ -1125,9 +1303,6 @@ class OpenStackBackend(BaseOpenStackBackend):
         backend_rules = {
             rule['id']: self._normalize_security_group_rule(rule)
             for rule in backend_security_group['security_group_rules']
-            # TODO: Currently only security group rules for incoming traffic can be created
-            # Therefore we should not modify security group rules for outgoing traffic
-            if rule['direction'] == 'ingress'
         }
 
         # list of nc rules, that do not exist in openstack
@@ -1201,8 +1376,8 @@ class OpenStackBackend(BaseOpenStackBackend):
                     {
                         'security_group_rule': {
                             'security_group_id': security_group.backend_id,
-                            # XXX: Currently only security groups for incoming traffic can be created
-                            'direction': 'ingress',
+                            'ethertype': nc_rule.ethertype,
+                            'direction': nc_rule.direction,
                             'protocol': nc_rule_protocol,
                             'port_range_min': nc_rule.from_port
                             if nc_rule.from_port != -1
@@ -1211,6 +1386,10 @@ class OpenStackBackend(BaseOpenStackBackend):
                             if nc_rule.to_port != -1
                             else None,
                             'remote_ip_prefix': nc_rule.cidr,
+                            'remote_group_id': nc_rule.remote_group.backend_id
+                            if nc_rule.remote_group
+                            else None,
+                            'description': nc_rule.description,
                         }
                     }
                 )
@@ -1272,9 +1451,12 @@ class OpenStackBackend(BaseOpenStackBackend):
 
         connected_instances = set()
         for instance in instances:
-            for group in instance.security_groups:
-                if security_group.name == group['name']:
-                    connected_instances.add(instance.id)
+            if hasattr(
+                instance, 'security_groups'
+            ):  # can be missing if instance is being deleted
+                for group in instance.security_groups:
+                    if security_group.name == group['name']:
+                        connected_instances.add(instance.id)
         return connected_instances
 
     def detach_security_group_from_instance(self, group_id, server_id):
@@ -1301,6 +1483,16 @@ class OpenStackBackend(BaseOpenStackBackend):
                 security_group.backend_id, {'security_group': data}
             )
             self.push_security_group_rules(security_group)
+        except neutron_exceptions.NeutronClientException as e:
+            raise OpenStackBackendError(e)
+
+    @log_backend_action()
+    def set_static_routes(self, router):
+        neutron = self.neutron_client
+        try:
+            neutron.update_router(
+                router.backend_id, {'router': {'routes': router.routes}}
+            )
         except neutron_exceptions.NeutronClientException as e:
             raise OpenStackBackendError(e)
 
@@ -1353,15 +1545,21 @@ class OpenStackBackend(BaseOpenStackBackend):
             network.tenant.internal_network_id = network.backend_id
             network.tenant.save()
 
-    @log_backend_action()
-    def update_network(self, network):
+    def _update_network(self, network_id, data):
         neutron = self.neutron_admin_client
 
-        data = {'name': network.name}
         try:
-            neutron.update_network(network.backend_id, {'network': data})
+            neutron.update_network(network_id, {'network': data})
         except neutron_exceptions.NeutronException as e:
             raise OpenStackBackendError(e)
+
+    @log_backend_action()
+    def update_network(self, network):
+        self._update_network(network.backend_id, {'name': network.name})
+
+    @log_backend_action()
+    def set_network_mtu(self, network):
+        self._update_network(network.backend_id, {'mtu': network.mtu})
 
     @log_backend_action()
     def delete_network(self, network):
@@ -1422,7 +1620,12 @@ class OpenStackBackend(BaseOpenStackBackend):
         }
         if subnet.dns_nameservers:
             data['dns_nameservers'] = subnet.dns_nameservers
-        data.update(self._serialize_subnet_gateway(subnet))
+        if subnet.host_routes:
+            data['host_routes'] = subnet.host_routes
+        if subnet.disable_gateway:
+            data['gateway_ip'] = None
+        elif subnet.gateway_ip:
+            data['gateway_ip'] = subnet.gateway_ip
         try:
             response = neutron.create_subnet({'subnets': [data]})
             backend_subnet = response['subnets'][0]
@@ -1447,36 +1650,45 @@ class OpenStackBackend(BaseOpenStackBackend):
         else:
             self.connect_subnet(subnet)
 
-        data = {'name': subnet.name}
-        data.update(self._serialize_subnet_gateway(subnet))
+        data = {
+            'name': subnet.name,
+            'dns_nameservers': subnet.dns_nameservers,
+            'host_routes': subnet.host_routes,
+        }
+
+        # We should send gateway_ip only when it is changed, because
+        # updating gateway_ip is prohibited when the ip is used.
+        try:
+            backend_subnet = neutron.show_subnet(subnet.backend_id)['subnet']
+        except neutron_exceptions.NeutronClientException as e:
+            raise OpenStackBackendError(e)
+
+        if backend_subnet['gateway_ip'] != subnet.gateway_ip:
+            data['gateway_ip'] = subnet.gateway_ip
+
         try:
             neutron.update_subnet(subnet.backend_id, {'subnet': data})
         except neutron_exceptions.NeutronException as e:
             raise OpenStackBackendError(e)
 
-    def _serialize_subnet_gateway(self, subnet):
-        data = {}
-        if subnet.disable_gateway:
-            data['gateway_ip'] = None
-        elif subnet.gateway_ip:
-            data['gateway_ip'] = subnet.gateway_ip
-        return data
-
     def disconnect_subnet(self, subnet):
         neutron = self.neutron_admin_client
         try:
-            ports = neutron.list_ports(
-                network_id=subnet.network.backend_id,
-                device_owner='network:router_interface',
-            )['ports']
+            ports = neutron.list_ports(network_id=subnet.network.backend_id)['ports']
 
             for port in ports:
+                if port['device_owner'] not in VALID_ROUTER_INTERFACE_OWNERS:
+                    continue
                 neutron.remove_interface_router(
                     port['device_id'], {'subnet_id': subnet.backend_id}
                 )
 
         except neutron_exceptions.NeutronClientException as e:
             raise OpenStackBackendError(e)
+
+        else:
+            subnet.is_connected = False
+            subnet.save(update_fields=['is_connected'])
 
     def connect_subnet(self, subnet):
         try:
@@ -1488,6 +1700,9 @@ class OpenStackBackend(BaseOpenStackBackend):
             )
         except neutron_exceptions.NeutronException as e:
             raise OpenStackBackendError(e)
+        else:
+            subnet.is_connected = True
+            subnet.save(update_fields=['is_connected'])
 
     @log_backend_action()
     def delete_subnet(self, subnet):
@@ -1507,17 +1722,40 @@ class OpenStackBackend(BaseOpenStackBackend):
         except neutron_exceptions.NeutronClientException as e:
             raise OpenStackBackendError(e)
 
+        is_connected = self.is_subnet_connected(
+            backend_subnet['id'], backend_subnet['network_id']
+        )
+
         subnet = models.SubNet(
             name=backend_subnet['name'],
             description=backend_subnet['description'],
             allocation_pools=backend_subnet['allocation_pools'],
+            host_routes=backend_subnet['host_routes'],
+            dns_nameservers=backend_subnet['dns_nameservers'],
             cidr=backend_subnet['cidr'],
             ip_version=backend_subnet.get('ip_version'),
             gateway_ip=backend_subnet.get('gateway_ip'),
             enable_dhcp=backend_subnet.get('enable_dhcp', False),
             state=models.Network.States.OK,
+            is_connected=is_connected,
         )
         return subnet
+
+    def is_subnet_connected(self, subnet_backend_id, subnet_network_backend_id):
+        neutron = self.neutron_admin_client
+
+        try:
+            ports = neutron.list_ports(network_id=subnet_network_backend_id)['ports']
+        except neutron_exceptions.NeutronClientException as e:
+            raise OpenStackBackendError(e)
+
+        for port in ports:
+            if port['device_owner'] not in VALID_ROUTER_INTERFACE_OWNERS:
+                continue
+            for fixed_ip in port['fixed_ips']:
+                if fixed_ip['subnet_id'] == subnet_backend_id:
+                    return True
+        return False
 
     @log_backend_action()
     def pull_subnet(self, subnet):
@@ -1526,15 +1764,9 @@ class OpenStackBackend(BaseOpenStackBackend):
 
         subnet.refresh_from_db()
         if subnet.modified < import_time:
-            update_fields = (
-                'name',
-                'cidr',
-                'allocation_pools',
-                'ip_version',
-                'gateway_ip',
-                'enable_dhcp',
+            update_pulled_fields(
+                subnet, imported_subnet, models.SubNet.get_backend_fields()
             )
-            update_pulled_fields(subnet, imported_subnet, update_fields)
 
     @log_backend_action('pull floating ip')
     def pull_floating_ip(self, floating_ip):

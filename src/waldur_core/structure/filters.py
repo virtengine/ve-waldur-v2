@@ -109,9 +109,24 @@ class CustomerFilter(NameFilterSet):
     native_name = django_filters.CharFilter(lookup_expr='icontains')
     abbreviation = django_filters.CharFilter(lookup_expr='icontains')
     contact_details = django_filters.CharFilter(lookup_expr='icontains')
-    division_uuid = django_filters.UUIDFilter(field_name='division__uuid')
+    division_uuid = django_filters.ModelMultipleChoiceFilter(
+        field_name='division__uuid',
+        label='division_uuid',
+        to_field_name='uuid',
+        queryset=models.Division.objects.all(),
+    )
     division_name = django_filters.CharFilter(
         field_name='division__name', lookup_expr='icontains'
+    )
+    division_type_uuid = django_filters.ModelMultipleChoiceFilter(
+        field_name='division__type__uuid',
+        label='division_type_uuid',
+        to_field_name='uuid',
+        queryset=models.DivisionType.objects.all(),
+    )
+
+    division_type_name = django_filters.CharFilter(
+        field_name='division__type__name', lookup_expr='icontains'
     )
 
     class Meta:
@@ -290,11 +305,7 @@ def filter_visible_users(queryset, user, extra=None):
         projectpermission__is_active=True,
     )
 
-    queryset = (
-        queryset.filter(is_staff=False)
-        .filter(subquery | Q(uuid=user.uuid) | (extra or Q()))
-        .distinct()
-    )
+    queryset = queryset.filter(subquery | Q(uuid=user.uuid) | (extra or Q())).distinct()
 
     if not (user.is_staff or user.is_support):
         queryset = queryset.filter(is_active=True, is_staff=False)
@@ -454,6 +465,18 @@ class CustomerPermissionFilter(UserPermissionFilter):
     customer_url = core_filters.URLFilter(
         view_name='customer-detail', field_name='customer__uuid',
     )
+
+
+class CustomerPermissionReviewFilter(django_filters.FilterSet):
+    customer_uuid = django_filters.UUIDFilter(field_name='customer__uuid')
+    reviewer_uuid = django_filters.UUIDFilter(field_name='reviewer__uuid')
+    o = django_filters.OrderingFilter(fields=('created', 'closed'))
+
+    class Meta:
+        model = models.CustomerPermissionReview
+        fields = [
+            'is_pending',
+        ]
 
 
 class SshKeyFilter(NameFilterSet):
@@ -823,10 +846,22 @@ class ResourceSummaryFilterBackend(core_filters.SummaryFilter):
 
 class DivisionFilter(NameFilterSet):
     type = django_filters.CharFilter(field_name='type__name', lookup_expr='iexact')
+    type_uuid = django_filters.UUIDFilter(field_name='type__uuid')
+    type_url = core_filters.URLFilter(
+        view_name='division-type-detail', field_name='type__uuid',
+    )
     parent = django_filters.UUIDFilter(field_name='parent__uuid')
 
     class Meta:
         model = models.Division
+        fields = [
+            'name',
+        ]
+
+
+class DivisionTypesFilter(NameFilterSet):
+    class Meta:
+        model = models.DivisionType
         fields = [
             'name',
         ]

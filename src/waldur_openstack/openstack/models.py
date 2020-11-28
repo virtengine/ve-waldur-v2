@@ -1,5 +1,6 @@
 from urllib.parse import urlparse
 
+from django.core import validators
 from django.db import models
 from django.template.defaultfilters import slugify
 from django.utils.translation import ugettext_lazy as _
@@ -161,6 +162,13 @@ class SecurityGroupRule(openstack_base_models.BaseSecurityGroupRule):
     security_group = models.ForeignKey(
         on_delete=models.CASCADE, to=SecurityGroup, related_name='rules'
     )
+    remote_group = models.ForeignKey(
+        on_delete=models.CASCADE,
+        to=SecurityGroup,
+        related_name='+',
+        null=True,
+        blank=True,
+    )
 
 
 class FloatingIP(core_models.RuntimeStateMixin, structure_models.SubResource):
@@ -306,6 +314,24 @@ class Tenant(structure_models.PrivateCloud):
             return limit
 
 
+class Router(structure_models.SubResource):
+    service_project_link = models.ForeignKey(
+        OpenStackServiceProjectLink, related_name='routers', on_delete=models.PROTECT
+    )
+    tenant: Tenant = models.ForeignKey(
+        on_delete=models.CASCADE, to=Tenant, related_name='routers'
+    )
+    routes = JSONField(default=list)
+    fixed_ips = JSONField(default=list)
+
+    def get_backend(self):
+        return self.tenant.get_backend()
+
+    @classmethod
+    def get_url_name(cls):
+        return 'openstack-router'
+
+
 class Network(core_models.RuntimeStateMixin, structure_models.SubResource):
     service_project_link = models.ForeignKey(
         OpenStackServiceProjectLink, related_name='networks', on_delete=models.PROTECT
@@ -316,6 +342,16 @@ class Network(core_models.RuntimeStateMixin, structure_models.SubResource):
     is_external = models.BooleanField(default=False)
     type = models.CharField(max_length=50, blank=True)
     segmentation_id = models.IntegerField(null=True)
+    mtu = models.IntegerField(
+        null=True,
+        help_text=_(
+            'The maximum transmission unit (MTU) value to address fragmentation.'
+        ),
+        validators=[
+            validators.MinValueValidator(68),
+            validators.MaxValueValidator(9000),
+        ],
+    )
 
     def get_backend(self):
         return self.tenant.get_backend()
@@ -341,25 +377,20 @@ class Network(core_models.RuntimeStateMixin, structure_models.SubResource):
             'type',
             'segmentation_id',
             'runtime_state',
+            'mtu',
         )
 
 
-class SubNet(structure_models.SubResource):
+class SubNet(openstack_base_models.BaseSubNet, structure_models.SubResource):
     service_project_link = models.ForeignKey(
         OpenStackServiceProjectLink, related_name='subnets', on_delete=models.PROTECT
     )
     network = models.ForeignKey(
         on_delete=models.CASCADE, to=Network, related_name='subnets'
     )
-    cidr = models.CharField(max_length=32, blank=True)
-    gateway_ip = models.GenericIPAddressField(protocol='IPv4', null=True)
-    allocation_pools = JSONField(default=dict)
-    ip_version = models.SmallIntegerField(default=4)
     disable_gateway = models.BooleanField(default=False)
-    enable_dhcp = models.BooleanField(default=True)
-    dns_nameservers = JSONField(
-        default=list,
-        help_text=_('List of DNS name servers associated with the subnet.'),
+    host_routes = JSONField(
+        default=list, help_text=_('List of additional routes for the subnet.'),
     )
 
     class Meta:
@@ -392,7 +423,29 @@ class SubNet(structure_models.SubResource):
             'enable_dhcp',
             'gateway_ip',
             'dns_nameservers',
+            'host_routes',
+            'is_connected',
         )
+
+
+class Port(structure_models.SubResource, openstack_base_models.Port):
+    service_project_link = models.ForeignKey(
+        OpenStackServiceProjectLink, related_name='ports', on_delete=models.CASCADE
+    )
+    tenant: Tenant = models.ForeignKey(
+        on_delete=models.CASCADE, to=Tenant, related_name='ports'
+    )
+    network = models.ForeignKey(
+        on_delete=models.CASCADE,
+        to=Network,
+        related_name='ports',
+        null=True,
+        blank=True,
+    )
+
+    @classmethod
+    def get_url_name(cls):
+        return 'openstack-port'
 
 
 class CustomerOpenStack(TimeStampedModel):

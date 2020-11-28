@@ -2,11 +2,13 @@ import mock
 from ddt import data, ddt
 from django.core import mail, signing
 from django.test import override_settings
+from django.urls import reverse
 from rest_framework import status
 
 from waldur_core.core import utils as core_utils
 
 from .. import models, tasks
+from ..backend.atlassian import ServiceDeskBackend
 from . import base, factories
 
 
@@ -29,6 +31,15 @@ class FeedbackCreateTest(base.BaseTest):
             data={'evaluation': models.Feedback.Evaluation.POSITIVE, 'token': token},
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_comment_has_been_created_if_feedback_has_been_synchronized(self):
+        with mock.patch.object(ServiceDeskBackend, 'create_comment'):
+            backend = ServiceDeskBackend()
+            feedback = factories.FeedbackFactory(comment='Test Feedback', evaluation=0)
+            backend.create_feedback(feedback)
+            self.assertTrue(
+                models.Feedback.objects.filter(issue=feedback.issue).exists()
+            )
 
     def test_user_cannot_create_feedback_if_token_is_wrong(self):
         url = factories.FeedbackFactory.get_list_url()
@@ -76,3 +87,45 @@ class FeedbackNotificationTest(base.BaseTest):
         serialized_issue = core_utils.serialize_instance(issue)
         tasks.send_issue_feedback_notification(serialized_issue)
         self.assertEqual(len(mail.outbox), 1)
+
+
+@ddt
+class FeedbackReportTest(base.BaseTest):
+    def setUp(self):
+        super(FeedbackReportTest, self).setUp()
+        factories.FeedbackFactory(evaluation=models.Feedback.Evaluation.POSITIVE)
+        factories.FeedbackFactory(evaluation=models.Feedback.Evaluation.NEGATIVE)
+        self.avg = round(
+            (models.Feedback.Evaluation.POSITIVE + models.Feedback.Evaluation.NEGATIVE)
+            / 2,
+            2,
+        )
+
+    @data(
+        'staff', 'global_support',
+    )
+    def test_user_can_get_report(self, user):
+        if user:
+            self.client.force_authenticate(getattr(self.fixture, user))
+            url_report = reverse('support-feedback-report')
+            response = self.client.get(url_report)
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertTrue(response.data, {'Positive': 1, 'Negative': 1})
+
+            url_average = reverse('support-feedback-average-report')
+            response = self.client.get(url_average)
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertTrue(response.data, self.avg)
+
+    @data(
+        'owner', 'admin', 'manager', 'user', '',
+    )
+    def test_user_can_not_get_report(self, user):
+        if user:
+            self.client.force_authenticate(getattr(self.fixture, user))
+            url_report = reverse('support-feedback-report')
+            response = self.client.get(url_report)
+            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+            url_average = reverse('support-feedback-average-report')
+            response = self.client.get(url_average)
+            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)

@@ -3,25 +3,44 @@ from django.db import models
 from django.utils.translation import ugettext_lazy as _
 
 from waldur_core.core import models as core_models
+from waldur_core.core.fields import JSONField
 from waldur_core.structure import models as structure_models
 
 
-class BaseSecurityGroupRule(models.Model):
+class BaseSecurityGroupRule(core_models.DescribableMixin, models.Model):
     TCP = 'tcp'
     UDP = 'udp'
     ICMP = 'icmp'
 
-    CHOICES = (
+    PROTOCOLS = (
         (TCP, 'tcp'),
         (UDP, 'udp'),
         (ICMP, 'icmp'),
     )
 
+    INGRESS = 'ingress'
+    EGRESS = 'egress'
+
+    DIRECTIONS = (
+        (INGRESS, 'ingress'),
+        (EGRESS, 'egress'),
+    )
+
+    IPv4 = 'IPv4'
+    IPv6 = 'IPv6'
+
+    ETHER_TYPES = (
+        (IPv4, 'IPv4'),
+        (IPv6, 'IPv6'),
+    )
+
     # Empty string represents any protocol
-    protocol = models.CharField(max_length=4, blank=True, choices=CHOICES)
+    protocol = models.CharField(max_length=4, blank=True, choices=PROTOCOLS)
     from_port = models.IntegerField(validators=[MaxValueValidator(65535)], null=True)
     to_port = models.IntegerField(validators=[MaxValueValidator(65535)], null=True)
-    cidr = models.CharField(max_length=32, blank=True)
+    cidr = models.CharField(max_length=32, blank=True, null=True)
+    direction = models.CharField(max_length=8, default=INGRESS, choices=DIRECTIONS)
+    ethertype = models.CharField(max_length=8, default=IPv4, choices=ETHER_TYPES)
 
     backend_id = models.CharField(max_length=128, blank=True)
 
@@ -45,6 +64,13 @@ class Port(core_models.BackendModelMixin, models.Model):
     ip6_address = models.GenericIPAddressField(null=True, blank=True, protocol='IPv6')
     backend_id = models.CharField(max_length=255, blank=True)
 
+    allowed_address_pairs = JSONField(
+        default=list,
+        help_text=_(
+            'A server can send a packet with source address which matches one of the specified allowed address pairs.'
+        ),
+    )
+
     class Meta:
         abstract = True
 
@@ -57,6 +83,7 @@ class Port(core_models.BackendModelMixin, models.Model):
             'ip4_address',
             'ip6_address',
             'mac_address',
+            'allowed_address_pairs',
         )
 
 
@@ -83,3 +110,21 @@ class BaseVolumeType(core_models.DescribableMixin, structure_models.ServicePrope
 
     def __str__(self):
         return self.name
+
+
+class BaseSubNet(models.Model):
+    class Meta:
+        abstract = True
+
+    cidr = models.CharField(max_length=32, blank=True)
+    gateway_ip = models.GenericIPAddressField(protocol='IPv4', null=True)
+    allocation_pools = JSONField(default=dict)
+    ip_version = models.SmallIntegerField(default=4)
+    enable_dhcp = models.BooleanField(default=True)
+    dns_nameservers = JSONField(
+        default=list,
+        help_text=_('List of DNS name servers associated with the subnet.'),
+    )
+    is_connected = models.BooleanField(
+        default=True, help_text=_('Is subnet connected to the default tenant router.')
+    )

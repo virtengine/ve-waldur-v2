@@ -11,10 +11,7 @@ from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.plugins import manager
 from waldur_mastermind.marketplace_slurm import PLUGIN_NAME
 from waldur_mastermind.slurm_invoices import models as slurm_invoices_models
-from waldur_slurm import models as slurm_models
 from waldur_slurm.apps import SlurmConfig
-
-from . import utils
 
 logger = logging.getLogger(__name__)
 
@@ -109,13 +106,31 @@ def _create_slurm_usage(instance):
                 .filter(Q(end__gt=date) | Q(end__isnull=True))
                 .get(resource=resource)
             )
-            marketplace_models.ComponentUsage.objects.create(
+
+            (
+                component_usage,
+                created,
+            ) = marketplace_models.ComponentUsage.objects.update_or_create(
                 resource=resource,
                 component=plan_component,
-                usage=usage,
-                date=date,
                 billing_period=month_start(date),
                 plan_period=plan_period,
+                defaults={"usage": usage, "date": date,},
+            )
+
+            if created:
+                operation: str = 'created'
+            else:
+                operation: str = 'updated'
+
+            logger.debug(
+                'marketplace.ComponentUsage [%s] was %s for resource [%s] '
+                'with usage = [%s] for date [%s]',
+                component_usage,
+                operation,
+                resource,
+                usage,
+                date,
             )
         except django_exceptions.ObjectDoesNotExist:
             logger.warning(
@@ -170,15 +185,3 @@ def update_component_quota(sender, instance, created=False, **kwargs):
             marketplace_models.ComponentQuota.objects.create(
                 resource=resource, component=plan_component, limit=limit, usage=usage
             )
-
-
-def add_component_usage(sender, instance, created=False, **kwargs):
-    component_usage = instance
-
-    if not created and not component_usage.tracker.has_changed('usage'):
-        return
-
-    if not isinstance(component_usage.resource.scope, slurm_models.Allocation):
-        return
-
-    utils.component_usage_register(component_usage)

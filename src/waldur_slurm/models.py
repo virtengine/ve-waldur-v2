@@ -4,6 +4,7 @@ from django.db import models
 from django.utils.translation import ugettext_lazy as _
 from model_utils import FieldTracker
 
+from waldur_core.core import models as core_models
 from waldur_core.structure import models as structure_models
 from waldur_slurm import mixins as slurm_mixins
 from waldur_slurm import utils
@@ -44,6 +45,7 @@ class SlurmServiceProjectLink(structure_models.ServiceProjectLink):
 
 
 SLURM_ALLOCATION_REGEX = 'a-zA-Z0-9-_'
+SLURM_ALLOCATION_NAME_MAX_LEN = 34
 
 
 class Allocation(structure_models.NewResource):
@@ -96,7 +98,7 @@ class Allocation(structure_models.NewResource):
         return get_batch_service(self.service_project_link.service.settings)
 
 
-class AllocationUsage(slurm_mixins.UsageMixin):
+class AllocationUsage(slurm_mixins.UsageMixin, core_models.UuidMixin):
     class Permissions:
         customer_path = 'allocation__service_project_link__project__customer'
         project_path = 'allocation__service_project_link__project'
@@ -112,6 +114,14 @@ class AllocationUsage(slurm_mixins.UsageMixin):
         validators=[MinValueValidator(1), MaxValueValidator(12)]
     )
 
+    tracker = FieldTracker()
+
+    def __str__(self):
+        return "%s [%s-%s]" % (self.allocation.name, self.month, self.year)
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
 
 class AllocationUserUsage(slurm_mixins.UsageMixin):
     """
@@ -125,3 +135,9 @@ class AllocationUserUsage(slurm_mixins.UsageMixin):
     )
 
     username = models.CharField(max_length=32)
+
+    def __str__(self):
+        return "%s: %s" % (self.username, self.allocation_usage.allocation.name)
+
+    def __repr__(self) -> str:
+        return self.__str__()

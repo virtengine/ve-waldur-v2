@@ -5,7 +5,7 @@ from io import BytesIO
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.postgres.fields import JSONField as BetterJSONField
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator, RegexValidator
 from django.db import models
 from django.db.models import Q
@@ -21,13 +21,13 @@ from waldur_core.core import mixins as core_mixins
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
 from waldur_core.core import validators as core_validators
-from waldur_core.core.fields import JSONField
 from waldur_core.logging.loggers import LoggableMixin
 from waldur_core.media.models import get_upload_path
 from waldur_core.media.validators import ImageValidator
 from waldur_core.quotas import fields as quotas_fields
 from waldur_core.quotas import models as quotas_models
 from waldur_core.structure import models as structure_models
+from waldur_geo_ip.mixins import CoordinatesMixin
 from waldur_pid import mixins as pid_mixins
 
 from ..common import mixins as common_mixins
@@ -264,11 +264,13 @@ class Offering(
     core_models.NameMixin,
     core_models.DescribableMixin,
     quotas_models.QuotaModelMixin,
+    structure_models.PermissionMixin,
     structure_models.StructureModel,
     TimeStampedModel,
     core_mixins.ScopeMixin,
     LoggableMixin,
     pid_mixins.DataciteMixin,
+    CoordinatesMixin,
 ):
     class States:
         DRAFT = 1
@@ -299,7 +301,7 @@ class Offering(
     category = models.ForeignKey(
         on_delete=models.CASCADE, to=Category, related_name='offerings'
     )
-    customer = models.ForeignKey(
+    customer: structure_models.Customer = models.ForeignKey(
         on_delete=models.CASCADE,
         to=structure_models.Customer,
         related_name='+',
@@ -329,14 +331,6 @@ class Offering(
         default=dict,
         help_text=_(
             'Private data used by specific plugin, such as credentials and hooks.'
-        ),
-    )
-    geolocations = JSONField(
-        default=list,
-        blank=True,
-        help_text=_(
-            'List of latitudes and longitudes. For example: '
-            '[{"latitude": 123, "longitude": 345}, {"latitude": 456, "longitude": 678}]'
         ),
     )
 
@@ -389,6 +383,10 @@ class Offering(
     def archive(self):
         pass
 
+    @transition(field=state, source='*', target=States.DRAFT)
+    def draft(self):
+        pass
+
     def __str__(self):
         return str(self.name)
 
@@ -429,6 +427,17 @@ class Offering(
         return settings.WALDUR_MARKETPLACE['OFFERING_LINK_TEMPLATE'].format(
             offering_uuid=self.uuid.hex
         )
+
+    def can_manage_role(self, user, role=None, timestamp=False):
+        if not self.shared:
+            return False
+        return user.is_staff or self.customer.has_user(
+            user, structure_models.CustomerRole.OWNER, timestamp
+        )
+
+    def get_users(self, role=None):
+        query = Q(offeringpermission__offering=self, offeringpermission__is_active=True)
+        return get_user_model().objects.filter(query).order_by('username')
 
 
 class OfferingComponent(
@@ -484,6 +493,8 @@ class OfferingComponent(
     limit_amount = models.IntegerField(blank=True, null=True)
     max_value = models.IntegerField(blank=True, null=True)
     min_value = models.IntegerField(blank=True, null=True)
+    is_boolean = models.BooleanField(default=False)
+    default_limit = models.IntegerField(blank=True, null=True)
     disable_quotas = models.BooleanField(
         default=False,
         help_text=_(
@@ -590,6 +601,10 @@ class Plan(
 
     def __str__(self):
         return str(self.name)
+
+    @property
+    def fixed_price(self):
+        return self.sum_components(OfferingComponent.BillingTypes.FIXED)
 
     @property
     def init_price(self):
@@ -719,6 +734,20 @@ class RequestTypeMixin(CostEstimateMixin):
                 self.cost += self.plan.init_price
             elif self.type == RequestTypeMixin.Types.UPDATE:
                 self.cost += self.plan.switch_price
+
+    @property
+    def fixed_price(self):
+        if self.type == RequestTypeMixin.Types.CREATE:
+            return self.plan.fixed_price
+        return 0
+
+    @property
+    def activation_price(self):
+        if self.type == RequestTypeMixin.Types.CREATE:
+            return self.plan.init_price
+        elif self.type == RequestTypeMixin.Types.UPDATE:
+            return self.plan.switch_price
+        return 0
 
 
 class CartItem(core_models.UuidMixin, TimeStampedModel, RequestTypeMixin):
@@ -892,10 +921,13 @@ class Order(core_models.UuidMixin, TimeStampedModel, LoggableMixin):
         return context
 
     def __str__(self):
-        return 'project: %s, created by: %s' % (
-            self.project.name,
-            self.created_by.username,
-        )
+        try:
+            return 'project: %s, created by: %s' % (
+                self.project.name,
+                self.created_by.username,
+            )
+        except (KeyError, ObjectDoesNotExist):
+            return f'<Order {self.pk}>'
 
 
 class Resource(
@@ -988,6 +1020,11 @@ class Resource(
         if self.scope:
             return self.scope.get_scope_type()
 
+    @property
+    def backend_id(self):
+        if self.scope:
+            return self.scope.backend_id
+
     def init_quotas(self):
         if self.limits:
             components_map = self.offering.get_usage_components()
@@ -1017,7 +1054,12 @@ class Resource(
         )
 
     def __str__(self):
-        return str(self.name)
+        if self.name:
+            return f'{self.name} ({self.offering.name})'
+        if self.scope:
+            return f'{self.name} ({self.content_type} / {self.object_id})'
+
+        return f'{self.uuid} ({self.offering.name})'
 
 
 class ResourcePlanPeriod(TimeStampedModel, TimeFramedModel, core_models.UuidMixin):
@@ -1191,7 +1233,7 @@ class ComponentQuota(models.Model):
 
 
 class ComponentUsage(
-    TimeStampedModel, core_models.DescribableMixin, core_models.UuidMixin
+    TimeStampedModel, core_models.DescribableMixin, core_models.UuidMixin, LoggableMixin
 ):
     resource = models.ForeignKey(
         on_delete=models.CASCADE, to=Resource, related_name='usages'
@@ -1221,6 +1263,9 @@ class ComponentUsage(
 
     def __str__(self):
         return 'resource: %s, component: %s' % (self.resource.name, self.component.name)
+
+    def get_log_fields(self):
+        return ('uuid', 'description', 'usage', 'date', 'resource', 'component')
 
 
 class AggregateResourceCount(core_mixins.ScopeMixin):
@@ -1261,3 +1306,23 @@ class OfferingFile(
 
     def __str__(self):
         return 'offering: %s' % self.offering
+
+
+class OfferingPermission(core_models.UuidMixin, structure_models.BasePermission):
+    class Meta:
+        unique_together = ('offering', 'user', 'is_active')
+
+    class Permissions:
+        customer_path = 'offering__customer'
+
+    offering: Offering = models.ForeignKey(
+        on_delete=models.CASCADE, to=Offering, related_name='permissions'
+    )
+    tracker = FieldTracker(fields=['expiration_time'])
+
+    @classmethod
+    def get_url_name(cls):
+        return 'marketplace-offering-permission'
+
+    def revoke(self):
+        self.offering.remove_user(self.user)

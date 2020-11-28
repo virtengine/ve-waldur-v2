@@ -4,7 +4,7 @@ from . import views
 
 
 def register_in(router):
-    router.register(r'rancher', views.ServiceViewSet, basename='rancher')
+    router.register(r'rancher', views.RancherServiceViewSet, basename='rancher')
     router.register(
         r'rancher-spl', views.ServiceProjectLinkViewSet, basename='rancher-spl'
     )
@@ -24,6 +24,23 @@ def register_in(router):
     router.register(
         r'rancher-templates', views.TemplateViewSet, basename='rancher-template'
     )
+    router.register(r'rancher-users', views.UserViewSet, basename='rancher-user')
+    router.register(
+        r'rancher-workloads', views.WorkloadViewSet, basename='rancher-workload'
+    )
+    router.register(r'rancher-hpas', views.HPAViewSet, basename='rancher-hpa')
+    router.register(
+        r'rancher-cluster-templates',
+        views.ClusterTemplateViewSet,
+        basename='rancher-cluster-template',
+    )
+    router.register(r'rancher-apps', views.ApplicationViewSet, basename='rancher-app')
+    router.register(
+        r'rancher-ingresses', views.IngressViewSet, basename='rancher-ingress'
+    )
+    router.register(
+        r'rancher-services', views.ServiceViewSet, basename='rancher-service'
+    )
 
 
 urlpatterns = [
@@ -31,5 +48,4 @@ urlpatterns = [
         r'^api/rancher-template-versions/(?P<template_uuid>[a-f0-9]+)/(?P<version>[0-9.]+)/$',
         views.TemplateVersionView.as_view(),
     ),
-    url(r'^api/rancher-apps/$', views.ApplicationViewSet.as_view()),
 ]

@@ -9,17 +9,14 @@ from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils.translation import ugettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
-from rest_framework import decorators, response
-from rest_framework import serializers as rf_serializers
-from rest_framework import status
+from rest_framework import decorators, response, status
 from rest_framework.exceptions import MethodNotAllowed, ValidationError
-from rest_framework.generics import GenericAPIView
 from rest_framework.permissions import SAFE_METHODS
 from rest_framework.views import APIView
 
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
-from waldur_core.core.utils import is_uuid_like
+from waldur_core.structure import exceptions as structure_exceptions
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure import views as structure_views
@@ -29,14 +26,14 @@ from waldur_core.structure.permissions import is_administrator
 from waldur_rancher.apps import RancherConfig
 from waldur_rancher.exceptions import RancherException
 
-from . import exceptions, executors, filters, models, serializers, validators
+from . import exceptions, executors, filters, models, serializers, utils, validators
 
 logger = logging.getLogger(__name__)
 
 
-class ServiceViewSet(structure_views.BaseServiceViewSet):
+class RancherServiceViewSet(structure_views.BaseServiceViewSet):
     queryset = models.RancherService.objects.all()
-    serializer_class = serializers.ServiceSerializer
+    serializer_class = serializers.RancherServiceSerializer
 
 
 class ServiceProjectLinkViewSet(structure_views.BaseServiceProjectLinkViewSet):
@@ -68,6 +65,7 @@ class ClusterViewSet(
         cluster = serializer.save()
         user = self.request.user
         nodes = serializer.validated_data.get('node_set')
+        install_longhorn = serializer.validated_data['install_longhorn']
 
         for node_data in nodes:
             node_data['cluster'] = cluster
@@ -75,7 +73,10 @@ class ClusterViewSet(
 
         transaction.on_commit(
             lambda: executors.ClusterCreateExecutor.execute(
-                cluster, user=user, is_heavy_task=True,
+                cluster,
+                user=user,
+                install_longhorn=install_longhorn,
+                is_heavy_task=True,
             )
         )
 
@@ -115,6 +116,32 @@ class ClusterViewSet(
     kubeconfig_file_validators = [
         core_validators.StateValidator(models.Cluster.States.OK)
     ]
+
+    @decorators.action(detail=True, methods=['post'])
+    def import_yaml(self, request, uuid=None):
+        cluster = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        yaml = serializer.validated_data['yaml']
+        default_namespace = serializer.validated_data.get('default_namespace')
+        namespace = serializer.validated_data.get('namespace')
+
+        backend = cluster.get_backend()
+        try:
+            backend.import_yaml(
+                cluster, yaml, default_namespace=default_namespace, namespace=namespace
+            )
+        except exceptions.RancherException as e:
+            message = e.args[0].get('message', 'Server error')
+            return response.Response(
+                {'details': message}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        executors.ClusterPullExecutor.execute(cluster)
+
+        return response.Response(status.HTTP_200_OK)
+
+    import_yaml_serializer_class = serializers.ImportYamlSerializer
 
 
 class NodeViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
@@ -176,6 +203,55 @@ class NodeViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
         return response.Response(status=status.HTTP_200_OK)
 
     unlink_openstack_permissions = [structure_permissions.is_staff]
+
+    @decorators.action(detail=True, methods=['get'])
+    def console(self, request, uuid=None):
+        node = self.get_object()
+
+        if not node.instance:
+            return response.Response(status=status.HTTP_404_NOT_FOUND)
+
+        backend = node.instance.get_backend()
+        backend_method = getattr(backend, 'get_console_url')
+
+        if backend_method:
+            try:
+                url = backend_method(node.instance)
+            except structure_exceptions.SerializableBackendError as e:
+                raise ValidationError(str(e))
+
+            return response.Response({'url': url}, status=status.HTTP_200_OK)
+        else:
+            return response.Response(status=status.HTTP_404_NOT_FOUND)
+
+    console_validators = [validators.console_validator]
+    console_permissions = [utils.check_permissions_for_console()]
+
+    @decorators.action(detail=True, methods=['get'])
+    def console_log(self, request, uuid=None):
+        node = self.get_object()
+
+        if not node.instance:
+            return response.Response(status=status.HTTP_404_NOT_FOUND)
+
+        backend = node.instance.get_backend()
+        serializer = self.get_serializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        length = serializer.validated_data.get('length')
+        backend_method = getattr(backend, 'get_console_output')
+
+        if backend_method:
+            try:
+                log = backend_method(node.instance, length)
+            except structure_exceptions.SerializableBackendError as e:
+                raise ValidationError(str(e))
+
+            return response.Response(log, status=status.HTTP_200_OK)
+        else:
+            return response.Response(status=status.HTTP_404_NOT_FOUND)
+
+    console_log_serializer_class = serializers.ConsoleLogSerializer
+    console_log_permissions = [utils.check_permissions_for_console_log()]
 
 
 class CatalogViewSet(OptionalReadonlyViewset, core_views.ActionsViewSet):
@@ -342,103 +418,126 @@ class TemplateVersionView(APIView):
         )
 
 
-class ApplicationViewSet(GenericAPIView):
-    serializer_class = rf_serializers.Serializer
+class ApplicationViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
+    queryset = models.Application.objects.all()
+    serializer_class = serializers.ApplicationSerializer
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    filterset_class = filters.ApplicationFilter
+    lookup_field = 'uuid'
+    create_executor = executors.ApplicationCreateExecutor
+    delete_executor = executors.ApplicationDeleteExecutor
 
-    def get(self, request):
-        cluster_uuid = request.query_params.get('cluster_uuid')
-        if not cluster_uuid or not is_uuid_like(cluster_uuid):
-            raise ValidationError('Cluster UUID is required.')
-        cluster = self.get_object(request, models.Cluster, cluster_uuid)
-        backend = cluster.settings.get_backend()
-        applications = backend.list_cluster_applications(cluster)
-        applications = self.paginate_queryset(applications)
-        return self.get_paginated_response(applications)
 
-    def delete(self, request):
-        project_uuid = request.data.get('project_uuid')
-        if not project_uuid or not is_uuid_like(project_uuid):
-            raise ValidationError('Project UUID is required.')
-        project = self.get_object(request, models.Project, project_uuid)
-        app_id = request.data.get('app_id')
-        if not app_id:
-            raise ValidationError('App ID is required.')
-        backend = project.settings.get_backend()
-        try:
-            backend.client.destroy_application(project.backend_id, app_id)
-        except RancherException as e:
-            return response.Response(
-                {'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST
-            )
+class UserViewSet(core_views.ReadOnlyActionsViewSet):
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    queryset = models.RancherUser.objects.all()
+    serializer_class = serializers.RancherUserSerializer
+    filterset_class = filters.UserFilter
+    lookup_field = 'uuid'
+
+
+class YamlMixin:
+    get_yaml_method = NotImplemented
+    put_yaml_method = NotImplemented
+
+    @decorators.action(detail=True, methods=['get', 'put'])
+    def yaml(self, request, *args, **kwargs):
+        workload = self.get_object()
+        backend = workload.get_backend()
+        if request.method == 'GET':
+            yaml = getattr(backend, self.get_yaml_method)(workload)
+            return response.Response({'yaml': yaml}, status=status.HTTP_200_OK)
+        else:
+            yaml = request.data['yaml']
+            try:
+                getattr(backend, self.put_yaml_method)(workload, yaml)
+            except RancherException as e:
+                message = e.args[0].get('message', 'Server error')
+                return response.Response(
+                    {'details': message}, status=status.HTTP_400_BAD_REQUEST
+                )
+            else:
+                return response.Response(status=status.HTTP_200_OK)
+
+
+class SyncDestroyMixin:
+    delete_scope_method = NotImplemented
+
+    def destroy(self, request, *args, **kwargs):
+        scope = self.get_object()
+        backend = scope.get_backend()
+        method = getattr(backend, self.delete_scope_method)
+        method(scope)
+        scope.delete()
         return response.Response(status=status.HTTP_204_NO_CONTENT)
 
-    def post(self, request):
-        if django_settings.WALDUR_RANCHER['READ_ONLY_MODE']:
-            raise MethodNotAllowed(method=request.method)
 
-        serializer = serializers.ApplicationCreateSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = serializer.validated_data
+class WorkloadViewSet(
+    OptionalReadonlyViewset, YamlMixin, SyncDestroyMixin, core_views.ActionsViewSet
+):
+    queryset = models.Workload.objects.all()
+    serializer_class = serializers.WorkloadSerializer
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    filterset_class = filters.WorkloadFilter
+    lookup_field = 'uuid'
+    get_yaml_method = 'get_workload_yaml'
+    put_yaml_method = 'put_workload_yaml'
+    delete_scope_method = 'delete_workload'
 
-        template = self.get_object(request, models.Template, data['template_uuid'])
-        project = self.get_object(request, models.Project, data['project_uuid'])
-        settings = {template.settings, project.settings}
+    @decorators.action(detail=True, methods=['post'])
+    def redeploy(self, request, *args, **kwargs):
+        workload = self.get_object()
+        backend = workload.get_backend()
+        backend.redeploy_workload(workload)
+        return response.Response(status=status.HTTP_200_OK)
 
-        client = project.settings.get_backend().client
 
-        if 'namespace_uuid' in data:
-            namespace = self.get_object(
-                request, models.Namespace, data['namespace_uuid']
-            )
-            settings.add(namespace.settings)
+class HPAViewSet(OptionalReadonlyViewset, YamlMixin, structure_views.ResourceViewSet):
+    queryset = models.HPA.objects.all()
+    serializer_class = serializers.HPASerializer
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    filterset_class = filters.HPAFilter
+    lookup_field = 'uuid'
+    create_executor = executors.HPACreateExecutor
+    update_executor = executors.HPAUpdateExecutor
+    delete_executor = executors.HPADeleteExecutor
+    get_yaml_method = 'get_hpa_yaml'
+    put_yaml_method = 'put_hpa_yaml'
 
-            if namespace.project != project:
-                raise ValidationError(_('Namespace should belong to the same project.'))
 
-        elif 'namespace_name' in data:
-            namespace_name = data['namespace_name']
-            try:
-                namespace_response = client.create_namespace(
-                    project.cluster.backend_id, project.backend_id, namespace_name
-                )
-            except RancherException as e:
-                return response.Response(
-                    {'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST
-                )
-            namespace = models.Namespace.objects.create(
-                name=namespace_name,
-                backend_id=namespace_response['id'],
-                settings=project.settings,
-                project=project,
-            )
-        else:
-            raise ValidationError(_('Namespace is not specified.'))
+class ClusterTemplateViewSet(core_views.ReadOnlyActionsViewSet):
+    queryset = models.ClusterTemplate.objects.all()
+    serializer_class = serializers.ClusterTemplateSerializer
+    lookup_field = 'uuid'
 
-        if len(settings) > 1:
-            raise ValidationError(
-                _(
-                    'The same settings should be used for template, project and namespace.'
-                )
-            )
 
-        try:
-            application = client.create_application(
-                template.catalog.backend_id,
-                template.name,
-                data['version'],
-                project.backend_id,
-                namespace.backend_id,
-                data['name'],
-                data.get('answers'),
-            )
-        except RancherException as e:
-            return response.Response(
-                {'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST
-            )
-        return response.Response(application, status=status.HTTP_201_CREATED)
+class IngressViewSet(
+    OptionalReadonlyViewset,
+    YamlMixin,
+    SyncDestroyMixin,
+    structure_views.ResourceViewSet,
+):
+    queryset = models.Ingress.objects.all()
+    serializer_class = serializers.IngressSerializer
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    filterset_class = filters.IngressFilter
+    lookup_field = 'uuid'
+    get_yaml_method = 'get_ingress_yaml'
+    put_yaml_method = 'put_ingress_yaml'
+    delete_scope_method = 'delete_ingress'
 
-    def get_object(self, request, model_class, object_uuid):
-        return get_object_or_404(
-            filter_queryset_for_user(model_class.objects.all(), request.user),
-            uuid=object_uuid,
-        )
+
+class ServiceViewSet(
+    OptionalReadonlyViewset,
+    YamlMixin,
+    SyncDestroyMixin,
+    structure_views.ResourceViewSet,
+):
+    queryset = models.Service.objects.all()
+    serializer_class = serializers.ServiceSerializer
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    filterset_class = filters.ServiceFilter
+    lookup_field = 'uuid'
+    get_yaml_method = 'get_service_yaml'
+    put_yaml_method = 'put_service_yaml'
+    delete_scope_method = 'delete_service'
