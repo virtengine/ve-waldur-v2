@@ -1,6 +1,6 @@
 from waldur_core.core import WaldurExtension
 
-
+## Class to define Zabbix static methods from waldur extension
 class ZabbixExtension(WaldurExtension):
     class Settings:
         WALDUR_ZABBIX = {

@@ -13,7 +13,7 @@ class SlurmError(BatchError):
 
 logger = logging.getLogger(__name__)
 
-
+## Class to define Slurm Config and Policies
 class SlurmClient(BaseBatchClient):
     """
     This class implements Python client for SLURM.

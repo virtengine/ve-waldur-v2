@@ -6,6 +6,7 @@ from django.utils.translation import ungettext
 from waldur_core.core.admin import ExecutorAdminAction, JsonWidget
 from waldur_core.structure import admin as structure_admin
 
+# Import Zabbix Service Properties
 from . import executors, tasks
 from .models import (
     Host,
@@ -15,7 +16,7 @@ from .models import (
     ZabbixService,
     ZabbixServiceProjectLink,
 )
-
+### Define Classes for admin permissions ###
 
 class SlaHistoryEventsInline(admin.TabularInline):
     model = SlaHistoryEvent

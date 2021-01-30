@@ -43,7 +43,7 @@ class VirtualMachinePullExecutor(core_executors.ActionExecutor):
             state_transition='begin_updating',
         )
 
-
+## Class to create Virtual Machines
 class VirtualMachineCreateExecutor(core_executors.CreateExecutor):
     @classmethod
     def get_task_signature(cls, instance, serialized_instance, **kwargs):
@@ -60,7 +60,7 @@ class VirtualMachineCreateExecutor(core_executors.CreateExecutor):
             ),
         )
 
-
+## Class to delete Virtual Machines
 class VirtualMachineDeleteExecutor(core_executors.DeleteExecutor):
     @classmethod
     def get_task_signature(cls, instance, serialized_instance, **kwargs):
@@ -76,7 +76,7 @@ class VirtualMachineDeleteExecutor(core_executors.DeleteExecutor):
                 serialized_instance, state_transition='begin_deleting'
             )
 
-
+# Class to start Virtual Machines
 class VirtualMachineStartExecutor(core_executors.ActionExecutor):
     action = 'Start'
 
@@ -107,7 +107,7 @@ class VirtualMachineStartExecutor(core_executors.ActionExecutor):
         )
         return chain(_tasks)
 
-
+## Class to stop Virtual Machines
 class VirtualMachineStopExecutor(core_executors.ActionExecutor):
     action = 'Stop'
 
@@ -124,7 +124,7 @@ class VirtualMachineStopExecutor(core_executors.ActionExecutor):
             ),
         )
 
-
+## Class to reset Virtual Machine
 class VirtualMachineResetExecutor(core_executors.ActionExecutor):
     action = 'Reset'
 
@@ -161,7 +161,7 @@ class VirtualMachineResetExecutor(core_executors.ActionExecutor):
         )
         return chain(_tasks)
 
-
+## Class to Suspend the Virtual Machine
 class VirtualMachineSuspendExecutor(core_executors.ActionExecutor):
     action = 'Suspend'
 
@@ -178,7 +178,7 @@ class VirtualMachineSuspendExecutor(core_executors.ActionExecutor):
             ),
         )
 
-
+## Class to Shutdown the Virtual Machine
 class VirtualMachineShutdownGuestExecutor(core_executors.ActionExecutor):
     action = 'Shutdown Guest'
 
@@ -202,7 +202,7 @@ class VirtualMachineShutdownGuestExecutor(core_executors.ActionExecutor):
             ),
         )
 
-
+## Class to reboot Virtual Machine
 class VirtualMachineRebootGuestExecutor(core_executors.ActionExecutor):
     action = 'Reboot Guest'
 
@@ -229,7 +229,7 @@ class VirtualMachineRebootGuestExecutor(core_executors.ActionExecutor):
             ),
         )
 
-
+## Class to update the Virtual Machine
 class VirtualMachineUpdateExecutor(core_executors.UpdateExecutor):
     @classmethod
     def get_task_signature(cls, instance, serialized_instance, **kwargs):
@@ -244,7 +244,7 @@ class VirtualMachineUpdateExecutor(core_executors.UpdateExecutor):
                 serialized_instance, state_transition='begin_updating'
             )
 
-
+## Class to create a port group
 class PortCreateExecutor(core_executors.CreateExecutor):
     @classmethod
     def get_task_signature(cls, instance, serialized_instance, **kwargs):
@@ -265,7 +265,7 @@ class PortPullExecutor(core_executors.ActionExecutor):
             serialized_instance, 'pull_port', state_transition='begin_updating'
         )
 
-
+## Class to delete port group
 class PortDeleteExecutor(core_executors.DeleteExecutor):
     @classmethod
     def get_task_signature(cls, instance, serialized_instance, **kwargs):
@@ -288,7 +288,7 @@ class DiskPullExecutor(core_executors.ActionExecutor):
             serialized_instance, 'pull_disk', state_transition='begin_updating'
         )
 
-
+## Class to create Disk
 class DiskCreateExecutor(core_executors.CreateExecutor):
     @classmethod
     def get_task_signature(cls, instance, serialized_instance, **kwargs):
@@ -300,7 +300,7 @@ class DiskCreateExecutor(core_executors.CreateExecutor):
             task, core_tasks.BackendMethodTask().si(serialized_instance, 'pull_disk',)
         )
 
-
+## Class to delete Disk
 class DiskDeleteExecutor(core_executors.DeleteExecutor):
     @classmethod
     def get_task_signature(cls, instance, serialized_instance, **kwargs):
@@ -335,7 +335,7 @@ class DiskDeleteExecutor(core_executors.DeleteExecutor):
         else:
             return core_tasks.ErrorStateTransitionTask().s(serialized_instance)
 
-
+## Class to notify the chnage in configuration of the Virtual Machine
 class VirtualMachineUpdatedNotificationTask(core_tasks.Task):
     """
     Send notification that virtual machine configuration has been changed on backend
@@ -347,7 +347,7 @@ class VirtualMachineUpdatedNotificationTask(core_tasks.Task):
     def execute(self, instance):
         signals.vm_updated.send(self.__class__, vm=instance)
 
-
+## Class to extend the disk
 class DiskExtendExecutor(core_executors.ActionExecutor):
     action = 'Extend'
 

@@ -1,6 +1,6 @@
 from waldur_core.core import WaldurExtension
 
-
+## Class to define VMware static methods from waldur extension
 class VMwareExtension(WaldurExtension):
     class Settings:
         WALDUR_VMWARE = {

@@ -7,7 +7,7 @@ from waldur_core.structure import filters as structure_filters
 
 from . import models
 
-
+## Class to define Project link Filter
 class ServiceProjectLinkFilter(structure_filters.BaseServiceProjectLinkFilter):
     service = core_filters.URLFilter(
         view_name='rancher-detail', field_name='service__uuid'
@@ -16,12 +16,12 @@ class ServiceProjectLinkFilter(structure_filters.BaseServiceProjectLinkFilter):
     class Meta(structure_filters.BaseServiceProjectLinkFilter.Meta):
         model = models.RancherServiceProjectLink
 
-
+## CLass to define Cluster FIlter
 class ClusterFilter(structure_filters.BaseResourceFilter):
     class Meta(structure_filters.BaseResourceFilter.Meta):
         model = models.Cluster
 
-
+## CLass to define Node Filter
 class NodeFilter(django_filters.FilterSet):
     cluster_uuid = django_filters.UUIDFilter(field_name='cluster__uuid')
 
@@ -29,7 +29,7 @@ class NodeFilter(django_filters.FilterSet):
         model = models.Node
         fields = ('cluster_uuid',)
 
-
+## Class to define Project Filter
 class ProjectFilter(structure_filters.ServicePropertySettingsFilter):
     cluster_uuid = django_filters.UUIDFilter(field_name='cluster__uuid')
 
@@ -58,7 +58,7 @@ class NamespaceFilter(structure_filters.ServicePropertySettingsFilter):
             'cluster_uuid',
         )
 
-
+## Class to define Template Filter
 class TemplateFilter(structure_filters.ServicePropertySettingsFilter):
     catalog_uuid = django_filters.UUIDFilter(field_name='catalog__uuid')
     cluster_uuid = django_filters.UUIDFilter(method='filter_by_cluster')
@@ -89,7 +89,7 @@ class TemplateFilter(structure_filters.ServicePropertySettingsFilter):
             )
             return queryset.filter(Q(cluster=cluster) | global_subquery)
 
-
+## Class to define User Filter
 class UserFilter(django_filters.FilterSet):
     cluster_uuid = django_filters.UUIDFilter(method='filter_by_cluster')
     user_uuid = django_filters.UUIDFilter(field_name='user__uuid')
@@ -159,7 +159,7 @@ class HPAFilter(structure_filters.ServicePropertySettingsFilter):
             'workload_uuid',
         )
 
-
+## Class to define Application Filter
 class ApplicationFilter(structure_filters.BaseResourceFilter):
     cluster_uuid = django_filters.UUIDFilter(field_name='cluster__uuid')
     project_uuid = django_filters.UUIDFilter(field_name='project__uuid')
@@ -178,7 +178,7 @@ class IngressFilter(structure_filters.BaseResourceFilter):
     class Meta(structure_filters.BaseResourceFilter.Meta):
         model = models.Ingress
 
-
+## Class to define Service Filter
 class ServiceFilter(structure_filters.BaseResourceFilter):
     cluster_uuid = django_filters.UUIDFilter(
         field_name='namespace__project__cluster__uuid'

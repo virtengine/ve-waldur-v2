@@ -7,7 +7,7 @@ from waldur_core.core.models import StateMixin
 
 from . import models, tasks
 
-
+## Class to start Virtual Machines
 class ClusterCreateExecutor(core_executors.CreateExecutor):
     @classmethod
     def get_task_signature(cls, instance, serialized_instance, user, install_longhorn):
@@ -53,7 +53,7 @@ class ClusterCreateExecutor(core_executors.CreateExecutor):
             _tasks.append(NodeCreateExecutor.as_signature(node, user_id=user.id))
         return _tasks
 
-
+## Class to delete Virtual Machines
 class ClusterDeleteExecutor(core_executors.DeleteExecutor):
     @classmethod
     def get_success_signature(cls, instance, serialized_instance, **kwargs):
@@ -89,7 +89,7 @@ class ClusterUpdateExecutor(core_executors.UpdateExecutor):
                 serialized_instance, state_transition='begin_updating'
             )
 
-
+##Class to create node
 class NodeCreateExecutor(core_executors.CreateExecutor):
     @classmethod
     def get_task_signature(cls, instance, serialized_instance, user_id):
@@ -98,7 +98,7 @@ class NodeCreateExecutor(core_executors.CreateExecutor):
             tasks.PollRuntimeStateNodeTask().si(serialized_instance),
         )
 
-
+##Class to delete node
 class NodeDeleteExecutor(core_executors.BaseExecutor):
     @classmethod
     def get_failure_signature(cls, instance, serialized_instance, **kwargs):
@@ -164,7 +164,7 @@ class HPADeleteExecutor(core_executors.DeleteExecutor):
                 serialized_instance, state_transition='begin_deleting'
             )
 
-
+##Class to create Application
 class ApplicationCreateExecutor(core_executors.CreateExecutor):
     @classmethod
     def get_task_signature(cls, instance, serialized_instance):
@@ -184,7 +184,7 @@ class ApplicationCreateExecutor(core_executors.CreateExecutor):
             ),
         )
 
-
+##Class to delete Application
 class ApplicationDeleteExecutor(core_executors.DeleteExecutor):
     @classmethod
     def get_task_signature(cls, instance, serialized_instance, **kwargs):

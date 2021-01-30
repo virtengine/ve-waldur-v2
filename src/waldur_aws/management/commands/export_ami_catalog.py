@@ -4,7 +4,7 @@ from django.core.management.base import BaseCommand, CommandError
 
 from ... import models
 
-
+## Class to define parameters exporting AWS AMI
 class Command(BaseCommand):
     help_text = 'Export catalog of Amazon images.'
     args = '[ami_catalog.csv]'

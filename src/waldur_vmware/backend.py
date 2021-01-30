@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 class VMwareBackendError(ServiceBackendError):
     pass
 
-
+## Class to connect VMware backend to waldur
 class VMwareBackend(ServiceBackend):
     def __init__(self, settings):
         """
@@ -503,7 +503,7 @@ class VMwareBackend(ServiceBackend):
         else:
             logger.warning(
                 'Folder is not specified for VM with ID: %s. '
-                'Trying to assign default folder.',
+                'Trying to assi0gn default folder.',
                 vm.id,
             )
             placement['folder'] = self.get_default_vm_folder()

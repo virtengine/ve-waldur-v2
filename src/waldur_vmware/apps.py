@@ -1,7 +1,7 @@
 from django.apps import AppConfig
 from django.db.models import signals
 
-
+## Class that imports Vmware config data to waldur AppConfig
 class VMwareConfig(AppConfig):
     name = 'waldur_vmware'
     verbose_name = 'VMware'

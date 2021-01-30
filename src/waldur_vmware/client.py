@@ -6,7 +6,7 @@ from waldur_vmware.exceptions import VMwareError
 
 logger = logging.getLogger(__name__)
 
-
+## Class to define VMware Config and Policies
 class VMwareClient:
     """
     Lightweight VMware vCenter Automation API client.

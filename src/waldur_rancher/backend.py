@@ -27,7 +27,7 @@ from . import client, models, signals, utils
 
 logger = logging.getLogger(__name__)
 
-
+## Class to set configuration
 class RancherBackend(ServiceBackend):
 
     DEFAULTS = {
@@ -1096,7 +1096,7 @@ class RancherBackend(ServiceBackend):
             runtime_state=remote_app['state'],
             created=remote_app['created'],
             backend_id=remote_app['id'],
-            answers=remote_app.get('answers', {}),
+            answers=remote_app.get('answers'),
             version=params['version'][0],
         )
 

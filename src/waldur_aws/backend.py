@@ -27,7 +27,7 @@ RESOURCE_EXTRA_ATTRIBUTES_MAP['volume']['volume_type'] = {
     'transform_func': str,
 }
 
-
+## Class to get EC2 Node and volumes, create volumes and edit existing nodes
 class ExtendedEC2NodeDriver(EC2NodeDriver):
     def get_node(self, node_id):
         """
@@ -184,6 +184,7 @@ class AWSBackendError(ServiceBackendError):
     pass
 
 
+## Class to connect AWS backend to waldur 
 class AWSBackend(ServiceBackend):
     """ Waldur interface to AWS EC2 API.
         https://libcloud.apache.org/

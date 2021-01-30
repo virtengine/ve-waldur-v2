@@ -1,7 +1,7 @@
 from django.apps import AppConfig
 from django.db.models import signals
 
-
+## Class that imports Slurm config data to waldur AppConfig
 class SlurmConfig(AppConfig):
     name = 'waldur_slurm'
     verbose_name = 'SLURM'

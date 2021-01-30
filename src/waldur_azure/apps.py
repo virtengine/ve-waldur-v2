@@ -1,6 +1,6 @@
 from django.apps import AppConfig
 
-
+## Class that imports AWS config data to waldur AppConfig
 class AzureConfig(AppConfig):
     name = 'waldur_azure'
     verbose_name = 'Waldur Azure'

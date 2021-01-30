@@ -1,6 +1,6 @@
 from waldur_core.core import WaldurExtension
 
-
+## Class to define rancher static methods from waldur extension
 class RancherExtension(WaldurExtension):
     class Settings:
         WALDUR_RANCHER = {

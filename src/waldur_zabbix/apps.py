@@ -2,7 +2,8 @@ from django.apps import AppConfig
 from django.db.models import signals
 from django_fsm import signals as fsm_signals
 
-
+## Class to set the configration
+## Class that imports Zabbix config data to waldur AppConfig
 class ZabbixConfig(AppConfig):
     name = 'waldur_zabbix'
     verbose_name = 'Waldur Zabbix'

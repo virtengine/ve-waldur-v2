@@ -1,7 +1,8 @@
 from django.apps import AppConfig
 from django.db.models import signals
 
-
+## Class to set the configration
+## Class that imports Rancher config data to waldur AppConfig
 class RancherConfig(AppConfig):
     name = 'waldur_rancher'
     verbose_name = 'Rancher'

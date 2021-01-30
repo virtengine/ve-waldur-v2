@@ -7,7 +7,7 @@ from . import models
 
 logger = logging.getLogger(__name__)
 
-
+## Class to retrive Azure Service's Backend
 class AzureBackend(ServiceBackend):
     def __init__(self, settings):
         self.settings = settings

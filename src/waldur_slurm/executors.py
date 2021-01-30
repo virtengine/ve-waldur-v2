@@ -4,7 +4,7 @@ from waldur_core.structure import executors as structure_executors
 
 from . import models
 
-
+## Class to create Allocation
 class AllocationCreateExecutor(core_executors.CreateExecutor):
     @classmethod
     def get_task_signature(cls, volume, serialized_allocation, **kwargs):
@@ -14,7 +14,7 @@ class AllocationCreateExecutor(core_executors.CreateExecutor):
             state_transition='begin_creating',
         )
 
-
+## Class to update Allocation
 class AllocationUpdateExecutor(core_executors.UpdateExecutor):
     @classmethod
     def get_task_signature(cls, volume, serialized_volume, **kwargs):
@@ -32,7 +32,7 @@ class AllocationPullExecutor(core_executors.ActionExecutor):
             serialized_volume, 'pull_allocation', state_transition='begin_updating'
         )
 
-
+## Class to delete allocation
 class AllocationDeleteExecutor(core_executors.DeleteExecutor):
     @classmethod
     def get_task_signature(cls, volume, serialized_allocation, **kwargs):
@@ -41,7 +41,6 @@ class AllocationDeleteExecutor(core_executors.DeleteExecutor):
             'delete_allocation',
             state_transition='begin_deleting',
         )
-
 
 class SlurmCleanupExecutor(structure_executors.BaseCleanupExecutor):
     executors = ((models.Allocation, AllocationDeleteExecutor),)

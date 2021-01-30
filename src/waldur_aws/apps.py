@@ -1,6 +1,7 @@
 from django.apps import AppConfig
 
 
+## Class that imports AWS config data to waldur AppConfig
 class AWSConfig(AppConfig):
     name = 'waldur_aws'
     verbose_name = "Waldur AWS EC2"

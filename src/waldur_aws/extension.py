@@ -1,6 +1,6 @@
 from waldur_core.core import WaldurExtension
 
-
+## Class to define AWS static methods from waldur extension
 class AWSExtension(WaldurExtension):
     @staticmethod
     def django_app():

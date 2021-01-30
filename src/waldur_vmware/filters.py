@@ -14,13 +14,13 @@ class ServiceProjectLinkFilter(structure_filters.BaseServiceProjectLinkFilter):
     class Meta(structure_filters.BaseServiceProjectLinkFilter.Meta):
         model = models.VMwareServiceProjectLink
 
-
+## Class to define Virtual Machine Filter
 class VirtualMachineFilter(structure_filters.BaseResourceFilter):
     class Meta(structure_filters.BaseResourceFilter.Meta):
         model = models.VirtualMachine
         fields = structure_filters.BaseResourceFilter.Meta.fields + ('runtime_state',)
 
-
+## Class to define Port Filter
 class PortFilter(structure_filters.BaseResourceFilter):
     class Meta(structure_filters.BaseResourceFilter.Meta):
         model = models.Port
@@ -35,7 +35,7 @@ class PortFilter(structure_filters.BaseResourceFilter):
     )
     network_uuid = django_filters.UUIDFilter(field_name='network__uuid')
 
-
+#Class to define Disk Filter
 class DiskFilter(structure_filters.BaseResourceFilter):
     class Meta(structure_filters.BaseResourceFilter.Meta):
         model = models.Disk
@@ -48,12 +48,12 @@ class DiskFilter(structure_filters.BaseResourceFilter):
         ('size', 'size'),
     )
 
-
+## Class to define Template Filter
 class TemplateFilter(structure_filters.ServicePropertySettingsFilter):
     class Meta(structure_filters.ServicePropertySettingsFilter.Meta):
         model = models.Template
 
-
+## Class to define Cluster Filter
 class ClusterFilter(structure_filters.ServicePropertySettingsFilter):
     customer_uuid = django_filters.UUIDFilter(
         method='filter_customer', label='Customer UUID'
@@ -65,7 +65,7 @@ class ClusterFilter(structure_filters.ServicePropertySettingsFilter):
     class Meta(structure_filters.ServicePropertySettingsFilter.Meta):
         model = models.Cluster
 
-
+## Class to define Network Filter
 class NetworkFilter(structure_filters.ServicePropertySettingsFilter):
     customer_uuid = django_filters.UUIDFilter(
         method='filter_customer', label='Customer UUID'
@@ -83,7 +83,7 @@ class NetworkFilter(structure_filters.ServicePropertySettingsFilter):
     class Meta(structure_filters.ServicePropertySettingsFilter.Meta):
         model = models.Network
 
-
+## Class to define data store filter
 class DatastoreFilter(structure_filters.ServicePropertySettingsFilter):
     customer_uuid = django_filters.UUIDFilter(
         method='filter_customer', label='Customer UUID'
@@ -95,7 +95,7 @@ class DatastoreFilter(structure_filters.ServicePropertySettingsFilter):
     class Meta(structure_filters.ServicePropertySettingsFilter.Meta):
         model = models.Datastore
 
-
+## Classs to define Folder Filter
 class FolderFilter(structure_filters.ServicePropertySettingsFilter):
     customer_uuid = django_filters.UUIDFilter(
         method='filter_customer', label='Customer UUID'

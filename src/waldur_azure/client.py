@@ -33,6 +33,7 @@ class AzureBackendError(ServiceBackendError):
     pass
 
 
+## Class to define Azure Client Policies
 class AzureClient:
     def __init__(self, settings):
         self.subscription_id = str(settings.options['subscription_id'])

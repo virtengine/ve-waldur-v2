@@ -1,5 +1,5 @@
 from collections import OrderedDict
-
+## OS selection constants
 GUEST_OS_CHOICES = OrderedDict(
     (
         ('DOS', 'MS-DOS'),

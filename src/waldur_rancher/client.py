@@ -9,7 +9,7 @@ from .exceptions import NotFound, RancherException
 
 logger = logging.getLogger(__name__)
 
-
+## Class to define Rancher Client Policies
 class RancherClient:
     """
     Rancher API client.

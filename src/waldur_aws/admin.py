@@ -2,6 +2,7 @@ from django.contrib import admin
 
 from waldur_core.structure import admin as structure_admin
 
+# Import AWS Service Properties
 from .models import (
     AWSService,
     AWSServiceProjectLink,
@@ -12,6 +13,7 @@ from .models import (
     Volume,
 )
 
+### Define Classes for admin permissions ###
 
 class ImageAdmin(structure_admin.BackendModelAdmin):
     fields = 'name', 'region', 'backend_id'
@@ -39,6 +41,7 @@ class SizeAdmin(structure_admin.ProtectedModelMixin, structure_admin.BackendMode
 class VolumeAdmin(structure_admin.ResourceAdmin):
     pass
 
+############################################
 
 admin.site.register(Image, ImageAdmin)
 admin.site.register(Size, SizeAdmin)

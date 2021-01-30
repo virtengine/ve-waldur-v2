@@ -41,7 +41,7 @@ pyzabbix.logger.addFilter(ZabbixLogsFilter())
 class ZabbixBackendError(ServiceBackendError):
     pass
 
-
+## Class to set configuration 
 class ZabbixBackend(ServiceBackend):
 
     DEFAULTS = {

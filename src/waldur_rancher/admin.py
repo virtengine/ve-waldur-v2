@@ -9,7 +9,7 @@ from waldur_core.structure import admin as structure_admin
 
 from . import models, tasks
 
-
+### Define Classes for admin permissions ###
 class RancherUserClusterLinkInline(admin.TabularInline):
     model = models.RancherUserClusterLink
 

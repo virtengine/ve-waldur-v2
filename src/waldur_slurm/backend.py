@@ -17,7 +17,7 @@ from . import base, models
 
 logger = logging.getLogger(__name__)
 
-
+## Class to connect Slurm backend to waldur
 class SlurmBackend(ServiceBackend):
     def __init__(self, settings):
         self.settings = settings

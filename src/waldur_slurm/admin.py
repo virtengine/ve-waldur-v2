@@ -29,7 +29,7 @@ for cls in (structure_admin.CustomerAdmin, structure_admin.ProjectAdmin):
     cls.get_allocation_count = get_allocation_count
     cls.list_display += ('get_allocation_count',)
 
-
+## Classes to define admin permissions
 class AllocationAdmin(structure_admin.ResourceAdmin):
     class SyncAllocations(ExecutorAdminAction):
         executor = executors.AllocationPullExecutor

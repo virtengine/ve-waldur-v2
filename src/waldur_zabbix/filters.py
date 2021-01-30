@@ -29,7 +29,7 @@ class TriggerFilter(ServicePropertySettingsFilter):
             'template_uuid',
         )
 
-
+## Class to filter by users
 class UserFilter(ServicePropertySettingsFilter):
     surname = django_filters.CharFilter(lookup_expr='icontains')
     alias = django_filters.CharFilter(lookup_expr='icontains')

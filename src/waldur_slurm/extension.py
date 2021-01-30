@@ -1,6 +1,6 @@
 from waldur_core.core import WaldurExtension
 
-
+## Class to define Slurm static methods from waldur extension
 class SlurmExtension(WaldurExtension):
     class Settings:
         WALDUR_SLURM = {

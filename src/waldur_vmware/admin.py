@@ -10,7 +10,7 @@ from waldur_vmware.utils import is_basic_mode
 
 from . import executors, models
 
-
+### Define Classes for Disk admin permissions ###
 class DiskAdmin(structure_admin.ResourceAdmin):
     class Pull(ExecutorAdminAction):
         executor = executors.DiskPullExecutor
@@ -22,7 +22,7 @@ class DiskAdmin(structure_admin.ResourceAdmin):
 
     pull = Pull()
 
-
+### Define Classes for admin permissions ###
 class VirtualMachineAdmin(structure_admin.ResourceAdmin):
     class Pull(ExecutorAdminAction):
         executor = executors.VirtualMachinePullExecutor

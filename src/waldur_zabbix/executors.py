@@ -5,7 +5,7 @@ from waldur_core.core import executors, tasks, utils
 from . import models
 from .tasks import SMSTask, UpdateSettingsCredentials
 
-
+## Class to create Host
 class HostCreateExecutor(executors.CreateExecutor):
     @classmethod
     def get_task_signature(cls, host, serialized_host, **kwargs):
@@ -21,7 +21,7 @@ class HostUpdateExecutor(executors.UpdateExecutor):
             serialized_host, 'update_host', state_transition='begin_updating'
         )
 
-
+## Class to delete Host
 class HostDeleteExecutor(executors.DeleteExecutor):
     @classmethod
     def get_task_signature(cls, host, serialized_host, **kwargs):
@@ -40,7 +40,7 @@ class HostPullExecutor(executors.BaseExecutor):
     def get_task_signature(cls, host, serialized_host, **kwargs):
         return tasks.BackendMethodTask().si(serialized_host, 'pull_host')
 
-
+## Class to create IT Service
 class ITServiceCreateExecutor(executors.CreateExecutor):
     @classmethod
     def get_task_signature(cls, itservice, serialized_itservice, **kwargs):
@@ -48,7 +48,7 @@ class ITServiceCreateExecutor(executors.CreateExecutor):
             serialized_itservice, 'create_itservice', state_transition='begin_creating'
         )
 
-
+## Class to delete IT Service
 class ITServiceDeleteExecutor(executors.DeleteExecutor):
     @classmethod
     def get_task_signature(cls, itservice, serialized_itservice, **kwargs):
@@ -63,7 +63,7 @@ class ITServiceDeleteExecutor(executors.DeleteExecutor):
                 serialized_itservice, state_transition='begin_deleting'
             )
 
-
+## Class to create user
 class UserCreateExecutor(executors.CreateExecutor):
     @classmethod
     def get_task_signature(cls, user, serialized_user, **kwargs):
@@ -81,7 +81,7 @@ class UserCreateExecutor(executors.CreateExecutor):
             )
         return chain(*creation_tasks)
 
-
+## Class to update existing user
 class UserUpdateExecutor(executors.UpdateExecutor):
     @classmethod
     def get_task_signature(cls, user, serialized_user, **kwargs):
@@ -97,7 +97,7 @@ class UserUpdateExecutor(executors.UpdateExecutor):
             update_tasks.append(SMSTask().si(serialized_settings, message, user.phone))
         return chain(*update_tasks)
 
-
+## Class to delete existing user
 class UserDeleteExecutor(executors.DeleteExecutor):
     @classmethod
     def get_task_signature(cls, user, serialized_user, **kwargs):
@@ -110,7 +110,7 @@ class UserDeleteExecutor(executors.DeleteExecutor):
                 serialized_user, state_transition='begin_deleting'
             )
 
-
+## Class to reset existing user
 class ServiceSettingsPasswordResetExecutor(executors.ActionExecutor):
     """ Reset user password and update service settings options. """
 

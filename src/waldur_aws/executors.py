@@ -9,6 +9,7 @@ from . import models
 from .tasks import SetInstanceErredTask
 
 
+## Class to create volumes
 class VolumeCreateExecutor(executors.CreateExecutor):
     @classmethod
     def get_task_signature(cls, volume, serialized_volume, **kwargs):
@@ -27,6 +28,7 @@ class VolumeCreateExecutor(executors.CreateExecutor):
         )
 
 
+## Class to delete volumes
 class VolumeDeleteExecutor(executors.DeleteExecutor):
     @classmethod
     def get_task_signature(cls, volume, serialized_volume, **kwargs):
@@ -40,6 +42,7 @@ class VolumeDeleteExecutor(executors.DeleteExecutor):
             )
 
 
+## Class to detach volumes from EC2
 class VolumeDetachExecutor(executors.ActionExecutor):
     @classmethod
     def get_task_signature(cls, volume, serialized_volume, **kwargs):
@@ -58,6 +61,7 @@ class VolumeDetachExecutor(executors.ActionExecutor):
         )
 
 
+## Class to attached volumes to EC2
 class VolumeAttachExecutor(executors.ActionExecutor):
     @classmethod
     def get_task_signature(cls, volume, serialized_volume, **kwargs):
@@ -76,6 +80,7 @@ class VolumeAttachExecutor(executors.ActionExecutor):
         )
 
 
+## Class to createa EC2 instances
 class InstanceCreateExecutor(executors.CreateExecutor):
     @classmethod
     def get_task_signature(
@@ -139,6 +144,7 @@ class InstanceCreateExecutor(executors.CreateExecutor):
         return SetInstanceErredTask().s(serialized_instance)
 
 
+## Class to edit EC2 instance size
 class InstanceResizeExecutor(executors.ActionExecutor):
     @classmethod
     def get_task_signature(cls, instance, serialized_instance, **kwargs):
@@ -167,6 +173,7 @@ class InstanceResizeExecutor(executors.ActionExecutor):
         )
 
 
+## Class to stop EC2 instances
 class InstanceStopExecutor(executors.ActionExecutor):
     @classmethod
     def get_task_signature(cls, instance, serialized_instance, **kwargs):
@@ -183,6 +190,7 @@ class InstanceStopExecutor(executors.ActionExecutor):
         )
 
 
+## Class to start EC2 instances
 class InstanceStartExecutor(executors.ActionExecutor):
     @classmethod
     def get_task_signature(cls, instance, serialized_instance, **kwargs):
@@ -204,6 +212,7 @@ class InstanceStartExecutor(executors.ActionExecutor):
         )
 
 
+## Class to restart EC2 instances
 class InstanceRestartExecutor(executors.ActionExecutor):
     @classmethod
     def get_task_signature(cls, instance, serialized_instance, **kwargs):
@@ -222,6 +231,7 @@ class InstanceRestartExecutor(executors.ActionExecutor):
         )
 
 
+## Class to delete EC2 instances
 class InstanceDeleteExecutor(executors.DeleteExecutor):
     @classmethod
     def get_task_signature(cls, instance, serialized_instance, **kwargs):
