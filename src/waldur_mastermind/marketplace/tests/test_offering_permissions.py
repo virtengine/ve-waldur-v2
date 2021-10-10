@@ -1,7 +1,9 @@
 from ddt import data, ddt
+from freezegun import freeze_time
 from rest_framework import status, test
 from rest_framework.reverse import reverse
 
+from waldur_core.structure.models import CustomerRole
 from waldur_core.structure.tests import fixtures
 from waldur_core.structure.tests.factories import UserFactory
 from waldur_mastermind.marketplace import models
@@ -71,6 +73,51 @@ class GrantOfferingPermissionTest(test.APITransactionTestCase):
         response = self.grant_permission(user)
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_when_offering_permission_is_granted_customer_permission_is_granted_too(
+        self,
+    ):
+        self.grant_permission('owner')
+        self.assertTrue(
+            self.offering.customer.has_user(
+                self.fixture.user, CustomerRole.SERVICE_MANAGER
+            )
+        )
+
+    def test_service_manager_permission_is_created_even_for_customer_owner(self,):
+        self.offering.customer.add_user(self.fixture.user, CustomerRole.OWNER)
+        self.grant_permission('owner')
+        self.assertTrue(
+            self.offering.customer.has_user(
+                self.fixture.user, CustomerRole.SERVICE_MANAGER
+            )
+        )
+
+
+@ddt
+@freeze_time('2020-01-01')
+class UpdateOfferingPermissionTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.offering = factories.OfferingFactory(
+            shared=True, customer=self.fixture.customer
+        )
+        self.permission = factories.OfferingPermissionFactory(offering=self.offering)
+        self.url = factories.OfferingPermissionFactory.get_url(self.permission)
+
+    def change_permission(self, user):
+        self.client.force_authenticate(user=getattr(self.fixture, user))
+        return self.client.patch(self.url, {'expiration_time': '2021-01-01T00:00',},)
+
+    @data('staff', 'owner')
+    def test_authorized_user_can_change_offering_permission(self, user):
+        response = self.change_permission(user)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    @data('admin', 'manager')
+    def test_unauthorized_user_can_not_change_offering_permission(self, user):
+        response = self.change_permission(user)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
 
 @ddt
 class RevokeOfferingPermissionTest(test.APITransactionTestCase):
@@ -79,7 +126,8 @@ class RevokeOfferingPermissionTest(test.APITransactionTestCase):
         self.offering = factories.OfferingFactory(
             shared=True, customer=self.fixture.customer
         )
-        self.permission = OfferingPermission.objects.create(
+        self.offering.add_user(self.fixture.user)
+        self.permission = OfferingPermission.objects.get(
             offering=self.offering, user=self.fixture.user, is_active=True
         )
 
@@ -101,6 +149,36 @@ class RevokeOfferingPermissionTest(test.APITransactionTestCase):
         response = self.revoke_permission('admin')
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
+    def test_when_offering_permission_is_revoked_customer_permission_is_revoked_too(
+        self,
+    ):
+        self.revoke_permission('owner')
+        self.assertFalse(
+            self.offering.customer.has_user(
+                self.fixture.user, CustomerRole.SERVICE_MANAGER
+            )
+        )
+
+    def test_customer_permission_is_not_revoked_if_another_offering_exists(self,):
+        offering = factories.OfferingFactory(
+            shared=True, customer=self.fixture.customer
+        )
+        offering.add_user(self.fixture.user)
+        self.revoke_permission('owner')
+        self.assertTrue(
+            self.fixture.customer.has_user(
+                self.fixture.user, CustomerRole.SERVICE_MANAGER
+            )
+        )
+
+    def test_when_service_manager_role_is_revoked_offering_permissions_are_revoked_too(
+        self,
+    ):
+        self.offering.customer.remove_user(
+            self.fixture.user, CustomerRole.SERVICE_MANAGER
+        )
+        self.assertFalse(self.offering.has_user(self.fixture.user,))
+
 
 @ddt
 class OfferingUpdateTest(test.APITransactionTestCase):
@@ -121,6 +199,15 @@ class OfferingUpdateTest(test.APITransactionTestCase):
 
         self.offering.refresh_from_db()
         self.assertEqual(self.offering.name, 'new_offering')
+
+    def test_offering_lookup_succeeds_if_more_than_one_manager_exists(self):
+        self.client.force_authenticate(self.fixture.user)
+        user = UserFactory()
+        OfferingPermission.objects.create(
+            offering=self.offering, user=user, is_active=True
+        )
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
 
     @data(
         models.Offering.States.ACTIVE,

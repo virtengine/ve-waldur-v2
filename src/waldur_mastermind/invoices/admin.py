@@ -1,6 +1,5 @@
 from django.conf.urls import url
 from django.contrib import admin
-from django.forms import ModelChoiceField
 from django.forms.models import ModelForm
 from django.forms.widgets import CheckboxInput
 from django.http import HttpResponse
@@ -8,26 +7,31 @@ from django.shortcuts import redirect
 from django.urls import reverse
 from django.utils.html import format_html
 from django.utils.translation import ugettext_lazy as _
+from rest_framework.reverse import reverse as rest_reverse
+from reversion.admin import VersionAdmin
 
 from waldur_core.core import admin as core_admin
 from waldur_core.core.admin import JsonWidget
 
-from . import executors, models, tasks
+from . import models, tasks, utils
 
 
-class GenericItemInline(core_admin.UpdateOnlyModelAdmin, admin.StackedInline):
+class InvoiceItemInline(core_admin.UpdateOnlyModelAdmin, admin.StackedInline):
     model = models.InvoiceItem
-    readonly_fields = (
-        'pk',
+    fields = readonly_fields = (
+        'name',
         'price',
         'unit_price',
         'unit',
+        'measured_unit',
+        'start',
+        'end',
+        'article_code',
         'project_name',
         'project_uuid',
-        'get_factor',
         'quantity',
     )
-    exclude = ('project', 'content_type', 'object_id')
+    exclude = ('project',)
 
     def format_details(self, obj):
         return core_admin.format_json_field(obj.details)
@@ -56,9 +60,12 @@ class PaymentTypeFilter(admin.SimpleListFilter):
 
 
 class InvoiceAdmin(
-    core_admin.ExtraActionsMixin, core_admin.UpdateOnlyModelAdmin, admin.ModelAdmin
+    VersionAdmin,
+    core_admin.ExtraActionsMixin,
+    core_admin.UpdateOnlyModelAdmin,
+    admin.ModelAdmin,
 ):
-    inlines = [GenericItemInline]
+    inlines = [InvoiceItemInline]
     fields = [
         'tax_percent',
         'invoice_date',
@@ -68,6 +75,7 @@ class InvoiceAdmin(
         'year',
         'month',
         'pdf_file',
+        'backend_id',
     ]
     readonly_fields = ('customer', 'total', 'year', 'month', 'pdf_file')
     list_display = ('customer', 'total', 'year', 'month', 'state', 'payment_type')
@@ -86,12 +94,6 @@ class InvoiceAdmin(
 
     payment_type.short_description = _('Payment type')
 
-    class CreatePDFAction(core_admin.ExecutorAdminAction):
-        executor = executors.InvoicePDFCreateExecutor
-        short_description = _('Create PDF')
-
-    create_pdf = CreatePDFAction()
-
     def get_urls(self):
         my_urls = [
             url(
@@ -103,7 +105,9 @@ class InvoiceAdmin(
 
     def pdf_file_view(self, request, pk=None):
         invoice = models.Invoice.objects.get(id=pk)
-        file_response = HttpResponse(invoice.file, content_type='application/pdf')
+
+        file = utils.create_invoice_pdf(invoice)
+        file_response = HttpResponse(file, content_type='application/pdf')
         filename = invoice.get_filename()
         file_response[
             'Content-Disposition'
@@ -111,10 +115,9 @@ class InvoiceAdmin(
         return file_response
 
     def pdf_file(self, obj):
-        if not obj.file:
-            return ''
+        pdf_ref = rest_reverse('invoice-pdf', kwargs={'uuid': obj.uuid.hex},)
 
-        return format_html('<a href="./pdf_file">download</a>')
+        return format_html('<a href="%s">download</a>' % pdf_ref)
 
     pdf_file.short_description = "File"
 
@@ -122,7 +125,6 @@ class InvoiceAdmin(
         return [
             self.send_invoice_report,
             self.update_current_cost,
-            self.create_pdf_for_all,
         ]
 
     def send_invoice_report(self, request):
@@ -140,71 +142,6 @@ class InvoiceAdmin(
         return redirect(reverse('admin:invoices_invoice_changelist'))
 
     send_invoice_report.short_description = _('Update current cost for invoices')
-
-    def create_pdf_for_all(self, request):
-        tasks.create_pdf_for_all_invoices.delay()
-        message = _('PDF creation has been scheduled')
-        self.message_user(request, message)
-        return redirect(reverse('admin:invoices_invoice_changelist'))
-
-    create_pdf_for_all.name = _('Create PDF for all invoices')
-
-
-class PackageChoiceField(ModelChoiceField):
-    def label_from_instance(self, obj):
-        return '%s > %s > %s' % (
-            obj.tenant.service_project_link.project.customer,
-            obj.tenant.service_project_link.project.name,
-            obj.tenant.name,
-        )
-
-
-class ServiceDowntimeAdmin(admin.ModelAdmin):
-    list_display = (
-        'get_customer',
-        'get_project',
-        'offering',
-        'resource',
-        'get_package',
-        'start',
-        'end',
-    )
-    list_display_links = ('get_customer',)
-    search_fields = ('offering__name', 'resource__name')
-    date_hierarchy = 'start'
-
-    def get_readonly_fields(self, request, obj=None):
-        # Downtime record is protected from modifications
-        if obj is not None:
-            return self.readonly_fields + ('start', 'end', 'offering', 'resource')
-        return self.readonly_fields
-
-    def get_customer(self, downtime):
-        if downtime.offering:
-            return downtime.offering.customer
-
-        if downtime.resource:
-            return downtime.resource.customer
-
-        if downtime.package:
-            return downtime.package.tenant.service_project_link.project.customer
-
-    get_customer.short_description = _('Organization')
-
-    def get_project(self, downtime):
-        if downtime.resource:
-            return downtime.resource.project
-
-        if downtime.package:
-            return downtime.package.tenant.service_project_link.project
-
-    get_project.short_description = _('Project')
-
-    def get_package(self, downtime):
-        if downtime.package:
-            return downtime.package.tenant.name
-
-    get_package.short_description = _('Package')
 
 
 class PaymentProfileAdminForm(ModelForm):
@@ -226,6 +163,5 @@ class PaymentAdmin(admin.ModelAdmin):
 
 
 admin.site.register(models.Invoice, InvoiceAdmin)
-admin.site.register(models.ServiceDowntime, ServiceDowntimeAdmin)
 admin.site.register(models.PaymentProfile, PaymentProfileAdmin)
 admin.site.register(models.Payment, PaymentAdmin)

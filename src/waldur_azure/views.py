@@ -10,16 +10,6 @@ from waldur_core.structure import views as structure_views
 from . import executors, filters, models, serializers
 
 
-class AzureServiceViewSet(structure_views.BaseServiceViewSet):
-    queryset = models.AzureService.objects.all()
-    serializer_class = serializers.ServiceSerializer
-
-
-class AzureServiceProjectLinkViewSet(structure_views.BaseServiceProjectLinkViewSet):
-    queryset = models.AzureServiceProjectLink.objects.all()
-    serializer_class = serializers.ServiceProjectLinkSerializer
-
-
 class ImageViewSet(structure_views.BaseServicePropertyViewSet):
     queryset = models.Image.objects.all()
     serializer_class = serializers.ImageSerializer
@@ -45,25 +35,26 @@ class LocationViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class ResourceGroupViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = models.ResourceGroup.objects.all()
+    queryset = models.ResourceGroup.objects.all().order_by('name')
     serializer_class = serializers.ResourceGroupSerializer
     lookup_field = 'uuid'
 
 
-class PublicIPViewSet(structure_views.BaseResourceViewSet):
-    queryset = models.PublicIP.objects.all()
+class PublicIPViewSet(structure_views.ResourceViewSet):
+    queryset = models.PublicIP.objects.all().order_by('name')
     filterset_class = filters.PublicIPFilter
     serializer_class = serializers.PublicIPSerializer
     create_executor = executors.PublicIPCreateExecutor
     delete_executor = executors.PublicIPDeleteExecutor
 
 
-class VirtualMachineViewSet(structure_views.BaseResourceViewSet):
-    queryset = models.VirtualMachine.objects.all()
+class VirtualMachineViewSet(structure_views.ResourceViewSet):
+    queryset = models.VirtualMachine.objects.all().order_by('name')
     filterset_class = filters.VirtualMachineFilter
     serializer_class = serializers.VirtualMachineSerializer
     create_executor = executors.VirtualMachineCreateExecutor
     delete_executor = executors.VirtualMachineDeleteExecutor
+    pull_executor = executors.VirtualMachinePullExecutor
 
     @decorators.action(detail=True, methods=['post'])
     def start(self, request, uuid=None):
@@ -108,8 +99,8 @@ class VirtualMachineViewSet(structure_views.BaseResourceViewSet):
     restart_serializer_class = rf_serializers.Serializer
 
 
-class SQLServerViewSet(structure_views.BaseResourceViewSet):
-    queryset = models.SQLServer.objects.all()
+class SQLServerViewSet(structure_views.ResourceViewSet):
+    queryset = models.SQLServer.objects.all().order_by('name')
     filterset_class = filters.SQLServerFilter
     serializer_class = serializers.SQLServerSerializer
     create_executor = executors.SQLServerCreateExecutor
@@ -137,8 +128,8 @@ class SQLServerViewSet(structure_views.BaseResourceViewSet):
     create_database_serializer_class = serializers.SQLDatabaseCreateSerializer
 
 
-class SQLDatabaseViewSet(structure_views.BaseResourceViewSet):
-    queryset = models.SQLDatabase.objects.all()
+class SQLDatabaseViewSet(structure_views.ResourceViewSet):
+    queryset = models.SQLDatabase.objects.all().order_by('name')
     filterset_class = filters.SQLDatabaseFilter
     serializer_class = serializers.SQLDatabaseSerializer
     create_executor = executors.SQLDatabaseCreateExecutor

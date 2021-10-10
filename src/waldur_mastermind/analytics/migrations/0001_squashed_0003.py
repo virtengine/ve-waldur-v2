@@ -3,12 +3,6 @@ import django.db.models.deletion
 from django.db import migrations, models
 
 
-def import_quotas(apps, schema_editor):
-    from waldur_mastermind.analytics.utils import import_daily_usage
-
-    import_daily_usage()
-
-
 class Migration(migrations.Migration):
 
     initial = True
@@ -16,7 +10,6 @@ class Migration(migrations.Migration):
     dependencies = [
         ('contenttypes', '0002_remove_content_type_name'),
         ('quotas', '0001_squashed_0004'),
-        ('reversion', '0001_squashed_0004_auto_20160611_1202'),
     ]
 
     operations = [
@@ -46,7 +39,6 @@ class Migration(migrations.Migration):
                 ),
             ],
         ),
-        migrations.RunPython(import_quotas),
         migrations.AlterField(
             model_name='dailyquotahistory',
             name='content_type',

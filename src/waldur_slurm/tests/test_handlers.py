@@ -6,8 +6,8 @@ from waldur_core.core import utils as core_utils
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_freeipa import models as freeipa_models
+from waldur_slurm import tasks
 
-from .. import tasks
 from . import fixtures, utils
 
 
@@ -17,7 +17,7 @@ class SlurmAssociationSynchronizationTest(TransactionTestCase):
         self.fixture = fixtures.SlurmFixture()
         self.user = structure_factories.UserFactory()
 
-        service_settings = self.fixture.service.settings
+        service_settings = self.fixture.settings
         service_settings.options = {'default_account': 'waldur_user'}
         service_settings.save()
 

@@ -1,4 +1,5 @@
 from django.conf import settings as django_settings
+from django.utils.translation import ugettext_lazy as _
 from rest_framework import exceptions
 
 from waldur_core.structure import models as structure_models
@@ -111,12 +112,8 @@ def user_can_list_importable_resources(request, view, offering=None):
         )
 
     # Import private offerings must be available for admins and managers
-    if (
-        offering.scope
-        and offering.scope.scope
-        and offering.scope.scope.service_project_link
-    ):
-        project = offering.scope.scope.service_project_link.project
+    if offering.scope and offering.scope.scope and offering.scope.scope.project:
+        project = offering.scope.scope.project
         if (
             project.get_users(structure_models.ProjectRole.ADMINISTRATOR)
             .filter(pk=user.pk)
@@ -140,11 +137,7 @@ def user_can_list_importable_resources(request, view, offering=None):
         .distinct()
     )
 
-    allowed_customers = set(offering.allowed_customers.all())
-
-    if offering.customer not in owned_customers and not (
-        allowed_customers & owned_customers
-    ):
+    if offering.customer not in owned_customers:
         raise exceptions.PermissionDenied(
             'Import is limited to owners for private offerings.'
         )
@@ -154,8 +147,11 @@ def user_can_terminate_resource(request, view, resource=None):
     if not resource:
         return
 
+    # Allow to terminate resource in soft-deleted project
+    project = structure_models.Project.all_objects.get(id=resource.project_id)
+
     # Project manager/admin and customer owner are allowed to terminate resource.
-    if structure_permissions._has_admin_access(request.user, resource.project):
+    if structure_permissions._has_admin_access(request.user, project):
         return
 
     # Service provider is allowed to terminate resource too.
@@ -163,5 +159,77 @@ def user_can_terminate_resource(request, view, resource=None):
         request.user, resource.offering.customer
     ):
         return
+
+    raise exceptions.PermissionDenied()
+
+
+def user_is_owner_or_service_manager(request, view, obj=None):
+    if not obj:
+        return
+
+    if isinstance(obj, models.Offering):
+        offering = obj
+    elif isinstance(obj, models.Resource):
+        customer = structure_permissions._get_customer(obj)
+
+        if structure_permissions._has_owner_access(request.user, customer):
+            return
+
+        offering = obj.offering
+    else:
+        return
+
+    if offering.has_user(request.user):
+        return
+
+    if structure_permissions._has_owner_access(request.user, offering.customer):
+        return
+
+    if offering.customer.has_user(
+        request.user, role=structure_models.CustomerRole.SERVICE_MANAGER
+    ):
+        return
+
+    raise exceptions.PermissionDenied()
+
+
+def user_is_service_provider_owner_or_service_provider_manager(request, view, obj=None):
+    if not obj:
+        return
+
+    if structure_permissions._has_owner_access(request.user, obj.offering.customer):
+        return
+
+    if obj.offering.customer.has_user(
+        request.user, role=structure_models.CustomerRole.SERVICE_MANAGER
+    ):
+        return
+
+    raise exceptions.PermissionDenied()
+
+
+def user_can_update_thumbnail(request, view, obj=None):
+    if not obj:
+        return
+
+    offering = obj
+
+    if request.user.is_staff:
+        return
+
+    if offering.state not in (
+        models.Offering.States.ACTIVE,
+        models.Offering.States.DRAFT,
+        models.Offering.States.PAUSED,
+    ):
+        raise exceptions.PermissionDenied(_('You are not allowed to update a logo.'))
+    else:
+        if structure_permissions._has_owner_access(request.user, offering.customer):
+            return
+
+        if offering.customer.has_user(
+            request.user, role=structure_models.CustomerRole.SERVICE_MANAGER
+        ):
+            return
 
     raise exceptions.PermissionDenied()

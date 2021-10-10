@@ -1,16 +1,19 @@
+import datetime
 from unittest import mock
 
 from ddt import data, ddt
+from freezegun import freeze_time
 from rest_framework import status, test
 
 from waldur_core.structure.models import CustomerRole
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures
+from waldur_mastermind.marketplace import models
+from waldur_mastermind.marketplace.tasks import process_order
+from waldur_mastermind.marketplace.tests import factories
 from waldur_mastermind.marketplace.tests.factories import OFFERING_OPTIONS
 from waldur_mastermind.marketplace.tests.helpers import override_marketplace_settings
-
-from .. import models
-from . import factories
+from waldur_mastermind.marketplace_support import PLUGIN_NAME
 
 
 @ddt
@@ -219,14 +222,16 @@ class OrderCreateTest(test.APITransactionTestCase):
             'cpu_count': 5,
         }
 
-        offering = factories.OfferingFactory(state=models.Offering.States.ACTIVE)
+        offering = factories.OfferingFactory(
+            state=models.Offering.States.ACTIVE, type=PLUGIN_NAME
+        )
         plan = factories.PlanFactory(offering=offering)
 
         for key in limits.keys():
             models.OfferingComponent.objects.create(
                 offering=offering,
                 type=key,
-                billing_type=models.OfferingComponent.BillingTypes.USAGE,
+                billing_type=models.OfferingComponent.BillingTypes.LIMIT,
             )
 
         add_payload = {
@@ -364,6 +369,37 @@ class OrderCreateTest(test.APITransactionTestCase):
         )
         self.assertFalse(models.Order.objects.filter(created_by=user).exists())
 
+    def test_user_cannot_create_order_in_project_is_expired(self):
+        user = getattr(self.fixture, 'staff')
+        self.project.end_date = datetime.datetime(day=1, month=1, year=2020)
+        self.project.save()
+
+        with freeze_time('2020-01-01'):
+            response = self.create_order(user)
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_if_divisions_do_not_match_order_validation_fails(self):
+        user = self.fixture.staff
+        offering = factories.OfferingFactory(state=models.Offering.States.ACTIVE)
+        division = structure_factories.DivisionFactory()
+        offering.divisions.add(division)
+
+        response = self.create_order(user, offering)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_if_divisions_match_order_validation_passes(self):
+        user = self.fixture.staff
+        offering = factories.OfferingFactory(state=models.Offering.States.ACTIVE)
+        division = structure_factories.DivisionFactory()
+        offering.divisions.add(division)
+        self.fixture.customer.division = division
+        self.fixture.customer.save()
+
+        response = self.create_order(user, offering)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(models.Order.objects.filter(created_by=user).exists())
+        self.assertEqual(1, len(response.data['items']))
+
     def create_order(self, user, offering=None, add_payload=None):
         if offering is None:
             offering = factories.OfferingFactory(state=models.Offering.States.ACTIVE)
@@ -426,11 +462,112 @@ class OrderApproveTest(test.APITransactionTestCase):
         response = self.approve_order(self.fixture.owner)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    @mock.patch('waldur_mastermind.marketplace.tasks.process_order.delay')
+    def test_when_create_order_item_with_basic_offering_is_created_resource_is_marked_as_creating(
+        self, mocked_delay
+    ):
+        mocked_delay.side_effect = process_order
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer, type='Marketplace.Basic'
+        )
+        order_item = factories.OrderItemFactory(offering=offering, order=self.order)
+        self.approve_order(self.fixture.owner)
+        order_item.refresh_from_db()
+        self.assertEqual(order_item.resource.state, models.Resource.States.CREATING)
+
+    @mock.patch('waldur_mastermind.marketplace.tasks.process_order.delay')
+    def test_when_update_order_item_with_basic_offering_is_approved_resource_is_marked_as_ok(
+        self, mocked_delay
+    ):
+        mocked_delay.side_effect = process_order
+        new_limits = {'unit': 100}
+
+        plan_period = factories.ResourcePlanPeriodFactory()
+        old_plan = plan_period.plan
+        offering = old_plan.offering
+        offering.customer = self.fixture.customer
+        offering.type = 'Marketplace.Basic'
+        offering.save()
+
+        resource = plan_period.resource
+        resource.plan = old_plan
+        resource.offering = offering
+        resource.limits = {'unit': 50}
+        resource.save()
+
+        order_item = factories.OrderItemFactory(
+            offering=offering,
+            order=self.order,
+            type=models.OrderItem.Types.UPDATE,
+            resource=resource,
+            limits=new_limits,
+        )
+        new_plan = order_item.plan
+
+        self.approve_order(self.fixture.owner)
+        self.approve_order_item(self.fixture.owner, order_item)
+
+        order_item.refresh_from_db()
+
+        self.assertEqual(order_item.resource.state, models.Resource.States.OK)
+        self.assertEqual(order_item.resource.limits, new_limits)
+        self.assertEqual(order_item.resource.plan, new_plan)
+
+    @mock.patch('waldur_mastermind.marketplace.tasks.process_order.delay')
+    def test_when_terminate_order_item_with_basic_offering_is_approved_resource_is_marked_as_terminated(
+        self, mocked_delay
+    ):
+        mocked_delay.side_effect = process_order
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer, type='Marketplace.Basic'
+        )
+        resource = factories.ResourceFactory(offering=offering)
+        order_item = factories.OrderItemFactory(
+            offering=offering,
+            order=self.order,
+            type=models.OrderItem.Types.TERMINATE,
+            resource=resource,
+        )
+        self.approve_order(self.fixture.owner)
+        self.approve_order_item(self.fixture.owner, order_item)
+        order_item.refresh_from_db()
+        self.assertEqual(order_item.resource.state, models.Resource.States.TERMINATED)
+
+    @mock.patch('waldur_mastermind.marketplace.tasks.process_order.delay')
+    def test_when_order_with_basic_offering_is_approved_resource_is_marked_as_ok(
+        self, mocked_delay
+    ):
+        mocked_delay.side_effect = process_order
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer, type='Marketplace.Basic'
+        )
+        order_item = factories.OrderItemFactory(offering=offering, order=self.order)
+        self.approve_order(self.fixture.owner)
+        self.approve_order_item(self.fixture.owner, order_item)
+        order_item.refresh_from_db()
+        self.assertEqual(order_item.resource.state, models.Resource.States.OK)
+
+    def test_user_cannot_approve_order_if_project_is_expired(self):
+        self.project.end_date = datetime.datetime(year=2020, month=1, day=1).date()
+        self.project.save()
+
+        with freeze_time('2020-01-01'):
+            response = self.approve_order(self.fixture.staff)
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
     def approve_order(self, user):
         self.client.force_authenticate(user)
 
         response = self.client.post(self.url)
         self.order.refresh_from_db()
+        return response
+
+    def approve_order_item(self, user, order_item):
+        self.client.force_authenticate(user)
+
+        response = self.client.post(
+            factories.OrderItemFactory.get_url(order_item, 'approve',)
+        )
         return response
 
     def ensure_user_can_approve_order(self, user):

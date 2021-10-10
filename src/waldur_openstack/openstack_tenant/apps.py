@@ -23,8 +23,8 @@ class OpenStackTenantConfig(AppConfig):
             Customer,
             SharedServiceSettings,
         )
-        from waldur_core.structure import SupportedServices
-        from waldur_openstack.openstack.models import Tenant
+        from waldur_core.structure.registry import SupportedServices
+        from waldur_openstack.openstack.models import Tenant, SecurityGroupRule
 
         from .backend import OpenStackTenantBackend
         from . import handlers, models
@@ -65,7 +65,7 @@ class OpenStackTenantConfig(AppConfig):
             name='os_cpu_count',
             quota_field=TotalQuotaField(
                 target_models=[models.Instance],
-                path_to_scope='service_project_link.project',
+                path_to_scope='project',
                 target_field='cores',
             ),
         )
@@ -74,7 +74,7 @@ class OpenStackTenantConfig(AppConfig):
             name='os_ram_size',
             quota_field=TotalQuotaField(
                 target_models=[models.Instance],
-                path_to_scope='service_project_link.project',
+                path_to_scope='project',
                 target_field='ram',
             ),
         )
@@ -83,7 +83,7 @@ class OpenStackTenantConfig(AppConfig):
             name='os_storage_size',
             quota_field=TotalQuotaField(
                 target_models=[models.Volume, models.Snapshot],
-                path_to_scope='service_project_link.project',
+                path_to_scope='project',
                 target_field='size',
             ),
         )
@@ -92,7 +92,7 @@ class OpenStackTenantConfig(AppConfig):
             name='os_cpu_count',
             quota_field=TotalQuotaField(
                 target_models=[models.Instance],
-                path_to_scope='service_project_link.project.customer',
+                path_to_scope='project.customer',
                 target_field='cores',
             ),
         )
@@ -101,7 +101,7 @@ class OpenStackTenantConfig(AppConfig):
             name='os_ram_size',
             quota_field=TotalQuotaField(
                 target_models=[models.Instance],
-                path_to_scope='service_project_link.project.customer',
+                path_to_scope='project.customer',
                 target_field='ram',
             ),
         )
@@ -110,7 +110,7 @@ class OpenStackTenantConfig(AppConfig):
             name='os_storage_size',
             quota_field=TotalQuotaField(
                 target_models=[models.Volume, models.Snapshot],
-                path_to_scope='service_project_link.project.customer',
+                path_to_scope='project.customer',
                 target_field='size',
             ),
         )
@@ -150,6 +150,19 @@ class OpenStackTenantConfig(AppConfig):
                 sender=model,
                 dispatch_uid='openstack_tenant.handlers.delete_%s' % name,
             )
+
+        signals.post_save.connect(
+            handlers.sync_security_group_rule_property_when_resource_is_updated_or_created,
+            sender=SecurityGroupRule,
+            dispatch_uid='openstack_tenant.handlers.'
+            'sync_security_group_rule_property_when_resource_is_updated_or_created',
+        )
+
+        signals.post_delete.connect(
+            handlers.sync_security_group_rule_on_delete,
+            sender=SecurityGroupRule,
+            dispatch_uid='openstack_tenant.handlers.sync_security_group_rule_on_delete',
+        )
 
         signals.post_save.connect(
             handlers.log_backup_schedule_creation,
@@ -199,18 +212,10 @@ class OpenStackTenantConfig(AppConfig):
             dispatch_uid='openstack_tenant.handlers.update_service_settings',
         )
 
-        signals.m2m_changed.connect(
-            handlers.sync_certificates_between_openstack_service_with_openstacktenant_service,
-            sender=ServiceSettings.certifications.through,
-            dispatch_uid='openstack_tenant.handlers.'
-            'sync_certificates_between_openstack_service_with_openstacktenant_service',
-        )
-
-        signals.post_save.connect(
-            handlers.copy_certifications_from_openstack_service_to_openstacktenant_service,
-            sender=ServiceSettings,
-            dispatch_uid='openstack_tenant.handlers.'
-            'copy_certifications_from_openstack_service_to_openstacktenant_service',
+        fsm_signals.post_transition.connect(
+            handlers.mark_private_settings_as_erred_if_tenant_creation_failed,
+            sender=Tenant,
+            dispatch_uid='openstack_tenant.handlers.mark_private_settings_as_erred_if_tenant_creation_failed',
         )
 
         signals.post_save.connect(

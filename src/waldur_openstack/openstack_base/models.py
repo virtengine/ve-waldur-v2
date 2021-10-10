@@ -35,14 +35,14 @@ class BaseSecurityGroupRule(core_models.DescribableMixin, models.Model):
     )
 
     # Empty string represents any protocol
-    protocol = models.CharField(max_length=4, blank=True, choices=PROTOCOLS)
+    protocol = models.CharField(max_length=40, blank=True, choices=PROTOCOLS)
     from_port = models.IntegerField(validators=[MaxValueValidator(65535)], null=True)
     to_port = models.IntegerField(validators=[MaxValueValidator(65535)], null=True)
-    cidr = models.CharField(max_length=32, blank=True, null=True)
+    cidr = models.CharField(max_length=255, blank=True, null=True)
     direction = models.CharField(max_length=8, default=INGRESS, choices=DIRECTIONS)
-    ethertype = models.CharField(max_length=8, default=IPv4, choices=ETHER_TYPES)
+    ethertype = models.CharField(max_length=40, default=IPv4, choices=ETHER_TYPES)
 
-    backend_id = models.CharField(max_length=128, blank=True)
+    backend_id = models.CharField(max_length=36, blank=True)
 
     class Meta:
         abstract = True
@@ -60,30 +60,34 @@ class BaseSecurityGroupRule(core_models.DescribableMixin, models.Model):
 class Port(core_models.BackendModelMixin, models.Model):
     # TODO: Use dedicated field: https://github.com/django-macaddress/django-macaddress
     mac_address = models.CharField(max_length=32, blank=True)
-    ip4_address = models.GenericIPAddressField(null=True, blank=True, protocol='IPv4')
-    ip6_address = models.GenericIPAddressField(null=True, blank=True, protocol='IPv6')
+    fixed_ips = JSONField(
+        default=list,
+        help_text=_(
+            'A list of tuples (ip_address, subnet_id), where ip_address can be both IPv4 and IPv6 '
+            'and subnet_id is a backend id of the subnet'
+        ),
+    )
     backend_id = models.CharField(max_length=255, blank=True)
-
     allowed_address_pairs = JSONField(
         default=list,
         help_text=_(
             'A server can send a packet with source address which matches one of the specified allowed address pairs.'
         ),
     )
+    device_id = models.CharField(max_length=255, null=True, blank=True,)
+    device_owner = models.CharField(max_length=100, null=True, blank=True,)
 
     class Meta:
         abstract = True
 
-    def __str__(self):
-        return self.ip4_address or self.ip6_address or 'Not initialized'
-
     @classmethod
     def get_backend_fields(cls):
         return super(Port, cls).get_backend_fields() + (
-            'ip4_address',
-            'ip6_address',
+            'fixed_ips',
             'mac_address',
             'allowed_address_pairs',
+            'device_id',
+            'device_owner',
         )
 
 

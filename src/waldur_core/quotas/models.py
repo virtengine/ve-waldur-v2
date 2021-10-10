@@ -5,12 +5,11 @@ from django.contrib.contenttypes import fields as ct_fields
 from django.contrib.contenttypes import models as ct_models
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import models, transaction
-from django.db.models import F, Sum
+from django.db.models import Sum
 from django.utils.translation import ugettext_lazy as _
 from model_utils import FieldTracker
-from reversion import revisions as reversion
 
-from waldur_core.core.models import DescendantMixin, ReversionMixin, UuidMixin
+from waldur_core.core.models import DescendantMixin, UuidMixin
 from waldur_core.logging.loggers import LoggableMixin
 from waldur_core.logging.models import AlertThresholdMixin
 from waldur_core.quotas import exceptions, fields, managers
@@ -18,10 +17,7 @@ from waldur_core.quotas import exceptions, fields, managers
 logger = logging.getLogger(__name__)
 
 
-@reversion.register(fields=['usage', 'limit'])
-class Quota(
-    UuidMixin, AlertThresholdMixin, LoggableMixin, ReversionMixin, models.Model
-):
+class Quota(UuidMixin, AlertThresholdMixin, LoggableMixin, models.Model):
     """
     Abstract quota for any resource.
 
@@ -76,8 +72,16 @@ class Quota(
     def get_log_fields(self):
         return ('uuid', 'name', 'limit', 'usage', 'scope')
 
+    def get_scope(self):
+        from waldur_core.structure.models import Project
+
+        if self.content_type.model == 'project':
+            return Project.all_objects.get(id=self.object_id)
+
+        return self.scope
+
     def get_field(self):
-        fields = self.scope.get_quotas_fields()
+        fields = self.get_scope().get_quotas_fields()
         try:
             return next(f for f in fields if f.name == self.name)
         except StopIteration:
@@ -154,12 +158,12 @@ class QuotaModelMixin(models.Model):
     @transaction.atomic
     def add_quota_usage(self, quota_name, usage_delta, validate=False):
         if usage_delta < 0:
-            # Avoid race conditions by using F expressions.
-            # See also: https://docs.djangoproject.com/en/dev/ref/models/expressions/#avoiding-race-conditions-using-f
             # Skip update if it would result in negative value.
-            return self.quotas.filter(name=quota_name, usage__gte=-usage_delta).update(
-                usage=F('usage') + usage_delta
-            )
+            # We need to use save so that pre_save/post_save signals are emitted.
+            for quota in self.quotas.filter(name=quota_name, usage__gte=-usage_delta):
+                quota.usage += usage_delta
+                quota.save(update_fields=['usage'])
+                return
         quota = self.get_or_create_quota(quota_name)
         if validate and quota.is_exceeded(usage_delta):
             raise exceptions.QuotaValidationError(
@@ -192,8 +196,8 @@ class QuotaModelMixin(models.Model):
         if isinstance(self, DescendantMixin):
             # We need to use set in order to eliminate duplicates.
             # Consider, for example, two ways of traversing from resource to customer:
-            # resource -> spl -> project -> customer
-            # resource -> spl -> service -> customer
+            # resource -> project -> customer
+            # resource -> service -> customer
             return {a for a in self.get_ancestors() if isinstance(a, QuotaModelMixin)}
         return {}
 

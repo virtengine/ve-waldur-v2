@@ -1,314 +1,38 @@
-from django.utils.functional import cached_property
+from unittest import mock
+from unittest.mock import patch
 
-from waldur_core.core.models import StateMixin
-from waldur_core.structure import models as structure_models
+from ddt import data, ddt
+from rest_framework import status, test
+
 from waldur_core.structure import signals as structure_signals
+from waldur_core.structure.models import ServiceSettings
 from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_mastermind.marketplace.models import Resource
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
+from waldur_mastermind.marketplace.tests.factories import OfferingFactory
 from waldur_mastermind.marketplace_openstack import (
-    CORES_TYPE,
     INSTANCE_TYPE,
-    PACKAGE_TYPE,
-    RAM_TYPE,
-    STORAGE_TYPE,
+    TENANT_TYPE,
     VOLUME_TYPE,
 )
-from waldur_mastermind.packages import models as package_models
-from waldur_mastermind.packages.tests import fixtures as package_fixtures
-from waldur_openstack.openstack_tenant.tests import (
-    factories as openstack_tenant_factories,
+from waldur_mastermind.marketplace_openstack.tests.mocks import (
+    MOCK_FLAVOR,
+    MOCK_INSTANCE,
+    MOCK_TENANT,
+    MOCK_VOLUME,
 )
-from waldur_openstack.openstack_tenant.tests import (
-    fixtures as openstack_tenant_fixtures,
+from waldur_openstack.openstack import models
+from waldur_openstack.openstack.tests.factories import TenantFactory
+from waldur_openstack.openstack.tests.fixtures import OpenStackFixture
+from waldur_openstack.openstack.tests.test_tenant import BaseTenantActionsTest
+from waldur_openstack.openstack.tests.unittests.test_backend import BaseBackendTestCase
+from waldur_openstack.openstack_tenant.tests.factories import (
+    InstanceFactory,
+    VolumeFactory,
 )
+from waldur_openstack.openstack_tenant.tests.fixtures import OpenStackTenantFixture
 
-from .. import utils
+from .mocks import MockTenant
 from .utils import BaseOpenStackTest
-
-Types = package_models.PackageComponent.Types
-
-
-class TemplateImportTest(BaseOpenStackTest):
-    def setUp(self):
-        super(TemplateImportTest, self).setUp()
-        self.fixture = package_fixtures.PackageFixture()
-        self.template = self.fixture.openstack_template
-
-    def import_offering(self):
-        utils.import_openstack_service_settings(self.fixture.customer)
-
-    def test_plan_is_created(self):
-        self.import_offering()
-        plan = marketplace_models.Plan.objects.get(scope=self.template)
-
-        self.assertEqual(plan.offering.category, self.tenant_category)
-        self.assertEqual(plan.offering.scope, self.template.service_settings)
-
-    def test_duplicate_package_template_is_not_created(self):
-        self.import_offering()
-        self.assertEqual(1, package_models.PackageTemplate.objects.count())
-
-    def test_components_are_imported(self):
-        self.template.components.filter(type=Types.RAM).update(
-            amount=20 * 1024, price=10.0 / 1024
-        )
-        self.template.components.filter(type=Types.CORES).update(amount=10, price=3)
-        self.template.components.filter(type=Types.STORAGE).update(
-            amount=100 * 1024, price=1.0 / 1024
-        )
-
-        self.import_offering()
-        plan = marketplace_models.Plan.objects.get(scope=self.template)
-
-        template_components = self.template.components.all()
-        plan_components = plan.components.all()
-        offering_components = plan.offering.components.all()
-
-        self.assertEqual(plan_components.count(), template_components.count())
-        self.assertEqual(offering_components.count(), template_components.count())
-
-        ram_comp = plan_components.get(component__type=RAM_TYPE)
-        cores_comp = plan_components.get(component__type=CORES_TYPE)
-        storage_comp = plan_components.get(component__type=STORAGE_TYPE)
-
-        self.assertEqual(ram_comp.amount, 20)
-        self.assertEqual(cores_comp.amount, 10)
-        self.assertEqual(storage_comp.amount, 100)
-
-        self.assertEqual(ram_comp.price, 10)
-        self.assertEqual(cores_comp.price, 3)
-        self.assertEqual(storage_comp.price, 1)
-
-    def test_existing_template_is_skipped(self):
-        self.import_offering()
-        self.import_offering()
-
-        self.assertEqual(
-            marketplace_models.Offering.objects.filter(
-                scope=self.template.service_settings
-            ).count(),
-            1,
-        )
-
-    def test_shared_settings_flag_is_mapped(self):
-        service_settings = self.fixture.openstack_service_settings
-        service_settings.shared = True
-        service_settings.save()
-
-        self.import_offering()
-
-        offering = marketplace_models.Offering.objects.get(scope=service_settings)
-        self.assertTrue(offering.shared)
-
-    def test_setting_without_template_is_imported_without_plans(self):
-        self.template.delete()
-        self.import_offering()
-
-        service_settings = self.fixture.openstack_service_settings
-        offering = marketplace_models.Offering.objects.get(scope=service_settings)
-
-        self.assertEqual(offering.plans.all().count(), 0)
-
-    def test_setting_without_template_is_imported_in_draft_state(self):
-        self.template.delete()
-        self.import_offering()
-
-        service_settings = self.fixture.openstack_service_settings
-        offering = marketplace_models.Offering.objects.get(scope=service_settings)
-
-        self.assertEqual(offering.state, marketplace_models.Offering.States.DRAFT)
-
-
-class TenantImportTest(BaseOpenStackTest):
-    def setUp(self):
-        super(TenantImportTest, self).setUp()
-        self.fixture = openstack_tenant_fixtures.OpenStackTenantFixture()
-        self.tenant = self.fixture.tenant
-
-    def import_resource(self):
-        utils.import_openstack_service_settings(self.fixture.customer)
-        utils.import_openstack_tenants()
-        return marketplace_models.Resource.objects.get(scope=self.tenant)
-
-    def test_tenant_attributes_are_imported(self):
-        resource = self.import_resource()
-
-        self.assertEqual(resource.name, self.tenant.name)
-        self.assertEqual(resource.attributes['name'], self.tenant.name)
-        self.assertEqual(resource.project, self.tenant.project)
-
-    def test_tenant_name_is_updated(self):
-        resource = self.import_resource()
-
-        self.tenant.name = 'New name'
-        self.tenant.save()
-
-        resource.refresh_from_db()
-        self.assertEqual(resource.name, self.tenant.name)
-
-    def test_tenant_state_is_imported(self):
-        self.tenant.state = StateMixin.States.UPDATING
-        self.tenant.save()
-
-        resource = self.import_resource()
-        self.assertEqual(resource.state, Resource.States.UPDATING)
-
-    def test_tenant_without_package_does_not_have_plan(self):
-        resource = self.import_resource()
-        self.assertEqual(resource.plan, None)
-
-    def test_tenant_with_package_has_plan(self):
-        self.fixture = package_fixtures.PackageFixture()
-        self.tenant = self.fixture.openstack_package.tenant
-        self.template = self.fixture.openstack_package.template
-
-        resource = self.import_resource()
-        self.assertEqual(resource.plan.scope, self.template)
-
-    def test_existing_resources_are_skipped(self):
-        self.import_resource()
-        self.import_resource()
-
-        self.assertEqual(
-            marketplace_models.Resource.objects.filter(scope=self.tenant).count(), 1
-        )
-
-
-class TenantSettingImportTest(BaseOpenStackTest):
-    def setUp(self):
-        super(TenantSettingImportTest, self).setUp()
-        self.fixture = openstack_tenant_fixtures.OpenStackTenantFixture()
-        self.service_settings = self.fixture.openstack_tenant_service_settings
-
-    def test_instance_offering_has_valid_category(self):
-        utils.import_openstack_tenant_service_settings()
-
-        offerings = marketplace_models.Offering.objects.filter(
-            scope=self.service_settings
-        )
-        instance_offering = offerings.get(type=INSTANCE_TYPE)
-        self.assertTrue(instance_offering.category, self.instance_category)
-
-    def test_volume_offering_has_valid_category(self):
-        utils.import_openstack_tenant_service_settings()
-
-        offerings = marketplace_models.Offering.objects.filter(
-            scope=self.service_settings
-        )
-        volume_offering = offerings.get(type=VOLUME_TYPE)
-        self.assertTrue(volume_offering.category, self.volume_category)
-
-    def test_plan_is_created_for_template(self):
-        fixture = package_fixtures.PackageFixture()
-        template = fixture.openstack_package.template
-
-        utils.import_openstack_service_settings(fixture.customer)
-        utils.import_openstack_tenant_service_settings()
-
-        offerings = marketplace_models.Offering.objects.filter(
-            scope=fixture.openstack_package.service_settings
-        )
-        volume_offering = offerings.get(type=VOLUME_TYPE)
-
-        plan = marketplace_models.Plan.objects.get(
-            scope=template, offering=volume_offering
-        )
-        self.assertEqual(plan.components.all().count(), template.components.count())
-
-
-class InstanceImportTest(BaseOpenStackTest):
-    def setUp(self):
-        super(InstanceImportTest, self).setUp()
-        self.fixture = openstack_tenant_fixtures.OpenStackTenantFixture()
-        self.instance = self.fixture.instance
-
-    def import_resource(self):
-        utils.import_openstack_tenant_service_settings()
-        utils.import_openstack_instances_and_volumes()
-        return marketplace_models.Resource.objects.get(scope=self.instance)
-
-    def test_attributes_are_imported(self):
-        resource = self.import_resource()
-
-        self.assertEqual(resource.attributes['name'], self.instance.name)
-        self.assertEqual(resource.project, self.instance.project)
-
-    def test_state_is_imported(self):
-        self.instance.state = StateMixin.States.UPDATING
-        self.instance.save()
-
-        resource = self.import_resource()
-        self.assertEqual(resource.state, Resource.States.UPDATING)
-
-    def test_plan_is_imported(self):
-        fixture = package_fixtures.PackageFixture()
-        package = fixture.openstack_package
-        template = fixture.openstack_template
-        service_settings = package.service_settings
-
-        service = openstack_tenant_factories.OpenStackTenantServiceFactory(
-            settings=service_settings
-        )
-        spl = openstack_tenant_factories.OpenStackTenantServiceProjectLinkFactory(
-            service=service
-        )
-        self.instance = openstack_tenant_factories.InstanceFactory(
-            service_project_link=spl
-        )
-
-        utils.import_openstack_service_settings(fixture.customer)
-        resource = self.import_resource()
-        self.assertEqual(resource.plan.scope, template)
-
-
-class VolumeImportTest(BaseOpenStackTest):
-    def setUp(self):
-        super(VolumeImportTest, self).setUp()
-        self.fixture = openstack_tenant_fixtures.OpenStackTenantFixture()
-        self.volume = self.fixture.volume
-
-    def import_resource(self):
-        utils.import_openstack_tenant_service_settings()
-        utils.import_openstack_instances_and_volumes()
-        return marketplace_models.Resource.objects.get(scope=self.volume)
-
-    def test_attributes_are_imported(self):
-        resource = self.import_resource()
-
-        self.assertEqual(resource.attributes['name'], self.volume.name)
-        self.assertEqual(resource.project, self.volume.project)
-
-    def test_state_is_imported(self):
-        self.volume.state = StateMixin.States.UPDATING
-        self.volume.save()
-
-        resource = self.import_resource()
-        self.assertEqual(resource.state, Resource.States.UPDATING)
-
-    def test_plan_is_imported(self):
-        fixture = package_fixtures.PackageFixture()
-        package = fixture.openstack_package
-        template = fixture.openstack_template
-        service_settings = package.service_settings
-
-        service = openstack_tenant_factories.OpenStackTenantServiceFactory(
-            settings=service_settings
-        )
-        spl = openstack_tenant_factories.OpenStackTenantServiceProjectLinkFactory(
-            service=service
-        )
-        self.volume = openstack_tenant_factories.VolumeFactory(service_project_link=spl)
-
-        utils.import_openstack_service_settings(fixture.customer)
-        resource = self.import_resource()
-        self.assertEqual(resource.plan.scope, template)
-
-
-class OpenStackTenantFixture(openstack_tenant_fixtures.OpenStackTenantFixture):
-    @cached_property
-    def openstack_tenant_service_settings(self):
-        return structure_models.ServiceSettings.objects.get(scope=self.tenant)
 
 
 class ImportAsMarketplaceResourceTest(BaseOpenStackTest):
@@ -361,45 +85,301 @@ class ImportAsMarketplaceResourceTest(BaseOpenStackTest):
             marketplace_models.Offering.objects.filter(type=VOLUME_TYPE).exists()
         )
 
-    def test_when_volume_is_imported_from_tenant_marketplace_resource_is_created(self):
-        # Arrange
-        tenant = self.fixture.tenant
-        self.import_tenant(tenant)
-        volume = self.fixture.volume
-
-        # Act
-        structure_signals.resource_imported.send(
-            sender=volume.__class__, instance=volume,
-        )
-
-        # Assert
-        self.assertTrue(
-            marketplace_models.Resource.objects.filter(scope=volume).exists()
-        )
-
-    def test_when_instance_is_imported_from_tenant_marketplace_resource_is_created(
-        self,
-    ):
-        # Arrange
-        tenant = self.fixture.tenant
-        self.import_tenant(tenant)
-        instance = self.fixture.instance
-
-        # Act
-        structure_signals.resource_imported.send(
-            sender=instance.__class__, instance=instance,
-        )
-
-        # Assert
-        self.assertTrue(
-            marketplace_models.Resource.objects.filter(scope=instance).exists()
-        )
-
     def import_tenant(self, tenant):
         marketplace_factories.OfferingFactory(
-            scope=tenant.service_settings, type=PACKAGE_TYPE
+            scope=tenant.service_settings, type=TENANT_TYPE
         )
 
         structure_signals.resource_imported.send(
             sender=tenant.__class__, instance=tenant,
         )
+
+
+class BaseInstanceImportTest(BaseBackendTestCase, BaseOpenStackTest):
+    def setUp(self):
+        super(BaseInstanceImportTest, self).setUp()
+        self.fixture = OpenStackTenantFixture()
+        self.offering = marketplace_factories.OfferingFactory(
+            scope=self.fixture.openstack_tenant_service_settings,
+            type=INSTANCE_TYPE,
+            shared=False,
+            customer=self.fixture.customer,
+        )
+        self.mocked_nova().servers.list.return_value = [MOCK_INSTANCE]
+        self.mocked_nova().servers.get.return_value = MOCK_INSTANCE
+        self.mocked_nova().flavors.get.return_value = MOCK_FLAVOR
+        self.mocked_nova().volumes.get_server_volumes.return_value = []
+
+
+class InstanceImportableResourcesTest(BaseInstanceImportTest):
+    def setUp(self):
+        super(InstanceImportableResourcesTest, self).setUp()
+        self.url = OfferingFactory.get_url(self.offering, 'importable_resources')
+        self.client.force_authenticate(self.fixture.owner)
+
+    def test_importable_instances_are_returned(self):
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEquals(
+            response.data,
+            [
+                {
+                    'type': 'OpenStackTenant.Instance',
+                    'name': 'VM-1',
+                    'backend_id': '1',
+                    'description': '',
+                    'extra': [
+                        {'name': 'Runtime state', 'value': 'active'},
+                        {'name': 'Flavor', 'value': 'Standard'},
+                        {'name': 'RAM (MBs)', 'value': 4096},
+                        {'name': 'Cores', 'value': 4},
+                    ],
+                }
+            ],
+        )
+        self.mocked_nova().servers.list.assert_called()
+        self.mocked_nova().flavors.get.assert_called()
+
+
+class InstanceImportTest(BaseInstanceImportTest):
+    def setUp(self):
+        super(InstanceImportTest, self).setUp()
+        self.url = OfferingFactory.get_url(self.offering, 'import_resource')
+        self.client.force_authenticate(self.fixture.owner)
+
+    def _get_payload(self, backend_id='backend_id'):
+        return {
+            'backend_id': backend_id,
+            'project': self.fixture.project.uuid.hex,
+        }
+
+    @mock.patch(
+        'waldur_openstack.openstack_tenant.executors.InstancePullExecutor.execute'
+    )
+    def test_instance_can_be_imported(self, resource_import_execute_mock):
+        response = self.client.post(self.url, self._get_payload())
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        resource_import_execute_mock.assert_called()
+        instance = marketplace_models.Resource.objects.get()
+        self.assertEqual(instance.backend_id, '1')
+
+    def test_existing_instance_cannot_be_imported(self):
+        InstanceFactory(
+            service_settings=self.fixture.openstack_tenant_service_settings,
+            backend_id=MOCK_INSTANCE.id,
+        )
+        payload = self._get_payload(MOCK_INSTANCE.id)
+
+        response = self.client.post(self.url, payload)
+
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
+
+
+class BaseVolumeImportTest(BaseBackendTestCase, test.APITransactionTestCase):
+    def setUp(self):
+        super(BaseVolumeImportTest, self).setUp()
+        self.fixture = OpenStackTenantFixture()
+        self.offering = marketplace_factories.OfferingFactory(
+            scope=self.fixture.openstack_tenant_service_settings,
+            type=VOLUME_TYPE,
+            shared=False,
+            customer=self.fixture.customer,
+        )
+        self.mocked_cinder().volumes.list.return_value = [MOCK_VOLUME]
+        self.mocked_cinder().volumes.get.return_value = MOCK_VOLUME
+
+
+class VolumeImportableResourcesTest(BaseVolumeImportTest):
+    def setUp(self):
+        super(VolumeImportableResourcesTest, self).setUp()
+        self.url = OfferingFactory.get_url(self.offering, 'importable_resources')
+        self.client.force_authenticate(self.fixture.owner)
+
+    def test_importable_volumes_are_returned(self):
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data,
+            [
+                {
+                    'type': 'OpenStackTenant.Volume',
+                    'name': 'ssd-volume',
+                    'backend_id': '1',
+                    'description': '',
+                    'extra': [
+                        {'name': 'Is bootable', 'value': False},
+                        {'name': 'Size', 'value': 102400},
+                        {'name': 'Device', 'value': ''},
+                        {'name': 'Runtime state', 'value': 'available'},
+                    ],
+                }
+            ],
+        )
+
+
+class VolumeImportTest(BaseVolumeImportTest):
+    def setUp(self):
+        super(VolumeImportTest, self).setUp()
+        self.url = OfferingFactory.get_url(self.offering, 'import_resource')
+        self.client.force_authenticate(self.fixture.owner)
+
+    def test_backend_volume_is_imported(self):
+        response = self.client.post(self.url, self._get_payload())
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        instance = marketplace_models.Resource.objects.get()
+        self.assertEqual(instance.backend_id, '1')
+
+    def test_backend_volume_cannot_be_imported_if_it_is_registered_in_waldur(self):
+        volume = VolumeFactory(
+            service_settings=self.fixture.openstack_tenant_service_settings,
+            project=self.fixture.project,
+        )
+
+        response = self.client.post(self.url, self._get_payload(volume.backend_id))
+
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
+
+    def _get_payload(self, backend_id='backend_id'):
+        return {
+            'backend_id': backend_id,
+            'project': self.fixture.project.uuid.hex,
+        }
+
+
+@ddt
+class TenantImportableResourcesTest(BaseBackendTestCase, BaseTenantActionsTest):
+    def setUp(self):
+        super(TenantImportableResourcesTest, self).setUp()
+        self.offering = marketplace_factories.OfferingFactory(
+            scope=self.fixture.openstack_service_settings, type=TENANT_TYPE
+        )
+        self.url = OfferingFactory.get_url(self.offering, 'importable_resources')
+
+    def test_user_can_list_importable_resources(self):
+        self.client.force_authenticate(self.fixture.staff)
+        self.mocked_keystone().projects.list.return_value = [
+            MockTenant(name='First Tenant', id='1'),
+            MockTenant(name='Second Tenant', id='2'),
+        ]
+
+        response = self.client.get(self.url)
+
+        self.assertEquals(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEquals(
+            response.data,
+            [
+                {
+                    'type': 'OpenStack.Tenant',
+                    'name': 'First Tenant',
+                    'description': '',
+                    'backend_id': '1',
+                },
+                {
+                    'type': 'OpenStack.Tenant',
+                    'name': 'Second Tenant',
+                    'description': '',
+                    'backend_id': '2',
+                },
+            ],
+        )
+
+    @data('admin', 'manager', 'owner')
+    def test_user_does_not_have_permissions_to_list_resources(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.get(self.url)
+
+        self.assertEquals(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+@ddt
+class TenantImportTest(BaseBackendTestCase):
+    def setUp(self):
+        super(TenantImportTest, self).setUp()
+        self.fixture = OpenStackFixture()
+        self.backend_tenant = TenantFactory.build(
+            service_settings=self.fixture.openstack_service_settings,
+            project=self.fixture.project,
+        )
+        self.offering = marketplace_factories.OfferingFactory(
+            scope=self.fixture.openstack_service_settings, type=TENANT_TYPE
+        )
+
+    def test_tenant_is_imported(self):
+        response = self.import_tenant()
+
+        self.assertEquals(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEquals(response.data['backend_id'], self.backend_tenant.backend_id)
+        self.assertTrue(
+            models.Tenant.objects.filter(
+                backend_id=self.backend_tenant.backend_id
+            ).exists()
+        )
+
+    @patch('waldur_core.structure.handlers.event_logger')
+    def test_event_is_emitted(self, logger_mock):
+        self.import_tenant()
+
+        actual = logger_mock.resource.info.call_args[0][0]
+        expected = 'Resource {resource_full_name} has been imported.'
+        self.assertEqual(expected, actual)
+
+    @data('admin', 'manager', 'owner')
+    def test_user_cannot_import_tenant(self, user):
+        response = self.import_tenant(user)
+        self.assertEquals(
+            response.status_code, status.HTTP_403_FORBIDDEN, response.data
+        )
+
+    def test_tenant_cannot_be_imported_if_backend_id_exists_already(self):
+        self.backend_tenant.save()
+        response = self.import_tenant()
+        self.assertEquals(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
+
+    def test_imported_tenant_has_user_password_and_username(self):
+        response = self.import_tenant()
+
+        self.assertEquals(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEquals(response.data['backend_id'], self.backend_tenant.backend_id)
+
+        tenant = models.Tenant.objects.get(backend_id=self.backend_tenant.backend_id)
+        self.assertIsNotNone(tenant.user_username)
+        self.assertIsNotNone(tenant.user_password)
+
+    def test_imported_tenant_settings_have_username_and_password_set(self):
+        response = self.import_tenant()
+        self.assertEquals(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        tenant = models.Tenant.objects.get(backend_id=self.backend_tenant.backend_id)
+        service_settings = ServiceSettings.objects.get(scope=tenant)
+
+        self.assertEquals(tenant.user_username, service_settings.username)
+        self.assertEquals(tenant.user_password, service_settings.password)
+
+    @mock.patch('waldur_mastermind.marketplace_openstack.handlers.tasks')
+    def test_import_instances_and_volumes_if_tenant_has_been_imported(self, mock_tasks):
+        marketplace_factories.CategoryFactory(default_vm_category=True)
+        marketplace_factories.CategoryFactory(default_volume_category=True)
+        response = self.import_tenant()
+
+        self.assertEquals(response.status_code, status.HTTP_201_CREATED, response.data)
+        mock_tasks.import_instances_and_volumes_of_tenant.delay.assert_called_once()
+
+    def import_tenant(self, user='staff'):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        payload = {
+            'backend_id': self.backend_tenant.backend_id,
+            'project': self.fixture.project.uuid.hex,
+        }
+        url = OfferingFactory.get_url(self.offering, 'import_resource')
+        self.mocked_keystone.return_value.projects.get.return_value = MOCK_TENANT
+        return self.client.post(url, payload)

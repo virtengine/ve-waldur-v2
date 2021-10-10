@@ -29,6 +29,17 @@ class EventFactory(factory.DjangoModelFactory):
     def get_list_url(cls):
         return 'http://testserver' + reverse('event-list')
 
+    @classmethod
+    def get_stats_list_url(cls):
+        return 'http://testserver' + reverse('events-stats-list')
+
+
+class FeedFactory(factory.DjangoModelFactory):
+    class Meta:
+        model = models.Feed
+
+    event = factory.SubFactory(EventFactory)
+
 
 class WebHookFactory(factory.DjangoModelFactory):
     class Meta:
@@ -47,27 +58,6 @@ class WebHookFactory(factory.DjangoModelFactory):
             hook = WebHookFactory()
         return 'http://testserver' + reverse(
             'webhook-detail', kwargs={'uuid': hook.uuid.hex}
-        )
-
-
-class PushHookFactory(factory.DjangoModelFactory):
-    class Meta:
-        model = models.PushHook
-
-    event_types = get_valid_events()[:3]
-    token = 'VALID_TOKEN'
-    type = models.PushHook.Type.ANDROID
-
-    @classmethod
-    def get_list_url(cls):
-        return 'http://testserver' + reverse('pushhook-list')
-
-    @classmethod
-    def get_url(cls, hook=None):
-        if hook is None:
-            hook = PushHookFactory()
-        return 'http://testserver' + reverse(
-            'pushhook-detail', kwargs={'uuid': hook.uuid.hex}
         )
 
 

@@ -12,14 +12,10 @@ RegistrationManager represents the highest level of business logic and should be
 used for invoice items registration and termination.
 Registrators defines items creation and termination logic for each invoice item.
 """
-from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
 from django.utils import timezone
 
 from waldur_core.core import utils as core_utils
-from waldur_mastermind.invoices import models as invoices_models
-from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_mastermind.marketplace import utils as marketplace_utils
 
 
 class BaseRegistrator:
@@ -66,46 +62,26 @@ class BaseRegistrator:
         :return: invoice item, item's list (or another iterable object, f.e. tuple or queryset) or None
         """
 
-        model_type = ContentType.objects.get_for_model(source)
-        result = invoices_models.InvoiceItem.objects.filter(
-            content_type=model_type,
-            object_id=source.id,
-            invoice__customer=self.get_customer(source),
-            invoice__state=invoices_models.Invoice.States.PENDING,
-            invoice__year=now.year,
-            invoice__month=now.month,
-            end=core_utils.month_end(now),
-        ).first()
-        return result
+        raise NotImplementedError()
 
     def init_details(self, item):
-        item.name = self.get_name(item.scope)
-        item.details.update(self.get_details(item.scope))
-        item.details['scope_uuid'] = item.scope.uuid.hex
-        item.save(update_fields=['name', 'details'])
+        raise NotImplementedError()
 
     def get_name(self, source):
         return source.name
 
     def get_details(self, source):
-        if not isinstance(source, marketplace_models.Resource):
-            return {}
-
-        resource = source
-        details = marketplace_utils.get_offering_details(resource.offering)
-        details['limits'] = resource.limits
-        details['usages'] = {}
-
-        for usage in resource.usages.all():
-            details['usages'][usage.component.type] = usage.usage
-
-        return details
+        return {}
 
 
 class RegistrationManager:
     """ The highest interface for invoice item registration and termination. """
 
     _registrators = {}
+
+    @classmethod
+    def get_key(cls, source):
+        return getattr(source, 'invoice_registrator_key', source.__class__)
 
     @classmethod
     def get_registrators(cls):
@@ -117,7 +93,7 @@ class RegistrationManager:
 
     @classmethod
     def get_registrator(cls, source):
-        return cls._registrators[source.__class__]
+        return cls._registrators[cls.get_key(source)]
 
     @classmethod
     def get_or_create_invoice(cls, customer, date, **kwargs):
@@ -144,7 +120,7 @@ class RegistrationManager:
         if now is None:
             now = timezone.now()
 
-        registrator = cls._registrators[source.__class__]
+        registrator = cls._registrators[cls.get_key(source)]
         customer = registrator.get_customer(source)
 
         with transaction.atomic():
@@ -162,7 +138,7 @@ class RegistrationManager:
         if now is None:
             now = timezone.now()
 
-        registrator = cls._registrators[source.__class__]
+        registrator = cls._registrators[cls.get_key(source)]
         customer = registrator.get_customer(source)
 
         with transaction.atomic():
@@ -174,15 +150,15 @@ class RegistrationManager:
         if now is None:
             now = timezone.now()
 
-        registrator = cls._registrators[source.__class__]
+        registrator = cls._registrators[cls.get_key(source)]
         return registrator._find_item(source, now)
 
     @classmethod
     def get_name(cls, source):
-        registrator = cls._registrators[source.__class__]
+        registrator = cls._registrators[cls.get_key(source)]
         return registrator.get_name(source)
 
     @classmethod
     def get_details(cls, source):
-        registrator = cls._registrators[source.__class__]
+        registrator = cls._registrators[cls.get_key(source)]
         return registrator.get_details(source)

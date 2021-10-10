@@ -1,4 +1,3 @@
-import decimal
 from unittest import mock
 
 from django.conf import settings as django_settings
@@ -6,10 +5,10 @@ from django.test import TestCase
 from freezegun import freeze_time
 
 from waldur_freeipa import models as freeipa_models
+from waldur_slurm import models
 from waldur_slurm.client import SlurmClient
 from waldur_slurm.parser import SlurmReportLine
 
-from .. import models
 from . import factories, fixtures
 
 VALID_REPORT = """
@@ -28,12 +27,62 @@ allocation1|cpu=400,mem=100M,gres/gpu=120
 allocation1|
 """
 
+VALID_USERS_ASSOCIATIONS = """
+allocation1|
+allocation1|user1
+allocation1|user2
+allocation1|user3
+"""
+
 
 class BackendTest(TestCase):
     def setUp(self):
         self.fixture = fixtures.SlurmFixture()
         self.allocation = self.fixture.allocation
         self.account = self.allocation.backend_id
+
+    def prepare_limits_check(self, quotas):
+        self.allocation.cpu_limit = quotas['CPU']
+        self.allocation.gpu_limit = quotas['GPU']
+        self.allocation.ram_limit = quotas['RAM']
+        self.allocation.save()
+
+        template = (
+            'sacctmgr --parsable2 --noheader --immediate'
+            ' modify account %s set GrpTRESMins=cpu=%d,gres/gpu=%d,mem=%d'
+        )
+
+        context = (
+            self.account,
+            self.allocation.cpu_limit,
+            self.allocation.gpu_limit,
+            self.allocation.ram_limit,
+        )
+
+        return [
+            'ssh',
+            '-o',
+            'UserKnownHostsFile=/dev/null',
+            '-o',
+            'StrictHostKeyChecking=no',
+            'root@localhost',
+            '-p',
+            '22',
+            '-i',
+            '/etc/waldur/id_rsa',
+            template % context,
+        ]
+
+    @mock.patch('subprocess.check_output')
+    def test_allocation_creation(self, check_output):
+        backend = self.allocation.get_backend()
+        backend.create_allocation(self.allocation)
+
+        self.allocation.refresh_from_db()
+        default_limits = django_settings.WALDUR_SLURM['DEFAULT_LIMITS']
+        self.assertEqual(self.allocation.cpu_limit, default_limits['CPU'])
+        self.assertEqual(self.allocation.gpu_limit, default_limits['GPU'])
+        self.assertEqual(self.allocation.ram_limit, default_limits['RAM'])
 
     @mock.patch('subprocess.check_output')
     def test_usage_synchronization(self, check_output):
@@ -61,12 +110,8 @@ class BackendTest(TestCase):
         backend = self.allocation.get_backend()
         backend.sync_usage()
 
-        allocation_usage = models.AllocationUsage.objects.get(
-            allocation=self.allocation, year=2017, month=10,
-        )
-
         user1_allocation_usage = models.AllocationUserUsage.objects.get(
-            allocation_usage=allocation_usage, user=user1
+            allocation=self.allocation, year=2017, month=10, user=user1
         )
 
         self.assertEqual(user1_allocation_usage.cpu_usage, 1)
@@ -74,43 +119,30 @@ class BackendTest(TestCase):
         self.assertEqual(user1_allocation_usage.ram_usage, 51200)
 
         user2_allocation_usage = models.AllocationUserUsage.objects.get(
-            allocation_usage=allocation_usage, user=user2
+            allocation=self.allocation, year=2017, month=10, user=user2
         )
         self.assertEqual(user2_allocation_usage.cpu_usage, 2 * 2 * 2)
         self.assertEqual(user2_allocation_usage.gpu_usage, 2 * 2 * 2)
         self.assertEqual(user2_allocation_usage.ram_usage, 2 * 2 * 51200)
 
     @mock.patch('subprocess.check_output')
-    def test_set_resource_limits(self, check_output):
+    def test_set_default_resource_limits(self, check_output):
         default_limits = django_settings.WALDUR_SLURM['DEFAULT_LIMITS']
-        self.allocation.cpu_limit = default_limits['CPU']
-        self.allocation.gpu_limit = default_limits['GPU']
-        self.allocation.ram_limit = default_limits['RAM']
-        self.allocation.save()
+        command = self.prepare_limits_check(default_limits)
 
-        template = (
-            'sacctmgr --parsable2 --noheader --immediate'
-            ' modify account %s set GrpTRES=cpu=%d,gres/gpu=%d,mem=%d'
-        )
-        context = (
-            self.account,
-            self.allocation.cpu_limit,
-            self.allocation.gpu_limit,
-            self.allocation.ram_limit,
-        )
-        command = [
-            'ssh',
-            '-o',
-            'UserKnownHostsFile=/dev/null',
-            '-o',
-            'StrictHostKeyChecking=no',
-            'root@localhost',
-            '-p',
-            '22',
-            '-i',
-            '/etc/waldur/id_rsa',
-            template % context,
-        ]
+        backend = self.allocation.get_backend()
+        backend.set_resource_limits(self.allocation)
+
+        check_output.assert_called_once_with(command, encoding='utf-8', stderr=-2)
+
+    @mock.patch('subprocess.check_output')
+    def test_set_custom_resource_limits(self, check_output):
+        quotas_dict = {
+            'CPU': 1000,
+            'GPU': 2000,
+            'RAM': 3000,
+        }
+        command = self.prepare_limits_check(quotas_dict)
 
         backend = self.allocation.get_backend()
         backend.set_resource_limits(self.allocation)
@@ -152,7 +184,6 @@ class BackendTest(TestCase):
 
         self.assertEqual(result_name, final_correct_name)
 
-    @freeze_time('2020-02-01')
     @mock.patch('subprocess.check_output')
     def test_allocation_zero_usage_created(self, check_output):
         association = f"{self.account}|cpu=400,mem=100M,gres/gpu=120"
@@ -168,15 +199,6 @@ class BackendTest(TestCase):
             self.assertEqual(self.allocation.cpu_usage, 0)
             self.assertEqual(self.allocation.gpu_usage, 0)
             self.assertEqual(self.allocation.ram_usage, 0)
-
-            year = 2020
-            month = 2
-            allocation_usage = models.AllocationUsage.objects.get(
-                allocation=self.allocation, year=year, month=month
-            )
-            self.assertEqual(allocation_usage.cpu_usage, 0)
-            self.assertEqual(allocation_usage.gpu_usage, 0)
-            self.assertEqual(allocation_usage.ram_usage, 0)
 
     @mock.patch('subprocess.check_output')
     def test_allocation_limits_are_not_changed_after_if_association_lines_are_invalid(
@@ -202,39 +224,19 @@ class BackendTest(TestCase):
             self.assertEqual(self.allocation.gpu_limit, gpu_limit_old)
             self.assertEqual(self.allocation.ram_limit, ram_limit_old)
 
-
-class BackendMOABTest(TestCase):
-    def setUp(self):
-        self.fixture = fixtures.SlurmFixture()
-        self.fixture.service.settings.options = {'batch_service': 'MOAB'}
-        self.fixture.allocation.deposit_usage = 0
-
-        self.subprocess_patcher = mock.patch('subprocess.check_output')
-        self.subprocess_mock = self.subprocess_patcher.start()
-        self.subprocess_mock.return_value = """
-            test_acc|4|||21|centos|0.00|1
-            test_acc|4|6|12|20|centos|0.00|1
-            test_acc|4|||100|centos|0.03|1
-            test_acc|4|||100|centos|0.03|1
-            test_acc|4|||500|centos|0.17|1
-            test_acc|4|||2|centos|0.00|1
-        """.replace(
-            'test_acc', self.fixture.allocation.backend_id
+    @mock.patch('subprocess.check_output')
+    def test_allocation_associations(self, check_output):
+        check_output.return_value = VALID_USERS_ASSOCIATIONS.replace(
+            'allocation1', self.account
         )
 
-    def tearDown(self):
-        mock.patch.stopall()
+        stale_association = factories.AssociationFactory(
+            allocation=self.allocation, username='user4'
+        )
 
-    def test_allocation_synchronization(self):
-        backend = self.fixture.service.settings.get_backend()
-        backend.sync()
-        self.fixture.allocation.refresh_from_db()
-        self.assertEqual(self.fixture.allocation.deposit_usage, decimal.Decimal('0.23'))
+        backend = self.allocation.get_backend()
+        backend._update_allocation_associations(self.allocation)
 
-    def test_allocation_usage_synchronization(self):
-        backend = self.fixture.service.settings.get_backend()
-        backend.sync()
-        usage = models.AllocationUsage.objects.get(allocation=self.fixture.allocation)
-        self.assertEqual(usage.cpu_usage, 64)
-        self.assertEqual(usage.gpu_usage, 6)
-        self.assertEqual(usage.ram_usage, 12)
+        self.allocation.refresh_from_db()
+        self.assertEqual(3, self.allocation.associations.count())
+        self.assertNotIn(stale_association, self.allocation.associations.all())

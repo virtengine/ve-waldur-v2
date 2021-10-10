@@ -1,10 +1,9 @@
-import base64
 import logging
 from csv import DictWriter
 from io import StringIO
 
 import pdfkit
-from celery import chain, shared_task
+from celery import shared_task
 from django.conf import settings
 from django.db.models import Q
 from django.template.loader import render_to_string
@@ -40,59 +39,48 @@ def create_monthly_invoices():
         customers = customers.filter(accounting_start_date__lt=timezone.now())
 
     for customer in customers.iterator():
-        registrators.RegistrationManager.get_or_create_invoice(
-            customer, core_utils.month_start(date)
-        )
+        try:
+            registrators.RegistrationManager.get_or_create_invoice(
+                customer, core_utils.month_start(date)
+            )
+        except Exception:
+            # Continue processing even if some customers could not be processed
+            logger.exception(
+                'Unable to create monthly invoice for customer %s', customer
+            )
 
     if settings.WALDUR_INVOICES['INVOICE_REPORTING']['ENABLE']:
         send_invoice_report.delay()
 
     if settings.WALDUR_INVOICES['SEND_CUSTOMER_INVOICES']:
-        chain(create_pdf_for_new_invoices.si(), send_new_invoices_notification.si())()
-    else:
-        create_pdf_for_new_invoices.delay()
+        send_new_invoices_notification.delay()
 
 
 @shared_task(name='invoices.send_invoice_notification')
 def send_invoice_notification(invoice_uuid):
     """ Sends email notification with invoice link to customer owners """
     invoice = models.Invoice.objects.get(uuid=invoice_uuid)
-    link_template = settings.WALDUR_INVOICES['INVOICE_LINK_TEMPLATE']
-
-    if not link_template:
-        logger.error(
-            'INVOICE_LINK_TEMPLATE is not set. '
-            'Sending of invoice notification is not available.'
-        )
-        return
-
-    if '{uuid}' not in link_template:
-        logger.error(
-            'INVOICE_LINK_TEMPLATE must include \'{uuid}\' parameter. '
-            'Sending of invoice notification is not available.'
-        )
-        return
 
     context = {
         'month': invoice.month,
         'year': invoice.year,
         'customer': invoice.customer.name,
-        'link': link_template.format(uuid=invoice_uuid),
+        'link': core_utils.format_homeport_link('invoice/{uuid}', uuid=invoice_uuid),
     }
 
     emails = [owner.email for owner in invoice.customer.get_owners()]
+
     filename = None
     attachment = None
     content_type = None
 
-    if invoice._file:
-        filename = '%s_%s_%s.pdf' % (
-            settings.WALDUR_CORE['SITE_NAME'].replace(' ', '_'),
-            invoice.year,
-            invoice.month,
-        )
-        attachment = base64.b64decode(invoice._file)
-        content_type = 'application/pdf'
+    filename = '%s_%s_%s.pdf' % (
+        settings.WALDUR_CORE['SITE_NAME'].replace(' ', '_'),
+        invoice.year,
+        invoice.month,
+    )
+    attachment = utils.create_invoice_pdf(invoice)
+    content_type = 'application/pdf'
 
     logger.debug(
         'About to send invoice {invoice} notification to {emails}'.format(
@@ -158,8 +146,9 @@ def format_invoice_csv(invoices):
         writer.writeheader()
 
         for invoice in invoices:
-            items = invoice.items
-            items = utils.filter_invoice_items(items)
+            items = utils.filter_invoice_items(
+                invoice.items.order_by('project_name', 'name')
+            )
             serializer = serializers.SAFReportSerializer(items, many=True)
             writer.writerows(serializer.data)
         return stream.getvalue()
@@ -170,8 +159,7 @@ def format_invoice_csv(invoices):
     writer.writeheader()
 
     for invoice in invoices:
-        items = invoice.items
-        items = utils.filter_invoice_items(items)
+        items = utils.filter_invoice_items(invoice.items.all())
         serializer = serializers.InvoiceItemReportSerializer(items, many=True)
         writer.writerows(serializer.data)
 
@@ -185,25 +173,6 @@ def update_invoices_current_cost():
 
     for invoice in models.Invoice.objects.filter(year=year, month=month):
         invoice.update_current_cost()
-
-
-@shared_task
-def create_invoice_pdf(serialized_invoice):
-    invoice = core_utils.deserialize_instance(serialized_invoice)
-    utils.create_invoice_pdf(invoice)
-
-
-@shared_task
-def create_pdf_for_all_invoices():
-    for invoice in models.Invoice.objects.all():
-        utils.create_invoice_pdf(invoice)
-
-
-@shared_task
-def create_pdf_for_new_invoices():
-    date = timezone.now()
-    for invoice in models.Invoice.objects.filter(year=date.year, month=date.month):
-        utils.create_invoice_pdf(invoice)
 
 
 @shared_task

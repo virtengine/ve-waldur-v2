@@ -7,8 +7,8 @@ from django.db.models import Count, signals
 from django.utils.timezone import now
 
 from waldur_core.core import utils as core_utils
-from waldur_core.structure.models import Customer, Project
-from waldur_mastermind.invoices import models as invoices_models
+from waldur_core.structure import models as structure_models
+from waldur_core.structure.models import Customer, CustomerRole, Project
 
 from . import callbacks, log, models, tasks, utils
 
@@ -261,19 +261,26 @@ def connect_resource_handlers(*resources):
         signals.post_save.connect(
             change_order_item_state,
             sender=model,
-            dispatch_uid='waldur_mastermind.marketpace.change_order_item_state_%s'
+            dispatch_uid='waldur_mastermind.marketplace.change_order_item_state_%s'
             % suffix,
         )
 
         signals.pre_delete.connect(
             terminate_resource,
             sender=model,
-            dispatch_uid='waldur_mastermind.marketpace.terminate_resource_%s' % suffix,
+            dispatch_uid='waldur_mastermind.marketplace.terminate_resource_%s' % suffix,
         )
 
 
 def synchronize_resource_metadata(sender, instance, created=False, **kwargs):
-    fields = {'action', 'action_details', 'state', 'runtime_state', 'name'}
+    fields = {
+        'action',
+        'action_details',
+        'state',
+        'runtime_state',
+        'name',
+        'backend_id',
+    }
     if not created and not set(instance.tracker.changed()) & fields:
         return
 
@@ -296,7 +303,7 @@ def connect_resource_metadata_handlers(*resources):
         signals.post_save.connect(
             synchronize_resource_metadata,
             sender=model,
-            dispatch_uid='waldur_mastermind.marketpace.'
+            dispatch_uid='waldur_mastermind.marketplace.'
             'synchronize_resource_metadata_%s_%s' % (index, model.__class__),
         )
 
@@ -335,29 +342,6 @@ def limit_update_failed(sender, order_item, error_message, **kwargs):
     log.log_resource_limit_update_failed(resource)
 
 
-def add_component_usage(sender, instance, created=False, **kwargs):
-    component_usage = instance
-
-    if not created and not component_usage.tracker.has_changed('usage'):
-        return
-
-    if not isinstance(component_usage.resource, models.Resource):
-        return
-
-    try:
-        item = invoices_models.InvoiceItem.objects.get(
-            invoice__year=component_usage.billing_period.year,
-            invoice__month=component_usage.billing_period.month,
-            scope=component_usage.resource,
-        )
-        usages = item.details.get('usages', {})
-        usages[component_usage.component.type] = component_usage.usage
-        item.details['usages'] = usages
-        item.save()
-    except invoices_models.InvoiceItem.DoesNotExist:
-        pass
-
-
 def log_offering_permission_granted(
     sender, structure, user, role=None, created_by=None, **kwargs
 ):
@@ -372,3 +356,183 @@ def log_offering_permission_revoked(
 
 def log_offering_permission_updated(sender, instance, user, **kwargs):
     log.log_offering_permission_updated(instance, user)
+
+
+def add_service_manager_role_to_customer(
+    sender, structure, user, role=None, created_by=None, **kwargs
+):
+    if not structure.customer.has_user(user, CustomerRole.SERVICE_MANAGER):
+        structure.customer.add_user(user, CustomerRole.SERVICE_MANAGER)
+
+
+def drop_service_manager_role_from_customer(
+    sender, structure, user, role=None, removed_by=None, **kwargs
+):
+    if not models.OfferingPermission.objects.filter(
+        offering__customer=structure.customer, user=user, is_active=True
+    ).exists():
+        structure.customer.remove_user(user, CustomerRole.SERVICE_MANAGER)
+
+
+def drop_offering_permissions_if_service_manager_role_is_revoked(
+    sender, structure, user, role=None, removed_by=None, **kwargs
+):
+    if role != CustomerRole.SERVICE_MANAGER:
+        return
+    for perm in models.OfferingPermission.objects.filter(
+        offering__customer=structure, user=user, is_active=True
+    ):
+        perm.revoke()
+
+
+def disable_empty_service_settings(offering):
+    service_settings = getattr(offering, 'scope', None)
+    if not service_settings:
+        return
+
+    if not isinstance(service_settings, structure_models.ServiceSettings):
+        return
+
+    if (
+        not models.Resource.objects.filter(offering=offering)
+        .exclude(state=models.Resource.States.TERMINATED)
+        .exists()
+    ):
+        service_settings.is_active = False
+        service_settings.save(update_fields=['is_active'])
+
+
+def enable_nonempty_service_settings(offering):
+    service_settings = getattr(offering, 'scope', None)
+    if not service_settings:
+        return
+
+    if not isinstance(service_settings, structure_models.ServiceSettings):
+        return
+
+    if (
+        models.Resource.objects.filter(offering=offering)
+        .exclude(state=models.Resource.States.TERMINATED)
+        .exists()
+    ):
+        service_settings.is_active = True
+        service_settings.save(update_fields=['is_active'])
+
+
+def disable_archived_service_settings_without_existing_resource(
+    sender, instance, created=False, **kwargs
+):
+    if created:
+        return
+
+    if not instance.tracker.has_changed('state'):
+        return
+
+    if instance.state != models.Resource.States.TERMINATED:
+        return
+
+    offering: models.Offering = instance.offering
+
+    if offering.state != models.Offering.States.ARCHIVED:
+        return
+
+    disable_empty_service_settings(offering)
+
+
+def disable_service_settings_without_existing_resource_when_archived(
+    sender, instance, created=False, **kwargs
+):
+    if created:
+        return
+
+    if not instance.tracker.has_changed('state'):
+        return
+
+    if instance.state != models.Offering.States.ARCHIVED:
+        return
+
+    disable_empty_service_settings(instance)
+
+
+def enable_service_settings_with_existing_resource(
+    sender, instance, created=False, **kwargs
+):
+    if created:
+        return
+
+    if not instance.tracker.has_changed('state'):
+        return
+
+    if instance.state in [
+        models.Resource.States.TERMINATED,
+        models.Resource.States.TERMINATING,
+    ]:
+        return
+
+    enable_nonempty_service_settings(instance.offering)
+
+
+def enable_service_settings_when_not_archived(
+    sender, instance, created=False, **kwargs
+):
+    if created:
+        return
+
+    if not instance.tracker.has_changed('state'):
+        return
+
+    if instance.state == models.Offering.States.ARCHIVED:
+        return
+
+    enable_nonempty_service_settings(instance)
+
+
+def resource_has_been_renamed(sender, instance, created=False, **kwargs):
+    if created:
+        return
+
+    if not instance.tracker.has_changed('name'):
+        return
+
+    log.log_marketplace_resource_renamed(
+        instance, instance.tracker.previous('name') or ''
+    )
+
+
+def delete_expired_project_if_every_resource_has_been_terminated(
+    sender, instance, created=False, **kwargs
+):
+    if created:
+        return
+
+    if not instance.tracker.has_changed('state'):
+        return
+
+    if instance.state != models.Resource.States.TERMINATED:
+        return
+
+    project = structure_models.Project.all_objects.get(pk=instance.project_id)
+
+    if project.is_expired:
+        resources = (
+            models.Resource.objects.filter(project=project)
+            .exclude(
+                state__in=(
+                    models.Resource.States.ERRED,
+                    models.Resource.States.TERMINATED,
+                )
+            )
+            .exists()
+        )
+        if not resources:
+            project.delete()
+
+
+def log_offering_user_created(sender, instance, created=False, **kwargs):
+    if not created:
+        return
+    log.log_offering_user_created(instance)
+
+
+def log_offering_user_deleted(sender, instance, **kwargs):
+    log.log_offering_user_deleted(instance)

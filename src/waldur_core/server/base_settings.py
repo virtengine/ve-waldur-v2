@@ -7,9 +7,8 @@ import locale
 import os
 import warnings
 
-from celery.schedules import crontab
-
 from waldur_core.core import WaldurExtension
+from waldur_core.core.metadata import WaldurConfiguration
 from waldur_core.server.admin.settings import *  # noqa: F403
 
 encoding = locale.getpreferredencoding()
@@ -30,6 +29,9 @@ MEDIA_ROOT = '/media_root/'
 MEDIA_URL = '/media/'
 
 ALLOWED_HOSTS = []
+SITE_ID = 1
+DBTEMPLATES_USE_REVERSION = True
+DBTEMPLATES_USE_CODEMIRROR = True
 
 # Application definition
 INSTALLED_APPS = (
@@ -39,11 +41,11 @@ INSTALLED_APPS = (
     'django.contrib.messages',
     'django.contrib.humanize',
     'django.contrib.staticfiles',
+    'django.contrib.sites',
 
     'waldur_core.landing',
     'waldur_core.logging',
     'waldur_core.core',
-    'waldur_core.monitoring',
     'waldur_core.quotas',
     'waldur_core.structure',
     'waldur_core.users',
@@ -61,6 +63,16 @@ INSTALLED_APPS = (
     'jsoneditor',
     'modeltranslation',
     'import_export',
+
+    'health_check',
+    'health_check.db',
+    'health_check.cache',
+    'health_check.storage',
+    'health_check.contrib.migrations',
+    'health_check.contrib.celery_ping',
+    'dbtemplates',
+
+    'binary_database_files',
 )
 INSTALLED_APPS += ADMIN_INSTALLED_APPS  # noqa: F405
 
@@ -129,7 +141,7 @@ ANONYMOUS_USER_ID = None
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [os.path.join(BASE_DIR, 'src', 'waldur_core', 'templates')],
+        'DIRS': (os.path.join(BASE_DIR, 'src', 'waldur_core', 'templates'),),
         'OPTIONS': {
             'context_processors': (
                 'django.template.context_processors.debug',
@@ -141,10 +153,11 @@ TEMPLATES = [
                 'django.template.context_processors.static',
                 'django.template.context_processors.tz',
             ),
-            'loaders': (
+            'loaders': ADMIN_TEMPLATE_LOADERS + (
+                'dbtemplates.loader.Loader',
                 'django.template.loaders.filesystem.Loader',
                 'django.template.loaders.app_directories.Loader',
-            ) + ADMIN_TEMPLATE_LOADERS,  # noqa: F405
+            ),  # noqa: F405
         },
     },
 ]
@@ -160,10 +173,6 @@ SESSION_SAVE_EVERY_REQUEST = True
 
 WSGI_APPLICATION = 'waldur_core.server.wsgi.application'
 
-# Internationalization
-# https://docs.djangoproject.com/en/2.2/topics/i18n/
-LANGUAGE_CODE = 'en-us'
-
 TIME_ZONE = 'UTC'
 
 USE_I18N = True
@@ -172,11 +181,6 @@ USE_L10N = True
 
 LOCALE_PATHS = (
     os.path.join(BASE_DIR, 'src', 'waldur_core', 'locale'),
-)
-
-LANGUAGES = (
-    ('en', 'English'),
-    ('et', 'Estonian'),
 )
 
 USE_TZ = True
@@ -249,80 +253,7 @@ CELERY_BEAT_SCHEDULE = {
     },
 }
 
-# Logging
-# Send verified request on webhook processing
-VERIFY_WEBHOOK_REQUESTS = True
-
-
-# Extensions
-WALDUR_CORE = {
-    'EXTENSIONS_AUTOREGISTER': True,
-    'TOKEN_KEY': 'x-auth-token',
-
-    # wiki: http://docs.waldur.com/MasterMind+configuration
-    'AUTHENTICATION_METHODS': [
-        'LOCAL_SIGNIN',
-    ],
-    'INVITATIONS_ENABLED': True,
-    'ALLOW_SIGNUP_WITHOUT_INVITATION': True,
-    'VALIDATE_INVITATION_EMAIL': False,
-    'TOKEN_LIFETIME': timedelta(hours=1),
-    'INVITATION_LIFETIME': timedelta(weeks=1),
-    'OWNERS_CAN_MANAGE_OWNERS': False,
-    'OWNER_CAN_MANAGE_CUSTOMER': False,
-    'BACKEND_FIELDS_EDITABLE': True,
-    'INITIAL_CUSTOMER_AGREEMENT_NUMBER': 4000,
-    'CREATE_DEFAULT_PROJECT_ON_ORGANIZATION_CREATION': False,
-    'ONLY_STAFF_MANAGES_SERVICES': False,
-    'COMPANY_TYPES': (
-        'Ministry',
-        'Private company',
-        'Public company',
-        'Government owned company',
-    ),
-    'NATIVE_NAME_ENABLED': False,
-    'SITE_NAME': 'Waldur MasterMind',
-    'SITE_ADDRESS': 'Default address',
-    'SITE_EMAIL': 'Default email',
-    'SITE_PHONE': 'Default phone',
-    'SITE_LOGO': None,
-    'CURRENCY_NAME': 'EUR',
-    'LOGIN_COMPLETED_URL': 'https://example.com/#/login_completed/{token}/{method}/',
-    'LOGIN_FAILED_URL': 'https://example.com/#/login_failed/',
-    'LOGOUT_COMPLETED_URL': 'https://example.com/#/logout_completed/',
-    'LOGOUT_FAILED_URL': 'https://example.com/#/logout_failed/',
-    'NOTIFICATIONS_PROFILE_CHANGES': {'ENABLED': True, 'FIELDS': ('email', 'phone_number', 'job_title')},
-    # 'COUNTRIES': ['EE', 'LV', 'LT'],
-    'ENABLE_ACCOUNTING_START_DATE': False,
-    'USE_ATOMIC_TRANSACTION': True,
-    'NOTIFICATION_SUBJECT': 'Notifications from Waldur',
-    'LOGGING_REPORT_DIRECTORY': '/var/log/waldur',
-    'LOGGING_REPORT_INTERVAL': timedelta(days=7),
-    'HTTP_CHUNK_SIZE': 50,
-    'ONLY_STAFF_CAN_INVITE_USERS': False,
-    'INVITATION_APPROVE_URL': 'https://example.com/#/invitation_approve/{token}/',
-    'INVITATION_REJECT_URL': 'https://example.com/#/invitation_reject/{token}/',
-    'INVITATION_MAX_AGE': None,
-    'INVITATION_CREATE_MISSING_USER': False,
-    'INVITATION_DISABLE_MULTIPLE_ROLES': False,
-    'PROTECT_USER_DETAILS_FOR_REGISTRATION_METHODS': [],
-    'ATTACHMENT_LINK_MAX_AGE': timedelta(hours=1),
-    'EMAIL_CHANGE_URL': 'https://example.com/#/user_email_change/{code}/',
-    'EMAIL_CHANGE_MAX_AGE': timedelta(days=1),
-}
-
-WALDUR_CORE_PUBLIC_SETTINGS = [
-    'AUTHENTICATION_METHODS',
-    'INVITATIONS_ENABLED',
-    'ALLOW_SIGNUP_WITHOUT_INVITATION',
-    'VALIDATE_INVITATION_EMAIL',
-    'OWNER_CAN_MANAGE_CUSTOMER',
-    'OWNERS_CAN_MANAGE_OWNERS',
-    'COMPANY_TYPES',
-    'NATIVE_NAME_ENABLED',
-    'ONLY_STAFF_MANAGES_SERVICES',
-    'PROTECT_USER_DETAILS_FOR_REGISTRATION_METHODS',
-]
+globals().update(WaldurConfiguration().dict())
 
 for ext in WaldurExtension.get_extensions():
     INSTALLED_APPS += (ext.django_app(),)
@@ -358,13 +289,16 @@ SWAGGER_SETTINGS = {
     },
 }
 
-IPSTACK_ACCESS_KEY = ''
-
-USE_PROTECTED_URL = False
-CONVERT_MEDIA_URLS_TO_MASTERMIND_NETLOC = False
-
-IMPORT_EXPORT_USE_TRANSACTIONS = True
-
 AXES_ONLY_USER_FAILURES = True
 AXES_COOLOFF_TIME = timedelta(minutes=10)
 AXES_FAILURE_LIMIT = 5
+
+# Django File Storage API
+DEFAULT_FILE_STORAGE = 'binary_database_files.storage.DatabaseStorage'
+DB_FILES_AUTO_EXPORT_DB_TO_FS = False
+DATABASE_FILES_URL_METHOD = 'URL_METHOD_2'
+
+# Disable excessive xmlschema and django-axes logging
+import logging
+logging.getLogger("xmlschema").propagate = False
+logging.getLogger("axes").propagate = False

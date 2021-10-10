@@ -10,36 +10,31 @@ from freezegun import freeze_time
 from waldur_core.core.tests.helpers import override_waldur_core_settings
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
-from waldur_mastermind.packages.tests import fixtures as package_fixtures
-from waldur_mastermind.packages.tests.utils import override_plugin_settings
-
-from ... import models, tasks, utils
-from .. import factories
-from .. import utils as test_utils
+from waldur_mastermind.invoices import models, tasks, utils
+from waldur_mastermind.invoices.tests import factories, fixtures
 
 
-@override_plugin_settings(BILLING_ENABLED=True)
-class CreateMonthlyInvoicesForPackagesTest(TestCase):
-    def test_invoice_is_created_monthly(self):
-        with freeze_time('2016-11-01'):
-            fixture = package_fixtures.PackageFixture()
-            package = fixture.openstack_package
+class CreateMonthlyInvoiceTest(TestCase):
+    def test_invoice_item_is_created_for_created_resource_in_new_month(self):
+        with freeze_time('2017-01-15'):
+            fixture = fixtures.InvoiceFixture()
+            fixture.resource.set_state_ok()
+            fixture.resource.save()
 
-        with freeze_time('2016-12-01'):
-            invoice = models.Invoice.objects.get(customer=fixture.customer)
-
-            # Create monthly invoices
+        with freeze_time('2017-02-01'):
             tasks.create_monthly_invoices()
 
-            # Check that old invoices has changed the state
-            invoice.refresh_from_db()
-            self.assertEqual(invoice.state, models.Invoice.States.CREATED)
+        self.assertEqual(models.InvoiceItem.objects.count(), 2)
 
-            # Check that new invoice where created with the same openstack items
-            new_invoice = models.Invoice.objects.get(
-                customer=fixture.customer, state=models.Invoice.States.PENDING
-            )
-            self.assertEqual(package, new_invoice.generic_items.first().scope)
+    def test_invoice_item_is_not_created_for_pending_resource_in_new_month(self):
+        with freeze_time('2017-01-15'):
+            fixture = fixtures.InvoiceFixture()
+            fixture.invoice_item
+
+        with freeze_time('2017-02-01'):
+            tasks.create_monthly_invoices()
+
+        self.assertEqual(models.InvoiceItem.objects.count(), 1)
 
     def test_old_invoices_are_marked_as_created(self):
 
@@ -94,9 +89,6 @@ class CheckAccountingStartDateTest(TestCase):
 
 
 @override_settings(task_always_eager=True)
-@test_utils.override_invoices_settings(
-    INVOICE_LINK_TEMPLATE='http://example.com/invoice/{uuid}'
-)
 class NotificationTest(TestCase):
     def setUp(self):
         self.fixture = structure_fixtures.CustomerFixture()
@@ -109,11 +101,6 @@ class NotificationTest(TestCase):
     def tearDown(self):
         super(NotificationTest, self).tearDown()
         mock.patch.stopall()
-
-    def test_send_invoice_without_pdf(self):
-        tasks.send_invoice_notification(self.invoice.uuid)
-        self.assertEqual(len(mail.outbox), 1)
-        self.assertEqual(len(mail.outbox[0].attachments), 0)
 
     def test_send_invoice_with_pdf(self):
         utils.create_invoice_pdf(self.invoice)

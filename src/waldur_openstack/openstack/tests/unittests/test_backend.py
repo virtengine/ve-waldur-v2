@@ -63,6 +63,7 @@ class PullFloatingIPTest(BaseBackendTestCase):
                     'id': floating_ip.backend_id,
                     'description': '',
                     'tenant_id': floating_ip.tenant.backend_id,
+                    'port_id': self.fixture.port.backend_id,
                 }
             ]
         )
@@ -92,6 +93,7 @@ class PullFloatingIPTest(BaseBackendTestCase):
         self.assertEqual(created_ip.runtime_state, floating_ip.runtime_state)
         self.assertEqual(created_ip.backend_network_id, floating_ip.backend_network_id)
         self.assertEqual(created_ip.address, floating_ip.address)
+        self.assertEqual(created_ip.port, self.fixture.port)
 
     @data(True, False)
     def test_floating_ip_is_deleted_if_it_is_not_returned_by_neutron(self, is_admin):
@@ -118,6 +120,7 @@ class PullFloatingIPTest(BaseBackendTestCase):
     def test_floating_ip_is_updated(self, is_admin):
         floating_ip = self.fixture.floating_ip
         floating_ip.runtime_state = 'ACTIVE'
+
         self.setup_client(is_admin, self._get_valid_new_backend_ip(floating_ip))
 
         floating_ip.runtime_state = 'DOWN'
@@ -127,6 +130,7 @@ class PullFloatingIPTest(BaseBackendTestCase):
 
         floating_ip.refresh_from_db()
         self.assertEqual(floating_ip.runtime_state, 'ACTIVE')
+        self.assertEqual(floating_ip.port, self.fixture.port)
 
 
 @ddt
@@ -293,25 +297,29 @@ class PushSecurityGroupTest(BaseBackendTestCase):
             }
         }
 
+        mocked_security_group_rule = {
+            'security_group_id': security_group.backend_id,
+            'ethertype': 'IPv4',
+            'direction': 'ingress',
+            'protocol': rule.protocol,
+            'port_range_min': rule.from_port,
+            'port_range_max': rule.to_port,
+            'remote_ip_prefix': rule.cidr,
+            'remote_group_id': None,
+            'description': rule.description,
+        }
+
+        self.mocked_neutron().create_security_group_rule.return_value = {
+            'security_group_rule': dict(id='valid_id', **mocked_security_group_rule)
+        }
+
         self.backend.push_security_group_rules(security_group)
 
         self.mocked_neutron().delete_security_group_rule.assert_has_calls(
             [mock.call(EGRESS_RULE_ID), mock.call(INGRESS_RULE_ID),]
         )
         self.mocked_neutron().create_security_group_rule.assert_called_once_with(
-            {
-                'security_group_rule': {
-                    'security_group_id': security_group.backend_id,
-                    'ethertype': 'IPv4',
-                    'direction': 'ingress',
-                    'protocol': rule.protocol,
-                    'port_range_min': rule.from_port,
-                    'port_range_max': rule.to_port,
-                    'remote_ip_prefix': rule.cidr,
-                    'remote_group_id': None,
-                    'description': rule.description,
-                }
-            }
+            {'security_group_rule': mocked_security_group_rule}
         )
 
 
@@ -361,7 +369,8 @@ class PullSubnetsTest(BaseBackendTestCase):
     def setUp(self):
         super(PullSubnetsTest, self).setUp()
         self.network = factories.NetworkFactory(
-            service_project_link=self.fixture.openstack_spl,
+            service_settings=self.fixture.openstack_service_settings,
+            project=self.fixture.project,
             tenant=self.tenant,
             backend_id='network_id',
         )
@@ -414,7 +423,8 @@ class PullSubnetsTest(BaseBackendTestCase):
 
     def test_existing_subnets_are_updated(self):
         subnet = factories.SubNetFactory(
-            service_project_link=self.fixture.openstack_spl,
+            service_settings=self.fixture.openstack_service_settings,
+            project=self.fixture.project,
             backend_id='backend_id',
             name='Old name',
             network=self.network,
@@ -491,7 +501,8 @@ class ImportTenantNetworksTest(BaseBackendTestCase):
         }
         network = factories.NetworkFactory(
             tenant=self.tenant,
-            service_project_link=self.tenant.service_project_link,
+            service_settings=self.tenant.service_settings,
+            project=self.tenant.project,
             backend_id=backend_network['id'],
         )
         self.assertEqual(self.tenant.networks.count(), 1)
@@ -657,3 +668,84 @@ class PullImagesTest(BaseBackendTestCase):
         self.mocked_glance().images.list.return_value[0]['status'] = 'deleted'
         self.backend.pull_images()
         self.assertEqual(models.Image.objects.count(), 0)
+
+
+class PullPortsTest(BaseBackendTestCase):
+    def setUp(self):
+        super(PullPortsTest, self).setUp()
+        self.subnet = self.fixture.subnet
+        self.subnet.backend_id = f'{self.subnet.name}_backend_id'
+        self.subnet.save()
+
+        self.port: models.Port = self.fixture.port
+        self.port.backend_id = f'{self.port.name}_backend_id'
+        self.port.fixed_ips = [
+            {'ip_address': '192.168.11.1', 'subnet_id': self.subnet.backend_id}
+        ]
+        self.port.save()
+
+    def _get_valid_new_backend_port(self, port: models.Port):
+        return dict(
+            ports=[
+                {
+                    'id': port.backend_id,
+                    'name': port.name,
+                    'tenant_id': port.tenant.backend_id,
+                    'network_id': port.network.backend_id,
+                    'fixed_ips': port.fixed_ips,
+                    'description': port.description,
+                    'mac_address': port.mac_address,
+                }
+            ]
+        )
+
+    def setup_client(self, is_admin, value):
+        self.mocked_neutron().list_ports.return_value = value
+
+    def call_backend(self):
+        return self.backend.pull_tenant_ports(self.tenant)
+
+    def test_port_is_created_if_does_not_exists(self):
+        port = self.port
+        self.setup_client(False, self._get_valid_new_backend_port(port))
+        port.delete()
+
+        self.call_backend()
+
+        self.assertEqual(models.Port.objects.count(), 1)
+        created_port: models.Port = models.Port.objects.get(
+            tenant=self.tenant, backend_id=port.backend_id
+        )
+
+        self.assertEqual(created_port.state, models.Port.States.OK)
+        self.assertEqual(created_port.network, port.network)
+
+        self.assertEqual(
+            created_port.fixed_ips,
+            [{'ip_address': '192.168.11.1', 'subnet_id': self.subnet.backend_id}],
+        )
+
+    def test_port_is_deleted_if_it_is_not_returned_by_neutron(self):
+        port = self.port
+        self.setup_client(False, dict(ports=[]))
+
+        self.call_backend()
+
+        self.assertRaises(models.Port.DoesNotExist, port.refresh_from_db)
+
+    def test_port_is_updated(self):
+        port: models.Port = self.port
+
+        self.setup_client(False, self._get_valid_new_backend_port(port))
+
+        port.fixed_ips = []
+        port.save()
+
+        self.call_backend()
+
+        port.refresh_from_db()
+
+        self.assertEqual(
+            port.fixed_ips,
+            [{'ip_address': '192.168.11.1', 'subnet_id': self.subnet.backend_id}],
+        )

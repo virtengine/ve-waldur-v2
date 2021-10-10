@@ -12,26 +12,16 @@ class MarketplaceSlurmConfig(AppConfig):
         from waldur_mastermind.marketplace import handlers as marketplace_handlers
         from waldur_mastermind.marketplace_slurm import PLUGIN_NAME
         from waldur_slurm import models as slurm_models
+        from waldur_slurm import signals as slurm_signals
         from waldur_slurm.apps import SlurmConfig
+        from . import handlers, processor, registrators as slurm_registrators
 
-        from . import handlers, processor
-
-        signals.post_save.connect(
-            handlers.synchronize_slurm_package,
-            sender=marketplace_models.PlanComponent,
-            dispatch_uid='waldur_mastermind.marketpace_slurm.synchronize_slurm_package',
-        )
-
-        signals.post_save.connect(
-            handlers.create_slurm_usage,
-            sender=slurm_models.AllocationUsage,
-            dispatch_uid='waldur_mastermind.marketpace_slurm.create_slurm_usage',
-        )
+        slurm_registrators.SlurmRegistrator.connect()
 
         signals.post_save.connect(
             handlers.update_component_quota,
             sender=slurm_models.Allocation,
-            dispatch_uid='waldur_mastermind.marketpace_slurm.update_component_quota',
+            dispatch_uid='waldur_mastermind.marketplace_slurm.update_component_quota',
         )
 
         marketplace_handlers.connect_resource_handlers(slurm_models.Allocation)
@@ -44,26 +34,29 @@ class MarketplaceSlurmConfig(AppConfig):
             delete_resource_processor=processor.DeleteAllocationProcessor,
             components=(
                 Component(
-                    type='cpu',
-                    name='CPU',
-                    measured_unit='hours',
-                    billing_type=USAGE,
-                    disable_quotas=True,
+                    type='cpu', name='CPU', measured_unit='hours', billing_type=USAGE,
                 ),
                 Component(
-                    type='gpu',
-                    name='GPU',
-                    measured_unit='hours',
-                    billing_type=USAGE,
-                    disable_quotas=True,
+                    type='gpu', name='GPU', measured_unit='hours', billing_type=USAGE,
                 ),
                 Component(
                     type='ram',
                     name='RAM',
                     measured_unit='GB-hours',
                     billing_type=USAGE,
-                    disable_quotas=True,
                 ),
             ),
             service_type=SlurmConfig.service_name,
+        )
+
+        slurm_signals.slurm_association_created.connect(
+            handlers.create_offering_user_for_slurm_user,
+            sender=slurm_models.Allocation,
+            dispatch_uid='waldur_mastermind.marketplace_slurm.create_offering_user_for_slurm_user',
+        )
+
+        slurm_signals.slurm_association_deleted.connect(
+            handlers.drop_offering_user_for_slurm_user,
+            sender=slurm_models.Allocation,
+            dispatch_uid='waldur_mastermind.marketplace_slurm.drop_offering_user_for_slurm_user',
         )

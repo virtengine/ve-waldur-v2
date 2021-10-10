@@ -7,17 +7,18 @@ from django.contrib.auth import get_user_model
 from django.core import signing
 from django.db import transaction
 from django.template import Context, Template
+from django.template import exceptions as template_exceptions
+from django.template.loader import get_template
 from django.utils.translation import ugettext_lazy as _
 from rest_framework import exceptions, serializers
 
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core.utils import is_uuid_like
 from waldur_core.media.serializers import ProtectedMediaSerializerMixin
-from waldur_core.structure import SupportedServices
 from waldur_core.structure import models as structure_models
-from waldur_core.structure import serializers as structure_serializers
+from waldur_core.structure.registry import get_resource_type
 from waldur_jira import serializers as jira_serializers
-from waldur_mastermind.common.serializers import validate_options
+from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.support.backend.atlassian import ServiceDeskBackend
 
 from . import models
@@ -27,12 +28,16 @@ User = get_user_model()
 
 
 def render_issue_template(config_name, issue):
-    issue_settings = settings.WALDUR_SUPPORT.get('ISSUE', {})
-    if not issue_settings:
-        return ''
+    try:
+        template = get_template('support/' + config_name + '.txt').template
+    except template_exceptions.TemplateDoesNotExist:
+        issue_settings = settings.WALDUR_SUPPORT.get('ISSUE', {})
+        if not issue_settings:
+            return ''
 
-    raw = issue_settings[config_name]
-    template = Template(raw)
+        raw = issue_settings[config_name]
+        template = Template(raw)
+
     return template.render(Context({'issue': issue}, autoescape=False))
 
 
@@ -55,7 +60,9 @@ class IssueSerializer(
     core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer
 ):
     resource = core_serializers.GenericRelatedField(
-        related_models=structure_models.ResourceMixin.get_all_models(), required=False
+        related_models=structure_models.BaseResource.get_all_models()
+        + [marketplace_models.Resource],
+        required=False,
     )
     caller = serializers.HyperlinkedRelatedField(
         view_name='user-detail',
@@ -181,16 +188,17 @@ class IssueSerializer(
         return fields
 
     def get_resource_type(self, obj):
-        if isinstance(obj.resource, structure_models.ResourceMixin):
-            return SupportedServices.get_name_for_model(
-                obj.resource_content_type.model_class()
-            )
+        if isinstance(obj.resource, structure_models.BaseResource):
+            return get_resource_type(obj.resource_content_type.model_class())
+        if isinstance(obj.resource, marketplace_models.Resource):
+            return 'Marketplace.Resource'
 
     def validate(self, attrs):
         if self.instance is not None:
             return attrs
+        request_user = self.context['request'].user
         if attrs.pop('is_reported_manually'):
-            attrs['caller'] = self.context['request'].user
+            attrs['caller'] = request_user
             if attrs.get('assignee'):
                 raise serializers.ValidationError(
                     {
@@ -200,20 +208,30 @@ class IssueSerializer(
                     }
                 )
         else:
+            # create a request on behalf of an agent
             if not attrs.get('caller'):
                 raise serializers.ValidationError(
                     {'caller': _('This field is required.')}
                 )
-            reporter = models.SupportUser.objects.filter(
-                user=self.context['request'].user, is_active=True
-            ).first()
-            if not reporter:
-                raise serializers.ValidationError(
-                    _(
-                        'You cannot report issues because your help desk account is not connected to profile.'
+            # if change of reporter is supported, use it
+            if settings.WALDUR_SUPPORT['MAP_WALDUR_USERS_TO_SERVICEDESK_AGENTS']:
+                reporter = models.SupportUser.objects.filter(
+                    user=request_user, is_active=True
+                ).first()
+                if not reporter:
+                    raise serializers.ValidationError(
+                        _(
+                            'You cannot report issues because your help desk account is not connected to profile.'
+                        )
                     )
+                attrs['reporter'] = reporter
+            else:
+                # leave a mark about reporter in the description field
+                attrs['description'] = (
+                    f'Reported by {request_user.full_name}.\n\n'
+                    + attrs.get('description', '')
                 )
-            attrs['reporter'] = reporter
+
         return attrs
 
     def validate_customer(self, customer):
@@ -254,7 +272,7 @@ class IssueSerializer(
 
     def validate_resource(self, resource):
         if resource:
-            self.validate_project(resource.service_project_link.project)
+            self.validate_project(resource.project)
         return resource
 
     def validate_priority(self, priority):
@@ -275,7 +293,7 @@ class IssueSerializer(
     def create(self, validated_data):
         resource = validated_data.get('resource')
         if resource:
-            validated_data['project'] = resource.service_project_link.project
+            validated_data['project'] = resource.project
         project = validated_data.get('project')
         if project:
             validated_data['customer'] = project.customer
@@ -404,260 +422,14 @@ class WebHookReceiverSerializer(jira_serializers.WebHookReceiverSerializer):
 WebHookReceiverSerializer.remove_event(['jira:issue_created'])
 
 
-class OfferingSerializer(
-    structure_serializers.PermissionFieldFilteringMixin,
-    core_serializers.AugmentedSerializerMixin,
-    serializers.HyperlinkedModelSerializer,
-):
-    type = serializers.ReadOnlyField(source='template.name')
-
-    template = serializers.HyperlinkedRelatedField(
-        queryset=models.OfferingTemplate.objects.all(),
-        view_name='support-offering-template-detail',
-        lookup_field='uuid',
-    )
-    plan = serializers.HyperlinkedRelatedField(
-        queryset=models.OfferingPlan.objects.all(),
-        view_name='support-offering-plan-detail',
-        lookup_field='uuid',
-        required=False,
-        write_only=True,
-    )
-    state = serializers.ReadOnlyField(source='get_state_display')
-    report = serializers.JSONField(required=False)
-    template_uuid = serializers.ReadOnlyField(source='template.uuid')
-    resource_type = serializers.SerializerMethodField()
-    error_message = serializers.ReadOnlyField(source='issue.error_message')
-
-    class Meta:
-        model = models.Offering
-        fields = (
-            'url',
-            'uuid',
-            'name',
-            'project',
-            'type',
-            'template',
-            'template_uuid',
-            'resource_type',
-            'plan',
-            'state',
-            'type_label',
-            'unit_price',
-            'unit',
-            'created',
-            'modified',
-            'issue',
-            'issue_name',
-            'issue_link',
-            'issue_key',
-            'issue_description',
-            'issue_uuid',
-            'issue_status',
-            'project_name',
-            'project_uuid',
-            'product_code',
-            'article_code',
-            'report',
-            'error_message',
-            'backend_id',
-        )
-        read_only_fields = (
-            'type_label',
-            'issue',
-            'unit_price',
-            'unit',
-            'state',
-            'product_code',
-            'article_code',
-            'backend_id',
-        )
-        protected_fields = ('project', 'type', 'template', 'plan')
-        extra_kwargs = dict(
-            url={'lookup_field': 'uuid', 'view_name': 'support-offering-detail'},
-            issue={'lookup_field': 'uuid', 'view_name': 'support-issue-detail'},
-            project={'lookup_field': 'uuid', 'view_name': 'project-detail'},
-            unit_price={'decimal_places': 2},
-        )
-        related_paths = dict(
-            issue=('uuid', 'name', 'status', 'key', 'description', 'link'),
-            project=('uuid', 'name',),
-        )
-
-    def validate_report(self, report):
-        if not isinstance(report, list):
-            raise serializers.ValidationError('Report should be a list.')
-
-        if len(report) == 0:
-            raise serializers.ValidationError(
-                'Report object should contain at least one section.'
-            )
-
-        for section in report:
-            if not isinstance(section, dict):
-                raise serializers.ValidationError('Report section should be an object.')
-
-            if not section.get('header'):
-                raise serializers.ValidationError(
-                    'Report section should contain header.'
-                )
-
-            if not section.get('body'):
-                raise serializers.ValidationError('Report section should contain body.')
-
-        return report
-
-    def get_filtered_field_names(self):
-        return ('project',)
-
-    def get_resource_type(self, obj):
-        return obj.get_scope_type()
-
-
-class ConfigurableFormDescriptionMixin:
-    def _form_description(self, configuration, validated_data):
-        result = []
-
-        for key in configuration.get('order') or []:
-            if key not in validated_data:
-                continue
-
-            label = configuration['options'].get(key, {})
-            label_value = label.get('label', key)
-            result.append('%s: \'%s\'' % (label_value, validated_data[key]))
-
-        if 'description' in validated_data:
-            result.append('\n %s' % validated_data['description'])
-
-        return '\n'.join(result)
-
-
-class OfferingCreateSerializer(OfferingSerializer, ConfigurableFormDescriptionMixin):
-    attributes = serializers.JSONField(required=False, write_only=True, allow_null=True)
-    description = serializers.CharField(
-        required=False, help_text=_('Description to add to the issue.')
-    )
-
-    class Meta(OfferingSerializer.Meta):
-        fields = OfferingSerializer.Meta.fields + ('description', 'attributes')
-        extra_kwargs = dict(
-            url={'lookup_field': 'uuid', 'view_name': 'support-offering-detail'},
-            issue={'lookup_field': 'uuid', 'view_name': 'support-issue-detail'},
-            project={
-                'lookup_field': 'uuid',
-                'view_name': 'project-detail',
-                'required': True,
-                'allow_empty': False,
-                'allow_null': False,
-            },
-        )
-
-    def create(self, validated_data):
-        """
-        Each offering corresponds to the single issue which has next values:
-            'project' - a hyperlinked field which must be provided with every request;
-            'customer' - customer is extracted from the provided project;
-            'caller' - a user who sent a request is considered to be a 'caller' of the issue;
-            'summary' - has a format of 'Request for <template_name>' or 'Request for "Support" if empty;
-            'description' - combined list of all other fields provided with the request;
-        """
-        template = validated_data['template']
-        plan = validated_data.pop('plan', None)
-
-        # Temporary code for backward compatibility
-        if not plan:
-            plan = template.plans.first()
-
-        # It's okay if there's no plan.
-        if plan and plan.template != template:
-            raise serializers.ValidationError(
-                {'plan': _('Plan should be related to the same template.'),}
-            )
-
-        attributes = validated_data.get('attributes', {})
-        if isinstance(template.config, dict) and template.config.get('options'):
-            try:
-                validate_options(template.config['options'], attributes)
-            except serializers.ValidationError as exc:
-                raise serializers.ValidationError({'attributes': exc})
-            else:
-                validated_data.update(attributes)
-
-        offering_configuration = template.config
-        issue_details = self._get_issue_details(validated_data)
-        issue_details['summary'] = render_issue_template('summary', issue_details)
-        issue_details['description'] = render_issue_template(
-            'description', issue_details
-        )
-        issue = models.Issue.objects.create(**issue_details)
-
-        payload = dict(
-            issue=issue,
-            project=issue.project,
-            name=validated_data.get('name'),
-            template=template,
-        )
-        if plan:
-            payload.update(
-                dict(
-                    product_code=plan.product_code,
-                    article_code=plan.article_code,
-                    unit_price=plan.unit_price,
-                    unit=plan.unit,
-                    plan=plan,
-                )
-            )
-        else:
-            # Temporary workaround for backward compatibility
-            payload.update(
-                dict(
-                    product_code=offering_configuration.get('product_code', ''),
-                    article_code=offering_configuration.get('article_code', ''),
-                )
-            )
-
-        offering = models.Offering.objects.create(**payload)
-
-        return offering
-
-    def _get_issue_details(self, validated_data):
-        project = validated_data['project']
-        template = validated_data['template']
-
-        return dict(
-            caller=self.context['request'].user,
-            project=project,
-            customer=project.customer,
-            type=settings.WALDUR_SUPPORT['DEFAULT_OFFERING_ISSUE_TYPE'],
-            summary='Request for \'%s\'' % template.config.get('label', template.name),
-            description=self._form_description(template.config, validated_data),
-        )
-
-
-class OfferingCompleteSerializer(serializers.Serializer):
-    unit_price = serializers.DecimalField(max_digits=13, decimal_places=7)
-    unit = serializers.ChoiceField(
-        choices=models.Offering.Units.CHOICES, default=models.Offering.Units.PER_DAY
-    )
-
-    def update(self, instance, validated_data):
-        instance.unit_price = validated_data['unit_price']
-        instance.unit = validated_data['unit']
-        instance.state = models.Offering.States.OK
-        instance.save(update_fields=['state', 'unit_price', 'unit'])
-        return instance
-
-
-class OfferingSetBackendIDSerializer(serializers.Serializer):
-    backend_id = serializers.CharField()
-
-
 class AttachmentSerializer(
     ProtectedMediaSerializerMixin,
     core_serializers.RestrictedSerializerMixin,
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
 ):
+    file_name = serializers.SerializerMethodField()
+
     class Meta:
         model = models.Attachment
         fields = (
@@ -669,15 +441,26 @@ class AttachmentSerializer(
             'file',
             'mime_type',
             'file_size',
+            'file_name',
             'thumbnail',
             'backend_id',
         )
-        read_only_fields = ('backend_id',)
+        read_only_fields = (
+            'mime_type',
+            'file_size',
+            'file_name',
+            'thumbnail',
+            'backend_id',
+        )
         extra_kwargs = dict(
             url={'lookup_field': 'uuid'},
             issue={'lookup_field': 'uuid', 'view_name': 'support-issue-detail'},
         )
         related_paths = dict(issue=('key',),)
+
+    def get_file_name(self, attachment):
+        _, file_name = os.path.split(attachment.file.name)
+        return file_name
 
     def validate(self, attrs):
         filename, file_extension = os.path.splitext(attrs['file'].name)
@@ -734,27 +517,6 @@ class TemplateSerializer(serializers.HyperlinkedModelSerializer):
         return fields
 
 
-class OfferingTemplateSerializer(serializers.HyperlinkedModelSerializer):
-    class Meta:
-        model = models.OfferingTemplate
-        fields = ('url', 'uuid', 'name', 'config')
-        extra_kwargs = dict(
-            url={
-                'lookup_field': 'uuid',
-                'view_name': 'support-offering-template-detail',
-            },
-        )
-
-
-class OfferingPlanSerializer(serializers.HyperlinkedModelSerializer):
-    class Meta:
-        model = models.OfferingPlan
-        fields = ('url', 'uuid', 'product_code', 'article_code', 'unit', 'unit_price')
-        extra_kwargs = dict(
-            url={'lookup_field': 'uuid', 'view_name': 'support-offering-plan-detail'},
-        )
-
-
 class CreateFeedbackSerializer(serializers.HyperlinkedModelSerializer):
     token = serializers.CharField(required=True, write_only=True)
 
@@ -799,3 +561,25 @@ class CreateFeedbackSerializer(serializers.HyperlinkedModelSerializer):
 
         attrs['issue'] = issue
         return attrs
+
+
+class FeedbackSerializer(serializers.HyperlinkedModelSerializer):
+    issue_uuid = serializers.ReadOnlyField(source='issue.uuid')
+    issue_key = serializers.ReadOnlyField(source='issue.key')
+    user_full_name = serializers.ReadOnlyField(source='issue.caller.full_name')
+    issue_summary = serializers.ReadOnlyField(source='issue.summary')
+
+    class Meta:
+        model = models.Feedback
+        fields = (
+            'uuid',
+            'created',
+            'modified',
+            'state',
+            'evaluation',
+            'comment',
+            'issue_uuid',
+            'user_full_name',
+            'issue_key',
+            'issue_summary',
+        )

@@ -1,3 +1,4 @@
+import datetime
 import logging
 
 from django.conf import settings
@@ -12,7 +13,7 @@ from waldur_core.core import utils as core_utils
 from waldur_mastermind.invoices import signals as cost_signals
 from waldur_mastermind.marketplace import models as marketplace_models
 
-from . import log, models, registrators, tasks
+from . import log, models, registrators
 
 logger = logging.getLogger(__name__)
 
@@ -140,80 +141,6 @@ def update_current_cost_when_invoice_item_is_deleted(sender, instance, **kwargs)
     transaction.on_commit(update_invoice)
 
 
-@transaction.atomic()
-def adjust_openstack_items_for_downtime(downtime):
-    scopes = []
-
-    if downtime.offering:
-        scopes.extend(
-            list(marketplace_models.Resource.objects.filter(offering=downtime.offering))
-        )
-
-    if downtime.resource:
-        scopes.append(downtime.resource)
-
-    for scope in scopes:
-        items = models.InvoiceItem.objects.filter(
-            downtime.get_intersection_subquery(), scope=scope,
-        )
-
-        for item in items:
-            # outside
-            if downtime.start <= item.start and item.end <= downtime.end:
-                item.create_compensation(
-                    item.name, downtime, start=item.start, end=item.end
-                )
-
-            # inside
-            elif item.start <= downtime.start and downtime.end <= item.end:
-                item.create_compensation(
-                    item.name, downtime, start=downtime.start, end=downtime.end
-                )
-
-            # left
-            elif downtime.end >= item.start and downtime.end <= item.end:
-                item.create_compensation(
-                    item.name, downtime, start=item.start, end=downtime.end
-                )
-
-            # right
-            elif downtime.start >= item.start and downtime.start <= item.end:
-                item.create_compensation(
-                    item.name, downtime, start=downtime.start, end=item.end
-                )
-
-
-def adjust_invoice_items_for_downtime(sender, instance, created=False, **kwargs):
-    downtime = instance
-    if not created:
-        logger.warning(
-            'Invoice items are not adjusted when downtime record is changed. '
-            'Record ID: %s',
-            downtime.id,
-        )
-
-    adjust_openstack_items_for_downtime(downtime)
-
-
-def downtime_has_been_deleted(sender, instance, **kwargs):
-    models.InvoiceItem.objects.filter(
-        invoice__state=models.Invoice.States.PENDING, details__downtime_id=instance.id
-    ).delete()
-
-
-def update_invoice_pdf(sender, instance, created=False, **kwargs):
-    if created:
-        return
-
-    invoice = instance
-
-    if not invoice.tracker.has_changed('current_cost'):
-        return
-
-    serialized_invoice = core_utils.serialize_instance(invoice)
-    tasks.create_invoice_pdf.delay(serialized_invoice)
-
-
 def projects_customer_has_been_changed(
     sender, project, old_customer, new_customer, created=False, **kwargs
 ):
@@ -235,6 +162,39 @@ def projects_customer_has_been_changed(
     )
 
     if create:
-        invoice.generic_items.filter(project=project).delete()
+        invoice.items.filter(project=project).delete()
     else:
-        invoice.generic_items.filter(project=project).update(invoice=new_invoice)
+        invoice.items.filter(project=project).update(invoice=new_invoice)
+
+
+def create_recurring_usage_if_invoice_has_been_created(
+    sender, instance, created=False, **kwargs
+):
+    if not created:
+        return
+
+    invoice = instance
+
+    now = timezone.now()
+    prev_month = (now.replace(day=1) - datetime.timedelta(days=1)).date()
+    prev_month_start = prev_month.replace(day=1)
+    usages = marketplace_models.ComponentUsage.objects.filter(
+        resource__project__customer=invoice.customer,
+        recurring=True,
+        billing_period__gte=prev_month_start,
+    ).exclude(resource__state=marketplace_models.Resource.States.TERMINATED)
+
+    if not usages:
+        return
+
+    for usage in usages:
+        marketplace_models.ComponentUsage.objects.create(
+            resource=usage.resource,
+            component=usage.component,
+            usage=usage.usage,
+            description=usage.description,
+            date=now,
+            plan_period=usage.plan_period,
+            recurring=usage.recurring,
+            billing_period=core_utils.month_start(now),
+        )

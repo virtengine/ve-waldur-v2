@@ -5,16 +5,16 @@ from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.db.models import Q
 from django.utils.translation import ugettext_lazy as _
-from django_filters.rest_framework import DjangoFilterBackend
 from django_filters.widgets import BooleanWidget
 from rest_framework import exceptions as rf_exceptions
 from rest_framework.filters import BaseFilterBackend
 
 from waldur_core.core import filters as core_filters
+from waldur_core.core.filters import LooseMultipleChoiceFilter
 from waldur_core.core.utils import is_uuid_like
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import models as structure_models
-from waldur_mastermind.marketplace.plugins import manager
+from waldur_mastermind.marketplace import plugins
 from waldur_pid import models as pid_models
 
 from . import models
@@ -25,27 +25,34 @@ class ServiceProviderFilter(django_filters.FilterSet):
         view_name='customer-detail', field_name='customer__uuid'
     )
     customer_uuid = django_filters.UUIDFilter(field_name='customer__uuid')
+    customer_keyword = django_filters.CharFilter(method='filter_customer_keyword')
     o = django_filters.OrderingFilter(fields=(('customer__name', 'customer_name'),))
 
     class Meta:
         model = models.ServiceProvider
         fields = []
 
+    def filter_customer_keyword(self, queryset, name, value):
+        return queryset.filter(
+            Q(customer__name__icontains=value)
+            | Q(customer__abbreviation__icontains=value)
+            | Q(customer__native_name__icontains=value)
+        )
 
-class BaseOfferingFilter(django_filters.FilterSet):
-    name = django_filters.CharFilter(lookup_expr='icontains')
-    name_exact = django_filters.CharFilter(field_name='name')
+
+class OfferingFilter(structure_filters.NameFilterSet, django_filters.FilterSet):
+    class Meta:
+        model = models.Offering
+        fields = []
+
     customer = core_filters.URLFilter(
         view_name='customer-detail', field_name='customer__uuid'
     )
     customer_uuid = django_filters.UUIDFilter(field_name='customer__uuid')
+    allowed_customer_uuid = django_filters.UUIDFilter(method='filter_allowed_customer')
+    service_manager_uuid = django_filters.UUIDFilter(method='filter_service_manager')
     project_uuid = django_filters.UUIDFilter(method='filter_project')
-    allowed_customer_uuid = django_filters.UUIDFilter(
-        field_name='customer__uuid', method='filter_allowed_customer'
-    )
-    attributes = django_filters.CharFilter(
-        field_name='attributes', method='filter_attributes'
-    )
+    attributes = django_filters.CharFilter(method='filter_attributes')
     state = core_filters.MappedMultipleChoiceFilter(
         choices=[
             (representation, representation)
@@ -58,10 +65,17 @@ class BaseOfferingFilter(django_filters.FilterSet):
     )
     category_uuid = django_filters.UUIDFilter(field_name='category__uuid')
     billable = django_filters.BooleanFilter(widget=BooleanWidget)
-    o = django_filters.OrderingFilter(fields=('name', 'created'))
+    shared = django_filters.BooleanFilter(widget=BooleanWidget)
+    description = django_filters.CharFilter(lookup_expr='icontains')
+    keyword = django_filters.CharFilter(method='filter_keyword', label='Keyword')
+    o = django_filters.OrderingFilter(fields=('name', 'created', 'type'))
+    type = LooseMultipleChoiceFilter()
 
     def filter_allowed_customer(self, queryset, name, value):
         return queryset.filter_for_customer(value)
+
+    def filter_service_manager(self, queryset, name, value):
+        return queryset.filter_for_service_manager(value)
 
     def filter_project(self, queryset, name, value):
         return queryset.filter_for_project(value)
@@ -89,23 +103,28 @@ class BaseOfferingFilter(django_filters.FilterSet):
                 queryset = queryset.filter(attributes__contains={k: v})
         return queryset
 
+    def filter_keyword(self, queryset, name, value):
+        return queryset.filter(
+            Q(name__icontains=value)
+            | Q(description__icontains=value)
+            | Q(customer__name__icontains=value)
+            | Q(customer__abbreviation__icontains=value)
+            | Q(customer__native_name__icontains=value)
+        )
 
-class OfferingFilter(BaseOfferingFilter):
-    shared = django_filters.BooleanFilter(widget=BooleanWidget)
 
-    class Meta:
-        model = models.Offering
-        fields = ['shared', 'type']
-
-
-class OfferingCustomersFilterBackend(DjangoFilterBackend):
+class OfferingCustomersFilterBackend(BaseFilterBackend):
     def filter_queryset(self, request, queryset, view):
         return queryset.filter_for_user(request.user)
 
 
-class OfferingImportableFilterBackend(DjangoFilterBackend):
+class OfferingImportableFilterBackend(BaseFilterBackend):
     def filter_queryset(self, request, queryset, view):
         if 'importable' in request.query_params:
+            queryset = queryset.filter(
+                type__in=plugins.manager.get_importable_offering_types()
+            )
+
             user = request.user
 
             if user.is_staff:
@@ -126,10 +145,9 @@ class OfferingImportableFilterBackend(DjangoFilterBackend):
             )
 
             owned_offerings_ids = list(
-                queryset.filter(
-                    Q(allowed_customers__in=owned_customers)
-                    | Q(customer__in=owned_customers)
-                ).values_list('id', flat=True)
+                queryset.filter(customer__in=owned_customers).values_list(
+                    'id', flat=True
+                )
             )
 
             # Import private offerings must be available for admins and managers
@@ -148,9 +166,8 @@ class OfferingImportableFilterBackend(DjangoFilterBackend):
                 if (
                     offering.scope
                     and offering.scope.scope
-                    and offering.scope.scope.service_project_link
-                    and offering.scope.scope.service_project_link.project.id
-                    in projects_ids
+                    and offering.scope.scope.project
+                    and offering.scope.scope.project.id in projects_ids
                 ):
                     used_offerings_ids.append(offering.id)
 
@@ -160,16 +177,21 @@ class OfferingImportableFilterBackend(DjangoFilterBackend):
         return queryset
 
 
-class OfferingFilterMixin:
-    offering = django_filters.UUIDFilter(field_name='offering__uuid')
-    offering_uuid = core_filters.URLFilter(
+class OfferingFilterMixin(django_filters.FilterSet):
+    offering = core_filters.URLFilter(
         view_name='marketplace-offering-detail', field_name='offering__uuid',
     )
+    offering_uuid = django_filters.UUIDFilter(field_name='offering__uuid')
 
 
 class OfferingPermissionFilter(
     OfferingFilterMixin, structure_filters.UserPermissionFilter
 ):
+    customer = core_filters.URLFilter(
+        view_name='customer-detail', field_name='offering__customer__uuid'
+    )
+    customer_uuid = django_filters.UUIDFilter(field_name='offering__customer__uuid')
+
     class Meta:
         model = models.OfferingPermission
         fields = []
@@ -217,6 +239,14 @@ class OrderFilter(django_filters.FilterSet):
             for db_value, representation in models.Order.States.CHOICES
         },
     )
+    type = django_filters.MultipleChoiceFilter(
+        choices=[
+            (representation, representation)
+            for db_value, representation in models.RequestTypeMixin.Types.CHOICES
+        ],
+        method='filter_items_type',
+        label='Items type',
+    )
     o = django_filters.OrderingFilter(
         fields=('created', 'approved_at', 'total_cost', 'state')
     )
@@ -224,6 +254,19 @@ class OrderFilter(django_filters.FilterSet):
     class Meta:
         model = models.Order
         fields = []
+
+    def filter_items_type(self, queryset, name, value):
+        type_ids = []
+
+        for v in value:
+            for type_id, type_name in models.RequestTypeMixin.Types.CHOICES:
+                if type_name == v:
+                    type_ids.append(type_id)
+
+        order_ids = models.OrderItem.objects.filter(type__in=type_ids).values_list(
+            'order_id', flat=True
+        )
+        return queryset.filter(id__in=order_ids)
 
 
 class OrderItemFilter(OfferingFilterMixin, django_filters.FilterSet):
@@ -233,6 +276,7 @@ class OrderItemFilter(OfferingFilterMixin, django_filters.FilterSet):
     customer_uuid = django_filters.UUIDFilter(
         field_name='order__project__customer__uuid'
     )
+    service_manager_uuid = django_filters.UUIDFilter(method='filter_service_manager')
     state = core_filters.MappedMultipleChoiceFilter(
         choices=[
             (representation, representation)
@@ -269,19 +313,30 @@ class OrderItemFilter(OfferingFilterMixin, django_filters.FilterSet):
         model = models.OrderItem
         fields = []
 
+    def filter_service_manager(self, queryset, name, value):
+        return queryset.filter(
+            offering__shared=True,
+            offering__permissions__user__uuid=value,
+            offering__permissions__is_active=True,
+        )
 
-class ResourceFilter(OfferingFilterMixin, django_filters.FilterSet):
-    name = django_filters.CharFilter(lookup_expr='icontains')
-    name_exact = django_filters.CharFilter(field_name='name')
+
+class ResourceFilter(
+    OfferingFilterMixin, structure_filters.NameFilterSet, django_filters.FilterSet
+):
     query = django_filters.CharFilter(method='filter_query')
     offering_type = django_filters.CharFilter(field_name='offering__type')
     offering_billable = django_filters.UUIDFilter(field_name='offering__billable')
     project_uuid = django_filters.UUIDFilter(field_name='project__uuid')
     project_name = django_filters.CharFilter(field_name='project__name')
     customer_uuid = django_filters.UUIDFilter(field_name='project__customer__uuid')
+    customer = core_filters.URLFilter(
+        view_name='customer-detail', field_name='project__customer__uuid'
+    )
+    service_manager_uuid = django_filters.UUIDFilter(method='filter_service_manager')
     category_uuid = django_filters.UUIDFilter(field_name='offering__category__uuid')
     provider_uuid = django_filters.UUIDFilter(field_name='offering__customer__uuid')
-    backend_id = django_filters.CharFilter(method='filter_backend_id')
+    backend_id = django_filters.CharFilter()
     state = core_filters.MappedMultipleChoiceFilter(
         choices=[
             (representation, representation)
@@ -300,26 +355,41 @@ class ResourceFilter(OfferingFilterMixin, django_filters.FilterSet):
 
     def filter_query(self, queryset, name, value):
         if is_uuid_like(value):
-            return queryset.filter(uuid=value)
+            if queryset.filter(uuid=value).exists():
+                return queryset.filter(uuid=value)
+            else:
+                return self.filter_scope_uuid(queryset, name, value)
         else:
-            return queryset.filter(name__icontains=value)
-
-    def filter_backend_id(self, queryset, name, value):
-        resource_models = [
-            b['resource_model']
-            for b in manager.backends.values()
-            if 'resource_model' in b.keys()
-        ]
-        for resource_model in resource_models:
-            resources_ids = resource_model.objects.filter(backend_id=value).values_list(
-                'id', flat=True
+            return queryset.filter(
+                Q(name__icontains=value)
+                | Q(backend_metadata__external_ips__icontains=value)
+                | Q(backend_metadata__internal_ips__icontains=value)
             )
 
-            if not resources_ids:
+    def filter_service_manager(self, queryset, name, value):
+        return queryset.filter(
+            offering__shared=True,
+            offering__permissions__user__uuid=value,
+            offering__permissions__is_active=True,
+        )
+
+    def filter_scope_uuid(self, queryset, name, value):
+
+        for offering_type in plugins.manager.get_offering_types():
+            resource_model = plugins.manager.get_resource_model(offering_type)
+
+            if not resource_model:
                 continue
 
-            ct = ContentType.objects.get_for_model(resource_model)
-            return queryset.filter(content_type=ct, object_id__in=resources_ids)
+            try:
+                obj = resource_model.objects.get(uuid=value)
+                ct = ContentType.objects.get_for_model(resource_model)
+
+                if queryset.filter(content_type=ct, object_id=obj.id).exists():
+                    return queryset.filter(content_type=ct, object_id=obj.id)
+
+            except resource_model.DoesNotExist:
+                continue
 
         return queryset.none()
 
@@ -440,6 +510,88 @@ class CustomerServiceProviderFilter(core_filters.BaseFilterBackend):
         return queryset
 
 
+class OfferingUserFilter(OfferingFilterMixin, django_filters.FilterSet):
+    user_uuid = django_filters.UUIDFilter(field_name='user__uuid')
+    o = django_filters.OrderingFilter(fields=('created',))
+
+    class Meta:
+        model = models.OfferingUser
+        fields = []
+
+
+class CategoryFilter(structure_filters.NameFilterSet, django_filters.FilterSet):
+    class Meta:
+        model = models.Category
+        fields = []
+
+    customer_uuid = django_filters.UUIDFilter(
+        method='filter_customer_uuid', label='Customer UUID'
+    )
+
+    customers_offerings_state = django_filters.MultipleChoiceFilter(
+        choices=models.Offering.States.CHOICES,
+        label='Customers offerings state',
+        method='filter_customers_offerings_state',
+    )
+
+    def filter_customer_uuid(self, queryset, name, value):
+        states = self.request.GET.getlist('customers_offerings_state')
+        offerings = models.Offering.objects.filter(customer__uuid=value)
+
+        if states:
+            offerings = offerings.filter(state__in=states)
+
+        category_ids = offerings.values_list('category_id', flat=True)
+
+        return queryset.filter(id__in=category_ids)
+
+    def filter_customers_offerings_state(self, queryset, name, value):
+        return queryset
+
+
+class PlanComponentFilter(django_filters.FilterSet):
+    class Meta:
+        model = models.PlanComponent
+        fields = []
+
+    offering_uuid = django_filters.UUIDFilter(
+        field_name='plan__offering__uuid', label='Offering UUID'
+    )
+
+    plan_uuid = django_filters.UUIDFilter(field_name='plan__uuid', label='Plan UUID')
+
+    shared = django_filters.BooleanFilter(
+        widget=BooleanWidget, field_name='plan__offering__shared'
+    )
+
+    archived = django_filters.BooleanFilter(field_name='plan__archived',)
+
+
+def user_extra_query(user):
+    customer_ids = structure_models.CustomerPermission.objects.filter(
+        user=user,
+        role__in=[
+            structure_models.CustomerRole.OWNER,
+            structure_models.CustomerRole.SERVICE_MANAGER,
+        ],
+        is_active=True,
+    ).values_list('customer_id', flat=True)
+    offering_ids = models.Offering.objects.filter(
+        shared=True, customer_id__in=customer_ids
+    ).values_list('id', flat=True)
+
+    project_ids = (
+        models.Resource.objects.filter(offering_id__in=offering_ids)
+        .exclude(state=models.Resource.States.TERMINATED)
+        .values_list('project_id', flat=True)
+    )
+    user_ids = structure_models.ProjectPermission.objects.filter(
+        project_id__in=project_ids, is_active=True
+    ).values_list('user_id', flat=True)
+
+    return Q(id__in=user_ids)
+
+
 structure_filters.ExternalCustomerFilterBackend.register(CustomerResourceFilter())
 structure_filters.ExternalCustomerFilterBackend.register(
     ServiceProviderOfferingFilter()
@@ -447,3 +599,4 @@ structure_filters.ExternalCustomerFilterBackend.register(
 structure_filters.ExternalCustomerFilterBackend.register(
     CustomerServiceProviderFilter()
 )
+structure_filters.UserFilterBackend.register_extra_query(user_extra_query)

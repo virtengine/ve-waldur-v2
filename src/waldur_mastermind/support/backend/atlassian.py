@@ -13,8 +13,8 @@ from django.utils import timezone
 from jira import Comment, JIRAError
 from jira.utils import json_loads
 
-from waldur_core.structure import ServiceBackendError
-from waldur_jira.backend import JiraBackend, reraise_exceptions
+from waldur_core.structure.exceptions import ServiceBackendError
+from waldur_jira.backend import JiraBackend, JiraBackendError, reraise_exceptions
 from waldur_mastermind.support import models
 from waldur_mastermind.support.exceptions import SupportUserInactive
 
@@ -111,7 +111,7 @@ class ServiceDeskBackend(JiraBackend, SupportBackend):
 
         if not models.RequestType.objects.filter(issue_type_name=issue.type).count():
             raise ServiceBackendError(
-                'Issue is not created because corresponding request type is not found.'
+                f'Issue is not created because request type is not found for issue type {issue.type}.'
             )
 
         args['requestTypeId'] = (
@@ -133,22 +133,26 @@ class ServiceDeskBackend(JiraBackend, SupportBackend):
         self._backend_issue_to_issue(backend_issue, issue)
         issue.save()
 
-    def create_confirmation_comment(self, issue):
-        try:
-            tmpl = models.TemplateConfirmationComment.objects.get(issue_type=issue.type)
-        except models.TemplateConfirmationComment.DoesNotExist:
+    def create_confirmation_comment(self, issue, comment_tmpl=''):
+        if not comment_tmpl:
             try:
                 tmpl = models.TemplateConfirmationComment.objects.get(
-                    issue_type='default'
+                    issue_type=issue.type
                 )
             except models.TemplateConfirmationComment.DoesNotExist:
-                logger.debug(
-                    'A confirmation comment hasn\'t been created, because a template does not exist.'
-                )
-                return
+                try:
+                    tmpl = models.TemplateConfirmationComment.objects.get(
+                        issue_type='default'
+                    )
+                except models.TemplateConfirmationComment.DoesNotExist:
+                    logger.debug(
+                        'A confirmation comment hasn\'t been created, because a template does not exist.'
+                    )
+                    return
+            comment_tmpl = tmpl.template
 
         body = (
-            Template(tmpl.template)
+            Template(comment_tmpl)
             .render(Context({'issue': issue}, autoescape=False))
             .strip()
         )
@@ -277,6 +281,7 @@ class ServiceDeskBackend(JiraBackend, SupportBackend):
         issue.description = backend_issue.fields.description or ''
         issue.type = backend_issue.fields.issuetype.name
         issue.resolution_date = backend_issue.fields.resolutiondate or None
+        issue.feedback_request = self.get_request_feedback_field(backend_issue)
 
         def get_support_user_by_field(fields, field_name):
             backend_user = getattr(fields, field_name, None)
@@ -430,3 +435,15 @@ class ServiceDeskBackend(JiraBackend, SupportBackend):
             backend_issue = self.get_backend_issue(feedback.issue.backend_id)
             kwargs = {field_name: feedback.get_evaluation_display()}
             backend_issue.update(**kwargs)
+
+    def get_request_feedback_field(self, backend_issue):
+        try:
+            field_name = self.get_field_id_by_name(
+                self.issue_settings['request_feedback']
+            )
+        except JiraBackendError:
+            logger.warning('Field request_feedback is not defined in Jira support.')
+            return True
+        value = getattr(backend_issue.fields, field_name, None)
+        # we treat any value we receive from backend as True. Unset / missing value means False.
+        return bool(value)

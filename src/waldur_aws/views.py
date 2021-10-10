@@ -10,31 +10,6 @@ from waldur_core.structure import views as structure_views
 from . import executors, filters, models, serializers
 
 
-class AmazonServiceViewSet(structure_views.BaseServiceViewSet):
-    queryset = models.AWSService.objects.all()
-    serializer_class = serializers.ServiceSerializer
-    import_serializer_class = serializers.InstanceImportSerializer
-
-    def get_import_context(self):
-        return {'resource_type': self.request.query_params.get('resource_type')}
-
-    def get_serializer_class(self):
-        from waldur_core.structure import SupportedServices
-
-        if self.request.method == 'POST':
-            resource_type = self.request.data.get('type')
-            if resource_type == SupportedServices.get_name_for_model(models.Instance):
-                return serializers.InstanceImportSerializer
-            elif resource_type == SupportedServices.get_name_for_model(models.Volume):
-                return serializers.VolumeImportSerializer
-        return super(AmazonServiceViewSet, self).get_serializer_class()
-
-
-class AmazonServiceProjectLinkViewSet(structure_views.BaseServiceProjectLinkViewSet):
-    queryset = models.AWSServiceProjectLink.objects.all()
-    serializer_class = serializers.ServiceProjectLinkSerializer
-
-
 class RegionViewSet(structure_views.BaseServicePropertyViewSet):
     queryset = models.Region.objects.all()
     serializer_class = serializers.RegionSerializer
@@ -57,7 +32,7 @@ class SizeViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class InstanceViewSet(structure_views.ResourceViewSet):
-    queryset = models.Instance.objects.all()
+    queryset = models.Instance.objects.all().order_by('name')
     filterset_class = filters.InstanceFilter
     serializer_class = serializers.InstanceSerializer
     create_executor = executors.InstanceCreateExecutor
@@ -141,7 +116,7 @@ class InstanceViewSet(structure_views.ResourceViewSet):
 
 
 class VolumeViewSet(structure_views.ResourceViewSet):
-    queryset = models.Volume.objects.all()
+    queryset = models.Volume.objects.all().order_by('name')
     serializer_class = serializers.VolumeSerializer
     create_executor = executors.VolumeCreateExecutor
     delete_executor = executors.VolumeDeleteExecutor

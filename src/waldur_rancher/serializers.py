@@ -2,17 +2,19 @@ from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core import validators as django_validators
 from django.core.exceptions import MultipleObjectsReturned
-from django.db import transaction
 from django.utils.translation import ugettext_lazy as _
 from rest_framework import serializers
 
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core import signals as core_signals
+from waldur_core.core.validators import BackendURLValidator
 from waldur_core.media.serializers import ProtectedMediaSerializerMixin
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import serializers as structure_serializers
 from waldur_core.structure.managers import filter_queryset_for_user
 from waldur_core.structure.models import VirtualMachine
+from waldur_openstack.openstack import models as openstack_models
+from waldur_openstack.openstack import serializers as openstack_serializers
 from waldur_openstack.openstack_tenant import apps as openstack_tenant_apps
 from waldur_openstack.openstack_tenant import models as openstack_tenant_models
 from waldur_openstack.openstack_tenant import (
@@ -22,44 +24,91 @@ from waldur_openstack.openstack_tenant.serializers import (
     _validate_instance_security_groups,
 )
 
-from . import exceptions, models, utils, validators
+from . import models, utils, validators
 
 
-class RancherServiceSerializer(
-    core_serializers.ExtraFieldOptionsMixin, structure_serializers.BaseServiceSerializer
-):
+class RancherServiceSerializer(structure_serializers.ServiceOptionsSerializer):
+    class Meta:
+        secret_fields = (
+            'backend_url',
+            'username',
+            'password',
+            'private_registry_url',
+            'private_registry_user',
+            'private_registry_password',
+        )
 
-    SERVICE_ACCOUNT_FIELDS = {
-        'backend_url': _('Rancher server URL'),
-        'username': _('Rancher access key'),
-        'password': _('Rancher secret key'),
-    }
+    backend_url = serializers.CharField(
+        max_length=200, label=_('Rancher server URL'), validators=[BackendURLValidator]
+    )
 
-    SERVICE_ACCOUNT_EXTRA_FIELDS = {
-        'base_image_name': _('Base image name'),
-        'cloud_init_template': _('Cloud init template'),
-        'default_mtu': _('Default MTU of a cluster'),
-        'private_registry_url': _('URL of a private registry for a cluster'),
-        'private_registry_user': _('Username for accessing a private registry'),
-        'private_registry_password': _('Password for accessing a private registry'),
-        'allocate_floating_ip_to_all_nodes': _(
+    username = serializers.CharField(max_length=100, label=_('Rancher access key'))
+
+    password = serializers.CharField(max_length=100, label=_('Rancher secret key'))
+
+    base_image_name = serializers.CharField(
+        source='options.base_image_name', label=_('Base image name')
+    )
+
+    cloud_init_template = serializers.CharField(
+        source='options.cloud_init_template',
+        label=_('Cloud init template'),
+        required=False,
+    )
+
+    default_mtu = serializers.IntegerField(
+        source='options.default_mtu',
+        label=_('Default MTU of a cluster'),
+        required=False,
+    )
+
+    private_registry_url = serializers.CharField(
+        source='options.private_registry_url',
+        help_text=_('URL of a private registry for a cluster'),
+        required=False,
+    )
+
+    private_registry_user = serializers.CharField(
+        source='options.private_registry_user',
+        help_text=_('Username for accessing a private registry'),
+        required=False,
+    )
+
+    private_registry_password = serializers.CharField(
+        source='options.private_registry_password',
+        help_text=_('Password for accessing a private registry'),
+        required=False,
+    )
+
+    allocate_floating_ip_to_all_nodes = serializers.BooleanField(
+        source='options.allocate_floating_ip_to_all_nodes',
+        help_text=_(
             'If True, on provisioning a floating IP will be allocated to each of the nodes'
         ),
-    }
+        required=False,
+    )
 
-    class Meta(structure_serializers.BaseServiceSerializer.Meta):
-        model = models.RancherService
-        required_fields = ('backend_url', 'username', 'password', 'base_image_name')
+    management_tenant_uuid = serializers.UUIDField(
+        source='options.management_tenant_uuid',
+        help_text=_('Tenant where Rancher management is running'),
+        required=False,
+    )
 
+    management_tenant_access_port = serializers.IntegerField(
+        source='options.management_tenant_access_port',
+        help_text=_('Management tenant access port'),
+        required=False,
+    )
 
-class ServiceProjectLinkSerializer(
-    structure_serializers.BaseServiceProjectLinkSerializer
-):
-    class Meta(structure_serializers.BaseServiceProjectLinkSerializer.Meta):
-        model = models.RancherServiceProjectLink
-        extra_kwargs = {
-            'service': {'lookup_field': 'uuid', 'view_name': 'vmware-detail'},
-        }
+    def validate_management_tenant_uuid(self, tenant_uuid):
+        if not filter_queryset_for_user(
+            openstack_models.Tenant.objects.filter(uuid=tenant_uuid),
+            self.context['request'].user,
+        ):
+            raise serializers.ValidationError(
+                _('User has not permissions for tenant %s') % tenant_uuid
+            )
+        return tenant_uuid
 
 
 class DataVolumeSerializer(
@@ -203,20 +252,6 @@ class ClusterSerializer(
     structure_serializers.SshPublicKeySerializerMixin,
     structure_serializers.BaseResourceSerializer,
 ):
-    service = serializers.HyperlinkedRelatedField(
-        source='service_project_link.service',
-        view_name='rancher-detail',
-        read_only=True,
-        lookup_field='uuid',
-    )
-
-    service_project_link = serializers.HyperlinkedRelatedField(
-        view_name='rancher-spl-detail',
-        queryset=models.RancherServiceProjectLink.objects.all(),
-        allow_null=True,
-        required=False,
-    )
-
     tenant_settings = serializers.HyperlinkedRelatedField(
         queryset=structure_models.ServiceSettings.objects.filter(
             type=openstack_tenant_apps.OpenStackTenantConfig.service_name
@@ -244,6 +279,10 @@ class ClusterSerializer(
         write_only=True,
     )
 
+    management_security_group = serializers.HyperlinkedRelatedField(
+        read_only=True, view_name='openstack-sgp-detail', lookup_field='uuid'
+    )
+
     class Meta(structure_serializers.BaseResourceSerializer.Meta):
         model = models.Cluster
         fields = structure_serializers.BaseResourceSerializer.Meta.fields + (
@@ -254,6 +293,7 @@ class ClusterSerializer(
             'ssh_public_key',
             'install_longhorn',
             'security_groups',
+            'management_security_group',
         )
         read_only_fields = (
             structure_serializers.BaseResourceSerializer.Meta.read_only_fields
@@ -282,16 +322,15 @@ class ClusterSerializer(
         if self.instance:
             return attrs
 
+        attrs = super(ClusterSerializer, self).validate(attrs)
         nodes = attrs['node_set']
         name = attrs['name']
-        spl = attrs['service_project_link']
+        service_settings = attrs['service_settings']
+        attrs['settings'] = service_settings
+        project = attrs['project']
         ssh_public_key = attrs.pop('ssh_public_key', None)
 
-        attrs['settings'] = spl.service.settings
-
-        clusters = models.Cluster.objects.filter(
-            settings=spl.service.settings, name=name
-        )
+        clusters = models.Cluster.objects.filter(settings=service_settings, name=name)
         if self.instance:
             clusters = clusters.exclude(id=self.instance.id)
         if clusters.exists():
@@ -302,9 +341,15 @@ class ClusterSerializer(
         if tenant_settings and security_groups:
             _validate_instance_security_groups(security_groups, tenant_settings)
         utils.expand_added_nodes(
-            name, nodes, spl, tenant_settings, ssh_public_key, security_groups
+            name,
+            nodes,
+            project,
+            service_settings,
+            tenant_settings,
+            ssh_public_key,
+            security_groups,
         )
-        return super(ClusterSerializer, self).validate(attrs)
+        return attrs
 
     def validate_nodes(self, nodes):
         if len([node for node in nodes if 'etcd' in node['roles']]) not in [1, 3, 5]:
@@ -332,11 +377,9 @@ class NodeSerializer(serializers.HyperlinkedModelSerializer):
     )
     resource_type = serializers.SerializerMethodField()
     state = serializers.ReadOnlyField(source='get_state_display')
-    service_name = serializers.ReadOnlyField(
-        source='service_project_link.service.settings.name'
-    )
-    service_uuid = serializers.ReadOnlyField(source='service_project_link.service.uuid')
-    project_uuid = serializers.ReadOnlyField(source='service_project_link.project.uuid')
+    service_settings_name = serializers.ReadOnlyField(source='service_settings.name')
+    service_settings_uuid = serializers.ReadOnlyField(source='service_settings.uuid')
+    project_uuid = serializers.ReadOnlyField(source='project.uuid')
     cluster_name = serializers.ReadOnlyField(source='cluster.name')
     cluster_uuid = serializers.ReadOnlyField(source='cluster.uuid')
     instance_name = serializers.ReadOnlyField(source='instance.name')
@@ -352,8 +395,8 @@ class NodeSerializer(serializers.HyperlinkedModelSerializer):
             'name',
             'backend_id',
             'project_uuid',
-            'service_name',
-            'service_uuid',
+            'service_settings_name',
+            'service_settings_uuid',
             'resource_type',
             'state',
             'cluster',
@@ -441,72 +484,16 @@ class CreateNodeSerializer(
         attrs = super(CreateNodeSerializer, self).validate(attrs)
         cluster = attrs['cluster']
         ssh_public_key = attrs.pop('ssh_public_key', None)
-        spl = cluster.service_project_link
         node = attrs
         utils.expand_added_nodes(
-            cluster.name, [node], spl, cluster.tenant_settings, ssh_public_key
+            cluster.name,
+            [node],
+            cluster.project,
+            cluster.service_settings,
+            cluster.tenant_settings,
+            ssh_public_key,
         )
         return attrs
-
-
-class ClusterImportableSerializer(serializers.Serializer):
-    service_project_link = serializers.HyperlinkedRelatedField(
-        view_name='rancher-spl-detail',
-        queryset=models.RancherServiceProjectLink.objects.all(),
-        write_only=True,
-    )
-
-    name = serializers.CharField(read_only=True)
-    backend_id = serializers.CharField(source="id", read_only=True)
-    type = serializers.SerializerMethodField()
-    extra = serializers.SerializerMethodField()
-    is_active = serializers.SerializerMethodField()
-
-    def get_type(self, cluster):
-        return 'Rancher.Cluster'
-
-    def get_extra(self, cluster):
-        spec = cluster.get('appliedSpec', {})
-        config = spec.get('rancherKubernetesEngineConfig', {})
-        backend_nodes = config.get('nodes', [])
-        return [
-            {'name': 'Number of nodes', 'value': len(backend_nodes),},
-            {'name': 'Created at', 'value': cluster.get('created'),},
-        ]
-
-    def get_is_active(self, cluster):
-        return cluster.get('state', '') == models.Cluster.RuntimeStates.ACTIVE
-
-
-class ClusterImportSerializer(ClusterImportableSerializer):
-    backend_id = serializers.CharField(write_only=True)
-
-    @transaction.atomic
-    def create(self, validated_data):
-        service_project_link = validated_data['service_project_link']
-        backend_id = validated_data['backend_id']
-
-        if models.Cluster.objects.filter(
-            settings=service_project_link.service.settings, backend_id=backend_id
-        ).exists():
-            raise serializers.ValidationError(
-                {'backend_id': _('Cluster has been imported already.')}
-            )
-
-        try:
-            backend = service_project_link.get_backend()
-            cluster = backend.import_cluster(
-                backend_id, service_project_link=service_project_link
-            )
-        except exceptions.RancherException as e:
-            raise serializers.ValidationError(
-                {
-                    'backend_id': _("Can't import cluster with ID %s. %s")
-                    % (validated_data['backend_id'], e)
-                }
-            )
-
-        return cluster
 
 
 class LinkOpenstackSerializer(serializers.Serializer):
@@ -642,20 +629,6 @@ class TemplateSerializer(
 
 
 class ApplicationSerializer(structure_serializers.BaseResourceSerializer):
-    service = serializers.HyperlinkedRelatedField(
-        source='service_project_link.service',
-        view_name='rancher-detail',
-        read_only=True,
-        lookup_field='uuid',
-    )
-
-    service_project_link = serializers.HyperlinkedRelatedField(
-        view_name='rancher-spl-detail',
-        queryset=models.RancherServiceProjectLink.objects.all(),
-        allow_null=True,
-        required=False,
-    )
-
     version = serializers.CharField()
     namespace_name = serializers.CharField(required=False, write_only=True)
     answers = serializers.DictField(required=False)
@@ -973,20 +946,6 @@ class ClusterTemplateSerializer(serializers.HyperlinkedModelSerializer):
 
 
 class IngressSerializer(structure_serializers.BaseResourceSerializer):
-    service = serializers.HyperlinkedRelatedField(
-        source='service_project_link.service',
-        view_name='rancher-detail',
-        read_only=True,
-        lookup_field='uuid',
-    )
-
-    service_project_link = serializers.HyperlinkedRelatedField(
-        view_name='rancher-spl-detail',
-        queryset=models.RancherServiceProjectLink.objects.all(),
-        allow_null=True,
-        required=False,
-    )
-
     rancher_project_name = serializers.ReadOnlyField(source='rancher_project.name')
     namespace_name = serializers.ReadOnlyField(source='namespace.name')
 
@@ -1046,20 +1005,6 @@ class NestedWorkloadSerializer(
 
 
 class ServiceSerializer(structure_serializers.BaseResourceSerializer):
-    service = serializers.HyperlinkedRelatedField(
-        source='service_project_link.service',
-        view_name='rancher-detail',
-        read_only=True,
-        lookup_field='uuid',
-    )
-
-    service_project_link = serializers.HyperlinkedRelatedField(
-        view_name='rancher-spl-detail',
-        queryset=models.RancherServiceProjectLink.objects.all(),
-        allow_null=True,
-        required=False,
-    )
-
     namespace_name = serializers.ReadOnlyField(source='namespace.name')
     target_workloads = NestedWorkloadSerializer(
         queryset=models.Workload.objects.all(), many=True, required=False
@@ -1133,13 +1078,24 @@ class ImportYamlSerializer(serializers.Serializer):
         return attrs
 
 
+class CreateManagementSecurityGroupSerializer(serializers.Serializer):
+    cidr = serializers.CharField(
+        validators=[openstack_serializers.validate_private_subnet_cidr],
+        default='192.168.42.0/24',
+        initial='192.168.42.0/24',
+    )
+    ethertype = serializers.ChoiceField(
+        choices=openstack_models.SecurityGroupRule.ETHER_TYPES,
+        initial=openstack_models.SecurityGroupRule.IPv4,
+        default=openstack_models.SecurityGroupRule.IPv4,
+    )
+
+
 def get_rancher_cluster_for_openstack_instance(serializer, scope):
     request = serializer.context['request']
     queryset = filter_queryset_for_user(models.Cluster.objects.all(), request.user)
     try:
-        cluster = queryset.filter(
-            tenant_settings=scope.service_project_link.service.settings
-        ).get()
+        cluster = queryset.filter(tenant_settings=scope.service_settings).get()
     except models.Cluster.DoesNotExist:
         return None
     except MultipleObjectsReturned:

@@ -1,7 +1,11 @@
 import logging
+import traceback
 from uuid import uuid4
 
-from celery.task import Task as CeleryTask
+from celery import Task as CeleryTask
+from celery import current_app
+from celery.app.task import _reprtask
+from celery.local import Proxy
 from celery.worker.request import Request
 from django.db import IntegrityError
 from django.db import models as django_models
@@ -18,7 +22,64 @@ class StateChangeError(RuntimeError):
     pass
 
 
-class Task(CeleryTask):
+class TaskType(type):
+    """
+    Meta class for tasks.
+    Automatically registers the task in the task registry (except
+    if the :attr:`Task.abstract`` attribute is set).
+    If no :attr:`Task.name` attribute is provided, then the name is generated
+    from the module and class name.
+    Taken from https://github.com/celery/celery/blob/4.3/celery/task/base.py
+    """
+
+    _creation_count = {}  # used by old non-abstract task classes
+
+    def __new__(cls, name, bases, attrs):
+        new = super(TaskType, cls).__new__
+        task_module = attrs.get('__module__') or '__main__'
+
+        # - Abstract class: abstract attribute shouldn't be inherited.
+        abstract = attrs.pop('abstract', None)
+        if abstract or not attrs.get('autoregister', True):
+            return new(cls, name, bases, attrs)
+
+        # The 'app' attribute is now a property, with the real app located
+        # in the '_app' attribute.  Previously this was a regular attribute,
+        # so we should support classes defining it.
+        app = attrs.pop('_app', None) or attrs.pop('app', None)
+
+        # Attempt to inherit app from one the bases
+        if not isinstance(app, Proxy) and app is None:
+            for base in bases:
+                if getattr(base, '_app', None):
+                    app = base._app
+                    break
+            else:
+                app = current_app._get_current_object()
+        attrs['_app'] = app
+
+        # - Automatically generate missing/empty name.
+        task_name = attrs.get('name')
+        if not task_name:
+            attrs['name'] = task_name = app.gen_task_name(name, task_module)
+
+        # - Create and register class.
+        # Because of the way import happens (recursively)
+        # we may or may not be the first time the task tries to register
+        # with the framework.  There should only be one class for each task
+        # name, so we always return the registered version.
+        tasks = app._tasks
+        if task_name not in tasks:
+            tasks.register(new(cls, name, bases, attrs))
+        instance = tasks[task_name]
+        instance.bind(app)
+        return instance.__class__
+
+    def __repr__(self):
+        return _reprtask(self)
+
+
+class Task(CeleryTask, metaclass=TaskType):
     """ Base class for tasks that are run by executors.
 
     Provides standard way for input data deserialization.
@@ -65,7 +126,7 @@ class Task(CeleryTask):
         pass
 
 
-class EmptyTask(CeleryTask):
+class EmptyTask(CeleryTask, metaclass=TaskType):
     def run(self, *args, **kwargs):
         pass
 
@@ -203,7 +264,7 @@ class BackendMethodTask(RuntimeStateChangeTask, StateTransitionTask):
 
     def execute(self, instance, backend_method, *args, **kwargs):
         backend = self.get_backend(instance)
-        return getattr(backend, backend_method)(instance, *args, **kwargs)
+        getattr(backend, backend_method)(instance, *args, **kwargs)
 
 
 class IndependentBackendMethodTask(BackendMethodTask):
@@ -211,7 +272,7 @@ class IndependentBackendMethodTask(BackendMethodTask):
 
     def execute(self, instance, backend_method, *args, **kwargs):
         backend = self.get_backend(instance)
-        return getattr(backend, backend_method)(*args, **kwargs)
+        getattr(backend, backend_method)(*args, **kwargs)
 
 
 class DeletionTask(Task):
@@ -249,14 +310,22 @@ class ErrorMessageTask(Task):
 
     def save_error_message(self, instance):
         if isinstance(instance, models.ErrorMessageMixin):
-            instance.error_message = self.result.result or ''
-            instance.error_traceback = str(self.result.traceback)
+            try:
+                error_message = self.result.result or ''
+                error_traceback = str(self.result.traceback)
+            except AttributeError as ex:
+                error_message = f'Internal error: {ex.message}'
+                error_traceback = traceback.format_exc()
+
+            instance.error_message = error_message
+            instance.error_traceback = error_traceback
+
             instance.save(update_fields=['error_message', 'error_traceback'])
             # log exception if instance is not already ERRED.
             if instance.state != models.StateMixin.States.ERRED:
                 message = 'Instance: %s.\n' % utils.serialize_instance(instance)
-                message += 'Error: %s.\n' % self.result.result
-                message += self.result.traceback
+                message += 'Error: %s.\n' % error_message
+                message += error_traceback
                 logger.exception(message)
 
     def execute(self, instance):
@@ -310,7 +379,7 @@ class PreApplyExecutorTask(Task):
         self.executor.pre_apply(instance, **kwargs)
 
 
-class BackgroundTask(CeleryTask):
+class BackgroundTask(CeleryTask, metaclass=TaskType):
     """ Task that is run in background via celerybeat.
 
         Background task features:
@@ -456,7 +525,7 @@ class PollBackendCheckTask(Task):
         return instance
 
 
-class ExtensionTaskMixin(CeleryTask):
+class ExtensionTaskMixin(CeleryTask, metaclass=TaskType):
     """
     This mixin allows to skip task scheduling if extension is disabled.
     Subclasses should implement "is_extension_disabled" method which returns boolean value.

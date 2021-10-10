@@ -1,6 +1,6 @@
 from django.db import models
 
-from waldur_core.core.managers import GenericKeyMixin, SummaryQuerySet
+from waldur_core.core.managers import GenericKeyMixin
 
 
 def get_permission_subquery(permissions, user):
@@ -19,11 +19,9 @@ def get_permission_subquery(permissions, user):
 
         subquery |= models.Q(**kwargs)
 
-    # Add extra query which basically allows to
-    # additionally filter by some flag and ignore permissions
-    extra_query = getattr(permissions, 'extra_query', None)
-    if extra_query:
-        subquery |= models.Q(**extra_query)
+    build_query = getattr(permissions, 'build_query', None)
+    if build_query:
+        subquery |= build_query(user)
 
     return subquery
 
@@ -126,23 +124,14 @@ class StructureQueryset(models.QuerySet):
 StructureManager = models.Manager.from_queryset(StructureQueryset)
 
 
-class ResourceSummaryQuerySet(SummaryQuerySet):
-    # Hack for permissions
-    @property
-    def model(self):
-        from waldur_core.structure.models import ResourceMixin
-
-        return ResourceMixin
-
-
 class ServiceSettingsManager(GenericKeyMixin, models.Manager):
     """ Allows to filter and get service settings by generic key """
 
     def get_available_models(self):
         """ Return list of models that are acceptable """
-        from waldur_core.structure.models import ResourceMixin
+        from waldur_core.structure.models import BaseResource
 
-        return ResourceMixin.get_all_models()
+        return BaseResource.get_all_models()
 
 
 class SharedServiceSettingsManager(ServiceSettingsManager):

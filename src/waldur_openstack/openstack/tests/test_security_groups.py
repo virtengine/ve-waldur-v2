@@ -3,8 +3,8 @@ from unittest.mock import patch
 from ddt import data, ddt
 from rest_framework import status, test
 
-from .. import models
-from . import factories, fixtures
+from waldur_openstack.openstack import models
+from waldur_openstack.openstack.tests import factories, fixtures
 
 
 class BaseSecurityGroupTest(test.APITransactionTestCase):
@@ -143,6 +143,26 @@ class SecurityGroupCreateTest(BaseSecurityGroupTest):
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_user_can_create_security_group_rule_for_tcp_protocol_with_any_range(self,):
+        self.client.force_authenticate(self.fixture.staff)
+
+        response = self.client.post(
+            self.url,
+            data={
+                'name': 'allow-all',
+                'rules': [
+                    {
+                        'protocol': 'tcp',
+                        'from_port': -1,
+                        'to_port': -1,
+                        'cidr': '0.0.0.0/0',
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
     def test_can_not_create_security_group_with_invalid_protocol(self):
         self.client.force_authenticate(self.fixture.staff)
 
@@ -212,16 +232,20 @@ class SecurityGroupCreateTest(BaseSecurityGroupTest):
                 'name': 'https',
                 'rules': [
                     {
+                        'direction': 'ingress',
                         'protocol': 'tcp',
                         'from_port': 8001,
                         'to_port': 8001,
                         'cidr': '1.1.1.1/1',
+                        'remote_group': 'https://example.com/api/openstack-security-groups/45754c360acd4982b79aa6830c9e86cc/',
                     },
                     {
+                        'direction': 'ingress',
                         'protocol': 'tcp',
                         'from_port': 8001,
                         'to_port': 8001,
                         'cidr': '1.1.1.1/1',
+                        'remote_group': 'https://example.com/api/openstack-security-groups/45754c360acd4982b79aa6830c9e86cc/',
                     },
                 ],
             },
@@ -237,7 +261,8 @@ class SecurityGroupUpdateTest(BaseSecurityGroupTest):
     def setUp(self):
         super(SecurityGroupUpdateTest, self).setUp()
         self.security_group = factories.SecurityGroupFactory(
-            service_project_link=self.fixture.openstack_spl,
+            service_settings=self.fixture.openstack_service_settings,
+            project=self.fixture.project,
             tenant=self.fixture.tenant,
             state=models.SecurityGroup.States.OK,
         )
@@ -296,7 +321,8 @@ class SecurityGroupUpdateTest(BaseSecurityGroupTest):
 
     def test_security_group_name_should_be_unique(self):
         existing_group = factories.SecurityGroupFactory(
-            service_project_link=self.fixture.openstack_spl,
+            service_settings=self.fixture.openstack_service_settings,
+            project=self.fixture.project,
             tenant=self.fixture.tenant,
             state=models.SecurityGroup.States.OK,
         )
@@ -310,7 +336,8 @@ class SecurityGroupSetRulesTest(BaseSecurityGroupTest):
     def setUp(self):
         super(SecurityGroupSetRulesTest, self).setUp()
         self.security_group = factories.SecurityGroupFactory(
-            service_project_link=self.fixture.openstack_spl,
+            service_settings=self.fixture.openstack_service_settings,
+            project=self.fixture.project,
             tenant=self.fixture.tenant,
             state=models.SecurityGroup.States.OK,
         )
@@ -473,7 +500,8 @@ class SecurityGroupDeleteTest(BaseSecurityGroupTest):
     def setUp(self):
         super(SecurityGroupDeleteTest, self).setUp()
         self.security_group = factories.SecurityGroupFactory(
-            service_project_link=self.fixture.openstack_spl,
+            service_settings=self.fixture.openstack_service_settings,
+            project=self.fixture.project,
             tenant=self.fixture.tenant,
             state=models.SecurityGroup.States.OK,
         )
@@ -516,7 +544,9 @@ class SecurityGroupRetrieveTest(BaseSecurityGroupTest):
     def setUp(self):
         super(SecurityGroupRetrieveTest, self).setUp()
         self.security_group = factories.SecurityGroupFactory(
-            service_project_link=self.fixture.openstack_spl, tenant=self.fixture.tenant,
+            service_settings=self.fixture.openstack_service_settings,
+            project=self.fixture.project,
+            tenant=self.fixture.tenant,
         )
         self.url = factories.SecurityGroupFactory.get_url(self.security_group)
 

@@ -68,7 +68,7 @@ class SlurmClient(BaseBatchClient):
         return self._execute_command(['remove', 'account', 'where', 'name=%s' % name])
 
     def set_resource_limits(self, account, quotas):
-        quota = 'GrpTRES=cpu=%d,gres/gpu=%d,mem=%d' % (
+        quota = 'GrpTRESMins=cpu=%d,gres/gpu=%d,mem=%d' % (
             quotas.cpu,
             quotas.gpu,
             quotas.ram,
@@ -135,13 +135,28 @@ class SlurmClient(BaseBatchClient):
         args = [
             'show',
             'association',
-            'format=account,GrpTRES',
+            'format=account,GrpTRESMins',
             'where',
             'accounts=%s' % account,
         ]
         output = self._execute_command(args, immediate=False)
         return [
             SlurmAssociationLine(line) for line in output.splitlines() if '|' in line
+        ]
+
+    def list_account_users(self, account):
+        args = [
+            'list',
+            'associations',
+            'format=account,user',
+            'where',
+            'account=%s' % account,
+        ]
+        output = self._execute_command(args)
+        return [
+            line.split("|")[1]
+            for line in output.splitlines()
+            if '|' in line and line[-1] != '|'
         ]
 
     def _execute_command(self, command, command_name='sacctmgr', immediate=True):

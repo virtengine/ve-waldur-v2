@@ -10,21 +10,8 @@ from waldur_core.structure import views as structure_views
 from . import executors, filters, log, models, serializers
 
 
-class DigitalOceanServiceViewSet(structure_views.BaseServiceViewSet):
-    queryset = models.DigitalOceanService.objects.all()
-    serializer_class = serializers.ServiceSerializer
-    import_serializer_class = serializers.DropletImportSerializer
-
-
-class DigitalOceanServiceProjectLinkViewSet(
-    structure_views.BaseServiceProjectLinkViewSet
-):
-    queryset = models.DigitalOceanServiceProjectLink.objects.all()
-    serializer_class = serializers.ServiceProjectLinkSerializer
-
-
 class ImageViewSet(structure_views.BaseServicePropertyViewSet):
-    queryset = models.Image.objects.all()
+    queryset = models.Image.objects.all().order_by('name')
     serializer_class = serializers.ImageSerializer
     filterset_class = filters.ImageFilter
     lookup_field = 'uuid'
@@ -41,14 +28,14 @@ class RegionViewSet(structure_views.BaseServicePropertyViewSet):
 
 
 class SizeViewSet(structure_views.BaseServicePropertyViewSet):
-    queryset = models.Size.objects.all()
+    queryset = models.Size.objects.all().order_by('name')
     serializer_class = serializers.SizeSerializer
     filterset_class = filters.SizeFilter
     lookup_field = 'uuid'
 
 
 class DropletViewSet(structure_views.ResourceViewSet):
-    queryset = models.Droplet.objects.all()
+    queryset = models.Droplet.objects.all().order_by('name')
     serializer_class = serializers.DropletSerializer
     filterset_class = filters.DropletFilter
     create_executor = executors.DropletCreateExecutor
@@ -173,25 +160,13 @@ class DropletViewSet(structure_views.ResourceViewSet):
             event_context={'droplet': droplet, 'size': size},
         )
 
-        cores_increment = size.cores - droplet.cores
-        ram_increment = size.ram - droplet.ram
-        disk_increment = None
-
         droplet.cores = size.cores
         droplet.ram = size.ram
 
         if disk:
-            disk_increment = size.disk - droplet.disk
             droplet.disk = size.disk
 
         droplet.save()
-
-        spl = droplet.service_project_link
-
-        if disk_increment:
-            spl.add_quota_usage(spl.Quotas.storage, disk_increment, validate=True)
-        spl.add_quota_usage(spl.Quotas.ram, ram_increment, validate=True)
-        spl.add_quota_usage(spl.Quotas.vcpu, cores_increment, validate=True)
 
         return response.Response(
             {'detail': _('resizing was scheduled')}, status=status.HTTP_202_ACCEPTED

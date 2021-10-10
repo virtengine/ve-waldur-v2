@@ -1,11 +1,14 @@
 from ddt import data, ddt
-from django.conf import settings
 from django.core import mail
 from rest_framework import status, test
 
+from waldur_core.core.utils import format_homeport_link
+from waldur_core.media.utils import dummy_image
+from waldur_core.structure import models as structure_models
 from waldur_core.structure.tests import factories as structure_factories
-from waldur_core.structure.tests import fixtures
+from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.marketplace import models, tasks, utils
+from waldur_mastermind.marketplace.tests import fixtures
 from waldur_mastermind.marketplace.tests.helpers import override_marketplace_settings
 
 from . import factories
@@ -14,7 +17,7 @@ from . import factories
 @ddt
 class ServiceProviderGetTest(test.APITransactionTestCase):
     def setUp(self):
-        self.fixture = fixtures.ProjectFixture()
+        self.fixture = structure_fixtures.ProjectFixture()
         self.service_provider = factories.ServiceProviderFactory(
             customer=self.fixture.customer
         )
@@ -28,7 +31,17 @@ class ServiceProviderGetTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.json()), 1)
 
-    def test_service_provider_should_be_invisible_to_unauthenticated_users(self):
+    def test_service_provider_should_be_visible_to_unauthenticated_users_by_default(
+        self,
+    ):
+        url = factories.ServiceProviderFactory.get_list_url()
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    @override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=False)
+    def test_service_provider_should_be_invisible_to_unauthenticated_users_when_offerings_are_public(
+        self,
+    ):
         url = factories.ServiceProviderFactory.get_list_url()
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
@@ -58,7 +71,7 @@ class ServiceProviderGetTest(test.APITransactionTestCase):
 @ddt
 class ServiceProviderRegisterTest(test.APITransactionTestCase):
     def setUp(self):
-        self.fixture = fixtures.ProjectFixture()
+        self.fixture = structure_fixtures.ProjectFixture()
         self.customer = self.fixture.customer
 
     @data('staff')
@@ -115,7 +128,7 @@ class ServiceProviderRegisterTest(test.APITransactionTestCase):
 @ddt
 class ServiceProviderUpdateTest(test.APITransactionTestCase):
     def setUp(self):
-        self.fixture = fixtures.ProjectFixture()
+        self.fixture = structure_fixtures.ProjectFixture()
         self.customer = self.fixture.customer
 
     @data('staff', 'owner')
@@ -132,7 +145,7 @@ class ServiceProviderUpdateTest(test.APITransactionTestCase):
         response, service_provider = self.update_service_provider(user)
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
-    def update_service_provider(self, user, payload=None):
+    def update_service_provider(self, user, payload=None, **kwargs):
         if not payload:
             payload = {'enable_notifications': False}
 
@@ -141,7 +154,7 @@ class ServiceProviderUpdateTest(test.APITransactionTestCase):
         self.client.force_authenticate(user)
         url = factories.ServiceProviderFactory.get_url(service_provider)
 
-        response = self.client.patch(url, payload)
+        response = self.client.patch(url, payload, **kwargs)
         service_provider.refresh_from_db()
 
         return response, service_provider
@@ -173,11 +186,25 @@ class ServiceProviderUpdateTest(test.APITransactionTestCase):
         response = self.client.post(url)
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_upload_service_provider_image(self):
+        payload = {'image': dummy_image()}
+        response, service_provider = self.update_service_provider(
+            'staff', payload=payload, format='multipart'
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertTrue(service_provider.image)
+
+        url = factories.ServiceProviderFactory.get_url(service_provider)
+        response = self.client.patch(url, {'image': None})
+        service_provider.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertFalse(service_provider.image)
+
 
 @ddt
 class ServiceProviderDeleteTest(test.APITransactionTestCase):
     def setUp(self):
-        self.fixture = fixtures.ProjectFixture()
+        self.fixture = structure_fixtures.ProjectFixture()
         self.customer = self.fixture.customer
         self.service_provider = factories.ServiceProviderFactory(customer=self.customer)
 
@@ -249,12 +276,14 @@ class CustomerSerializerTest(test.APITransactionTestCase):
 
 class ServiceProviderNotificationTest(test.APITransactionTestCase):
     def setUp(self):
-        self.fixture = fixtures.CustomerFixture()
+        self.fixture = structure_fixtures.CustomerFixture()
         self.fixture.owner
         self.service_provider = factories.ServiceProviderFactory(
             customer=self.fixture.customer
         )
-        offering = factories.OfferingFactory(customer=self.fixture.customer)
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer, type='Support.OfferingTemplate'
+        )
         self.component = factories.OfferingComponentFactory(
             billing_type=models.OfferingComponent.BillingTypes.USAGE, offering=offering
         )
@@ -284,8 +313,95 @@ class ServiceProviderNotificationTest(test.APITransactionTestCase):
             mail.outbox[0].subject, 'Reminder about missing usage reports.'
         )
         self.assertTrue('My resource' in mail.outbox[0].body)
-        link_template = settings.WALDUR_MARKETPLACE['PUBLIC_RESOURCES_LINK_TEMPLATE']
-        public_resources_url = link_template.format(
-            organization_uuid=self.fixture.customer.uuid
+        public_resources_url = format_homeport_link(
+            'organizations/{organization_uuid}/marketplace-public-resources/',
+            organization_uuid=self.fixture.customer.uuid,
         )
         self.assertTrue(public_resources_url in mail.outbox[0].body)
+
+
+class ConsumerProjectListTest(test.APITransactionTestCase):
+    def setUp(self) -> None:
+        self.mp_fixture = fixtures.MarketplaceFixture()
+
+        self.consumer_project = self.mp_fixture.project
+        self.consumable_resource = self.mp_fixture.resource
+        self.url = factories.ServiceProviderFactory.get_url(
+            self.mp_fixture.service_provider, action='projects'
+        )
+
+    def test_service_provider_can_view_project_with_purchased_resource(self):
+        self.client.force_login(self.mp_fixture.offering_owner)
+        response = self.client.get(self.url)
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn(
+            self.consumer_project.uuid.hex, [item['uuid'] for item in response.data]
+        )
+
+
+class ConsumerSshKeyListTest(test.APITransactionTestCase):
+    def setUp(self) -> None:
+        self.mp_fixture = fixtures.MarketplaceFixture()
+
+        self.consumer_project = self.mp_fixture.project
+        self.consumable_resource = self.mp_fixture.resource
+        self.admin = self.mp_fixture.admin
+        self.ssh_key = structure_factories.SshPublicKeyFactory(
+            user=self.admin, is_shared=True,
+        )
+        self.url = factories.ServiceProviderFactory.get_url(
+            self.mp_fixture.service_provider, action='keys'
+        )
+
+    def test_service_provider_can_view_ssh_keys_from_project_with_purchased_resource(
+        self,
+    ):
+        self.client.force_login(self.mp_fixture.offering_owner)
+        response = self.client.get(self.url)
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn(self.ssh_key.uuid.hex, [item['uuid'] for item in response.data])
+
+
+class ConsumerProjectPermissionListTest(test.APITransactionTestCase):
+    def setUp(self) -> None:
+        self.mp_fixture = fixtures.MarketplaceFixture()
+
+        self.consumer_project = self.mp_fixture.project
+        self.consumable_resource = self.mp_fixture.resource
+        self.admin = self.mp_fixture.admin
+        self.permission = structure_models.ProjectPermission.objects.get(
+            user=self.admin, project=self.consumer_project, is_active=True,
+        )
+        self.url = factories.ServiceProviderFactory.get_url(
+            self.mp_fixture.service_provider, action='project_permissions'
+        )
+
+    def test_service_provider_can_view_project_permissions_in_project_with_purchased_resource(
+        self,
+    ):
+        self.client.force_login(self.mp_fixture.offering_owner)
+        response = self.client.get(self.url)
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn(self.permission.id, [item['pk'] for item in response.data])
+
+
+class ConsumerUserListTest(test.APITransactionTestCase):
+    def setUp(self) -> None:
+        self.mp_fixture = fixtures.MarketplaceFixture()
+
+        self.consumer_project = self.mp_fixture.project
+        self.consumable_resource = self.mp_fixture.resource
+        self.admin = self.mp_fixture.admin
+        self.url = factories.ServiceProviderFactory.get_url(
+            self.mp_fixture.service_provider, action='users'
+        )
+
+    def test_service_provider_can_view_users_in_project_with_purchased_resource(self,):
+        self.client.force_login(self.mp_fixture.offering_owner)
+        response = self.client.get(self.url)
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn(self.admin.uuid.hex, [item['uuid'] for item in response.data])

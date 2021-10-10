@@ -2,16 +2,7 @@ from django.contrib import admin
 
 from waldur_core.structure import admin as structure_admin
 
-# Import AWS Service Properties
-from .models import (
-    AWSService,
-    AWSServiceProjectLink,
-    Image,
-    Instance,
-    Region,
-    Size,
-    Volume,
-)
+from .models import Image, Instance, Region, Size, Volume
 
 ### Define Classes for admin permissions ###
 
@@ -48,5 +39,3 @@ admin.site.register(Size, SizeAdmin)
 admin.site.register(Region, RegionAdmin)
 admin.site.register(Instance, structure_admin.VirtualMachineAdmin)
 admin.site.register(Volume, VolumeAdmin)
-admin.site.register(AWSService, structure_admin.ServiceAdmin)
-admin.site.register(AWSServiceProjectLink, structure_admin.ServiceProjectLinkAdmin)

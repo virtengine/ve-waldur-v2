@@ -109,18 +109,17 @@ class Saml2LoginView(BaseSaml2View):
         sign_requests = getattr(conf, '_sp_authn_requests_signed', False)
         if sign_requests:
             signature_algorithm = (
-                settings.WALDUR_AUTH_SAML2.get('signature_algorithm') or SIG_RSA_SHA1
+                settings.WALDUR_AUTH_SAML2.get('SIGNATURE_ALGORITHM') or SIG_RSA_SHA1
             )
             digest_algorithm = (
-                settings.WALDUR_AUTH_SAML2.get('digest_algorithm') or DIGEST_SHA1
+                settings.WALDUR_AUTH_SAML2.get('DIGEST_ALGORITHM') or DIGEST_SHA1
             )
 
             kwargs['sign'] = True
             kwargs['sigalg'] = signature_algorithm
-            kwargs['sign_alg'] = signature_algorithm
             kwargs['digest_alg'] = digest_algorithm
 
-        nameid_format = settings.WALDUR_AUTH_SAML2.get('nameid_format')
+        nameid_format = settings.WALDUR_AUTH_SAML2.get('NAMEID_FORMAT')
         if nameid_format or nameid_format == "":  # "" is a valid setting in pysaml2
             kwargs['nameid_format'] = nameid_format
 
@@ -175,7 +174,11 @@ class Saml2LoginCompleteView(RefreshTokenMixin, BaseSaml2View):
         serializer.is_valid(raise_exception=True)
 
         attribute_mapping = get_custom_setting(
-            'SAML_ATTRIBUTE_MAPPING', {'uid': ('username',)}
+            'SAML_ATTRIBUTE_MAPPING',
+            {
+                'uid': ('username',),
+                'eduPersonScopedAffiliation': ('_process_saml2_affiliations',),
+            },
         )
         create_unknown_user = get_custom_setting('SAML_CREATE_UNKNOWN_USER', True)
 
@@ -234,7 +237,7 @@ class Saml2LoginCompleteView(RefreshTokenMixin, BaseSaml2View):
         if user is None:
             return login_failed(_('SAML2 authentication failed.'))
 
-        registration_method = settings.WALDUR_AUTH_SAML2.get('name', 'saml2')
+        registration_method = settings.WALDUR_AUTH_SAML2.get('NAME', 'saml2')
         if user.registration_method != registration_method:
             user.registration_method = registration_method
             user.save(update_fields=['registration_method'])
@@ -277,7 +280,7 @@ class Saml2LogoutView(BaseSaml2View):
         )
         subject_id = _get_subject_id(request.session)
         if subject_id is None:
-            return logout_failed(_('You cannot be logged out.'))
+            return logout_failed(_('Remote SAML2 logout has failed.'))
 
         try:
             result = client.global_logout(subject_id)

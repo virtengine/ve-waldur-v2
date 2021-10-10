@@ -37,7 +37,9 @@ def remove_ssh_key_from_all_tenants_on_it_deletion(sender, instance, **kwargs):
     user = ssh_key.user
     tenants = structure_filters.filter_queryset_for_user(Tenant.objects.all(), user)
     for tenant in tenants:
-        if not structure_permissions._has_admin_access(user, tenant.project):
+        project = structure_models.Project.all_objects.get(id=tenant.project_id)
+
+        if not structure_permissions._has_admin_access(user, project):
             continue
         serialized_tenant = core_utils.serialize_instance(tenant)
         core_tasks.BackendMethodTask().delay(
@@ -89,3 +91,35 @@ def update_service_settings_name(sender, instance, created=False, **kwargs):
     else:
         service_settings.name = tenant.name
         service_settings.save()
+
+
+def log_security_group_cleaned(sender, instance, **kwargs):
+    event_logger.openstack_security_group.info(
+        'Security group %s has been cleaned from cache.' % instance.name,
+        event_type='openstack_security_group_cleaned',
+        event_context={'security_group': instance,},
+    )
+
+
+def log_security_group_rule_cleaned(sender, instance, **kwargs):
+    event_logger.openstack_security_group_rule.info(
+        'Security group rule %s has been cleaned from cache.' % str(instance),
+        event_type='openstack_security_group_rule_cleaned',
+        event_context={'security_group_rule': instance,},
+    )
+
+
+def log_network_cleaned(sender, instance, **kwargs):
+    event_logger.openstack_network.info(
+        'Network %s has been cleaned from cache.' % instance.name,
+        event_type='openstack_network_cleaned',
+        event_context={'network': instance,},
+    )
+
+
+def log_subnet_cleaned(sender, instance, **kwargs):
+    event_logger.openstack_subnet.info(
+        'SubNet %s has been cleaned.' % instance.name,
+        event_type='openstack_subnet_cleaned',
+        event_context={'subnet': instance,},
+    )

@@ -1,35 +1,27 @@
-import base64
 import datetime
 import decimal
 import logging
 from calendar import monthrange
-from datetime import timedelta
-from io import BytesIO
 
+from dateutil.parser import parse as parse_datetime
 from django.conf import settings
-from django.contrib.contenttypes.fields import GenericForeignKey
-from django.contrib.contenttypes.models import ContentType
 from django.contrib.postgres.fields import JSONField
-from django.core.exceptions import ObjectDoesNotExist, ValidationError
+from django.core.exceptions import ObjectDoesNotExist
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
-from django.db.models import Q
 from django.utils import timezone
-from django.utils.functional import cached_property
 from django.utils.translation import ugettext_lazy as _
 from model_utils import FieldTracker
+from reversion import revisions as reversion
 
 from waldur_core.core import models as core_models
-from waldur_core.core import utils as core_utils
 from waldur_core.core.exceptions import IncorrectStateException
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.common import mixins as common_mixins
 from waldur_mastermind.common.utils import quantize_price
-from waldur_mastermind.invoices.utils import get_price_per_day
 from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_mastermind.packages import models as package_models
 
-from . import managers, utils
+from . import utils
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +33,7 @@ def get_created_date():
     return datetime.date(now.year, now.month, 1)
 
 
-class Invoice(core_models.UuidMixin, models.Model):
+class Invoice(core_models.UuidMixin, core_models.BackendMixin, models.Model):
     """ Invoice describes billing information about purchased resources for customers on a monthly basis """
 
     class Permissions:
@@ -96,7 +88,6 @@ class Invoice(core_models.UuidMixin, models.Model):
         blank=True,
         help_text=_('Date then invoice moved from state pending to created.'),
     )
-    _file = models.TextField(blank=True, editable=False)
 
     tracker = FieldTracker()
 
@@ -117,7 +108,9 @@ class Invoice(core_models.UuidMixin, models.Model):
 
     @property
     def price(self):
-        return quantize_price(decimal.Decimal(sum((item.price for item in self.items))))
+        return quantize_price(
+            decimal.Decimal(sum((item.price for item in self.items.all())))
+        )
 
     @property
     def tax_current(self):
@@ -129,11 +122,7 @@ class Invoice(core_models.UuidMixin, models.Model):
 
     @property
     def price_current(self):
-        return sum((item.price_current for item in self.items))
-
-    @property
-    def items(self):
-        return self.generic_items.all()
+        return sum((item.price_current for item in self.items.all()))
 
     @property
     def due_date(self):
@@ -163,21 +152,6 @@ class Invoice(core_models.UuidMixin, models.Model):
         self.invoice_date = timezone.now().date()
         self.save(update_fields=['state', 'invoice_date'])
 
-    @property
-    def file(self):
-        if not self._file:
-            return
-
-        content = base64.b64decode(self._file)
-        return BytesIO(content)
-
-    @file.setter
-    def file(self, value):
-        self._file = value
-
-    def has_file(self):
-        return bool(self._file)
-
     def get_filename(self):
         return 'invoice_{}.pdf'.format(self.uuid)
 
@@ -185,22 +159,76 @@ class Invoice(core_models.UuidMixin, models.Model):
         return '%s | %s-%s' % (self.customer, self.year, self.month)
 
 
-class InvoiceItem(common_mixins.ProductCodeMixin, common_mixins.UnitPriceMixin):
+def get_quantity(unit, start, end):
+    """
+    For fixed components this method computes number of billing periods resource
+    was used from the time it was purchased or from the start of current month
+    till the time it was terminated or billing plan has been switched or end of current month.
+    """
+    month_days = monthrange(start.year, start.month)[1]
+
+    if unit == Units.PER_HOUR:
+        return utils.get_full_hours(start, end)
+    elif unit == Units.PER_DAY:
+        return utils.get_full_days(start, end)
+    elif unit == Units.PER_HALF_MONTH:
+        if (start.day == 1 and end.day == 15) or (
+            start.day == 16 and end.day == month_days
+        ):
+            return 1
+        elif start.day == 1 and end.day == month_days:
+            return 2
+        elif start.day == 1 and end.day > 15:
+            return quantize_price(1 + (end.day - 15) / decimal.Decimal(month_days / 2))
+        elif start.day < 16 and end.day == month_days:
+            return quantize_price(
+                1 + (16 - start.day) / decimal.Decimal(month_days / 2)
+            )
+        else:
+            return quantize_price(
+                (end.day - start.day + 1) / decimal.Decimal(month_days / 2.0)
+            )
+    # By default PER_MONTH
+    else:
+        if start.day == 1 and end.day == month_days:
+            return 1
+
+        use_days = (end - start).days + 1
+        return quantize_price(decimal.Decimal(use_days) / month_days)
+
+
+class InvoiceItem(
+    core_models.UuidMixin, common_mixins.ProductCodeMixin, common_mixins.UnitPriceMixin
+):
     """
     It is expected that get_scope_type method is defined as class method in scope class
     as it is used in generic invoice item serializer.
+
+    1) For fixed components quantity field stores number of days or hours resource
+    was used from the time it was purchased or from the start of current month
+    till the time it was terminated or billing plan has been switched or end of current month.
+
+    2) For usage-based components quantity field stores amount of quota reported for the resource
+    during the current billing period (ie month).
+
+    3) For limit-based components quantity field stores amount of quota requested
+    for the resource during provisioning. If limit type is monthly, this value is copied from
+    previous billing period until resource is terminated.
     """
 
     invoice = models.ForeignKey(
-        on_delete=models.CASCADE, to=Invoice, related_name='generic_items'
+        on_delete=models.CASCADE, to=Invoice, related_name='items'
     )
-    content_type = models.ForeignKey(
-        on_delete=models.CASCADE, to=ContentType, null=True, related_name='+'
+    quantity = models.DecimalField(default=0, max_digits=22, decimal_places=7)
+    measured_unit = models.CharField(
+        max_length=30, help_text=_('Unit of measurement, for example, GB.'), blank=True
     )
-    object_id = models.PositiveIntegerField(null=True)
-    quantity = models.PositiveIntegerField(default=0)
-
-    scope = GenericForeignKey('content_type', 'object_id')
+    resource = models.ForeignKey(
+        on_delete=models.PROTECT,
+        to=marketplace_models.Resource,
+        related_name='invoice_items',
+        null=True,
+    )
     name = models.TextField(default='')
     details = JSONField(
         default=dict, blank=True, help_text=_('Stores data about scope')
@@ -222,7 +250,6 @@ class InvoiceItem(common_mixins.ProductCodeMixin, common_mixins.UnitPriceMixin):
     project_name = models.CharField(max_length=150, blank=True)
     project_uuid = models.CharField(max_length=32, blank=True)
 
-    objects = managers.InvoiceItemManager()
     tracker = FieldTracker()
 
     @property
@@ -238,52 +265,67 @@ class InvoiceItem(common_mixins.ProductCodeMixin, common_mixins.UnitPriceMixin):
         return self.price + self.tax
 
     def _price(self, current=False):
-        return quantize_price(
-            self.unit_price * decimal.Decimal(self.get_factor(current))
-        )
+        """
+        For components billed daily and hourly this method returns estimated price if `current` is True.
+        Otherwise, it returns total price calculated using `quantity` field.
+        It is assumed that value of `quantity` field is updated automatically when invoice item is terminated.
+        """
+        quantity = self.quantity
+        if current:
+            if self.unit == self.Units.PER_HOUR:
+                quantity = utils.get_full_hours(
+                    self.start, min(self.end, timezone.now())
+                )
+            if self.unit == self.Units.PER_DAY:
+                quantity = utils.get_full_days(
+                    self.start, min(self.end, timezone.now())
+                )
 
-    def get_factor(self, current=False):
-        month_days = monthrange(self.start.year, self.start.month)[1]
+        return quantize_price(self.unit_price * decimal.Decimal(quantity))
+
+    def get_measured_unit(self):
+        if self.measured_unit:
+            return self.measured_unit
+
+        plural = self.quantity > 1
 
         if self.unit == self.Units.QUANTITY:
-            return self.quantity
-        elif self.unit == self.Units.PER_HOUR:
-            if current:
-                return utils.get_full_hours(self.start, min(self.end, timezone.now()))
-            else:
-                return utils.get_full_hours(self.start, self.end)
-        elif self.unit == self.Units.PER_DAY:
-            if current:
-                return utils.get_full_days(self.start, min(self.end, timezone.now()))
-            else:
-                return self.usage_days
-        elif self.unit == self.Units.PER_HALF_MONTH:
-            if (self.start.day == 1 and self.end.day == 15) or (
-                self.start.day == 16 and self.end.day == month_days
-            ):
-                return 1
-            elif self.start.day == 1 and self.end.day == month_days:
-                return 2
-            elif self.start.day == 1 and self.end.day > 15:
-                return quantize_price(
-                    1 + (self.end.day - 15) / decimal.Decimal(month_days / 2)
-                )
-            elif self.start.day < 16 and self.end.day == month_days:
-                return quantize_price(
-                    1 + (16 - self.start.day) / decimal.Decimal(month_days / 2)
-                )
-            else:
-                return quantize_price(
-                    (self.end.day - self.start.day + 1)
-                    / decimal.Decimal(month_days / 2.0)
-                )
-        # By default PER_MONTH
-        else:
-            if self.start.day == 1 and self.end.day == month_days:
-                return 1
+            if not self.resource or not self.resource.scope:
+                return ''
 
-            use_days = (self.end - self.start).days + 1
-            return quantize_price(decimal.Decimal(use_days) / month_days)
+            if getattr(self.resource.scope, 'content_type', None):
+                meta = self.resource.scope.content_type.model_class()._meta
+            else:
+                meta = self.resource.scope._meta
+            return (
+                str(meta.verbose_name_plural).lower()
+                if plural
+                else str(meta.verbose_name).lower()
+            )
+        elif self.unit == self.Units.PER_HOUR:
+            return _('hours') if plural else _('hour')
+        elif self.unit == self.Units.PER_DAY:
+            return _('days') if plural else _('day')
+        elif self.unit == self.Units.PER_HALF_MONTH:
+            return _('percents from half a month')
+        else:
+            return _('percents from a month')
+
+    def get_project_uuid(self):
+        if self.project_uuid:
+            return self.project_uuid
+        try:
+            return structure_models.Project.all_objects.get(id=self.project_id).uuid
+        except ObjectDoesNotExist:
+            return
+
+    def get_project_name(self):
+        if self.project_name:
+            return self.project_name
+        try:
+            return structure_models.Project.all_objects.get(id=self.project_id).name
+        except ObjectDoesNotExist:
+            return
 
     @property
     def price(self):
@@ -293,147 +335,46 @@ class InvoiceItem(common_mixins.ProductCodeMixin, common_mixins.UnitPriceMixin):
     def price_current(self):
         return self._price(current=True)
 
-    @property
-    def usage_days(self):
+    def update_quantity(self):
         """
-        Returns the number of days package was used from the time
-        it was purchased or from the start of current month
+        For fixed-price component quantity is updated when item is terminated.
+        For usage-based component quantity is updated when usage is reported.
+        For limit-based component quantity is updated when limit is updated.
         """
-        full_days = utils.get_full_days(self.start, self.end)
-        return full_days
+        plan_component_id = self.details.get('plan_component_id')
+        if not plan_component_id:
+            return
+        try:
+            plan_component = marketplace_models.PlanComponent.objects.get(
+                id=plan_component_id
+            )
+        except marketplace_models.PlanComponent.DoesNotExist:
+            return
+        if (
+            plan_component.component.billing_type
+            == marketplace_models.OfferingComponent.BillingTypes.FIXED
+        ):
+            new_quantity = get_quantity(self.unit, self.start, self.end)
+            if new_quantity != self.quantity:
+                self.quantity = new_quantity
+            self.save(update_fields=['quantity'])
 
     def terminate(self, end=None):
         self.end = end or timezone.now()
         self.save(update_fields=['end'])
+        self.update_quantity()
+
+        resource_limit_periods = self.details.get('resource_limit_periods')
+        if resource_limit_periods:
+            last_period = resource_limit_periods[-1]
+            last_period['end'] = self.end.isoformat()
+            last_period['billing_periods'] = utils.get_full_days(
+                parse_datetime(last_period['start']), self.end
+            )
+            self.save(update_fields=['details'])
 
     def __str__(self):
         return self.name or '<InvoiceItem %s>' % self.pk
-
-    def create_compensation(self, name, downtime, **kwargs):
-        FIELDS = (
-            'invoice',
-            'project',
-            'project_name',
-            'project_uuid',
-            'product_code',
-            'article_code',
-            'unit',
-            'unit_price',
-            'start',
-            'end',
-            'details',
-        )
-
-        params = {}
-        for field in FIELDS:
-            try:
-                params[field] = getattr(self, field)
-            except ObjectDoesNotExist:
-                pass  # if a reference was deleted
-        params.update(kwargs)
-        if params['unit_price'] > 0:
-            params['unit_price'] *= -1
-
-        name = _('Compensation. %s') % name
-        params['details']['name'] = name
-        params['details']['downtime_id'] = downtime.id
-        params['name'] = name
-        return InvoiceItem.objects.create(**params)
-
-
-def get_default_downtime_start():
-    return timezone.now() - settings.WALDUR_INVOICES['DOWNTIME_DURATION_MINIMAL']
-
-
-class ServiceDowntime(models.Model):
-    """
-    Currently this model is restricted to OpenStack package only.
-    It is expected that implementation would be generalized to support other resources as well.
-    """
-
-    start = models.DateTimeField(
-        default=get_default_downtime_start,
-        help_text=_('Date and time when downtime has started.'),
-    )
-    end = models.DateTimeField(
-        default=timezone.now, help_text=_('Date and time when downtime has ended.')
-    )
-    package = models.ForeignKey(
-        on_delete=models.CASCADE,
-        to=package_models.OpenStackPackage,
-        blank=True,
-        null=True,
-        editable=False,
-    )
-    offering = models.ForeignKey(
-        on_delete=models.CASCADE,
-        to=marketplace_models.Offering,
-        blank=True,
-        null=True,
-        limit_choices_to={'billable': True},
-    )
-    resource = models.ForeignKey(
-        on_delete=models.CASCADE,
-        to=marketplace_models.Resource,
-        blank=True,
-        null=True,
-        limit_choices_to={'offering__billable': True},
-    )
-
-    def clean(self):
-        self._validate_duration()
-        self._validate_offset()
-        self._validate_intersection()
-        self._validate_resource_and_offering()
-
-    def _validate_duration(self):
-        duration = self.end - self.start
-
-        duration_min = settings.WALDUR_INVOICES['DOWNTIME_DURATION_MINIMAL']
-        if duration_min is not None and duration < duration_min:
-            raise ValidationError(
-                _('Downtime duration is too small. Minimal duration is %s')
-                % duration_min
-            )
-
-        duration_max = settings.WALDUR_INVOICES['DOWNTIME_DURATION_MAXIMAL']
-        if duration_max is not None and duration > duration_max:
-            raise ValidationError(
-                _('Downtime duration is too big. Maximal duration is %s') % duration_max
-            )
-
-    def _validate_offset(self):
-        if self.start > timezone.now() or self.end > timezone.now():
-            raise ValidationError(
-                _(
-                    'Future downtime is not supported yet. '
-                    'Please select date in the past instead.'
-                )
-            )
-
-    def _validate_resource_and_offering(self):
-        if self.offering and self.resource:
-            raise ValidationError('Cannot define an offering and a resource.')
-
-        if not (self.offering or self.resource):
-            raise ValidationError('You must define an offering or a resource.')
-
-    def get_intersection_subquery(self):
-        left = Q(start__gte=self.start, start__lte=self.end)
-        right = Q(end__gte=self.start, end__lte=self.end)
-        inside = Q(start__gte=self.start, end__lte=self.end)
-        outside = Q(start__lte=self.start, end__gte=self.end)
-        return Q(left | right | inside | outside)
-
-    def _validate_intersection(self):
-        qs = ServiceDowntime.objects.filter(
-            self.get_intersection_subquery(), package=self.package
-        )
-        if qs.exists():
-            ids = ', '.join(str(item.id) for item in qs)
-            raise ValidationError(
-                _('Downtime period intersects with another period with ID: %s.') % ids
-            )
 
 
 class PaymentType(models.CharField):
@@ -507,144 +448,5 @@ class Payment(core_models.UuidMixin, core_models.TimeStampedModel):
         return 'payment'
 
 
-class InvoiceItemAdjuster:
-    def __init__(self, invoice, source, start, unit_price, unit):
-        self.invoice = invoice
-        self.source = source
-        self.start = start
-        self.unit_price = unit_price
-        self.unit = unit
-
-    @cached_property
-    def content_type(self):
-        return ContentType.objects.get_for_model(self.source)
-
-    @property
-    def invoice_items(self):
-        # TODO: Remove temporary workaround for OpenStack package
-        if isinstance(self.source, package_models.OpenStackPackage):
-            return InvoiceItem.objects.filter(
-                invoice=self.invoice,
-                content_type=self.content_type,
-                details__tenant_name=self.source.tenant.name,
-            )
-        return InvoiceItem.objects.filter(
-            invoice=self.invoice,
-            content_type=self.content_type,
-            object_id=self.source.pk,
-        )
-
-    @cached_property
-    def old_item(self):
-        qs = self.invoice_items
-        if self.unit == Units.PER_DAY:
-            qs = qs.filter(end__day=self.start.day)
-        elif self.unit == Units.PER_HOUR:
-            qs = qs.filter(end__day=self.start.day, end__hour=self.start.hour)
-        elif self.unit == Units.PER_MONTH:
-            qs = qs.filter(end__month=self.start.month)
-        elif self.unit == Units.PER_HALF_MONTH:
-            if self.start.day <= 15:
-                qs = qs.filter(end__day__lte=15)
-            else:
-                qs = qs.filter(end__day__gt=15)
-        else:
-            qs = qs.none()
-        return qs.order_by('-unit_price').first()
-
-    @property
-    def old_price(self):
-        return get_price_per_day(self.old_item.unit_price, self.old_item.unit)
-
-    @property
-    def new_price(self):
-        return get_price_per_day(self.unit_price, self.unit)
-
-    def shift_forward(self):
-        """
-        Adjust old invoice item end field to the end of current unit.
-        Adjust new invoice item start field to the start of next unit.
-        """
-        end = self.old_item.end
-
-        if self.old_item.unit != self.unit and self.unit == Units.PER_MONTH:
-            end = core_utils.month_end(end)
-        elif self.old_item.unit != self.unit and self.unit == Units.PER_HALF_MONTH:
-            if end.day > 15:
-                end = core_utils.month_end(end)
-            else:
-                end = end.replace(day=15)
-        elif self.unit == Units.PER_HOUR:
-            end = end.replace(minute=59, second=59)
-        else:
-            end = end.replace(hour=23, minute=59, second=59)
-
-        start = end + timedelta(seconds=1)
-        return start, end
-
-    def shift_backward(self):
-        """
-        Adjust old invoice item end field to the end of previous unit
-        Adjust new invoice item field to the start of current unit.
-        """
-        end = self.old_item.end
-
-        if self.old_item.unit != self.unit and self.unit == Units.PER_MONTH:
-            start = core_utils.month_start(end)
-        elif self.old_item.unit != self.unit and self.unit == Units.PER_HALF_MONTH:
-            if end.day < 15:
-                start = core_utils.month_start(end)
-            else:
-                start = end.replace(day=15)
-        elif self.unit == Units.PER_HOUR:
-            start = end.replace(minute=0, second=0)
-        else:
-            start = end.replace(hour=0, minute=0, second=0)
-
-        end = start - timedelta(seconds=1)
-        return start, end
-
-    def remove_new_items(self, start):
-        """
-        Cleanup planned invoice items when new item is created.
-        """
-        qs = self.invoice_items
-        if self.unit == Units.PER_DAY:
-            qs = qs.filter(start__day=start.day)
-        elif self.unit == Units.PER_HOUR:
-            qs = qs.filter(start__day=start.day, start__hour=start.hour)
-        else:
-            qs = qs.none()
-
-        qs.delete()
-
-    def adjust(self):
-        start = self.start
-
-        if self.old_item and self.old_item.price > 0:
-            if self.old_price >= self.new_price:
-                start, end = self.shift_forward()
-            else:
-                start, end = self.shift_backward()
-
-            self.old_item.end = end
-            self.old_item.save(update_fields=['end'])
-
-        self.remove_new_items(start)
-
-        return start
-
-
-def adjust_invoice_items(invoice, source, start, unit_price, unit):
-    """
-    When resource configuration is switched, old invoice item
-    is terminated and new invoice item is created.
-    In order to avoid double counting we should ensure that
-    there're no overlapping invoice items for the same scope.
-
-    By default daily prorate is used even if plan is monthly or half-monthly.
-    Two notable exceptions are:
-    1) Switching from daily plan to monthly.
-    2) Switching between hourly plans.
-    """
-    return InvoiceItemAdjuster(invoice, source, start, unit_price, unit).adjust()
+reversion.register(InvoiceItem)
+reversion.register(Invoice, follow=('items',))

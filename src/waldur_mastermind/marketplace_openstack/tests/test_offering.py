@@ -16,29 +16,23 @@ from waldur_mastermind.marketplace.management.commands.load_categories import (
 )
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 from waldur_mastermind.marketplace_openstack import (
-    CORES_TYPE,
-    RAM_TYPE,
     STORAGE_MODE_DYNAMIC,
     STORAGE_MODE_FIXED,
-    STORAGE_TYPE,
 )
-from waldur_mastermind.marketplace_openstack.utils import (
-    create_offering_components,
-    merge_plans,
-)
-from waldur_mastermind.packages import models as package_models
-from waldur_mastermind.packages.tests import fixtures as package_fixtures
 from waldur_openstack.openstack import models as openstack_models
 from waldur_openstack.openstack.tests import fixtures as openstack_fixtures
+from waldur_openstack.openstack.tests.factories import VolumeTypeFactory
+from waldur_openstack.openstack_base.tests.fixtures import OpenStackFixture
 
-from .. import INSTANCE_TYPE, PACKAGE_TYPE, VOLUME_TYPE
+from .. import INSTANCE_TYPE, TENANT_TYPE, VOLUME_TYPE
+from . import fixtures
 from .utils import BaseOpenStackTest, override_plugin_settings
 
 
 class VpcExternalFilterTest(BaseOpenStackTest):
     def setUp(self):
         super(VpcExternalFilterTest, self).setUp()
-        self.fixture = package_fixtures.OpenStackFixture()
+        self.fixture = OpenStackFixture()
         self.offering = marketplace_factories.OfferingFactory(
             category=self.tenant_category
         )
@@ -61,163 +55,6 @@ class VpcExternalFilterTest(BaseOpenStackTest):
         self.client.force_authenticate(self.fixture.owner)
         response = self.client.get(self.url)
         self.assertEqual(1, len(response.data))
-
-
-class TemplateOfferingTest(BaseOpenStackTest):
-    def test_template_for_plan_is_created(self):
-        fixture = package_fixtures.OpenStackFixture()
-        offering = marketplace_factories.OfferingFactory(
-            type=PACKAGE_TYPE, scope=fixture.openstack_service_settings
-        )
-        plan = marketplace_factories.PlanFactory(offering=offering)
-        ram_component = marketplace_models.OfferingComponent.objects.create(
-            offering=offering, type=RAM_TYPE,
-        )
-        marketplace_models.PlanComponent.objects.create(
-            plan=plan, component=ram_component, amount=20, price=10,
-        )
-
-        cores_component = marketplace_models.OfferingComponent.objects.create(
-            offering=offering, type=CORES_TYPE,
-        )
-        marketplace_models.PlanComponent.objects.create(
-            plan=plan, component=cores_component, amount=10, price=3,
-        )
-
-        storage_component = marketplace_models.OfferingComponent.objects.create(
-            offering=offering, type=STORAGE_TYPE,
-        )
-        marketplace_models.PlanComponent.objects.create(
-            plan=plan, component=storage_component, amount=100, price=1,
-        )
-        plan.refresh_from_db()
-
-        template = plan.scope
-        self.assertTrue(isinstance(template, package_models.PackageTemplate))
-
-        template_ram_component = template.components.get(type=RAM_TYPE)
-        template_cores_component = template.components.get(type=CORES_TYPE)
-        template_storage_component = template.components.get(type=STORAGE_TYPE)
-
-        self.assertEqual(template_ram_component.amount, 20 * 1024)
-        self.assertEqual(template_ram_component.price, 10.0 / 1024)
-
-        self.assertEqual(template_cores_component.amount, 10)
-        self.assertEqual(template_cores_component.price, 3)
-
-        self.assertEqual(template_storage_component.amount, 100 * 1024)
-        self.assertEqual(template_storage_component.price, 1.0 / 1024)
-
-    def test_template_for_plan_is_not_created_if_type_is_invalid(self):
-        offering = marketplace_factories.OfferingFactory(type='INVALID')
-        plan = marketplace_factories.PlanFactory(offering=offering)
-        plan.refresh_from_db()
-        self.assertIsNone(plan.scope)
-
-    def test_when_plan_is_archived_template_is_updated(self):
-        # Arrange
-        fixture = package_fixtures.OpenStackFixture()
-        offering = marketplace_factories.OfferingFactory(
-            type=PACKAGE_TYPE, scope=fixture.openstack_service_settings
-        )
-        plan = marketplace_factories.PlanFactory(offering=offering)
-        plan.refresh_from_db()
-
-        # Act
-        plan.archived = True
-        plan.save()
-        template = plan.scope
-
-        # Assert
-        self.assertTrue(template.archived)
-
-    def test_when_plan_is_unarchived_template_is_updated(self):
-        # Arrange
-        fixture = package_fixtures.OpenStackFixture()
-        offering = marketplace_factories.OfferingFactory(
-            type=PACKAGE_TYPE, scope=fixture.openstack_service_settings
-        )
-        plan = marketplace_factories.PlanFactory(offering=offering, archived=True)
-        plan.refresh_from_db()
-
-        # Act
-        plan.archived = False
-        plan.save()
-        template = plan.scope
-
-        # Assert
-        self.assertFalse(template.archived)
-
-    def test_when_plan_name_is_updated_template_is_updated(self):
-        # Arrange
-        fixture = package_fixtures.OpenStackFixture()
-        offering = marketplace_factories.OfferingFactory(
-            type=PACKAGE_TYPE, scope=fixture.openstack_service_settings
-        )
-        plan = marketplace_factories.PlanFactory(offering=offering)
-        plan.refresh_from_db()
-
-        # Act
-        plan.name = 'Compute-intensive'
-        plan.save()
-        template = plan.scope
-
-        # Assert
-        self.assertEqual(template.name, plan.name)
-
-    def test_when_template_is_archived_plan_is_updated(self):
-        # Arrange
-        fixture = package_fixtures.OpenStackFixture()
-        offering = marketplace_factories.OfferingFactory(
-            type=PACKAGE_TYPE, scope=fixture.openstack_service_settings
-        )
-        plan = marketplace_factories.PlanFactory(offering=offering)
-        plan.refresh_from_db()
-        template = plan.scope
-
-        # Act
-        template.archived = True
-        template.save()
-        plan.refresh_from_db()
-
-        # Assert
-        self.assertTrue(plan.archived)
-
-    def test_when_template_is_unarchived_template_is_updated(self):
-        # Arrange
-        fixture = package_fixtures.OpenStackFixture()
-        offering = marketplace_factories.OfferingFactory(
-            type=PACKAGE_TYPE, scope=fixture.openstack_service_settings
-        )
-        plan = marketplace_factories.PlanFactory(offering=offering, archived=True)
-        plan.refresh_from_db()
-        template = plan.scope
-
-        # Act
-        template.archived = False
-        template.save()
-        plan.refresh_from_db()
-
-        # Assert
-        self.assertFalse(plan.archived)
-
-    def test_when_template_name_is_updated_template_is_synchronized(self):
-        # Arrange
-        fixture = package_fixtures.OpenStackFixture()
-        offering = marketplace_factories.OfferingFactory(
-            type=PACKAGE_TYPE, scope=fixture.openstack_service_settings
-        )
-        plan = marketplace_factories.PlanFactory(offering=offering)
-        plan.refresh_from_db()
-        template = plan.scope
-
-        # Act
-        template.name = 'Compute-intensive'
-        template.save()
-        plan.refresh_from_db()
-
-        # Assert
-        self.assertEqual(plan.name, template.name)
 
 
 class PlanComponentsTest(test.APITransactionTestCase):
@@ -247,24 +84,6 @@ class PlanComponentsTest(test.APITransactionTestCase):
         response = self.create_offering(False)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
-    def test_total_price_is_calculated_from_components(self):
-        response = self.create_offering()
-        offering = marketplace_models.Offering.objects.get(uuid=response.data['uuid'])
-        self.assertEqual(
-            offering.plans.first().unit_price, 10 * 10 + 100 * 100 + 1000 * 1000
-        )
-
-    def test_plan_components_are_updated(self):
-        response = self.create_offering()
-        offering = marketplace_models.Offering.objects.get(uuid=response.data['uuid'])
-        component = offering.plans.first().components.get(component__type='cores')
-        component.amount += 1
-        component.save()
-        template = package_models.PackageTemplate.objects.get(
-            service_settings=offering.scope
-        )
-        self.assertEqual(template.components.get(type='cores').amount, component.amount)
-
     def create_offering(self, components=True):
         fixture = structure_fixtures.ProjectFixture()
         url = marketplace_factories.OfferingFactory.get_list_url()
@@ -273,7 +92,7 @@ class PlanComponentsTest(test.APITransactionTestCase):
             'name': 'offering',
             'category': marketplace_factories.CategoryFactory.get_url(self.category),
             'customer': structure_factories.CustomerFactory.get_url(fixture.customer),
-            'type': PACKAGE_TYPE,
+            'type': TENANT_TYPE,
             'service_attributes': {
                 'backend_url': 'http://example.com/',
                 'username': 'root',
@@ -292,7 +111,6 @@ class PlanComponentsTest(test.APITransactionTestCase):
         }
         if components:
             payload['plans'][0]['prices'] = self.prices
-            payload['plans'][0]['quotas'] = self.quotas
         with mock.patch('waldur_core.structure.models.ServiceSettings.get_backend'):
             return self.client.post(url, payload)
 
@@ -308,6 +126,7 @@ class OpenStackResourceOfferingTest(BaseOpenStackTest):
 
         self.assertTrue(isinstance(service_settings, structure_models.ServiceSettings))
         self.assertEqual(service_settings.scope, tenant)
+        self.assertEqual(offering.customer, tenant.project.customer)
 
     @data(INSTANCE_TYPE, VOLUME_TYPE)
     @override_plugin_settings(AUTOMATICALLY_CREATE_PRIVATE_OFFERING=False)
@@ -323,9 +142,10 @@ class OpenStackResourceOfferingTest(BaseOpenStackTest):
     def test_offering_is_not_created_if_tenant_is_not_created_via_marketplace(
         self, offering_type
     ):
-        fixture = package_fixtures.OpenStackFixture()
+        fixture = OpenStackFixture()
         tenant = openstack_models.Tenant.objects.create(
-            service_project_link=fixture.openstack_spl,
+            service_settings=fixture.openstack_service_settings,
+            project=fixture.project,
             state=openstack_models.Tenant.States.CREATING,
         )
 
@@ -346,9 +166,10 @@ class OpenStackResourceOfferingTest(BaseOpenStackTest):
         self.assertEqual(offering.state, marketplace_models.Offering.States.ARCHIVED)
 
     def trigger_offering_creation(self):
-        fixture = package_fixtures.OpenStackFixture()
+        fixture = OpenStackFixture()
         tenant = openstack_models.Tenant.objects.create(
-            service_project_link=fixture.openstack_spl,
+            service_settings=fixture.openstack_service_settings,
+            project=fixture.project,
             state=openstack_models.Tenant.States.CREATING,
         )
         resource = marketplace_factories.ResourceFactory(scope=tenant)
@@ -359,54 +180,13 @@ class OpenStackResourceOfferingTest(BaseOpenStackTest):
         return tenant
 
 
-class MergePlansTest(test.APITransactionTestCase):
-    def setUp(self):
-        fixture = package_fixtures.OpenStackFixture()
-        offering = marketplace_factories.OfferingFactory(
-            type=PACKAGE_TYPE, scope=fixture.openstack_service_settings
-        )
-        create_offering_components(offering)
-        for name in 'Basic', 'Advanced':
-            plan = marketplace_factories.PlanFactory(offering=offering, name=name)
-            prices = {
-                CORES_TYPE: 1,
-                RAM_TYPE: 0.1,
-                STORAGE_TYPE: 0.01,
-            }
-            for key, value in prices.items():
-                component = marketplace_models.OfferingComponent.objects.get(
-                    offering=offering, type=key,
-                )
-                marketplace_models.PlanComponent.objects.create(
-                    plan=plan, component=component, price=value,
-                )
-            resource = marketplace_factories.ResourceFactory(
-                offering=offering, plan=plan,
-            )
-            marketplace_factories.OrderItemFactory(
-                offering=offering, plan=plan, resource=resource,
-            )
-        self.offering = offering
-
-    def test_plans_are_merged(self):
-        merge_plans(self.offering, self.offering.plans.first())
-        self.assertEqual(self.offering.plans.count(), 1)
-        self.assertEqual(self.offering.plans.get().name, 'Default')
-        self.assertEqual(
-            marketplace_models.Resource.objects.filter(offering=self.offering).count(),
-            2,
-        )
-        self.assertEqual(
-            marketplace_models.OrderItem.objects.filter(offering=self.offering).count(),
-            2,
-        )
-
-
 class OfferingComponentForVolumeTypeTest(test.APITransactionTestCase):
     def setUp(self) -> None:
         self.fixture = openstack_fixtures.OpenStackFixture()
         self.offering = marketplace_factories.OfferingFactory(
-            type=PACKAGE_TYPE, scope=self.fixture.openstack_service_settings
+            type=TENANT_TYPE,
+            scope=self.fixture.openstack_service_settings,
+            plugin_options={'storage_mode': STORAGE_MODE_DYNAMIC},
         )
         self.volume_type = self.fixture.volume_type
 
@@ -417,10 +197,26 @@ class OfferingComponentForVolumeTypeTest(test.APITransactionTestCase):
         self.assertEqual(component.offering, self.offering)
         self.assertEqual(
             component.billing_type,
-            marketplace_models.OfferingComponent.BillingTypes.USAGE,
+            marketplace_models.OfferingComponent.BillingTypes.LIMIT,
         )
         self.assertEqual(component.name, 'Storage (%s)' % self.volume_type.name)
         self.assertEqual(component.type, 'gigabytes_' + self.volume_type.name)
+
+    def test_offering_component_for_volume_type_is_not_created_if_storage_mode_is_fixed(
+        self,
+    ):
+        self.offering.plugin_options = {'storage_mode': STORAGE_MODE_FIXED}
+        self.offering.save()
+
+        new_volume_type = VolumeTypeFactory(
+            settings=self.fixture.openstack_service_settings
+        )
+
+        self.assertFalse(
+            marketplace_models.OfferingComponent.objects.filter(
+                scope=new_volume_type
+            ).exists()
+        )
 
     def test_offering_component_name_is_updated(self):
         self.volume_type.name = 'new name'
@@ -472,3 +268,232 @@ class OfferingComponentForVolumeTypeTest(test.APITransactionTestCase):
         self.assertEqual(
             self.offering.plugin_options['storage_mode'], STORAGE_MODE_FIXED
         )
+
+
+class OfferingCreateTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = openstack_fixtures.OpenStackFixture()
+        self.customer_url = structure_factories.CustomerFactory.get_url(
+            customer=self.fixture.customer
+        )
+        self.category_url = marketplace_factories.CategoryFactory.get_url()
+        self.url = marketplace_factories.OfferingFactory.get_list_url()
+        mock_backend_patch = mock.patch(
+            'waldur_openstack.openstack_base.backend.BaseOpenStackBackend.get_client'
+        )
+        mock_backend_patch.start()
+        mock_executors_patch = mock.patch(
+            'waldur_mastermind.marketplace_openstack.views.executors'
+        )
+        mock_executors_patch.start()
+
+    def tearDown(self):
+        mock.patch.stopall()
+
+    def test_create_offering(self):
+        payload = self._get_payload()
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(self.url, payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            marketplace_models.Offering.objects.filter(name='TEST').exists()
+        )
+        self.assertTrue(
+            marketplace_models.OfferingComponent.objects.filter(
+                offering__name='TEST'
+            ).exists()
+        )
+        component = marketplace_models.OfferingComponent.objects.get(
+            offering__name='TEST', type='cores'
+        )
+        self.assertEqual(component.article_code, 'artcode1')
+        self.assertEqual(component.min_value, 1)
+        self.assertEqual(component.max_value, 100)
+
+    def _get_payload(self):
+        return {
+            "name": "TEST",
+            "category": self.category_url,
+            "customer": self.customer_url,
+            "type": TENANT_TYPE,
+            "service_attributes": {
+                "backend_url": "https://193.0.0.1:5000/v3/",
+                "username": "admin",
+                "password": "password",
+                "tenant_name": "admin",
+                "external_network_id": "admin",
+            },
+            "shared": True,
+            "attributes": {},
+            "plugin_options": {"storage_mode": "fixed"},
+            "components": [
+                {
+                    "type": "cores",
+                    "name": "Cores",
+                    "measured_unit": "cores",
+                    "billing_type": "limit",
+                    "limit_period": None,
+                    "article_code": "artcode1",
+                    "min_value": 1,
+                    "max_value": 100,
+                },
+                {
+                    "type": "ram",
+                    "name": "RAM",
+                    "measured_unit": "GB",
+                    "billing_type": "limit",
+                    "limit_period": None,
+                    "article_code": "artcode2",
+                    "min_value": 1024,
+                    "max_value": 102400,
+                },
+                {
+                    "type": "storage",
+                    "name": "Storage",
+                    "measured_unit": "GB",
+                    "billing_type": "limit",
+                    "limit_period": None,
+                    "article_code": "artcode3",
+                    "min_value": 1024,
+                    "max_value": 102400,
+                },
+            ],
+        }
+
+    def test_create_offering_with_limits(self):
+        payload = self._get_payload()
+        payload.pop('components')
+        payload['limits'] = {
+            'cores': {'min': 1, 'max': 100},
+            'ram': {'min': 1024, 'max': 102400},
+            'storage': {'min': 1024, 'max': 102400},
+        }
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(self.url, payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            marketplace_models.Offering.objects.filter(name='TEST').exists()
+        )
+        self.assertTrue(
+            marketplace_models.OfferingComponent.objects.filter(
+                offering__name='TEST'
+            ).exists()
+        )
+        component = marketplace_models.OfferingComponent.objects.get(
+            offering__name='TEST', type='cores'
+        )
+        self.assertEqual(component.min_value, 1)
+        self.assertEqual(component.max_value, 100)
+
+
+@ddt
+class OfferingUpdateTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = openstack_fixtures.OpenStackFixture()
+        self.offering = marketplace_factories.OfferingFactory(
+            type=TENANT_TYPE, scope=self.fixture.openstack_service_settings
+        )
+        self.component = marketplace_factories.OfferingComponentFactory(
+            offering=self.offering, type='cores', article_code='article_code',
+        )
+        self.url = marketplace_factories.OfferingFactory.get_url(offering=self.offering)
+
+    def test_update_article_code(self):
+        payload = {
+            'components': [
+                {
+                    'type': 'cores',
+                    'name': 'Cores',
+                    'measured_unit': 'hours',
+                    'billing_type': 'fixed',
+                    'article_code': 'new_article_code',
+                }
+            ],
+        }
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.patch(self.url, payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.component.refresh_from_db()
+        self.assertEqual(self.component.article_code, 'new_article_code')
+
+    def test_validate_extra_components(self):
+        payload = {
+            'components': [
+                {
+                    'type': 'extra',
+                    'name': 'extra',
+                    'measured_unit': 'hours',
+                    'billing_type': 'fixed',
+                }
+            ],
+        }
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.patch(self.url, payload)
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class OfferingDetailsTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = openstack_fixtures.OpenStackFixture()
+        self.offering = marketplace_factories.OfferingFactory(
+            type=TENANT_TYPE, scope=self.fixture.openstack_service_settings
+        )
+        marketplace_factories.OfferingComponentFactory(
+            offering=self.offering, type='cores'
+        )
+        marketplace_factories.OfferingComponentFactory(
+            offering=self.offering, type='ram'
+        )
+        marketplace_factories.OfferingComponentFactory(
+            offering=self.offering, type='storage'
+        )
+        marketplace_factories.OfferingComponentFactory(
+            offering=self.offering, type='gigabytes_ssd'
+        )
+        self.url = marketplace_factories.OfferingFactory.get_url(offering=self.offering)
+
+    def test_when_storage_mode_is_fixed_offering_components_are_filtered(self):
+        self.offering.plugin_options['storage_mode'] = STORAGE_MODE_FIXED
+        self.offering.save()
+
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url)
+        actual_types = {component['type'] for component in response.data['components']}
+        expected_types = {'cores', 'ram', 'storage'}
+        self.assertEqual(actual_types, expected_types)
+
+    def test_when_storage_mode_is_dynamic_offering_components_are_filtered(self):
+        self.offering.plugin_options['storage_mode'] = STORAGE_MODE_DYNAMIC
+        self.offering.save()
+
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url)
+        actual_types = {component['type'] for component in response.data['components']}
+        expected_types = {'cores', 'ram', 'gigabytes_ssd'}
+        self.assertEqual(actual_types, expected_types)
+
+
+@ddt
+class OfferingNameTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceOpenStackFixture()
+
+    @data(INSTANCE_TYPE, VOLUME_TYPE)
+    def test_renaming_openstack_tenant_should_also_rename_linked_private_offerings(
+        self, offering_type
+    ):
+        offering = marketplace_factories.OfferingFactory(
+            type=offering_type, scope=self.fixture.private_settings,
+        )
+        self.fixture.openstack_tenant.name = 'new_name'
+        self.fixture.openstack_tenant.save()
+        offering.refresh_from_db()
+        self.assertTrue('new_name' in offering.name)

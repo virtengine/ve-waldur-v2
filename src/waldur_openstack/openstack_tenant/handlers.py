@@ -3,6 +3,7 @@ import logging
 from django.contrib.contenttypes.models import ContentType
 from django.core import exceptions as django_exceptions
 from django.db import IntegrityError, transaction
+from django.db.models import Q
 
 from waldur_core.core.models import StateMixin
 from waldur_core.quotas.models import Quota
@@ -356,8 +357,28 @@ class SecurityGroupHandler(BaseSynchronizationHandler):
                 backend_id=rule.backend_id,
                 security_group=security_group,
             )
-            for rule in openstack_security_group.rules.iterator()
+            for rule in openstack_security_group.rules.exclude(backend_id='')
         ]
+
+    def pull_remote_group(self, group_property, group_resource, service_settings):
+        # Skip rules with empty backend ID (ie rules being created)
+        for rule_resource in group_resource.rules.exclude(
+            Q(remote_group=None) | Q(backend_id='')
+        ):
+            try:
+                remote_group = models.SecurityGroup.objects.get(
+                    settings=service_settings,
+                    backend_id=rule_resource.remote_group.backend_id,
+                )
+                rule_property = models.SecurityGroupRule.objects.get(
+                    security_group=group_property, backend_id=rule_resource.backend_id
+                )
+            except django_exceptions.ObjectDoesNotExist:
+                continue
+            else:
+                if rule_property.remote_group != remote_group:
+                    rule_property.remote_group = remote_group
+                    rule_property.save(update_fields=['remote_group'])
 
     def create_service_property(self, resource, settings):
         service_property, _ = super(SecurityGroupHandler, self).create_service_property(
@@ -366,6 +387,7 @@ class SecurityGroupHandler(BaseSynchronizationHandler):
         if resource.rules.count() > 0:
             group_rules = self.map_rules(service_property, resource)
             service_property.rules.bulk_create(group_rules)
+        self.pull_remote_group(service_property, resource, settings)
         return service_property
 
     def update_service_property(self, resource, settings):
@@ -375,9 +397,6 @@ class SecurityGroupHandler(BaseSynchronizationHandler):
         if not service_property:
             return
 
-        service_property.rules.all().delete()
-        group_rules = self.map_rules(service_property, resource)
-        service_property.rules.bulk_create(group_rules)
         return service_property
 
 
@@ -418,54 +437,6 @@ resource_handlers = (
 )
 
 
-def sync_certificates_between_openstack_service_with_openstacktenant_service(
-    sender, instance, action, **kwargs
-):
-    """
-    Copies certifications links in original service settings to derived openstack tenant service settings.
-    Handling works only for OpenStack service settings and ignored for all others.
-    """
-    service_settings = instance
-    if (
-        action not in ['post_add', 'post_remove', 'post_clear']
-        or service_settings.type != openstack_apps.OpenStackConfig.service_name
-    ):
-        return
-
-    tenants = openstack_models.Tenant.objects.filter(
-        service_project_link__service__settings=service_settings
-    )
-
-    if not tenants:
-        return
-
-    openstack_settings = structure_models.ServiceSettings.objects.filter(
-        scope__in=tenants
-    )
-
-    with transaction.atomic():
-        for settings in openstack_settings:
-            settings.certifications.clear()
-            settings.certifications.add(*service_settings.certifications.all())
-
-
-def copy_certifications_from_openstack_service_to_openstacktenant_service(
-    sender, instance, created=False, **kwargs
-):
-    if not created or instance.type != apps.OpenStackTenantConfig.service_name:
-        return
-
-    tenant = instance.scope
-    if not isinstance(tenant, openstack_models.Tenant):
-        return
-
-    admin_settings = tenant.service_project_link.service.settings
-
-    with transaction.atomic():
-        instance.certifications.clear()
-        instance.certifications.add(*admin_settings.certifications.all())
-
-
 def copy_flavor_exclude_regex_to_openstacktenant_service_settings(
     sender, instance, created=False, **kwargs
 ):
@@ -476,7 +447,7 @@ def copy_flavor_exclude_regex_to_openstacktenant_service_settings(
     if not isinstance(tenant, openstack_models.Tenant):
         return
 
-    admin_settings = tenant.service_project_link.service.settings
+    admin_settings = tenant.service_settings
     instance.options['flavor_exclude_regex'] = admin_settings.options.get(
         'flavor_exclude_regex', ''
     )
@@ -501,9 +472,7 @@ def copy_config_drive_to_openstacktenant_service_settings(
     if old_value == new_value:
         return
 
-    tenants = openstack_models.Tenant.objects.filter(
-        service_project_link__service__settings=instance
-    )
+    tenants = openstack_models.Tenant.objects.filter(service_settings=instance)
     ctype = ContentType.objects.get_for_model(openstack_models.Tenant)
     tenant_settings = structure_models.ServiceSettings.objects.filter(
         object_id__in=tenants.values_list('id'), content_type=ctype
@@ -523,8 +492,8 @@ def create_service_from_tenant(sender, instance, created=False, **kwargs):
         return
 
     tenant = instance
-    admin_settings = tenant.service_project_link.service.settings
-    customer = tenant.service_project_link.project.customer
+    admin_settings = tenant.service_settings
+    customer = tenant.project.customer
     service_settings = structure_models.ServiceSettings.objects.create(
         name=tenant.name,
         scope=tenant,
@@ -552,20 +521,12 @@ def create_service_from_tenant(sender, instance, created=False, **kwargs):
         ]
         service_settings.save()
 
-    service = models.OpenStackTenantService.objects.create(
-        settings=service_settings, customer=customer,
-    )
-
-    models.OpenStackTenantServiceProjectLink.objects.create(
-        service=service, project=tenant.service_project_link.project,
-    )
-
 
 def update_service_settings(sender, instance, created=False, **kwargs):
     tenant = instance
 
     if created or not (
-        set(['external_network_id', 'name', 'backend_id'])
+        {'name', 'backend_id', 'internal_network_id', 'external_network_id'}
         & set(tenant.tracker.changed())
     ):
         return
@@ -579,10 +540,29 @@ def update_service_settings(sender, instance, created=False, **kwargs):
     except structure_models.ServiceSettings.MultipleObjectsReturned:
         return
     else:
+        service_settings.options['internal_network_id'] = tenant.internal_network_id
         service_settings.options['external_network_id'] = tenant.external_network_id
         service_settings.options['tenant_id'] = tenant.backend_id
         service_settings.name = tenant.name
         service_settings.save()
+
+
+def mark_private_settings_as_erred_if_tenant_creation_failed(
+    sender, instance, name, source, target, **kwargs
+):
+    if target == StateMixin.States.ERRED and source == StateMixin.States.CREATING:
+        try:
+            service_settings = structure_models.ServiceSettings.objects.get(
+                scope=instance, type=apps.OpenStackTenantConfig.service_name
+            )
+        except structure_models.ServiceSettings.DoesNotExist:
+            return
+        except structure_models.ServiceSettings.MultipleObjectsReturned:
+            return
+        else:
+            service_settings.set_erred()
+            service_settings.error_message = 'Failed to create tenant: %s.' % instance
+            service_settings.save(update_fields=['state', 'error_message'])
 
 
 def sync_private_settings_quotas_with_tenant_quotas(
@@ -640,3 +620,88 @@ def delete_volume_type_quotas_from_private_service_settings(sender, instance, **
     tenant = quota.scope
     private_settings = structure_models.ServiceSettings.objects.filter(scope=tenant)
     Quota.objects.filter(scope__in=private_settings, name=quota.name).delete()
+
+
+def sync_security_group_rule_property_when_resource_is_updated_or_created(
+    sender, instance, created=False, **kwargs
+):
+    rule = instance
+
+    try:
+        service_settings = structure_models.ServiceSettings.objects.get(
+            scope=rule.security_group.tenant,
+            type=apps.OpenStackTenantConfig.service_name,
+        )
+    except (
+        django_exceptions.ObjectDoesNotExist,
+        django_exceptions.MultipleObjectsReturned,
+    ):
+        return
+
+    try:
+        security_group = models.SecurityGroup.objects.get(
+            settings=service_settings, backend_id=rule.security_group.backend_id
+        )
+    except django_exceptions.ObjectDoesNotExist:
+        return
+
+    if not rule.backend_id:
+        return
+
+    remote_group = None
+    if rule.remote_group and rule.remote_group.backend_id:
+        try:
+            remote_group = models.SecurityGroup.objects.get(
+                settings=service_settings, backend_id=rule.remote_group.backend_id
+            )
+        except django_exceptions.ObjectDoesNotExist:
+            pass
+
+    models.SecurityGroupRule.objects.update_or_create(
+        security_group=security_group,
+        backend_id=rule.backend_id,
+        defaults=dict(
+            ethertype=rule.ethertype,
+            direction=rule.direction,
+            protocol=rule.protocol,
+            from_port=rule.from_port,
+            to_port=rule.to_port,
+            cidr=rule.cidr,
+            description=rule.description,
+            remote_group=remote_group,
+        ),
+    )
+
+
+def sync_security_group_rule_on_delete(sender, instance, **kwargs):
+    rule = instance
+
+    if not rule.backend_id:
+        return
+
+    try:
+        service_settings = structure_models.ServiceSettings.objects.get(
+            scope=rule.security_group.tenant,
+            type=apps.OpenStackTenantConfig.service_name,
+        )
+    except (
+        django_exceptions.ObjectDoesNotExist,
+        django_exceptions.MultipleObjectsReturned,
+    ):
+        return
+
+    try:
+        security_group = models.SecurityGroup.objects.get(
+            settings=service_settings, backend_id=rule.security_group.backend_id
+        )
+    except django_exceptions.ObjectDoesNotExist:
+        return
+
+    try:
+        rule = models.SecurityGroupRule.objects.get(
+            security_group=security_group, backend_id=rule.backend_id
+        )
+    except django_exceptions.ObjectDoesNotExist:
+        return
+    else:
+        rule.delete()

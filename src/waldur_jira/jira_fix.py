@@ -2,6 +2,7 @@ import collections
 import json
 import os
 import re
+import unicodedata
 
 from jira import JIRA, JIRAError, utils
 from jira.resources import Attachment, Customer, Issue, RequestType, ServiceDesk, User
@@ -14,6 +15,10 @@ CHARS_LIMIT = 255
 
 
 def _get_filename(path):
+    # JIRA does not support composite symbols from Latin-1 charset.
+    # Hence we need to use NFD normalization which translates
+    # each character into its decomposed form.
+    path = unicodedata.normalize('NFD', path)
     limit = CHARS_LIMIT - PADDING
     fname = os.path.basename(path)
     filename = fname.split('.')[0]
@@ -48,7 +53,7 @@ def _upload_file(manager, issue, upload_file, filename):
         'file': (filename, upload_file),
     }
     headers = {
-        'X-Atlassian-Token': 'nocheck',
+        'X-Atlassian-Token': 'no-check',
     }
     req = Request('POST', url, headers=headers, files=files, auth=manager._session.auth)
     prepped = req.prepare()
@@ -72,7 +77,7 @@ def _upload_file(manager, issue, upload_file, filename):
     return attachment
 
 
-def add_attachment(manager, issue, path):
+def add_attachment(manager, issue, file):
     """
     Replace jira's method 'add_attachment' while don't well fixed this issue
     https://github.com/shazow/urllib3/issues/303
@@ -82,10 +87,8 @@ def add_attachment(manager, issue, path):
     :param path: [string]
     :return: [jira.JIRA.resources.Attachment instance]
     """
-    filename = _get_filename(path)
-
-    with open(path, 'rb') as f:
-        return _upload_file(manager, issue, f, filename)
+    filename = _get_filename(file.name)
+    return _upload_file(manager, issue, file.file.read(), filename)
 
 
 def service_desk(manager, id_or_key):

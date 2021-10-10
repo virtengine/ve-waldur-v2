@@ -3,8 +3,7 @@ from django.utils import timezone
 from rest_framework.reverse import reverse
 
 from waldur_core.structure.tests import factories as structure_factories
-
-from .. import models
+from waldur_mastermind.invoices import models
 
 
 class InvoiceFactory(factory.DjangoModelFactory):
@@ -34,6 +33,19 @@ class InvoiceItemFactory(factory.DjangoModelFactory):
 
     invoice = factory.SubFactory(InvoiceFactory)
     project = factory.SubFactory(structure_factories.ProjectFactory)
+
+    @classmethod
+    def get_url(cls, invoice=None, action=None):
+        if invoice is None:
+            invoice = InvoiceItemFactory()
+        url = 'http://testserver' + reverse(
+            'invoice-item-detail', kwargs={'uuid': invoice.uuid.hex}
+        )
+        return url if action is None else url + action + '/'
+
+    @classmethod
+    def get_list_url(cls):
+        return 'http://testserver' + reverse('invoice-item-list')
 
 
 class PaymentProfileFactory(factory.DjangoModelFactory):

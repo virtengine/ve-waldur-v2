@@ -532,7 +532,9 @@ class CreateVolumesTest(VolumesBaseTest):
 
     def _get_volume(self):
         volume = factories.VolumeFactory(
-            service_project_link=self.fixture.spl, backend_id=None,
+            service_settings=self.fixture.openstack_tenant_service_settings,
+            project=self.fixture.project,
+            backend_id=None,
         )
 
         backend = OpenStackTenantBackend(self.settings)
@@ -543,7 +545,6 @@ class CreateVolumesTest(VolumesBaseTest):
 class ImportVolumeTest(BaseBackendTest):
     def setUp(self):
         super(ImportVolumeTest, self).setUp()
-        self.spl = self.fixture.spl
         self.backend_volume_id = 'backend_id'
         self.backend_volume = self._get_valid_volume(self.backend_volume_id)
 
@@ -551,7 +552,7 @@ class ImportVolumeTest(BaseBackendTest):
 
     def test_volume_is_imported(self):
         volume = self.tenant_backend.import_volume(
-            self.backend_volume_id, save=True, service_project_link=self.spl
+            self.backend_volume_id, project=self.fixture.project, save=True
         )
 
         self.assertTrue(
@@ -565,11 +566,13 @@ class ImportVolumeTest(BaseBackendTest):
 
     def test_volume_instance_is_not_created_during_import(self):
         vm = factories.InstanceFactory(
-            backend_id='instance_backend_id', service_project_link=self.spl
+            backend_id='instance_backend_id',
+            service_settings=self.fixture.openstack_tenant_service_settings,
+            project=self.fixture.project,
         )
         self.backend_volume.attachments = [dict(server_id=vm.backend_id)]
         volume = self.tenant_backend.import_volume(
-            self.backend_volume_id, save=True, service_project_link=self.spl
+            self.backend_volume_id, project=self.fixture.project, save=True
         )
 
         self.assertIsNotNone(volume.instance)
@@ -586,7 +589,6 @@ class ImportVolumeTest(BaseBackendTest):
 class PullVolumeTest(BaseBackendTest):
     def setUp(self):
         super(PullVolumeTest, self).setUp()
-        self.spl = self.fixture.spl
         self.backend_volume_id = 'backend_id'
         self.backend_volume = self._get_valid_volume(self.backend_volume_id)
 
@@ -594,12 +596,15 @@ class PullVolumeTest(BaseBackendTest):
 
     def test_volume_instance_is_pulled(self):
         vm = factories.InstanceFactory(
-            backend_id='instance_backend_id', service_project_link=self.spl
+            backend_id='instance_backend_id',
+            service_settings=self.fixture.openstack_tenant_service_settings,
+            project=self.fixture.project,
         )
         volume = factories.VolumeFactory(
             backend_id=self.backend_volume_id,
             instance=vm,
-            service_project_link=self.spl,
+            service_settings=self.fixture.openstack_tenant_service_settings,
+            project=self.fixture.project,
         )
         self.backend_volume.attachments = [dict(server_id=vm.backend_id)]
         self.tenant_backend.pull_volume(volume)
@@ -609,7 +614,9 @@ class PullVolumeTest(BaseBackendTest):
 
     def test_volume_image_is_pulled(self):
         volume = factories.VolumeFactory(
-            backend_id=self.backend_volume_id, service_project_link=self.spl,
+            backend_id=self.backend_volume_id,
+            service_settings=self.fixture.openstack_tenant_service_settings,
+            project=self.fixture.project,
         )
         image = factories.ImageFactory(settings=self.settings)
         self.backend_volume.volume_image_metadata = {'image_id': image.backend_id}
@@ -620,7 +627,9 @@ class PullVolumeTest(BaseBackendTest):
 
     def test_volume_image_is_not_pulled(self):
         volume = factories.VolumeFactory(
-            backend_id=self.backend_volume_id, service_project_link=self.spl,
+            backend_id=self.backend_volume_id,
+            service_settings=self.fixture.openstack_tenant_service_settings,
+            project=self.fixture.project,
         )
         self.backend_volume.volume_image_metadata = {}
         self.tenant_backend.pull_volume(volume)
@@ -871,12 +880,18 @@ class PullInstanceInternalIpsTest(BaseBackendTest):
         # Assert
         internal_ip.refresh_from_db()
         self.assertEqual(internal_ip.mac_address, 'DC-D6-5E-9B-49-70')
-        self.assertEqual(internal_ip.ip4_address, '10.0.0.2')
+        self.assertEqual(internal_ip.fixed_ips[0]['ip_address'], '10.0.0.2')
 
     def test_shared_internal_ips_are_reassigned(self):
         # Arrange
-        vm1 = factories.InstanceFactory(service_project_link=self.fixture.spl)
-        vm2 = factories.InstanceFactory(service_project_link=self.fixture.spl)
+        vm1 = factories.InstanceFactory(
+            service_settings=self.fixture.openstack_tenant_service_settings,
+            project=self.fixture.project,
+        )
+        vm2 = factories.InstanceFactory(
+            service_settings=self.fixture.openstack_tenant_service_settings,
+            project=self.fixture.project,
+        )
 
         subnet = self.fixture.subnet
         internal_ip = factories.InternalIPFactory(
@@ -965,7 +980,7 @@ class PullInternalIpsTest(BaseBackendTest):
         # Assert
         internal_ip.refresh_from_db()
         self.assertEqual(internal_ip.mac_address, 'DC-D6-5E-9B-49-70')
-        self.assertEqual(internal_ip.ip4_address, '10.0.0.2')
+        self.assertEqual(internal_ip.fixed_ips[0]['ip_address'], '10.0.0.2')
 
     def test_even_if_internal_ip_is_not_connected_it_is_not_skipped(self):
         # Arrange
@@ -982,7 +997,7 @@ class PullInternalIpsTest(BaseBackendTest):
         self.assertEqual(internal_ip.instance, None)
         self.assertEqual(internal_ip.backend_id, 'port_id')
         self.assertEqual(internal_ip.mac_address, 'DC-D6-5E-9B-49-70')
-        self.assertEqual(internal_ip.ip4_address, '10.0.0.2')
+        self.assertEqual(internal_ip.fixed_ips[0]['ip_address'], '10.0.0.2')
 
     def test_instance_has_several_ports_in_the_same_network_connected_to_the_same_instance(
         self,
@@ -1026,10 +1041,16 @@ class PullInternalIpsTest(BaseBackendTest):
         )
         self.assertEqual({subnet.id}, actual_subnets)
 
-        actual_addresses = set(
-            instance.internal_ips_set.values_list('ip4_address', flat=True)
+        actual_addresses = list(
+            instance.internal_ips_set.values_list('fixed_ips', flat=True)
         )
-        self.assertEqual({'10.0.0.2', '10.0.0.3'}, actual_addresses)
+        self.assertEqual(
+            [
+                [{'ip_address': '10.0.0.2', 'subnet_id': subnet_id}],
+                [{'ip_address': '10.0.0.3', 'subnet_id': subnet_id}],
+            ],
+            actual_addresses,
+        )
 
         actual_ids = set(instance.internal_ips_set.values_list('backend_id', flat=True))
         self.assertEqual({'port1', 'port2'}, actual_ids)
@@ -1105,7 +1126,6 @@ class GetInstancesTest(BaseBackendTest):
 class ImportInstanceTest(BaseBackendTest):
     def setUp(self):
         super(ImportInstanceTest, self).setUp()
-        self.spl = self.fixture.spl
         self.backend_id = 'instance_id'
         self.backend_instance = self._get_valid_instance(self.backend_id)
         self.nova_client_mock.servers.get.return_value = self.backend_instance
@@ -1118,7 +1138,7 @@ class ImportInstanceTest(BaseBackendTest):
         self.nova_client_mock.volumes.get_server_volumes.return_value = []
 
         instance = self.tenant_backend.import_instance(
-            self.backend_id, save=True, service_project_link=self.spl
+            self.backend_id, self.fixture.project,
         )
 
         self.assertEquals(instance.backend_id, self.backend_id)
@@ -1132,14 +1152,17 @@ class ImportInstanceTest(BaseBackendTest):
         self.assertEquals(instance.name, self.backend_instance.name)
 
     def test_volume_is_attached_to_imported_instance_if_they_are_registered(self):
-        expected_volume = factories.VolumeFactory(service_project_link=self.spl)
+        expected_volume = factories.VolumeFactory(
+            service_settings=self.fixture.openstack_tenant_service_settings,
+            project=self.fixture.project,
+        )
         backend_volume = self._get_valid_volume(backend_id=expected_volume.backend_id)
         backend_volume.volumeId = backend_volume.id
         self.nova_client_mock.volumes.get_server_volumes.return_value = [backend_volume]
         self.cinder_client_mock.volumes.get.return_value = backend_volume
 
         instance = self.tenant_backend.import_instance(
-            self.backend_id, save=True, service_project_link=self.spl
+            self.backend_id, self.fixture.project,
         )
 
         self.assertEquals(instance.backend_id, self.backend_id)
@@ -1156,7 +1179,7 @@ class ImportInstanceTest(BaseBackendTest):
         self.cinder_client_mock.volumes.get.return_value = backend_volume
 
         instance = self.tenant_backend.import_instance(
-            self.backend_id, save=True, service_project_link=self.spl
+            self.backend_id, self.fixture.project,
         )
 
         self.assertEquals(instance.backend_id, self.backend_id)
@@ -1171,7 +1194,7 @@ class ImportInstanceTest(BaseBackendTest):
         self.nova_client_mock.volumes.get_server_volumes.return_value = []
 
         instance = self.tenant_backend.import_instance(
-            self.backend_id, save=True, service_project_link=self.spl
+            self.backend_id, self.fixture.project,
         )
 
         self.assertEquals(instance.backend_id, self.backend_id)
@@ -1185,13 +1208,15 @@ class PullInstanceFloatingIpsTest(BaseBackendTest):
         instance = self.fixture.instance
 
         ip1 = factories.InternalIPFactory(
-            subnet=subnet, backend_id='port_id1', ip4_address='192.168.42.42',
+            subnet=subnet,
+            backend_id='port_id1',
+            fixed_ips=[{'ip_address': '192.168.42.42', 'subnet_id': subnet.backend_id}],
         )
 
         ip2 = factories.InternalIPFactory(
             subnet=subnet,
             backend_id='port_id2',
-            ip4_address='192.168.42.62',
+            fixed_ips=[{'ip_address': '192.168.42.62', 'subnet_id': subnet.backend_id}],
             instance=instance,
         )
 

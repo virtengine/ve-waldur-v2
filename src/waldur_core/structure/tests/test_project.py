@@ -1,17 +1,18 @@
+import datetime
 from unittest import mock
 
 from ddt import data, ddt
 from django.test import TransactionTestCase
 from django.urls import reverse
+from freezegun import freeze_time
 from mock_django import mock_signal_receiver
 from rest_framework import status, test
 
-from waldur_core.quotas.tests import factories as quota_factories
-from waldur_core.structure import executors, models, permissions, signals, views
-from waldur_core.structure.management.commands.move_project import move_project
+from waldur_core.structure import executors, models, permissions, signals
 from waldur_core.structure.models import CustomerRole, Project, ProjectRole
 from waldur_core.structure.tests import factories, fixtures
 from waldur_core.structure.tests import models as test_models
+from waldur_core.structure.utils import move_project
 
 
 class ProjectPermissionGrantTest(TransactionTestCase):
@@ -59,6 +60,7 @@ class ProjectPermissionGrantTest(TransactionTestCase):
             created_by=None,
             sender=Project,
             signal=signals.structure_role_granted,
+            expiration_time=None,
         )
 
     def test_add_user_doesnt_emit_structure_role_granted_if_grant_existed_before(self):
@@ -134,6 +136,7 @@ class ProjectPermissionRevokeTest(TransactionTestCase):
         self.assertFalse(receiver.called, 'structure_role_remove should not be emitted')
 
 
+@ddt
 class ProjectUpdateDeleteTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = fixtures.ServiceFixture()
@@ -149,6 +152,41 @@ class ProjectUpdateDeleteTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIn('New project name', response.data['name'])
         self.assertTrue(Project.objects.filter(name=data['name']).exists())
+
+    def test_update_backend_id(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        data = {'backend_id': 'backend_id'}
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(self.fixture.project), data
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('backend_id', response.data['backend_id'])
+        self.assertTrue(Project.objects.filter(backend_id=data['backend_id']).exists())
+
+    @data('staff', 'owner')
+    def test_user_can_update_end_date(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        with freeze_time('2020-01-01'):
+            data = {'end_date': '2021-01-01'}
+            response = self.client.patch(
+                factories.ProjectFactory.get_url(self.fixture.project), data
+            )
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.fixture.project.refresh_from_db()
+            self.assertTrue(self.fixture.project.end_date)
+
+    @data('manager', 'admin')
+    def test_user_cannot_update_end_date(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        with freeze_time('2020-01-01'):
+            data = {'end_date': '2021-01-01'}
+            response = self.client.patch(
+                factories.ProjectFactory.get_url(self.fixture.project), data
+            )
+            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+            self.fixture.project.refresh_from_db()
+            self.assertFalse(self.fixture.project.end_date)
 
     # Delete tests:
     def test_user_can_delete_project_belonging_to_the_customer_he_owns(self):
@@ -167,6 +205,7 @@ class ProjectUpdateDeleteTest(test.APITransactionTestCase):
         self.assertTrue(Project.structure_objects.filter(pk=pk).exists())
 
 
+@ddt
 class ProjectCreateTest(test.APITransactionTestCase):
     def setUp(self):
         self.fixture = fixtures.ServiceFixture()
@@ -199,15 +238,6 @@ class ProjectCreateTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertFalse(Project.objects.filter(name=data['name']).exists())
 
-    def test_owner_cannot_create_project_if_customer_quota_were_exceeded(self):
-        self.fixture.customer.set_quota_limit('nc_project_count', 0)
-        data = self._get_valid_project_payload(self.fixture.customer)
-        self.client.force_authenticate(self.fixture.owner)
-
-        response = self.client.post(factories.ProjectFactory.get_list_url(), data)
-
-        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
-
     def test_customer_support_cannot_create_project(self):
         self.client.force_authenticate(self.fixture.customer_support)
         data = self._get_valid_project_payload(self.fixture.customer)
@@ -217,27 +247,74 @@ class ProjectCreateTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         self.assertFalse(Project.objects.filter(name=data['name']).exists())
 
-    def test_user_can_specify_certifications(self):
+    def test_validate_end_date(self):
+        self.client.force_authenticate(self.fixture.staff)
+        payload = self._get_valid_project_payload(self.fixture.customer)
+        payload['end_date'] = '2021-06-01'
+
+        with freeze_time('2021-07-01'):
+            response = self.client.post(
+                factories.ProjectFactory.get_list_url(), payload
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertTrue(
+                'Cannot be earlier than the current date.' in str(response.data)
+            )
+            self.assertFalse(Project.objects.filter(name=payload['name']).exists())
+
+        with freeze_time('2021-06-01'):
+            response = self.client.post(
+                factories.ProjectFactory.get_list_url(), payload
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+            self.assertTrue(
+                Project.objects.filter(
+                    name=payload['name'],
+                    end_date=datetime.datetime(year=2021, month=6, day=1).date(),
+                ).exists()
+            )
+
+    @data('staff', 'owner')
+    def test_user_can_set_end_date(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        payload = self._get_valid_project_payload(self.fixture.customer)
+        payload['end_date'] = '2021-06-01'
+
+        with freeze_time('2021-01-01'):
+            response = self.client.post(
+                factories.ProjectFactory.get_list_url(), payload
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+            self.assertTrue(
+                Project.objects.filter(
+                    name=payload['name'],
+                    end_date=datetime.datetime(year=2021, month=6, day=1).date(),
+                ).exists()
+            )
+
+    @data('manager', 'admin')
+    def test_user_cannot_set_end_date(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        payload = self._get_valid_project_payload(self.fixture.customer)
+        payload['end_date'] = '2021-06-01'
+
+        with freeze_time('2021-01-01'):
+            response = self.client.post(
+                factories.ProjectFactory.get_list_url(), payload
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_project_oecd_fos_2007_code(self):
         self.client.force_authenticate(self.fixture.owner)
-        data = self._get_valid_project_payload(self.fixture.customer)
-        certificate = factories.ServiceCertificationFactory()
-        data['certifications'] = [
-            {"url": factories.ServiceCertificationFactory.get_url(certificate)}
-        ]
-
-        response = self.client.post(factories.ProjectFactory.get_list_url(), data)
-
+        payload = self._get_valid_project_payload(self.fixture.customer)
+        payload['oecd_fos_2007_code'] = '1.1'
+        response = self.client.post(factories.ProjectFactory.get_list_url(), payload)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertTrue(
-            Project.objects.filter(
-                name=data['name'], customer=self.fixture.customer
-            ).exists()
-        )
-        self.assertTrue(
-            models.ServiceCertification.objects.filter(
-                projects__name=data['name'], name=certificate.name
-            ).exists()
-        )
+        self.assertEqual('1.1', response.data['oecd_fos_2007_code'])
 
     def _get_valid_project_payload(self, customer):
         return {
@@ -496,159 +573,13 @@ class ProjectCountersListTest(test.APITransactionTestCase):
         self.admin = self.fixture.admin
         self.manager = self.fixture.manager
         self.project = self.fixture.project
-        self.service = self.fixture.service
-        self.resource = self.fixture.resource
         self.url = factories.ProjectFactory.get_url(self.project, action='counters')
 
     def test_user_can_get_project_counters(self):
         self.client.force_authenticate(self.fixture.owner)
-        response = self.client.get(self.url, {'fields': ['users', 'apps', 'vms']})
+        response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data, {'users': 2, 'apps': 0, 'vms': 1})
-
-    def test_additional_counters_could_be_registered(self):
-        views.ProjectCountersView.register_counter('test', lambda project: 100)
-        self.client.force_authenticate(self.fixture.owner)
-        response = self.client.get(self.url, {'fields': ['test']})
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data, {'test': 100})
-
-
-@ddt
-class ProjectCertificationUpdateTest(test.APITransactionTestCase):
-    def setUp(self):
-        self.fixture = fixtures.ServiceFixture()
-        self.project = self.fixture.project
-        self.associated_certification = factories.ServiceCertificationFactory()
-        self.project.certifications.add(self.associated_certification)
-        self.new_certification = factories.ServiceCertificationFactory()
-        self.url = factories.ProjectFactory.get_url(
-            self.project, action='update_certifications'
-        )
-
-    @data('staff', 'owner')
-    def test_user_can_update_certifications(self, user):
-        self.client.force_authenticate(getattr(self.fixture, user))
-        payload = self._get_payload(self.new_certification)
-
-        response = self.client.post(self.url, payload)
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertTrue(
-            self.project.certifications.filter(pk=self.new_certification.pk).exists()
-        )
-        self.assertFalse(
-            self.project.certifications.filter(
-                pk=self.associated_certification.pk
-            ).exists()
-        )
-
-    @data('global_support', 'manager')
-    def test_user_cannot_update_certifications_if_he_has_no_permissions(self, user):
-        self.client.force_authenticate(getattr(self.fixture, user))
-        payload = self._get_payload(self.new_certification)
-
-        response = self.client.post(self.url, payload)
-
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-
-    def _get_payload(self, *certifications):
-        urls = [
-            {"url": factories.ServiceCertificationFactory.get_url(c)}
-            for c in certifications
-        ]
-        return {'certifications': urls}
-
-
-class ProjectCertificationGetTest(test.APITransactionTestCase):
-    def setUp(self):
-        self.fixture = fixtures.ServiceFixture()
-
-    def test_service_certification_state_is_ok_if_project_certifications_is_a_subset_of_service_certifications(
-        self,
-    ):
-        self.client.force_authenticate(self.fixture.owner)
-        link = self.fixture.service_project_link
-        project_certifications = [factories.ServiceCertificationFactory()]
-        service_certifications = project_certifications + [
-            factories.ServiceCertificationFactory()
-        ]
-        link.service.settings.certifications.add(*service_certifications)
-        link.project.certifications.add(*project_certifications)
-        url = factories.ProjectFactory.get_url(link.project)
-
-        response = self.client.get(url)
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertIsNotNone('validation_state', response.data['services'][0])
-        self.assertEqual(response.data['services'][0]['validation_state'], "OK")
-
-    def test_certification_state_is_erred_if_project_certifications_is_not_a_subset_of_service_certifications(
-        self,
-    ):
-        self.client.force_authenticate(self.fixture.owner)
-        link = self.fixture.service_project_link
-        service_certification = factories.ServiceCertificationFactory()
-        project_certification = factories.ServiceCertificationFactory()
-        link.service.settings.certifications.add(service_certification)
-        link.project.certifications.add(project_certification)
-        url = factories.ProjectFactory.get_url(link.project)
-
-        response = self.client.get(url)
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertIsNotNone('validation_state', response.data['services'][0])
-        self.assertEqual(response.data['services'][0]['validation_state'], "ERRED")
-
-    def test_missing_certification_name_is_in_error_message(self):
-        self.client.force_authenticate(self.fixture.owner)
-        link = self.fixture.service_project_link
-        service_certification = factories.ServiceCertificationFactory()
-        project_certification = factories.ServiceCertificationFactory()
-        link.service.settings.certifications.add(service_certification)
-        link.project.certifications.add(project_certification)
-        url = factories.ProjectFactory.get_url(link.project)
-
-        response = self.client.get(url)
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertIsNotNone('validation_state', response.data['services'][0])
-        self.assertEqual(response.data['services'][0]['validation_state'], "ERRED")
-        self.assertIn(
-            project_certification.name,
-            response.data['services'][0]['validation_message'],
-        )
-
-
-@ddt
-class ProjectQuotasTest(test.APITransactionTestCase):
-    def setUp(self):
-        self.fixture = fixtures.ProjectFixture()
-        self.quota = self.fixture.project.quotas.get(name=Project.Quotas.nc_app_count)
-
-    def update_quota(self):
-        url = quota_factories.QuotaFactory.get_url(self.quota)
-        return self.client.put(url, {'limit': 100})
-
-    @data('staff', 'owner')
-    def test_authorized_user_can_edit_project_quota(self, user):
-        self.client.force_login(getattr(self.fixture, user))
-
-        response = self.update_quota()
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-
-        self.quota.refresh_from_db()
-        self.assertEqual(self.quota.limit, 100)
-
-    @data('admin', 'manager')
-    def test_non_authorized_user_can_not_edit_project_quota(self, user):
-        self.client.force_login(getattr(self.fixture, user))
-
-        response = self.update_quota()
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-
-        self.quota.refresh_from_db()
-        self.assertNotEqual(self.quota.limit, 100)
+        self.assertEqual(response.data, {'users': 2})
 
 
 class TestExecutor(executors.BaseCleanupExecutor):
@@ -689,21 +620,6 @@ class ProjectCleanupTest(test.APITransactionTestCase):
         executors.ProjectCleanupExecutor.execute(fixture.project, is_async=False)
 
         self.assertFalse(models.Project.objects.filter(id=project.id).exists())
-
-    def test_project_with_resources_without_executors_is_not_deleted(
-        self, get_extensions
-    ):
-        fixture = fixtures.ServiceFixture()
-        project = fixture.project
-        resource = fixture.resource
-
-        get_extensions.return_value = []
-        executors.ProjectCleanupExecutor.execute(fixture.project, is_async=False)
-
-        self.assertTrue(models.Project.objects.filter(id=project.id).exists())
-        self.assertTrue(
-            test_models.TestNewInstance.objects.filter(id=resource.id).exists()
-        )
 
     def test_project_with_resources_and_executors_is_deleted(self, get_extensions):
         fixture = fixtures.ServiceFixture()
@@ -758,3 +674,41 @@ class ChangeProjectCustomerTest(test.APITransactionTestCase):
         self.assertEqual(
             self.new_customer.quotas.get(name='nc_project_count').usage, 1.0
         )
+
+
+class ProjectMoveTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.project = self.fixture.project
+        self.url = factories.ProjectFactory.get_url(self.project, action='move_project')
+        self.customer = factories.CustomerFactory()
+
+    def get_response(self, role, customer):
+        self.client.force_authenticate(role)
+        payload = {'customer': {'url': factories.CustomerFactory.get_url(customer)}}
+        return self.client.post(self.url, payload)
+
+    def test_move_project_rest(self):
+        response = self.get_response(self.fixture.staff, self.customer)
+
+        self.project.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.project.customer, self.customer)
+
+    def test_move_project_is_not_possible_when_customer_the_same(self):
+        old_customer = self.project.customer
+        response = self.get_response(self.fixture.staff, old_customer)
+
+        self.project.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.project.customer, old_customer)
+
+    def test_move_project_is_not_possible_when_new_customer_is_blocked(self):
+        old_customer = self.project.customer
+        self.customer.blocked = True
+        self.customer.save(update_fields=['blocked'])
+        response = self.get_response(self.fixture.staff, self.customer)
+
+        self.project.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.project.customer, old_customer)

@@ -1,7 +1,11 @@
+import collections
+import datetime
 import logging
 
 from celery import shared_task
+from dateutil.relativedelta import relativedelta
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
 from django.db.models import Q, Sum
@@ -11,12 +15,16 @@ from rest_framework import status
 from waldur_core.core import utils as core_utils
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.common.utils import create_request
+from waldur_mastermind.invoices import models as invoices_models
 from waldur_mastermind.invoices import utils as invoice_utils
 from waldur_mastermind.marketplace.utils import process_order_item
 
 from . import exceptions, models, utils, views
 
 logger = logging.getLogger(__name__)
+
+
+User = get_user_model()
 
 
 def approve_order(order, user):
@@ -30,10 +38,9 @@ def approve_order(order, user):
     transaction.on_commit(
         lambda: process_order.delay(serialized_order, serialized_user)
     )
-    transaction.on_commit(lambda: create_order_pdf.delay(order.pk))
 
 
-@shared_task(name='marketplace.process_order')
+@shared_task
 def process_order(serialized_order, serialized_user):
     order = core_utils.deserialize_instance(serialized_order)
     user = core_utils.deserialize_instance(serialized_user)
@@ -41,21 +48,24 @@ def process_order(serialized_order, serialized_user):
         process_order_item(item, user)
 
 
-@shared_task(name='marketplace.create_screenshot_thumbnail')
+@shared_task
 def create_screenshot_thumbnail(uuid):
     screenshot = models.Screenshot.objects.get(uuid=uuid)
     utils.create_screenshot_thumbnail(screenshot)
 
 
-@shared_task(name='marketplace.notify_order_approvers')
+@shared_task
 def notify_order_approvers(uuid):
     order = models.Order.objects.get(uuid=uuid)
     users = order.get_approvers()
     emails = [u.email for u in users if u.email]
-    link_template = settings.WALDUR_MARKETPLACE['ORDER_LINK_TEMPLATE']
+    link = core_utils.format_homeport_link(
+        'projects/{project_uuid}/marketplace-order-list/',
+        project_uuid=order.project.uuid,
+    )
 
     context = {
-        'order_url': link_template.format(project_uuid=order.project.uuid),
+        'order_url': link,
         'order': order,
         'site_name': settings.WALDUR_CORE['SITE_NAME'],
     }
@@ -63,23 +73,12 @@ def notify_order_approvers(uuid):
     core_utils.broadcast_mail('marketplace', 'notification_approval', context, emails)
 
 
-@shared_task(name='marketplace.notify_about_resource_change')
+@shared_task
 def notify_about_resource_change(event_type, context, resource_uuid):
     resource = models.Resource.objects.get(uuid=resource_uuid)
-    emails = resource.project.get_users().values_list('email', flat=True)
+    project = structure_models.Project.all_objects.get(id=resource.project_id)
+    emails = project.get_users().values_list('email', flat=True)
     core_utils.broadcast_mail('marketplace', event_type, context, emails)
-
-
-@shared_task
-def create_order_pdf(order_id):
-    order = models.Order.objects.get(pk=order_id)
-    utils.create_order_pdf(order)
-
-
-@shared_task
-def create_pdf_for_all():
-    for order in models.Order.objects.all():
-        utils.create_order_pdf(order)
 
 
 def filter_aggregate_by_scope(queryset, scope):
@@ -178,7 +177,7 @@ def send_notifications_about_usages():
             )
 
 
-@shared_task(name='marketplace.terminate_resource')
+@shared_task
 def terminate_resource(serialized_resource, serialized_user):
     resource = core_utils.deserialize_instance(serialized_resource)
     user = core_utils.deserialize_instance(serialized_user)
@@ -187,3 +186,124 @@ def terminate_resource(serialized_resource, serialized_user):
 
     if response.status_code != status.HTTP_200_OK:
         raise exceptions.ResourceTerminateException(response.rendered_content)
+
+
+@shared_task(
+    name='waldur_mastermind.marketplace.terminate_resources_if_project_end_date_has_been_reached'
+)
+def terminate_resources_if_project_end_date_has_been_reached():
+    expired_projects = structure_models.Project.objects.exclude(
+        end_date__isnull=True
+    ).filter(end_date__lte=timezone.datetime.today())
+
+    for project in expired_projects:
+        resources = models.Resource.objects.filter(project=project).filter(
+            state__in=(models.Resource.States.OK, models.Resource.States.ERRED)
+        )
+
+        if resources:
+            utils.schedule_resources_termination(resources)
+        else:
+            project.delete()
+
+
+@shared_task(name='waldur_mastermind.marketplace.notify_about_stale_resource')
+def notify_about_stale_resource():
+    if not settings.WALDUR_MARKETPLACE['ENABLE_STALE_RESOURCE_NOTIFICATIONS']:
+        return
+
+    today = datetime.datetime.today()
+    prev_1 = today - relativedelta(months=1)
+    prev_2 = today - relativedelta(months=2)
+    items = invoices_models.InvoiceItem.objects.filter(
+        Q(invoice__month=today.month, invoice__year=today.year,)
+        | Q(invoice__month=prev_1.month, invoice__year=prev_1.year)
+        | Q(invoice__month=prev_2.month, invoice__year=prev_2.year)
+    )
+    actual_resources_ids = []
+
+    for item in items:
+        if item.price:
+            actual_resources_ids.append(item.resource.id)
+
+    resources = (
+        models.Resource.objects.exclude(id__in=actual_resources_ids)
+        .exclude(
+            Q(state=models.Resource.States.TERMINATED)
+            | Q(state=models.Resource.States.TERMINATING)
+            | Q(state=models.Resource.States.CREATING)
+        )
+        .exclude(offering__billable=False)
+    )
+    user_resources = collections.defaultdict(list)
+
+    for resource in resources:
+        owners = resource.project.customer.get_owners().exclude(email='')
+        resource_url = core_utils.format_homeport_link(
+            '/projects/{project_uuid}/marketplace-project-resource-details/{resource_uuid}/',
+            project_uuid=resource.project.uuid.hex,
+            resource_uuid=resource.uuid.hex,
+        )
+
+        for user in owners:
+            user_resources[user.email].append(
+                {'resource': resource, 'resource_url': resource_url}
+            )
+
+    for key, value in user_resources.items():
+        core_utils.broadcast_mail(
+            'marketplace',
+            'notification_about_stale_resources',
+            {'resources': value},
+            [key],
+        )
+
+
+@shared_task(
+    name='waldur_mastermind.marketplace.terminate_resource_if_its_end_date_has_been_reached'
+)
+def terminate_resource_if_its_end_date_has_been_reached():
+    expired_resources = models.Resource.objects.exclude(
+        end_date__isnull=True,
+        state__in=(
+            models.Resource.States.TERMINATED,
+            models.Resource.States.TERMINATING,
+        ),
+    ).filter(end_date__lte=timezone.datetime.today())
+
+    utils.schedule_resources_termination(expired_resources)
+
+
+@shared_task
+def notify_about_resource_termination(resource_uuid, user_uuid, is_staff_action=None):
+    resource = models.Resource.objects.get(uuid=resource_uuid)
+    user = User.objects.get(uuid=user_uuid)
+    admin_emails = set(
+        resource.project.get_users(structure_models.ProjectRole.ADMINISTRATOR)
+        .exclude(email='')
+        .values_list('email', flat=True)
+    )
+    manager_emails = set(
+        resource.project.get_users(structure_models.ProjectRole.MANAGER)
+        .exclude(email='')
+        .values_list('email', flat=True)
+    )
+    emails = admin_emails | manager_emails
+    resource_url = core_utils.format_homeport_link(
+        '/projects/{project_uuid}/marketplace-project-resource-details/{resource_uuid}/',
+        project_uuid=resource.project.uuid.hex,
+        resource_uuid=resource.uuid.hex,
+    )
+    context = {'resource': resource, 'user': user, 'resource_url': resource_url}
+
+    if is_staff_action:
+        core_utils.broadcast_mail(
+            'marketplace',
+            'marketplace_resource_terminatate_scheduled_staff',
+            context,
+            emails,
+        )
+    else:
+        core_utils.broadcast_mail(
+            'marketplace', 'marketplace_resource_terminatate_scheduled', context, emails
+        )

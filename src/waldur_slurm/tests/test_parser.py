@@ -24,13 +24,12 @@ class ParserTest(TestCase):
 
     def get_report(self, raw):
         self.fixture = fixtures.SlurmFixture()
-        self.fixture.service.settings.options = {'batch_service': 'SLURM'}
 
         self.subprocess_patcher = mock.patch('subprocess.check_output')
         self.subprocess_mock = self.subprocess_patcher.start()
         self.subprocess_mock.return_value = raw
 
-        backend = self.fixture.service.settings.get_backend()
+        backend = self.fixture.settings.get_backend()
         return backend.get_usage_report(VALID_ALLOCATION)
 
     def tearDown(self):

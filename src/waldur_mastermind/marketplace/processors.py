@@ -1,48 +1,29 @@
 import logging
 
-from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from rest_framework import serializers, status
 from rest_framework.reverse import reverse
 
-from waldur_core.structure import SupportedServices
-from waldur_core.structure import models as structure_models
 from waldur_mastermind.common import utils as common_utils
 from waldur_mastermind.marketplace import models, signals
-from waldur_mastermind.marketplace.utils import validate_limits
+from waldur_mastermind.marketplace.callbacks import resource_creation_succeeded
+from waldur_mastermind.marketplace.utils import create_local_resource, validate_limits
 
 logger = logging.getLogger(__name__)
 
 
-def get_spl_url(spl_model_class, order_item):
-    """
-    Find service project link URL for specific service settings and marketplace order.
-    """
-    service_settings = order_item.offering.scope
-
-    service_settings_type = spl_model_class._meta.app_config.service_name
-
-    if (
-        not isinstance(service_settings, structure_models.ServiceSettings)
-        or service_settings.type != service_settings_type
-    ):
-        raise serializers.ValidationError(
-            'Offering has invalid scope. Service settings object is expected.'
-        )
-
-    project = order_item.order.project
-
-    try:
-        spl = spl_model_class.objects.get(
-            project=project,
-            service__settings=service_settings,
-            service__customer=project.customer,
-        )
-        return reverse('{}-detail'.format(spl.get_url_name()), kwargs={'pk': spl.pk})
-    except ObjectDoesNotExist:
-        raise serializers.ValidationError(
-            'Project does not have access to the service.'
-        )
+def get_order_item_post_data(order_item, fields):
+    project_url = reverse(
+        'project-detail', kwargs={'uuid': order_item.order.project.uuid}
+    )
+    service_settings_url = reverse(
+        'servicesettings-detail', kwargs={'uuid': order_item.offering.scope.uuid}
+    )
+    return dict(
+        service_settings=service_settings_url,
+        project=project_url,
+        **copy_attributes(fields, order_item),
+    )
 
 
 def copy_attributes(fields, order_item):
@@ -78,23 +59,15 @@ class BaseOrderItemProcessor:
 
 class AbstractCreateResourceProcessor(BaseOrderItemProcessor):
     def process_order_item(self, user):
+        # scope can be a reference to a different object or a string representing
+        # unique key of a scoped object, e.g. remote UUID
         scope = self.send_request(user)
 
         with transaction.atomic():
-            resource = models.Resource(
-                project=self.order_item.order.project,
-                offering=self.order_item.offering,
-                plan=self.order_item.plan,
-                limits=self.order_item.limits,
-                attributes=self.order_item.attributes,
-                name=self.order_item.attributes.get('name') or '',
-                scope=scope,
-            )
-            resource.init_cost()
-            resource.save()
-            resource.init_quotas()
-            self.order_item.resource = resource
-            self.order_item.save(update_fields=['resource'])
+            resource = create_local_resource(self.order_item, scope)
+
+            if not scope or type(scope) == str:
+                resource_creation_succeeded(resource)
 
     def send_request(self, user):
         """
@@ -124,9 +97,10 @@ class CreateResourceProcessor(AbstractCreateResourceProcessor):
     def validate_order_item(self, request):
         post_data = self.get_post_data()
         serializer_class = self.get_serializer_class()
-        context = {'request': request, 'skip_permission_check': True}
-        serializer = serializer_class(data=post_data, context=context)
-        serializer.is_valid(raise_exception=True)
+        if serializer_class:
+            context = {'request': request, 'skip_permission_check': True}
+            serializer = serializer_class(data=post_data, context=context)
+            serializer.is_valid(raise_exception=True)
 
     def send_request(self, user):
         post_data = self.get_post_data()
@@ -135,14 +109,15 @@ class CreateResourceProcessor(AbstractCreateResourceProcessor):
         if response.status_code != status.HTTP_201_CREATED:
             raise serializers.ValidationError(response.data)
 
-        return self.get_scope_from_response(response)
+        if response.data:
+            return self.get_scope_from_response(response)
 
     def get_serializer_class(self):
         """
         This method should return DRF serializer class which
         validates request data to provision new resources.
         """
-        raise NotImplementedError
+        return None
 
     def get_viewset(self):
         """
@@ -179,9 +154,10 @@ class AbstractUpdateResourceProcessor(BaseOrderItemProcessor):
     def validate_request(self, request):
         post_data = self.get_post_data()
         serializer_class = self.get_serializer_class()
-        context = {'request': request, 'skip_permission_check': True}
-        serializer = serializer_class(data=post_data, context=context)
-        serializer.is_valid(raise_exception=True)
+        if serializer_class:
+            context = {'request': request, 'skip_permission_check': True}
+            serializer = serializer_class(data=post_data, context=context)
+            serializer.is_valid(raise_exception=True)
 
     def process_order_item(self, user):
         """We need to overwrite process order item because two cases exist:
@@ -190,39 +166,48 @@ class AbstractUpdateResourceProcessor(BaseOrderItemProcessor):
             try:
                 # self.update_limits_process method can execute not is_async
                 # because in this case an order has got only one order item.
-                self.update_limits_process(user)
-            except NotImplementedError:
-                self.order_item.set_state_erred()
-                self.order_item.save(update_fields=['state'])
-                logger.warning(
-                    'An update of limits has been called. '
-                    'But update limits process for the plugin has not been implemented. '
-                    'Order item ID: %s, Plugin: %s.',
-                    self.order_item.id,
-                    self.order_item.offering.type,
-                )
+                done = self.update_limits_process(user)
             except Exception as e:
-                signals.limit_update_failed.send(
+                signals.resource_limit_update_failed.send(
                     sender=self.order_item.resource.__class__,
                     order_item=self.order_item,
-                    error_message=str(e),
+                    error_message=str(e) or str(type(e)),
+                )
+                return
+            if done:
+                signals.resource_limit_update_succeeded.send(
+                    sender=self.order_item.resource.__class__,
+                    order_item=self.order_item,
                 )
             else:
-                signals.limit_update_succeeded.send(
-                    sender=self.order_item.resource.__class__,
-                    order_item=self.order_item,
-                )
+                with transaction.atomic():
+                    self.order_item.resource.set_state_updating()
+                    self.order_item.resource.save(update_fields=['state'])
             return
 
         resource = self.get_resource()
         if not resource:
             raise serializers.ValidationError('Resource is not found.')
+        done = self.send_request(user)
 
-        self.send_request(user)
-        self.order_item.resource.set_state_updating()
-        self.order_item.resource.save(update_fields=['state'])
+        if done:
+            with transaction.atomic():
+                # check if a new plan has been requested
+                if resource.plan != self.order_item.plan:
+                    logger.info(
+                        f'Changing plan of a resource {resource.name} from {resource.plan} to {self.order_item.plan}. Order item ID: {self.order_item.id}'
+                    )
+                    resource.plan = self.order_item.plan
+                    resource.save(update_fields=['plan'])
 
-    def send_request(self, user):
+                self.order_item.state = models.OrderItem.States.DONE
+                self.order_item.save(update_fields=['state'])
+        else:
+            with transaction.atomic():
+                self.order_item.resource.set_state_updating()
+                self.order_item.resource.save(update_fields=['state'])
+
+    def send_request(self, user, resource):
         """
         This method should send request to backend.
         """
@@ -232,16 +217,21 @@ class AbstractUpdateResourceProcessor(BaseOrderItemProcessor):
         """
         This method should return related resource of order item.
         """
-        return self.order_item.resource.scope
+        return self.order_item.resource
 
     def update_limits_process(self, user):
         """
         This method implements limits update processing.
+        It should return True if sync operation has been successfully completed
+        and return False or None if async operation has been scheduled.
         """
         raise NotImplementedError
 
 
-class UpdateResourceProcessor(AbstractUpdateResourceProcessor):
+class UpdateScopedResourceProcessor(AbstractUpdateResourceProcessor):
+    def get_resource(self):
+        return self.order_item.resource.scope
+
     def send_request(self, user):
         view = self.get_view()
         payload = self.get_post_data()
@@ -249,12 +239,15 @@ class UpdateResourceProcessor(AbstractUpdateResourceProcessor):
         if response.status_code != status.HTTP_202_ACCEPTED:
             raise serializers.ValidationError(response.data)
 
+        # we expect all children to implement async update process, which will set state of resource back to OK
+        return False
+
     def get_serializer_class(self):
         """
         This method should return DRF serializer class which
         validates request data to update existing resource.
         """
-        raise NotImplementedError
+        return None
 
     def get_view(self):
         """
@@ -278,7 +271,7 @@ class AbstractDeleteResourceProcessor(BaseOrderItemProcessor):
         """
         This method should return related resource of order item.
         """
-        return self.order_item.resource.scope
+        return self.order_item.resource
 
     def send_request(self, user, resource):
         """
@@ -306,12 +299,17 @@ class AbstractDeleteResourceProcessor(BaseOrderItemProcessor):
                 self.order_item.resource.save(update_fields=['state'])
 
 
-class DeleteResourceProcessor(AbstractDeleteResourceProcessor):
+class DeleteScopedResourceProcessor(AbstractDeleteResourceProcessor):
     viewset = NotImplementedError
+
+    def get_resource(self):
+        return self.order_item.resource.scope
 
     def send_request(self, user, resource):
         view = self.get_viewset().as_view({'delete': 'destroy'})
         delete_attributes = self.order_item.attributes
+        # Delete resource processor operates with scoped resources
+
         response = common_utils.delete_request(
             view, user, uuid=resource.uuid.hex, query_params=delete_attributes
         )
@@ -333,14 +331,14 @@ class DeleteResourceProcessor(AbstractDeleteResourceProcessor):
 class BaseCreateResourceProcessor(CreateResourceProcessor):
     """
     Abstract base class to adapt resource provisioning endpoints to marketplace API.
-    It is assumed that resource model and serializer uses service project link.
     """
 
     viewset = NotImplementedError
     fields = NotImplementedError
 
-    def get_viewset(self):
-        return self.viewset
+    @classmethod
+    def get_viewset(cls):
+        return cls.viewset
 
     def get_fields(self):
         """
@@ -349,19 +347,12 @@ class BaseCreateResourceProcessor(CreateResourceProcessor):
         """
         return self.fields
 
-    def get_resource_model(self):
+    @classmethod
+    def get_resource_model(cls):
         """
         Get resource model used by viewset from its queryset.
         """
-        return self.get_viewset().queryset.model
-
-    def get_spl_model(self):
-        """
-        Get service project link model used by resource model using service registry.
-        """
-        return SupportedServices.get_related_models(self.get_resource_model())[
-            'service_project_link'
-        ]
+        return cls.get_viewset().queryset.model
 
     def get_serializer_class(self):
         """
@@ -373,17 +364,17 @@ class BaseCreateResourceProcessor(CreateResourceProcessor):
         )
 
     def get_post_data(self):
-        order_item = self.order_item
-        return dict(
-            service_project_link=get_spl_url(self.get_spl_model(), order_item),
-            **copy_attributes(self.get_fields(), order_item)
-        )
+        return get_order_item_post_data(self.order_item, self.get_fields())
 
     def get_scope_from_response(self, response):
         return self.get_resource_model().objects.get(uuid=response.data['uuid'])
 
 
 class BasicCreateResourceProcessor(AbstractCreateResourceProcessor):
+    def process_order_item(self, user):
+        with transaction.atomic():
+            create_local_resource(self.order_item, None)
+
     def send_request(self, user):
         pass
 
@@ -393,15 +384,15 @@ class BasicCreateResourceProcessor(AbstractCreateResourceProcessor):
 
 class BasicDeleteResourceProcessor(AbstractDeleteResourceProcessor):
     def send_request(self, user, resource):
-        return True
+        return False
 
 
 class BasicUpdateResourceProcessor(AbstractUpdateResourceProcessor):
     def send_request(self, user):
-        pass
+        return False
 
     def validate_request(self, request):
         pass
 
     def update_limits_process(self, user):
-        pass
+        return False

@@ -4,8 +4,7 @@ from django.db import transaction
 from waldur_core.core.models import User
 from waldur_core.logging.loggers import EventLogger, event_logger
 from waldur_core.structure.models import Project
-
-from . import models, tasks
+from waldur_mastermind.marketplace import models, tasks
 
 
 class MarketplaceOrderLogger(EventLogger):
@@ -32,6 +31,7 @@ class MarketplaceOrderLogger(EventLogger):
 
 class MarketplaceResourceLogger(EventLogger):
     resource = models.Resource
+    old_name = str
 
     def process(
         self, level, message_template, event_type='undefined', event_context=None
@@ -88,7 +88,10 @@ class MarketplaceResourceLogger(EventLogger):
             'marketplace_resource_terminate_failed',
             'marketplace_resource_update_limits_succeeded',
             'marketplace_resource_update_limits_failed',
+            'marketplace_resource_renamed',
+            'marketplace_resource_update_end_date_succeeded',
         )
+        nullable_fields = ['old_name']
 
     @staticmethod
     def get_scopes(event_context):
@@ -134,12 +137,26 @@ class MarketplaceOfferingPermissionEventLogger(EventLogger):
         return {event_context['offering'].customer}
 
 
+class MarketplaceOfferingUserEventLogger(EventLogger):
+    offering_user = models.OfferingUser
+
+    class Meta:
+        event_types = (
+            'marketplace_offering_user_created',
+            'marketplace_offering_user_deleted',
+        )
+        event_groups = {
+            'users': event_types,
+        }
+
+
 event_logger.register('marketplace_order', MarketplaceOrderLogger)
 event_logger.register('marketplace_resource', MarketplaceResourceLogger)
 event_logger.register('marketplace_component_usage', MarketplaceComponentUsageLogger)
 event_logger.register(
     'marketplace_offering_permission', MarketplaceOfferingPermissionEventLogger
 )
+event_logger.register('marketplace_offering_user', MarketplaceOfferingUserEventLogger)
 
 
 def log_order_created(order):
@@ -208,7 +225,7 @@ def log_resource_creation_succeeded(resource):
 
 def log_resource_creation_failed(instance):
     event_logger.marketplace_resource.error(
-        'Resource {resource_name} creation has been failed.',
+        'Resource {resource_name} creation has failed.',
         event_type='marketplace_resource_create_failed',
         event_context={'resource': instance},
     )
@@ -240,7 +257,7 @@ def log_resource_update_succeeded(resource):
 
 def log_resource_update_failed(instance):
     event_logger.marketplace_resource.error(
-        'Resource {resource_name} update has been failed.',
+        'Resource {resource_name} update has failed.',
         event_type='marketplace_resource_update_failed',
         event_context={'resource': instance},
     )
@@ -264,7 +281,7 @@ def log_resource_terminate_succeeded(resource):
 
 def log_resource_terminate_failed(instance):
     event_logger.marketplace_resource.error(
-        'Resource {resource_name} deletion has been failed.',
+        'Resource {resource_name} deletion has failed.',
         event_type='marketplace_resource_terminate_failed',
         event_context={'resource': instance},
     )
@@ -352,4 +369,78 @@ def log_offering_permission_updated(permission, user):
 
     event_logger.marketplace_offering_permission.info(
         template % context, event_type='role_updated', event_context=event_context,
+    )
+
+
+def log_marketplace_resource_renamed(resource, old_name):
+    event_context = {
+        'old_name': old_name,
+        'resource': resource,
+    }
+
+    event_logger.marketplace_resource.info(
+        'Marketplace resource {resource_name} has been renamed.'
+        ' Old name: {old_name}.',
+        event_type='marketplace_resource_renamed',
+        event_context=event_context,
+    )
+
+
+def log_marketplace_resource_end_date_has_been_updated(resource, user, template=None):
+    template = template or (
+        'End date of marketplace resource %(resource_name)s has been updated.'
+        ' End date: %(end_date)s.'
+        ' User: %(user)s.'
+    )
+
+    context = {
+        'resource_name': resource.name,
+        'end_date': resource.end_date,
+        'user': user,
+    }
+
+    event_context = {
+        'resource': resource,
+    }
+
+    event_logger.marketplace_resource.info(
+        template % context,
+        event_type='marketplace_resource_update_end_date_succeeded',
+        event_context=event_context,
+    )
+
+
+def log_marketplace_resource_end_date_has_been_updated_by_provider(resource, user):
+    template = (
+        'End date of marketplace resource %(resource_name)s has been updated by provider.'
+        ' End date: %(end_date)s.'
+        ' User: %(user)s.'
+    )
+
+    log_marketplace_resource_end_date_has_been_updated(resource, user, template)
+
+
+def log_marketplace_resource_end_date_has_been_updated_by_staff(resource, user):
+    template = (
+        'End date of marketplace resource %(resource_name)s has been updated by staff.'
+        ' End date: %(end_date)s.'
+        ' User: %(user)s.'
+    )
+
+    log_marketplace_resource_end_date_has_been_updated(resource, user, template)
+
+
+def log_offering_user_created(offering_user):
+    event_logger.marketplace_offering_user.info(
+        f'Account for user {offering_user.user.username} in offering {offering_user.offering.name} has been created.',
+        event_type='marketplace_offering_user_created',
+        event_context={'offering_user': offering_user},
+    )
+
+
+def log_offering_user_deleted(offering_user):
+    event_logger.marketplace_offering_user.info(
+        f'Account for user {offering_user.user.username} in offering {offering_user.offering.name} has been deleted.',
+        event_type='marketplace_offering_user_deleted',
+        event_context={'offering_user': offering_user},
     )

@@ -2,11 +2,10 @@ from django.test import TestCase
 
 from waldur_core.core.models import StateMixin
 from waldur_core.structure import models as structure_models
-from waldur_core.structure.tests import factories as structure_factories
+from waldur_openstack.openstack.models import Tenant
 from waldur_openstack.openstack.tests import factories as openstack_factories
-
-from ... import apps, models
-from .. import factories
+from waldur_openstack.openstack_tenant import apps, models
+from waldur_openstack.openstack_tenant.tests import factories
 
 
 class BaseServicePropertyTest(TestCase):
@@ -61,6 +60,100 @@ class SecurityGroupHandlerTest(BaseServicePropertyTest):
             ).exists()
         )
 
+    def test_when_security_group_is_created_remote_group_is_filled(self):
+        group1 = openstack_factories.SecurityGroupFactory(
+            tenant=self.tenant, state=StateMixin.States.CREATING
+        )
+        group2 = openstack_factories.SecurityGroupFactory(tenant=self.tenant)
+
+        openstack_security_rule = openstack_factories.SecurityGroupRuleFactory(
+            security_group=group1, remote_group=group2
+        )
+
+        group1.set_ok()
+        group1.save()
+
+        self.assertTrue(
+            models.SecurityGroupRule.objects.filter(
+                backend_id=openstack_security_rule.backend_id,
+                security_group__backend_id=group1.backend_id,
+                remote_group__backend_id=group2.backend_id,
+            ).exists()
+        )
+
+    def test_when_group_is_imported_remote_group_is_imported_too(self):
+        group1 = openstack_factories.SecurityGroupFactory(tenant=self.tenant)
+        group2 = openstack_factories.SecurityGroupFactory(tenant=self.tenant)
+        rule = openstack_factories.SecurityGroupRuleFactory(
+            security_group=group1, remote_group=group2
+        )
+        self.assertTrue(
+            models.SecurityGroupRule.objects.filter(
+                backend_id=rule.backend_id,
+                security_group__backend_id=group1.backend_id,
+                remote_group__backend_id=group2.backend_id,
+            ).exists()
+        )
+
+    def test_rule_without_backend_id_is_skipped_when_group_is_imported(self):
+        group1 = openstack_factories.SecurityGroupFactory(tenant=self.tenant)
+        group2 = openstack_factories.SecurityGroupFactory(tenant=self.tenant)
+        rule = openstack_factories.SecurityGroupRuleFactory(
+            security_group=group1, remote_group=group2, backend_id=''
+        )
+        self.assertFalse(
+            models.SecurityGroupRule.objects.filter(
+                backend_id=rule.backend_id,
+                security_group__backend_id=group1.backend_id,
+                remote_group__backend_id=group2.backend_id,
+            ).exists()
+        )
+
+    def test_rule_without_backend_id_is_synced_when_backend_id_is_assigned(self):
+        group1 = openstack_factories.SecurityGroupFactory(tenant=self.tenant)
+        group2 = openstack_factories.SecurityGroupFactory(tenant=self.tenant)
+        rule = openstack_factories.SecurityGroupRuleFactory(
+            security_group=group1, remote_group=group2, backend_id=''
+        )
+        rule.backend_id = 'valid_backend_id'
+        rule.save()
+        self.assertTrue(
+            models.SecurityGroupRule.objects.filter(
+                backend_id=rule.backend_id,
+                security_group__backend_id=group1.backend_id,
+                remote_group__backend_id=group2.backend_id,
+            ).exists()
+        )
+
+    def test_when_rule_is_updated_remote_group_is_synced(self):
+        group1 = openstack_factories.SecurityGroupFactory(tenant=self.tenant)
+        group2 = openstack_factories.SecurityGroupFactory(tenant=self.tenant)
+        rule = openstack_factories.SecurityGroupRuleFactory(security_group=group1)
+        rule.remote_group = group2
+        rule.save(update_fields=['remote_group'])
+        self.assertTrue(
+            models.SecurityGroupRule.objects.filter(
+                backend_id=rule.backend_id,
+                security_group__backend_id=group1.backend_id,
+                remote_group__backend_id=group2.backend_id,
+            ).exists()
+        )
+
+    def test_rule_without_backend_id_is_skipped_when_remote_group_is_changed(self):
+        group1 = openstack_factories.SecurityGroupFactory(tenant=self.tenant)
+        group2 = openstack_factories.SecurityGroupFactory(tenant=self.tenant)
+        rule = openstack_factories.SecurityGroupRuleFactory(security_group=group1)
+        rule.remote_group = group2
+        rule.backend_id = ''
+        rule.save()
+        self.assertFalse(
+            models.SecurityGroupRule.objects.filter(
+                backend_id=rule.backend_id,
+                security_group__backend_id=group1.backend_id,
+                remote_group__backend_id=group2.backend_id,
+            ).exists()
+        )
+
     def test_security_group_update(self):
         openstack_security_group = openstack_factories.SecurityGroupFactory(
             tenant=self.tenant,
@@ -80,16 +173,16 @@ class SecurityGroupHandlerTest(BaseServicePropertyTest):
         self.assertIn(openstack_security_group.name, security_group.name)
         self.assertIn(openstack_security_group.description, security_group.description)
 
-    def test_security_group_rules_are_updated_when_one_more_rule_is_added(self):
+    def test_security_group_rules_are_created_when_one_more_rule_is_added(self):
         openstack_security_group = openstack_factories.SecurityGroupFactory(
-            tenant=self.tenant, state=StateMixin.States.UPDATING
-        )
-        openstack_factories.SecurityGroupRuleFactory(
-            security_group=openstack_security_group
+            tenant=self.tenant, state=StateMixin.States.CREATING
         )
         security_group = factories.SecurityGroupFactory(
             settings=self.service_settings,
             backend_id=openstack_security_group.backend_id,
+        )
+        openstack_factories.SecurityGroupRuleFactory(
+            security_group=openstack_security_group
         )
         openstack_security_group.set_ok()
         openstack_security_group.save()
@@ -138,6 +231,29 @@ class SecurityGroupHandlerTest(BaseServicePropertyTest):
         openstack_security_group.save()
 
         self.assertEqual(models.SecurityGroup.objects.count(), 1)
+
+    def test_security_group_rules_are_deleted(self):
+        # Arrange
+        openstack_security_group = openstack_factories.SecurityGroupFactory(
+            tenant=self.tenant, state=StateMixin.States.UPDATING
+        )
+        rule = openstack_factories.SecurityGroupRuleFactory(
+            security_group=openstack_security_group
+        )
+        security_group = factories.SecurityGroupFactory(
+            settings=self.service_settings,
+            backend_id=openstack_security_group.backend_id,
+        )
+
+        # Act
+        openstack_security_group.set_ok()
+        openstack_security_group.save()
+        rule.delete()
+
+        # Assert
+        self.assertEqual(
+            security_group.rules.count(), 0, 'Security group rule has not been deleted'
+        )
 
 
 class FloatingIPHandlerTest(BaseServicePropertyTest):
@@ -223,6 +339,49 @@ class TenantChangeCredentialsTest(TestCase):
         self.assertEqual(service_settings.username, new_username)
 
 
+class UpdateTenantSettingsTest(TestCase):
+    def setUp(self) -> None:
+        self.tenant: Tenant = openstack_factories.TenantFactory()
+        self.service_settings = structure_models.ServiceSettings.objects.get(
+            scope=self.tenant, type=apps.OpenStackTenantConfig.service_name
+        )
+
+    def test_update_service_setting_external_network_id_if_updated_scope(self):
+        NEW_EXTERNAL_NETWORK_ID = 'new_external_network_id'
+        self.tenant.external_network_id = NEW_EXTERNAL_NETWORK_ID
+        self.tenant.save()
+        self.service_settings.refresh_from_db()
+        self.assertEqual(
+            self.service_settings.get_option('external_network_id'),
+            NEW_EXTERNAL_NETWORK_ID,
+        )
+
+    def test_update_service_setting_internal_network_id_if_updated_scope(self):
+        NEW_INTERNAL_NETWORK_ID = 'new_internal_network_id'
+        self.tenant.internal_network_id = NEW_INTERNAL_NETWORK_ID
+        self.tenant.save()
+        self.service_settings.refresh_from_db()
+        self.assertEqual(
+            self.service_settings.get_option('internal_network_id'),
+            NEW_INTERNAL_NETWORK_ID,
+        )
+
+    def test_mark_settings_as_erred_if_tenant_was_not_created(self):
+        # Arrange
+        self.tenant.state = StateMixin.States.CREATING
+        self.tenant.save()
+        self.service_settings.state = StateMixin.States.CREATING
+        self.service_settings.save()
+
+        # Act
+        self.tenant.set_erred()
+        self.tenant.save()
+
+        # Assert
+        self.service_settings.refresh_from_db()
+        self.assertEqual(self.service_settings.state, StateMixin.States.ERRED)
+
+
 class ConfigDriveUpdateTest(TestCase):
     def test_service_settings_config_drive_is_updated(self):
         # Arrange
@@ -232,8 +391,8 @@ class ConfigDriveUpdateTest(TestCase):
         )
 
         # Act
-        tenant.service_project_link.service.settings.options['config_drive'] = True
-        tenant.service_project_link.service.settings.save()
+        tenant.service_settings.options['config_drive'] = True
+        tenant.service_settings.save()
 
         # Assert
         service_settings.refresh_from_db()
@@ -337,102 +496,6 @@ class SubNetHandlerTest(BaseServicePropertyTest):
         self.assertEqual(models.SubNet.objects.count(), 0)
 
 
-class ServiceSettingsCertificationHandlerTest(TestCase):
-    def test_openstack_tenant_service_certifications_are_update_when_tenant_settings_certification_are_added(
-        self,
-    ):
-        tenant = openstack_factories.TenantFactory()
-        tenant_service1 = factories.OpenStackTenantServiceFactory(
-            settings__scope=tenant
-        )
-        tenant_service2 = factories.OpenStackTenantServiceFactory(
-            settings__scope=tenant
-        )
-        self.assertEqual(tenant_service1.settings.certifications.count(), 0)
-        self.assertEqual(tenant_service2.settings.certifications.count(), 0)
-        new_certification = structure_factories.ServiceCertificationFactory()
-
-        tenant.service_project_link.service.settings.certifications.add(
-            new_certification
-        )
-
-        self.assertTrue(
-            tenant_service1.settings.certifications.filter(
-                pk__in=[new_certification.pk]
-            ).exists()
-        )
-        self.assertTrue(
-            tenant_service2.settings.certifications.filter(
-                pk__in=[new_certification.pk]
-            ).exists()
-        )
-
-    def test_openstack_tenant_service_certifications_are_removed_if_tenant_settings_certifications_are_removed(
-        self,
-    ):
-        tenant = openstack_factories.TenantFactory()
-        tenant_service = factories.OpenStackTenantServiceFactory(settings__scope=tenant)
-        new_certification = structure_factories.ServiceCertificationFactory()
-
-        tenant.service_project_link.service.settings.certifications.add(
-            new_certification
-        )
-        self.assertEqual(tenant_service.settings.certifications.count(), 1)
-        tenant.service_project_link.service.settings.certifications.clear()
-
-        self.assertEqual(
-            tenant.service_project_link.service.settings.certifications.count(), 0
-        )
-        self.assertEquals(tenant_service.settings.certifications.count(), 0)
-
-
-class CopyCertificationsTest(TestCase):
-    def test_openstack_tenant_settings_certifications_are_copied_from_openstack_settings(
-        self,
-    ):
-        tenant = openstack_factories.TenantFactory()
-        certifications = structure_factories.ServiceCertificationFactory.create_batch(2)
-        tenant.service_project_link.service.settings.certifications.add(*certifications)
-
-        settings = factories.OpenStackTenantServiceSettingsFactory(scope=tenant)
-
-        certifications_pk = [c.pk for c in certifications]
-        self.assertEqual(
-            settings.certifications.filter(pk__in=certifications_pk).count(), 2
-        )
-
-    def test_openstack_tenant_settings_certifications_are_not_copied_on_update(self):
-        tenant = openstack_factories.TenantFactory()
-        certification = structure_factories.ServiceCertificationFactory()
-        tenant.service_project_link.service.settings.certifications.add(certification)
-        settings = factories.OpenStackTenantServiceSettingsFactory(scope=tenant)
-        self.assertEquals(settings.certifications.count(), 1)
-
-        settings.name = 'new_name'
-        settings.save()
-
-        self.assertEquals(settings.certifications.count(), 1)
-        self.assertEquals(settings.certifications.first().pk, certification.pk)
-
-    def test_openstack_tenant_settings_certifications_are_not_copied_if_scope_is_not_tenant(
-        self,
-    ):
-        instance = factories.InstanceFactory()
-        certification = structure_factories.ServiceCertificationFactory()
-        instance.service_project_link.service.settings.certifications.add(certification)
-
-        settings = factories.OpenStackTenantServiceSettingsFactory(scope=instance)
-
-        self.assertFalse(settings.certifications.exists())
-
-    def test_openstack_tenant_settings_certifications_are_not_copied_if_scope_is_None(
-        self,
-    ):
-        settings = factories.OpenStackTenantServiceSettingsFactory(scope=None)
-
-        self.assertFalse(settings.certifications.exists())
-
-
 class CreateServiceFromTenantTest(TestCase):
     def test_service_is_created_on_tenant_creation(self):
         tenant = openstack_factories.TenantFactory()
@@ -444,17 +507,12 @@ class CreateServiceFromTenantTest(TestCase):
             scope=tenant, type=apps.OpenStackTenantConfig.service_name,
         )
         self.assertEquals(service_settings.name, tenant.name)
-        self.assertEquals(
-            service_settings.customer, tenant.service_project_link.project.customer
-        )
+        self.assertEquals(service_settings.customer, tenant.project.customer)
         self.assertEquals(service_settings.username, tenant.user_username)
         self.assertEquals(service_settings.password, tenant.user_password)
+        self.assertEquals(service_settings.domain, tenant.service_settings.domain)
         self.assertEquals(
-            service_settings.domain, tenant.service_project_link.service.settings.domain
-        )
-        self.assertEquals(
-            service_settings.backend_url,
-            tenant.service_project_link.service.settings.backend_url,
+            service_settings.backend_url, tenant.service_settings.backend_url,
         )
         self.assertEquals(
             service_settings.type, apps.OpenStackTenantConfig.service_name
@@ -465,61 +523,39 @@ class CreateServiceFromTenantTest(TestCase):
         )
         self.assertFalse('console_type' in service_settings.options)
 
-        self.assertTrue(
-            models.OpenStackTenantService.objects.filter(
-                settings=service_settings,
-                customer=tenant.service_project_link.project.customer,
-            ).exists()
-        )
-
-        service = models.OpenStackTenantService.objects.get(
-            settings=service_settings,
-            customer=tenant.service_project_link.project.customer,
-        )
-
-        self.assertTrue(
-            models.OpenStackTenantServiceProjectLink.objects.filter(
-                service=service, project=tenant.service_project_link.project,
-            ).exists()
-        )
-
     def test_copy_console_type_from_admin_settings_to_private_settings(self):
-        service_project_link = openstack_factories.OpenStackServiceProjectLinkFactory()
-        service_project_link.service.settings.options['console_type'] = 'console_type'
-        service_project_link.service.settings.save()
-        tenant = openstack_factories.TenantFactory(
-            service_project_link=service_project_link
-        )
-        service_settings = structure_models.ServiceSettings.objects.get(
+        shared_settings = openstack_factories.OpenStackServiceSettingsFactory()
+        shared_settings.options['console_type'] = 'console_type'
+        shared_settings.save()
+        tenant = openstack_factories.TenantFactory(service_settings=shared_settings)
+        private_settings = structure_models.ServiceSettings.objects.get(
             scope=tenant, type=apps.OpenStackTenantConfig.service_name,
         )
-        self.assertTrue('console_type' in service_settings.options)
+        self.assertTrue('console_type' in private_settings.options)
         self.assertEquals(
-            service_settings.options['console_type'],
-            service_project_link.service.settings.options['console_type'],
+            shared_settings.options['console_type'],
+            private_settings.options['console_type'],
         )
 
     def test_copy_config_drive_from_admin_settings_to_private_settings(self):
-        service_project_link = openstack_factories.OpenStackServiceProjectLinkFactory()
-        service_project_link.service.settings.options['config_drive'] = True
-        service_project_link.service.settings.save()
-        tenant = openstack_factories.TenantFactory(
-            service_project_link=service_project_link
-        )
-        service_settings = structure_models.ServiceSettings.objects.get(
+        shared_settings = openstack_factories.OpenStackServiceSettingsFactory()
+        shared_settings.options['config_drive'] = True
+        shared_settings.save()
+        tenant = openstack_factories.TenantFactory(service_settings=shared_settings)
+        private_settings = structure_models.ServiceSettings.objects.get(
             scope=tenant, type=apps.OpenStackTenantConfig.service_name,
         )
-        self.assertTrue(service_settings.options['config_drive'])
+        self.assertTrue(private_settings.options['config_drive'])
 
     def test_copy_tenant_id_from_tenant_to_private_settings(self):
-        service_project_link = openstack_factories.OpenStackServiceProjectLinkFactory()
+        shared_settings = openstack_factories.OpenStackServiceSettingsFactory()
         tenant = openstack_factories.TenantFactory(
-            service_project_link=service_project_link, backend_id=None
+            service_settings=shared_settings, backend_id=None
         )
-        service_settings = structure_models.ServiceSettings.objects.get(
+        private_settings = structure_models.ServiceSettings.objects.get(
             scope=tenant, type=apps.OpenStackTenantConfig.service_name,
         )
         tenant.backend_id = 'VALID_BACKEND_ID'
         tenant.save()
-        service_settings.refresh_from_db()
-        self.assertTrue(service_settings.options['tenant_id'], tenant.backend_id)
+        private_settings.refresh_from_db()
+        self.assertTrue(private_settings.options['tenant_id'], tenant.backend_id)

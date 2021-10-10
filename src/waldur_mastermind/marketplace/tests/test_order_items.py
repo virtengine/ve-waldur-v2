@@ -1,32 +1,32 @@
 import unittest
 
 from ddt import data, ddt
+from django.core.exceptions import ValidationError
 from rest_framework import status, test
 
 from waldur_core.quotas import signals as quota_signals
-from waldur_core.structure.tests import fixtures
-
-from .. import models
-from . import factories
+from waldur_core.structure.tests import fixtures as structure_fixtures
+from waldur_mastermind.marketplace import models
+from waldur_mastermind.marketplace.tests import factories, fixtures
 
 
 @ddt
-class ItemGetTest(test.APITransactionTestCase):
+class OrderItemFilterTest(test.APITransactionTestCase):
     def setUp(self):
-        self.fixture = fixtures.ProjectFixture()
+        self.fixture = structure_fixtures.ProjectFixture()
         self.project = self.fixture.project
         self.manager = self.fixture.manager
         self.order = factories.OrderFactory(
             project=self.project, created_by=self.manager
         )
         self.order_item = factories.OrderItemFactory(order=self.order)
+        self.url = factories.OrderItemFactory.get_list_url()
 
     @data('staff', 'owner', 'admin', 'manager')
     def test_items_should_be_visible_to_colleagues_and_staff(self, user):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
-        url = factories.OrderItemFactory.get_list_url()
-        response = self.client.get(url)
+        response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.json()), 1)
 
@@ -34,22 +34,36 @@ class ItemGetTest(test.APITransactionTestCase):
     def test_items_should_be_invisible_to_other_users(self, user):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
-        url = factories.OrderItemFactory.get_list_url()
-        response = self.client.get(url)
+        response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.json()), 0)
 
     def test_items_should_be_invisible_to_unauthenticated_users(self):
-        url = factories.OrderItemFactory.get_list_url()
-        response = self.client.get(url)
+        response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_filter_order_items_for_service_manager(self):
+        # Arrange
+        offering = factories.OfferingFactory(customer=self.fixture.customer)
+        offering.add_user(self.fixture.user)
+        order_item = factories.OrderItemFactory(offering=offering, order=self.order)
+
+        # Act
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.get(
+            self.url, {'service_manager_uuid': self.fixture.user.uuid.hex}
+        )
+
+        # Assert
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['uuid'], order_item.uuid.hex)
 
 
 @unittest.skip('OrderItem creation is irrelevant now.')
 @ddt
 class ItemCreateTest(test.APITransactionTestCase):
     def setUp(self):
-        self.fixture = fixtures.ProjectFixture()
+        self.fixture = structure_fixtures.ProjectFixture()
         self.project = self.fixture.project
         self.manager = self.fixture.manager
         self.order = factories.OrderFactory(
@@ -106,7 +120,7 @@ class ItemCreateTest(test.APITransactionTestCase):
 @ddt
 class ItemUpdateTest(test.APITransactionTestCase):
     def setUp(self):
-        self.fixture = fixtures.ProjectFixture()
+        self.fixture = structure_fixtures.ProjectFixture()
         self.project = self.fixture.project
         self.manager = self.fixture.manager
         self.order = factories.OrderFactory(
@@ -152,7 +166,7 @@ class ItemUpdateTest(test.APITransactionTestCase):
 @ddt
 class ItemDeleteTest(test.APITransactionTestCase):
     def setUp(self):
-        self.fixture = fixtures.ProjectFixture()
+        self.fixture = structure_fixtures.ProjectFixture()
         self.project = self.fixture.project
         self.manager = self.fixture.manager
         self.order = factories.OrderFactory(
@@ -197,7 +211,7 @@ class ItemDeleteTest(test.APITransactionTestCase):
 @ddt
 class ItemTerminateTest(test.APITransactionTestCase):
     def setUp(self):
-        self.fixture = fixtures.ProjectFixture()
+        self.fixture = structure_fixtures.ProjectFixture()
         self.project = self.fixture.project
         self.manager = self.fixture.manager
         self.offering = factories.OfferingFactory(type='Support.OfferingTemplate')
@@ -241,7 +255,7 @@ class ItemTerminateTest(test.APITransactionTestCase):
 
 class AggregateResourceCountTest(test.APITransactionTestCase):
     def setUp(self):
-        self.fixture = fixtures.ServiceFixture()
+        self.fixture = structure_fixtures.ServiceFixture()
         self.project = self.fixture.project
         self.customer = self.fixture.customer
         self.plan = factories.PlanFactory()
@@ -303,3 +317,131 @@ class AggregateResourceCountTest(test.APITransactionTestCase):
             ).count,
             1,
         )
+
+
+class ItemValidateTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+
+    def test_types_of_items_in_one_order_must_be_the_same(self):
+        new_item = factories.OrderItemFactory(
+            order=self.fixture.order,
+            offering=self.fixture.offering,
+            type=models.RequestTypeMixin.Types.UPDATE,
+        )
+        self.assertRaises(ValidationError, new_item.clean)
+
+
+@ddt
+class ItemRejectTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = structure_fixtures.ProjectFixture()
+        self.project = self.fixture.project
+        self.manager = self.fixture.manager
+        self.offering = factories.OfferingFactory(
+            type='Support.OfferingTemplate', customer=self.fixture.customer
+        )
+        self.order = factories.OrderFactory(
+            project=self.project, created_by=self.manager
+        )
+        resource = factories.ResourceFactory(offering=self.offering)
+        self.order_item = factories.OrderItemFactory(
+            resource=resource,
+            order=self.order,
+            offering=self.offering,
+            state=models.OrderItem.States.EXECUTING,
+        )
+
+    @data(
+        'staff', 'owner',
+    )
+    def test_authorized_user_can_reject_item(self, user):
+        response = self.reject_item(user)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.order_item.refresh_from_db()
+        self.assertEqual(self.order_item.state, models.OrderItem.States.TERMINATED)
+
+    @data(
+        'admin', 'manager',
+    )
+    def test_user_cannot_reject_item(self, user):
+        response = self.reject_item(user)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @data(models.OrderItem.States.TERMINATED,)
+    def test_order_item_cannot_be_rejected_if_it_is_in_terminated_state(self, state):
+        self.order_item.state = state
+        self.order_item.save()
+        response = self.reject_item('staff')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @data(
+        models.OrderItem.States.DONE,
+        models.OrderItem.States.ERRED,
+        models.OrderItem.States.TERMINATING,
+        models.OrderItem.States.EXECUTING,
+        models.OrderItem.States.PENDING,
+    )
+    def test_order_item_can_be_rejected_if_it_is_not_in_terminated_state(self, state):
+        self.order_item.state = state
+        self.order_item.save()
+        response = self.reject_item('staff')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_when_create_order_item_with_basic_offering_is_rejected_resource_is_marked_as_terminated(
+        self,
+    ):
+        self.offering.type = 'Marketplace.Basic'
+        self.offering.save()
+
+        self.reject_item('owner')
+        self.order_item.refresh_from_db()
+        self.assertEqual(
+            models.Resource.States.TERMINATED, self.order_item.resource.state
+        )
+
+    def test_when_update_order_item_with_basic_offering_is_rejected_resource_is_marked_as_erred(
+        self,
+    ):
+        self.offering.type = 'Marketplace.Basic'
+        self.offering.save()
+        self.order_item.type = models.OrderItem.Types.UPDATE
+        self.order_item.save()
+
+        plan_period = factories.ResourcePlanPeriodFactory()
+        old_plan = plan_period.plan
+        old_plan.offering = self.offering
+        old_plan.save()
+
+        old_limits = {'unit': 50}
+        resource = self.order_item.resource
+        resource.plan = old_plan
+        resource.limits = old_limits
+        resource.save()
+
+        plan_period.resource = resource
+        plan_period.save()
+
+        self.reject_item('owner')
+        self.order_item.refresh_from_db()
+        self.assertEqual(models.Resource.States.ERRED, self.order_item.resource.state)
+        self.assertEqual(old_plan, self.order_item.resource.plan)
+        self.assertEqual(old_limits, self.order_item.resource.limits)
+
+    def test_when_terminate_order_item_with_basic_offering_is_rejected_resource_is_marked_as_erred(
+        self,
+    ):
+        self.offering.type = 'Marketplace.Basic'
+        self.offering.save()
+        self.order_item.type = models.OrderItem.Types.TERMINATE
+        self.order_item.save()
+
+        self.reject_item('owner')
+        self.order_item.refresh_from_db()
+        self.assertEqual(models.Resource.States.ERRED, self.order_item.resource.state)
+
+    def reject_item(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        url = factories.OrderItemFactory.get_url(self.order_item, 'reject')
+        return self.client.post(url)

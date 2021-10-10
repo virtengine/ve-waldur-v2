@@ -1,28 +1,25 @@
 import datetime
 import decimal
+import uuid
 
-from celery import chain
 from dateutil.relativedelta import relativedelta
 from django.db import transaction
 from django.db.models import Sum
-from django.http import Http404, HttpResponse
+from django.http import HttpResponse
 from django.utils.translation import ugettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import exceptions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from waldur_core.core import utils as core_utils
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
 from waldur_mastermind.common.utils import quantize_price
-from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_mastermind.support import models as support_models
 
-from . import filters, log, models, serializers, tasks
+from . import filters, log, models, serializers, tasks, utils
 
 
 class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
@@ -45,11 +42,7 @@ class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
     @action(detail=True, methods=['post'])
     def send_notification(self, request, uuid=None):
         invoice = self.get_object()
-        serialized_invoice = core_utils.serialize_instance(invoice)
-        chain(
-            tasks.create_invoice_pdf.si(serialized_invoice),
-            tasks.send_invoice_notification.si(invoice.uuid.hex),
-        )()
+        tasks.send_invoice_notification.delay(invoice.uuid.hex)
 
         return Response(
             {
@@ -66,11 +59,9 @@ class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
     @action(detail=True)
     def pdf(self, request, uuid=None):
         invoice = self.get_object()
-        if not invoice.has_file():
-            tasks.create_invoice_pdf.delay(core_utils.serialize_instance(invoice))
-            raise Http404()
 
-        file_response = HttpResponse(invoice.file, content_type='application/pdf')
+        file = utils.create_invoice_pdf(invoice)
+        file_response = HttpResponse(file, content_type='application/pdf')
         filename = invoice.get_filename()
         file_response[
             'Content-Disposition'
@@ -131,23 +122,15 @@ class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
         offerings = {}
 
         for item in invoice.items.all():
-            if not item.scope:
+            if not item.resource:
                 continue
 
-            if isinstance(item.scope, marketplace_models.Resource):
-                resource = item.scope
-                offering = resource.offering
-                customer = offering.customer
-                service_category_title = offering.category.title
-                service_provider_name = customer.name
-                service_provider_uuid = customer.serviceprovider.uuid.hex
-            elif isinstance(item.scope, support_models.Offering):
-                offering = item.scope.template
-                service_category_title = 'Request'
-                service_provider_name = ''
-                service_provider_uuid = ''
-            else:
-                continue
+            resource = item.resource
+            offering = resource.offering
+            customer = offering.customer
+            service_category_title = offering.category.title
+            service_provider_name = customer.name
+            service_provider_uuid = customer.serviceprovider.uuid.hex
 
             if offering.uuid.hex not in offerings.keys():
                 offerings[offering.uuid.hex] = {
@@ -249,6 +232,82 @@ class InvoiceViewSet(core_views.ReadOnlyActionsViewSet):
 
         return Response(result, status=status.HTTP_200_OK)
 
+    @action(detail=True, methods=['post'])
+    def set_backend_id(self, request, uuid=None):
+        invoice = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        backend_id = serializer.validated_data['backend_id']
+        invoice.backend_id = backend_id
+        invoice.save()
+        return Response(status=status.HTTP_200_OK)
+
+    set_backend_id_permissions = [structure_permissions.is_staff]
+    set_backend_id_serializer_class = serializers.BackendIdSerializer
+
+
+class InvoiceItemViewSet(core_views.ActionsViewSet):
+    disabled_actions = ['create']
+    queryset = models.InvoiceItem.objects.all()
+    serializer_class = serializers.InvoiceItemDetailSerializer
+    lookup_field = 'uuid'
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if self.request.user.is_staff:
+            return qs
+        else:
+            return qs.none()
+
+    @transaction.atomic
+    @action(detail=True, methods=['post'])
+    def create_compensation(self, request, **kwargs):
+        invoice_item = self.get_object()
+
+        serializer = self.get_serializer_class()(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        offering_component_name = serializer.validated_data['offering_component_name']
+
+        if invoice_item.unit_price < 0:
+            return Response(
+                'Can not create compensation for invoice item with negative unit price.',
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        year, month = utils.get_current_year(), utils.get_current_month()
+        invoice, _ = models.Invoice.objects.get_or_create(
+            customer=invoice_item.invoice.customer, month=month, year=year,
+        )
+
+        # Fill new invoice item details
+        if not invoice_item.details:
+            invoice_item.details = {}
+        invoice_item.details['original_invoice_item_uuid'] = invoice_item.uuid.hex
+        invoice_item.details['offering_component_name'] = offering_component_name
+
+        # Save new invoice item to database
+        invoice_item.invoice = invoice
+        invoice_item.pk = None
+        invoice_item.uuid = uuid.uuid4()
+        invoice_item.unit_price *= -1
+        invoice_item.save()
+
+        return Response(
+            {'invoice_item_uuid': invoice_item.uuid.hex},
+            status=status.HTTP_201_CREATED,
+        )
+
+    create_compensation_serializer_class = serializers.InvoiceItemCompensationSerializer
+
+    update_serializer_class = serializers.InvoiceItemUpdateSerializer
+
+    partial_update_serializer_class = serializers.InvoiceItemUpdateSerializer
+
+    create_compensation_permissions = (
+        update_permissions
+    ) = partial_update_permissions = destroy_permissions = [
+        structure_permissions.is_staff
+    ]
+
 
 class PaymentProfileViewSet(core_views.ActionsViewSet):
     lookup_field = 'uuid'
@@ -263,7 +322,7 @@ class PaymentProfileViewSet(core_views.ActionsViewSet):
     ) = partial_update_permissions = destroy_permissions = enable_permissions = [
         structure_permissions.is_staff
     ]
-    queryset = models.PaymentProfile.objects.all()
+    queryset = models.PaymentProfile.objects.all().order_by('name')
     serializer_class = serializers.PaymentProfileSerializer
 
     @action(detail=True, methods=['post'])
@@ -294,7 +353,7 @@ class PaymentViewSet(core_views.ActionsViewSet):
     ) = link_to_invoice_permissions = unlink_from_invoice_permissions = [
         structure_permissions.is_staff
     ]
-    queryset = models.Payment.objects.all()
+    queryset = models.Payment.objects.all().order_by('created')
     serializer_class = serializers.PaymentSerializer
 
     @action(detail=True, methods=['post'])

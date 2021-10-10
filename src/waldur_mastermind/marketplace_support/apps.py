@@ -8,59 +8,26 @@ class MarketplaceSupportConfig(AppConfig):
 
     def ready(self):
         from waldur_mastermind.marketplace.plugins import manager
-        from waldur_mastermind.marketplace import models as marketplace_models
-        from waldur_mastermind.marketplace import handlers as marketplace_handlers
         from waldur_mastermind.marketplace_support import PLUGIN_NAME
         from waldur_mastermind.support import models as support_models
+        from waldur_core.core import signals as core_signals
+        from waldur_mastermind.marketplace import serializers as marketplace_serializers
+        from waldur_mastermind.marketplace_support.serializers import add_issue
 
-        from . import handlers, processor
+        from . import handlers, processor, registrators
 
-        signals.post_save.connect(
-            handlers.create_support_template,
-            sender=marketplace_models.Offering,
-            dispatch_uid='waldur_mastermind.marketpace_support.create_support_template',
-        )
-
-        signals.post_save.connect(
-            handlers.update_support_template,
-            sender=marketplace_models.Offering,
-            dispatch_uid='waldur_mastermind.marketpace_support.update_support_template',
-        )
-
-        signals.post_save.connect(
-            handlers.change_order_item_state,
-            sender=support_models.Offering,
-            dispatch_uid='waldur_mastermind.marketpace_support.change_order_item_state',
-        )
-
-        signals.pre_delete.connect(
-            handlers.terminate_resource,
-            sender=support_models.Offering,
-            dispatch_uid='waldur_mastermind.marketpace_support.terminate_resource',
-        )
-
-        signals.post_save.connect(
-            handlers.create_or_update_support_plan,
-            sender=marketplace_models.Plan,
-            dispatch_uid='waldur_mastermind.marketpace_support.create_or_update_support_plan',
-        )
-
-        signals.post_save.connect(
-            handlers.change_offering_state,
-            sender=support_models.Issue,
-            dispatch_uid='waldur_mastermind.marketpace_support.change_offering_state',
-        )
+        registrators.SupportRegistrator.connect()
 
         signals.post_save.connect(
             handlers.update_order_item_if_issue_was_complete,
             sender=support_models.Issue,
-            dispatch_uid='waldur_mastermind.marketpace_support.update_order_item_if_issue_was_complete',
+            dispatch_uid='waldur_mastermind.marketplace_support.update_order_item_if_issue_was_complete',
         )
 
         signals.post_save.connect(
             handlers.notify_about_request_based_item_creation,
             sender=support_models.Issue,
-            dispatch_uid='waldur_mastermind.marketpace_support.notify_about_request_based_item_creation',
+            dispatch_uid='waldur_mastermind.marketplace_support.notify_about_request_based_item_creation',
         )
 
         manager.register(
@@ -69,7 +36,12 @@ class MarketplaceSupportConfig(AppConfig):
             update_resource_processor=processor.UpdateRequestProcessor,
             delete_resource_processor=processor.DeleteRequestProcessor,
             can_terminate_order_item=True,
-            resource_model=support_models.Offering,
+            enable_usage_notifications=True,
+            enable_remote_support=True,
+            can_update_limits=True,
         )
 
-        marketplace_handlers.connect_resource_metadata_handlers(support_models.Offering)
+        core_signals.pre_serializer_fields.connect(
+            sender=marketplace_serializers.OrderItemDetailsSerializer,
+            receiver=add_issue,
+        )

@@ -3,49 +3,8 @@ from django.urls import reverse
 from factory import fuzzy
 from libcloud.compute.types import NodeState
 
+from waldur_aws import models
 from waldur_core.structure.tests import factories as structure_factories
-
-from .. import models
-
-
-class AWSServiceFactory(factory.DjangoModelFactory):
-    class Meta:
-        model = models.AWSService
-
-    settings = factory.SubFactory(
-        structure_factories.ServiceSettingsFactory, type='Amazon'
-    )
-    customer = factory.SubFactory(structure_factories.CustomerFactory)
-
-    @classmethod
-    def get_url(cls, service=None):
-        if service is None:
-            service = AWSServiceFactory()
-        return 'http://testserver' + reverse(
-            'aws-detail', kwargs={'uuid': service.uuid.hex}
-        )
-
-    @classmethod
-    def get_list_url(cls):
-        return 'http://testserver' + reverse('aws-list')
-
-
-class AWSServiceProjectLinkFactory(factory.DjangoModelFactory):
-    class Meta:
-        model = models.AWSServiceProjectLink
-
-    service = factory.SubFactory(AWSServiceFactory)
-    project = factory.SubFactory(structure_factories.ProjectFactory)
-
-    @classmethod
-    def get_url(cls, spl=None):
-        if spl is None:
-            spl = AWSServiceProjectLinkFactory()
-        return 'http://testserver' + reverse('aws-spl-detail', kwargs={'pk': spl.id})
-
-    @classmethod
-    def get_list_url(cls):
-        return 'http://testserver' + reverse('aws-spl-list')
 
 
 class RegionFactory(factory.DjangoModelFactory):
@@ -120,7 +79,9 @@ class InstanceFactory(factory.DjangoModelFactory):
 
     name = factory.Sequence(lambda n: 'instance%s' % n)
     backend_id = factory.Sequence(lambda n: 'instance-id%s' % n)
-    service_project_link = factory.SubFactory(AWSServiceProjectLinkFactory)
+    service_settings = factory.SubFactory(
+        structure_factories.ServiceSettingsFactory, type='Amazon'
+    )
     region = factory.SubFactory(RegionFactory)
 
     state = models.Instance.States.OK

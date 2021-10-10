@@ -8,6 +8,7 @@ from rest_framework import serializers as rf_serializers
 from rest_framework import status
 
 from waldur_core.core import exceptions as core_exceptions
+from waldur_core.core import utils as core_utils
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
 from waldur_core.logging.loggers import event_logger
@@ -18,109 +19,6 @@ from waldur_core.structure import views as structure_views
 from . import executors, filters, models, serializers
 
 logger = logging.getLogger(__name__)
-
-
-class OpenStackServiceViewSet(structure_views.BaseServiceViewSet):
-    queryset = models.OpenStackService.objects.all().order_by('id')
-    serializer_class = serializers.ServiceSerializer
-
-    def list(self, request, *args, **kwargs):
-        """
-        To create a service, issue a **POST** to */api/openstack/* as a customer owner.
-
-        You can create service based on shared service settings. Example:
-
-        .. code-block:: http
-
-            POST /api/openstack/ HTTP/1.1
-            Content-Type: application/json
-            Accept: application/json
-            Authorization: Token c84d653b9ec92c6cbac41c706593e66f567a7fa4
-            Host: example.com
-
-            {
-                "name": "Common OpenStack",
-                "customer": "http://example.com/api/customers/1040561ca9e046d2b74268600c7e1105/",
-                "settings": "http://example.com/api/service-settings/93ba615d6111466ebe3f792669059cb4/"
-            }
-
-        Or provide your own credentials. Example:
-
-        .. code-block:: http
-
-            POST /api/openstack/ HTTP/1.1
-            Content-Type: application/json
-            Accept: application/json
-            Authorization: Token c84d653b9ec92c6cbac41c706593e66f567a7fa4
-            Host: example.com
-
-            {
-                "name": "My OpenStack",
-                "customer": "http://example.com/api/customers/1040561ca9e046d2b74268600c7e1105/",
-                "backend_url": "http://keystone.example.com:5000/v2.0",
-                "username": "admin",
-                "password": "secret"
-            }
-        """
-
-        return super(OpenStackServiceViewSet, self).list(request, *args, **kwargs)
-
-    def retrieve(self, request, *args, **kwargs):
-        """
-        To update OpenStack service issue **PUT** or **PATCH** against */api/openstack/<service_uuid>/*
-        as a customer owner. You can update service's `name` and `available_for_all` fields.
-
-        Example of a request:
-
-        .. code-block:: http
-
-            PUT /api/openstack/c6526bac12b343a9a65c4cd6710666ee/ HTTP/1.1
-            Content-Type: application/json
-            Accept: application/json
-            Authorization: Token c84d653b9ec92c6cbac41c706593e66f567a7fa4
-            Host: example.com
-
-            {
-                "name": "My OpenStack2"
-            }
-
-        To remove OpenStack service, issue **DELETE** against */api/openstack/<service_uuid>/* as
-        staff user or customer owner.
-        """
-        return super(OpenStackServiceViewSet, self).retrieve(request, *args, **kwargs)
-
-
-class OpenStackServiceProjectLinkViewSet(structure_views.BaseServiceProjectLinkViewSet):
-    queryset = models.OpenStackServiceProjectLink.objects.all()
-    serializer_class = serializers.ServiceProjectLinkSerializer
-    filterset_class = filters.OpenStackServiceProjectLinkFilter
-
-    def list(self, request, *args, **kwargs):
-        """
-        In order to be able to provision OpenStack resources, it must first be linked to a project. To do that,
-        **POST** a connection between project and a service to */api/openstack-service-project-link/*
-        as stuff user or customer owner.
-
-        Example of a request:
-
-        .. code-block:: http
-
-            POST /api/openstack-service-project-link/ HTTP/1.1
-            Content-Type: application/json
-            Accept: application/json
-            Authorization: Token c84d653b9ec92c6cbac41c706593e66f567a7fa4
-            Host: example.com
-
-            {
-                "project": "http://example.com/api/projects/e5f973af2eb14d2d8c38d62bcbaccb33/",
-                "service": "http://example.com/api/openstack/b0e8a4cbd47c4f9ca01642b7ec033db4/"
-            }
-
-        To remove a link, issue DELETE to URL of the corresponding connection as stuff user or customer owner.
-        """
-        return super(OpenStackServiceProjectLinkViewSet, self).list(
-            request, *args, **kwargs
-        )
 
 
 class FlavorViewSet(structure_views.BaseServicePropertyViewSet):
@@ -137,7 +35,7 @@ class FlavorViewSet(structure_views.BaseServicePropertyViewSet):
 
 
 class ImageViewSet(structure_views.BaseServicePropertyViewSet):
-    queryset = models.Image.objects.all()
+    queryset = models.Image.objects.all().order_by('name')
     serializer_class = serializers.ImageSerializer
     lookup_field = 'uuid'
     filterset_class = filters.ImageFilter
@@ -150,14 +48,12 @@ class VolumeTypeViewSet(structure_views.BaseServicePropertyViewSet):
     filterset_class = filters.VolumeTypeFilter
 
 
-class SecurityGroupViewSet(structure_views.BaseResourceViewSet):
-    queryset = models.SecurityGroup.objects.all()
+class SecurityGroupViewSet(structure_views.ResourceViewSet):
+    queryset = models.SecurityGroup.objects.all().order_by('tenant__name')
     serializer_class = serializers.SecurityGroupSerializer
     filterset_class = filters.SecurityGroupFilter
-    disabled_actions = [
-        'create',
-        'pull',
-    ]  # pull operation should be implemented in WAL-323
+    disabled_actions = ['create']
+    pull_executor = executors.SecurityGroupPullExecutor
 
     def default_security_group_validator(security_group):
         if security_group.name == 'default':
@@ -207,7 +103,7 @@ class SecurityGroupViewSet(structure_views.BaseResourceViewSet):
     set_rules_serializer_class = serializers.SecurityGroupRuleListUpdateSerializer
 
 
-class FloatingIPViewSet(structure_views.BaseResourceViewSet):
+class FloatingIPViewSet(structure_views.ResourceViewSet):
     queryset = models.FloatingIP.objects.all().order_by('address')
     serializer_class = serializers.FloatingIPSerializer
     filterset_class = filters.FloatingIPFilter
@@ -225,9 +121,67 @@ class FloatingIPViewSet(structure_views.BaseResourceViewSet):
 
         return super(FloatingIPViewSet, self).list(request, *args, **kwargs)
 
+    @decorators.action(detail=True, methods=['post'])
+    def attach_to_port(self, request, uuid=None):
+        floating_ip: models.FloatingIP = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        port: models.Port = serializer.validated_data['port']
+        if port.state != models.Port.States.OK:
+            raise core_exceptions.IncorrectStateException(
+                _(
+                    'The port [%(port)s] is expected to have [OK] state, but actual one is [%(state)s]'
+                )
+                % {'port': port, 'state': port.get_state_display()}
+            )
+        if port.tenant != floating_ip.tenant:
+            raise exceptions.ValidationError(
+                {
+                    'detail': _(
+                        'The port [%(port)s] is expected to belong to the same tenant [%(tenant)s] , but actual one is [%(actual_tenant)s]'
+                    )
+                    % {
+                        'port': port,
+                        'tenant': floating_ip.tenant,
+                        'actual_tenant': port.tenant,
+                    }
+                }
+            )
 
-class TenantViewSet(structure_views.ImportableResourceViewSet):
-    queryset = models.Tenant.objects.all()
+        executors.FloatingIPAttachExecutor().execute(
+            floating_ip, port=core_utils.serialize_instance(port)
+        )
+        return response.Response(
+            {'status': _('attaching was scheduled')}, status=status.HTTP_202_ACCEPTED
+        )
+
+    attach_to_port_serializer_class = serializers.FloatingIPAttachSerializer
+    attach_to_port_validators = [
+        core_validators.StateValidator(models.FloatingIP.States.OK)
+    ]
+
+    @decorators.action(detail=True, methods=['post'])
+    def detach_from_port(self, request=None, uuid=None):
+        floating_ip: models.FloatingIP = self.get_object()
+        if not floating_ip.port:
+            raise exceptions.ValidationError(
+                {
+                    'port': _('Floating IP [%(fip)s] is not attached to any port.')
+                    % {'fip': floating_ip}
+                }
+            )
+        executors.FloatingIPDetachExecutor().execute(floating_ip)
+        return response.Response(
+            {'status': _('detaching was scheduled')}, status=status.HTTP_202_ACCEPTED
+        )
+
+    detach_from_port_validators = [
+        core_validators.StateValidator(models.FloatingIP.States.OK)
+    ]
+
+
+class TenantViewSet(structure_views.ResourceViewSet):
+    queryset = models.Tenant.objects.all().order_by('name')
     serializer_class = serializers.TenantSerializer
     filterset_class = structure_filters.BaseResourceFilter
 
@@ -235,25 +189,26 @@ class TenantViewSet(structure_views.ImportableResourceViewSet):
     update_executor = executors.TenantUpdateExecutor
     pull_executor = executors.TenantPullExecutor
 
-    importable_resources_backend_method = 'get_tenants_for_import'
-    importable_resources_serializer_class = serializers.TenantImportableSerializer
-    importable_resources_permissions = [structure_permissions.is_staff]
-    import_resource_serializer_class = serializers.TenantImportSerializer
-    import_resource_permissions = [structure_permissions.is_staff]
-    import_resource_executor = executors.TenantImportExecutor
-
     def delete_permission_check(request, view, obj=None):
         if not obj:
             return
-        if obj.service_project_link.service.settings.shared:
+        if obj.service_settings.shared:
             if settings.WALDUR_OPENSTACK['MANAGER_CAN_MANAGE_TENANTS']:
-                structure_permissions.is_manager(request, view, obj)
+                structure_permissions.is_manager(
+                    request, view, obj, soft_deleted_projects=True
+                )
             elif settings.WALDUR_OPENSTACK['ADMIN_CAN_MANAGE_TENANTS']:
-                structure_permissions.is_administrator(request, view, obj)
+                structure_permissions.is_administrator(
+                    request, view, obj, soft_deleted_projects=True
+                )
             else:
-                structure_permissions.is_owner(request, view, obj)
+                structure_permissions.is_owner(
+                    request, view, obj, soft_deleted_projects=True
+                )
         else:
-            structure_permissions.is_administrator(request, view, obj)
+            structure_permissions.is_administrator(
+                request, view, obj, soft_deleted_projects=True
+            )
 
     delete_executor = executors.TenantDeleteExecutor
     destroy_permissions = [
@@ -462,7 +417,7 @@ class TenantViewSet(structure_views.ImportableResourceViewSet):
 
 class RouterViewSet(core_views.ReadOnlyActionsViewSet):
     lookup_field = 'uuid'
-    queryset = models.Router.objects.all()
+    queryset = models.Router.objects.all().order_by('tenant__name')
     filter_backends = (DjangoFilterBackend, structure_filters.GenericRoleFilter)
     filterset_class = filters.RouterFilter
     serializer_class = serializers.RouterSerializer
@@ -505,16 +460,18 @@ class RouterViewSet(core_views.ReadOnlyActionsViewSet):
     set_routes_validators = [core_validators.StateValidator(models.Router.States.OK)]
 
 
-class PortViewSet(core_views.ReadOnlyActionsViewSet):
-    lookup_field = 'uuid'
-    queryset = models.Port.objects.all()
+class PortViewSet(structure_views.ResourceViewSet):
+    queryset = models.Port.objects.all().order_by('network__name')
     filter_backends = (DjangoFilterBackend, structure_filters.GenericRoleFilter)
     filterset_class = filters.PortFilter
     serializer_class = serializers.PortSerializer
 
+    disabled_actions = ['create', 'update', 'partial_update']
+    delete_executor = executors.PortDeleteExecutor
 
-class NetworkViewSet(structure_views.BaseResourceViewSet):
-    queryset = models.Network.objects.all()
+
+class NetworkViewSet(structure_views.ResourceViewSet):
+    queryset = models.Network.objects.all().order_by('name')
     serializer_class = serializers.NetworkSerializer
     filterset_class = filters.NetworkFilter
 
@@ -528,11 +485,7 @@ class NetworkViewSet(structure_views.BaseResourceViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         subnet = serializer.save()
-        enable_default_gateway = serializer.validated_data['enable_default_gateway']
-
-        executors.SubNetCreateExecutor.execute(
-            subnet, enable_default_gateway=enable_default_gateway
-        )
+        executors.SubNetCreateExecutor.execute(subnet)
         return response.Response(serializer.data, status=status.HTTP_201_CREATED)
 
     create_subnet_validators = [
@@ -551,9 +504,25 @@ class NetworkViewSet(structure_views.BaseResourceViewSet):
     set_mtu_validators = [core_validators.StateValidator(models.Network.States.OK)]
     set_mtu_serializer_class = serializers.SetMtuSerializer
 
+    @decorators.action(detail=True, methods=['post'])
+    def create_port(self, request, uuid=None):
+        network: models.Network = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        port: models.Port = serializer.save()
 
-class SubNetViewSet(structure_views.BaseResourceViewSet):
-    queryset = models.SubNet.objects.all()
+        executors.PortCreateExecutor().execute(
+            port, network=core_utils.serialize_instance(network)
+        )
+        return response.Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    create_port_serializer_class = serializers.PortSerializer
+
+    create_port_validators = [core_validators.StateValidator(models.Network.States.OK)]
+
+
+class SubNetViewSet(structure_views.ResourceViewSet):
+    queryset = models.SubNet.objects.all().order_by('network')
     serializer_class = serializers.SubNetSerializer
     filterset_class = filters.SubNetFilter
 
@@ -562,9 +531,18 @@ class SubNetViewSet(structure_views.BaseResourceViewSet):
     delete_executor = executors.SubNetDeleteExecutor
     pull_executor = executors.SubNetPullExecutor
 
-    def get_update_executor_kwargs(self, serializer):
-        return {
-            'enable_default_gateway': serializer.validated_data[
-                'enable_default_gateway'
-            ]
-        }
+    @decorators.action(detail=True, methods=['post'])
+    def connect(self, request, uuid=None):
+        executors.SubnetConnectExecutor.execute(self.get_object())
+        return response.Response(status=status.HTTP_202_ACCEPTED)
+
+    connect_validators = [core_validators.StateValidator(models.SubNet.States.OK)]
+    connect_serializer_class = rf_serializers.Serializer
+
+    @decorators.action(detail=True, methods=['post'])
+    def disconnect(self, request, uuid=None):
+        executors.SubnetDisconnectExecutor.execute(self.get_object())
+        return response.Response(status=status.HTTP_202_ACCEPTED)
+
+    disconnect_validators = [core_validators.StateValidator(models.SubNet.States.OK)]
+    disconnect_serializer_class = rf_serializers.Serializer

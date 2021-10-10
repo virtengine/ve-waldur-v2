@@ -2,21 +2,6 @@ from waldur_core.core import WaldurExtension
 
 ## Class to define Slurm static methods from waldur extension
 class SlurmExtension(WaldurExtension):
-    class Settings:
-        WALDUR_SLURM = {
-            'ENABLED': False,
-            'CUSTOMER_PREFIX': 'waldur_customer_',
-            'PROJECT_PREFIX': 'waldur_project_',
-            'ALLOCATION_PREFIX': 'waldur_allocation_',
-            'PRIVATE_KEY_PATH': '/etc/waldur/id_rsa',
-            'DEFAULT_LIMITS': {
-                'CPU': 16000,  # Measured unit is CPU-hours
-                'GPU': 400,  # Measured unit is GPU-hours
-                'RAM': 100000 * 2 ** 10,  # Measured unit is MB
-                'DEPOSIT': 200,  # Measured unis is EUR
-            },
-        }
-
     @staticmethod
     def django_app():
         return 'waldur_slurm'

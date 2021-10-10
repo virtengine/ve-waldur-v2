@@ -7,7 +7,15 @@ class BillingConfig(AppConfig):
     verbose_name = 'Billing'
 
     def ready(self):
+        from waldur_core.core import signals as core_signals
+        from waldur_core.structure import serializers as structure_serializers
+        from waldur_core.structure import filters as structure_filters
         from waldur_mastermind.invoices import models as invoices_models
+        from waldur_mastermind.billing.serializers import add_price_estimate
+        from waldur_mastermind.billing.filters import (
+            CustomerEstimatedCostFilter,
+            CustomerCurrentCostFilter,
+        )
 
         from . import handlers, models
 
@@ -37,11 +45,22 @@ class BillingConfig(AppConfig):
         signals.post_save.connect(
             handlers.process_invoice_item,
             sender=invoices_models.InvoiceItem,
-            dispatch_uid='waldur_mastermind.billing. process_invoice_item',
+            dispatch_uid='waldur_mastermind.billing.process_invoice_item',
         )
 
-        signals.post_save.connect(
-            handlers.log_price_estimate_limit_update,
-            sender=models.PriceEstimate,
-            dispatch_uid='waldur_mastermind.billing.log_price_estimate_limit_update',
+        core_signals.pre_serializer_fields.connect(
+            sender=structure_serializers.ProjectSerializer, receiver=add_price_estimate,
+        )
+
+        core_signals.pre_serializer_fields.connect(
+            sender=structure_serializers.CustomerSerializer,
+            receiver=add_price_estimate,
+        )
+
+        structure_filters.ExternalCustomerFilterBackend.register(
+            CustomerEstimatedCostFilter()
+        )
+
+        structure_filters.ExternalCustomerFilterBackend.register(
+            CustomerCurrentCostFilter()
         )

@@ -21,14 +21,25 @@ class TestPublicSettings(TestCase):
             def get_public_settings():
                 return ['INFO']
 
+            @staticmethod
+            def get_dynamic_settings():
+                return {'DYN': 'dynamic'}
+
         extensions = {
+            'WALDUR_CORE': {},
+            'WALDUR_AUTH_SOCIAL': {},
+            'WALDUR_FREEIPA': {},
+            'WALDUR_KEYCLOAK': {},
+            'WALDUR_HPC': {},
+            'WALDUR_SLURM': {},
+            'WALDUR_PID': {},
+            'WALDUR_AUTH_SAML2': {},
+            'WALDUR_MARKETPLACE': {},
             'WALDUR_EXTENSION_1': {'ENABLED': False},
             'WALDUR_EXTENSION_2': {'ENABLED': True},
             'WALDUR_EXTENSION_3': {'SECRET': 'secret', 'INFO': 'info'},
         }
-        mock_settings = mock.Mock(
-            WALDUR_CORE={}, WALDUR_CORE_PUBLIC_SETTINGS=[], **extensions
-        )
+        mock_settings = mock.Mock(**extensions)
         self.patcher_settings = mock.patch(
             'waldur_core.core.views.settings', new=mock_settings
         )
@@ -60,6 +71,7 @@ class TestPublicSettings(TestCase):
     def test_if_field_in_get_public_settings_it_value_must_by_in_response(self):
         response = views.get_public_settings()
         self.assertTrue('INFO' in response['WALDUR_EXTENSION_3'])
+        self.assertTrue('DYN' in response['WALDUR_EXTENSION_3'])
 
     def test_if_field_not_in_get_public_settings_it_value_not_to_be_in_response(self):
         response = views.get_public_settings()
