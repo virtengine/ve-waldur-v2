@@ -1,6 +1,4 @@
-import base64
 from decimal import Decimal
-from io import BytesIO
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -14,8 +12,10 @@ from django.utils.functional import cached_property
 from django.utils.translation import ugettext_lazy as _
 from django_fsm import FSMIntegerField, transition
 from model_utils import FieldTracker
+from model_utils.fields import AutoCreatedField
 from model_utils.models import TimeFramedModel, TimeStampedModel
 from rest_framework import exceptions as rf_exceptions
+from reversion import revisions as reversion
 
 from waldur_core.core import mixins as core_mixins
 from waldur_core.core import models as core_models
@@ -34,10 +34,13 @@ from ..common import mixins as common_mixins
 from . import managers, plugins
 from .attribute_types import ATTRIBUTE_TYPES
 
+User = get_user_model()
+
 
 class ServiceProvider(
     core_models.UuidMixin,
     core_models.DescribableMixin,
+    structure_models.ImageModelMixin,
     structure_models.StructureModel,
     TimeStampedModel,
 ):
@@ -97,7 +100,12 @@ class ServiceProvider(
         super(ServiceProvider, self).save(*args, **kwargs)
 
 
-class Category(core_models.UuidMixin, quotas_models.QuotaModelMixin, TimeStampedModel):
+class Category(
+    core_models.BackendMixin,
+    core_models.UuidMixin,
+    quotas_models.QuotaModelMixin,
+    TimeStampedModel,
+):
     title = models.CharField(blank=False, max_length=255)
     icon = models.FileField(
         upload_to='marketplace_category_icons',
@@ -106,7 +114,45 @@ class Category(core_models.UuidMixin, quotas_models.QuotaModelMixin, TimeStamped
         validators=[ImageValidator],
     )
     description = models.TextField(blank=True)
-    backend_id = models.CharField(max_length=255, blank=True)
+
+    default_vm_category = models.BooleanField(
+        default=False,
+        help_text=_(
+            'Set to "true" if this category is for OpenStack VM. Only one category can have "true" value.'
+        ),
+    )
+    default_volume_category = models.BooleanField(
+        default=False,
+        help_text=_(
+            'Set to true if this category is for OpenStack Volume. Only one category can have "true" value.'
+        ),
+    )
+    default_tenant_category = models.BooleanField(
+        default=False,
+        help_text=_(
+            'Set to true if this category is for OpenStack Tenant. Only one category can have "true" value.'
+        ),
+    )
+
+    def clean_fields(self, exclude=None):
+        super().clean_fields(exclude=exclude)
+
+        for flag in [
+            'default_volume_category',
+            'default_vm_category',
+            'default_tenant_category',
+        ]:
+            if getattr(self, flag):
+                category = (
+                    Category.objects.filter(**{flag: True}).exclude(id=self.id).first()
+                )
+                if category:
+                    raise ValidationError(
+                        {
+                            flag: _('%s is already %s.')
+                            % (category, flag.replace('_', ' ')),
+                        }
+                    )
 
     class Quotas(quotas_models.QuotaModelMixin.Quotas):
         offering_count = quotas_fields.QuotaField(is_backend=True)
@@ -260,6 +306,7 @@ class CategoryComponentUsage(core_mixins.ScopeMixin):
 
 
 class Offering(
+    core_models.BackendMixin,
     core_models.UuidMixin,
     core_models.NameMixin,
     core_models.DescribableMixin,
@@ -271,6 +318,7 @@ class Offering(
     LoggableMixin,
     pid_mixins.DataciteMixin,
     CoordinatesMixin,
+    structure_models.ImageModelMixin,
 ):
     class States:
         DRAFT = 1
@@ -307,6 +355,13 @@ class Offering(
         related_name='+',
         null=True,
     )
+    project = models.ForeignKey(
+        on_delete=models.CASCADE,
+        to=structure_models.Project,
+        related_name='+',
+        null=True,
+        blank=True,
+    )
     # Volume offering is linked with VPC offering via parent field
     parent = models.ForeignKey(
         on_delete=models.CASCADE, to='Offering', null=True, blank=True
@@ -337,25 +392,28 @@ class Offering(
     native_name = models.CharField(max_length=160, default='', blank=True)
     native_description = models.CharField(max_length=500, default='', blank=True)
     terms_of_service = models.TextField(blank=True)
+    terms_of_service_link = models.URLField(blank=True)
+    privacy_policy_link = models.URLField(blank=True)
 
     type = models.CharField(max_length=100)
     state = FSMIntegerField(default=States.DRAFT, choices=States.CHOICES)
     paused_reason = models.TextField(blank=True)
+    divisions = models.ManyToManyField(
+        structure_models.Division, related_name='offerings', blank=True
+    )
 
     # If offering is not shared, it is available only to following user categories:
     # 1) staff user;
     # 2) global support user;
     # 3) users with active permission in original customer;
-    # 4) users with active permission in allowed customers and nested projects.
+    # 4) users with active permission in related project.
     shared = models.BooleanField(
         default=True, help_text=_('Accessible to all customers.')
     )
-    allowed_customers = models.ManyToManyField(structure_models.Customer, blank=True)
 
     billable = models.BooleanField(
         default=True, help_text=_('Purchase and usage is invoiced.')
     )
-    backend_id = models.CharField(max_length=255, blank=True)
 
     objects = managers.OfferingManager()
     tracker = FieldTracker()
@@ -379,6 +437,10 @@ class Offering(
     def pause(self):
         pass
 
+    @transition(field=state, source=States.PAUSED, target=States.ACTIVE)
+    def unpause(self):
+        pass
+
     @transition(field=state, source='*', target=States.ARCHIVED)
     def archive(self):
         pass
@@ -394,18 +456,33 @@ class Offering(
     def get_url_name(cls):
         return 'marketplace-offering'
 
-    def get_usage_components(self):
-        components = self.components.filter(
-            billing_type=OfferingComponent.BillingTypes.USAGE
-        )
-        return {component.type: component for component in components}
+    @cached_property
+    def component_factors(self):
+        # get factor from plugin components
+        plugin_components = plugins.manager.get_components(self.type)
+        return {c.type: c.factor for c in plugin_components}
 
     @cached_property
     def is_usage_based(self):
         return self.components.filter(
             billing_type=OfferingComponent.BillingTypes.USAGE,
-            use_limit_for_billing=False,
         ).exists()
+
+    def get_limit_components(self):
+        components = self.components.filter(
+            billing_type=OfferingComponent.BillingTypes.LIMIT
+        )
+        return {component.type: component for component in components}
+
+    @cached_property
+    def is_limit_based(self):
+        if not plugins.manager.can_update_limits(self.type):
+            return False
+        if not self.components.filter(
+            billing_type=OfferingComponent.BillingTypes.LIMIT
+        ).exists():
+            return False
+        return True
 
     @property
     def is_private(self):
@@ -424,8 +501,8 @@ class Offering(
         return self.created.year
 
     def get_datacite_url(self):
-        return settings.WALDUR_MARKETPLACE['OFFERING_LINK_TEMPLATE'].format(
-            offering_uuid=self.uuid.hex
+        return core_utils.format_homeport_link(
+            'marketplace-public-offering/{offering_uuid}/', offering_uuid=self.uuid.hex
         )
 
     def can_manage_role(self, user, role=None, timestamp=False):
@@ -437,11 +514,14 @@ class Offering(
 
     def get_users(self, role=None):
         query = Q(offeringpermission__offering=self, offeringpermission__is_active=True)
-        return get_user_model().objects.filter(query).order_by('username')
+        return User.objects.filter(query).order_by('username')
 
 
 class OfferingComponent(
-    common_mixins.ProductCodeMixin, BaseComponent, core_mixins.ScopeMixin
+    common_mixins.ProductCodeMixin,
+    BaseComponent,
+    core_mixins.ScopeMixin,
+    core_models.BackendMixin,
 ):
     class Meta:
         unique_together = ('type', 'offering')
@@ -452,10 +532,16 @@ class OfferingComponent(
         USAGE = 'usage'
         ONE_TIME = 'one'
         ON_PLAN_SWITCH = 'few'
+        LIMIT = 'limit'
 
         CHOICES = (
+            # if billing type is fixed, service provider specifies exact values of amount field of plan component model
             (FIXED, 'Fixed-price'),
+            # if billing type is usage-based billing is applied when usage report is submitted
             (USAGE, 'Usage-based'),
+            # if billing type is limit, user specifies limit when resource is provisioned or updated
+            (LIMIT, 'Limit-based'),
+            # if billing type is one-time, billing is applied once on resource activation
             (ONE_TIME, 'One-time'),
             # applies fee on resource activation and every time a plan has changed, using pricing of a new plan
             (ON_PLAN_SWITCH, 'One-time on plan switch'),
@@ -487,26 +573,18 @@ class OfferingComponent(
     billing_type = models.CharField(
         choices=BillingTypes.CHOICES, default=BillingTypes.FIXED, max_length=5
     )
+    # limit_period and limit_amount fields are used if billing_type is USAGE or LIMIT
     limit_period = models.CharField(
         choices=LimitPeriods.CHOICES, blank=True, null=True, max_length=5
     )
     limit_amount = models.IntegerField(blank=True, null=True)
+    # max_value and min_value fields are used if billing_type is LIMIT
     max_value = models.IntegerField(blank=True, null=True)
     min_value = models.IntegerField(blank=True, null=True)
+    # is_boolean field allows to render checkbox in UI which set limit amount to 1
     is_boolean = models.BooleanField(default=False)
+    # default_limit field is used by UI to prefill limit values
     default_limit = models.IntegerField(blank=True, null=True)
-    disable_quotas = models.BooleanField(
-        default=False,
-        help_text=_(
-            'Do not allow user to specify quotas when offering is provisioned.'
-        ),
-    )
-    use_limit_for_billing = models.BooleanField(
-        default=False,
-        help_text=_(
-            'Charge for usage-based component is based on user-requested limit.'
-        ),
-    )
     objects = managers.MixinManager('scope')
 
     def validate_amount(self, resource, amount, date):
@@ -522,15 +600,22 @@ class OfferingComponent(
 
         if total + amount > self.limit_amount:
             raise rf_exceptions.ValidationError(
-                _('Total amount exceeds exceeds limit. Total amount: %s, limit: %s.')
+                _('Total amount exceeds limit. Total amount: %s, limit: %s.')
                 % (total + amount, self.limit_amount)
             )
+
+    @property
+    def is_builtin(self):
+        return self.type in [
+            c.type for c in plugins.manager.get_components(self.offering.type)
+        ]
 
     def __str__(self):
         return str(self.name)
 
 
 class Plan(
+    core_models.BackendMixin,
     core_models.UuidMixin,
     TimeStampedModel,
     core_models.NameMixin,
@@ -554,7 +639,6 @@ class Plan(
         default=False, help_text=_('Forbids creation of new resources.')
     )
     objects = managers.MixinManager('scope')
-    backend_id = models.CharField(max_length=255, blank=True)
     max_amount = models.PositiveSmallIntegerField(
         blank=True,
         null=True,
@@ -580,21 +664,17 @@ class Plan(
         cost = self.unit_price
 
         if limits:
-            available_limits = plugins.manager.get_available_limits(self.offering.type)
-            components = self.offering.components.filter(
-                Q(billing_type=OfferingComponent.BillingTypes.USAGE)
-                | Q(type__in=available_limits)
-            )
-            components_map = {component.type: component for component in components}
+            components_map = self.offering.get_limit_components()
             component_prices = {
                 c.component.type: c.price for c in self.components.all()
             }
-            builtin_components = plugins.manager.get_components(self.offering.type)
-            component_factors = {c.type: c.factor for c in builtin_components}
+
+            factors = self.offering.component_factors
+
             for key in components_map.keys():
                 price = component_prices.get(key, 0)
                 limit = limits.get(key, 0)
-                factor = component_factors.get(key, 1)
+                factor = factors.get(key, 1)
                 cost += Decimal(price) * limit / factor
 
         return cost
@@ -700,7 +780,7 @@ class CostEstimateMixin(models.Model):
     class Meta:
         abstract = True
 
-    # Cost estimate is computed with respect to fixed plan components and usage-based limits
+    # Cost estimate is computed with respect to limit components
     cost = models.DecimalField(max_digits=22, decimal_places=10, null=True, blank=True)
     plan = models.ForeignKey(on_delete=models.CASCADE, to=Plan, null=True, blank=True)
     limits = BetterJSONField(blank=True, default=dict)
@@ -808,7 +888,6 @@ class Order(core_models.UuidMixin, TimeStampedModel, LoggableMixin):
         max_digits=22, decimal_places=10, null=True, blank=True
     )
     tracker = FieldTracker()
-    _file = models.TextField(blank=True, editable=False)
 
     class Permissions:
         customer_path = 'project__customer'
@@ -847,7 +926,6 @@ class Order(core_models.UuidMixin, TimeStampedModel, LoggableMixin):
         pass
 
     def get_approvers(self):
-        User = get_user_model()
         users = []
 
         if settings.WALDUR_MARKETPLACE['NOTIFY_STAFF_ABOUT_APPROVALS']:
@@ -870,21 +948,6 @@ class Order(core_models.UuidMixin, TimeStampedModel, LoggableMixin):
             users = order_admins if not users else users.union(order_admins)
 
         return users and users.distinct()
-
-    @property
-    def file(self):
-        if not self._file:
-            return
-
-        content = base64.b64decode(self._file)
-        return BytesIO(content)
-
-    @file.setter
-    def file(self, value):
-        self._file = value
-
-    def has_file(self):
-        return bool(self._file)
 
     def get_filename(self):
         return 'marketplace_order_{}.pdf'.format(self.uuid)
@@ -913,6 +976,11 @@ class Order(core_models.UuidMixin, TimeStampedModel, LoggableMixin):
             'total_cost',
         )
 
+    @property
+    def type(self):
+        if self.items.count():
+            return self.items.first().get_type_display()
+
     def _get_log_context(self, entity_name):
         context = super(Order, self)._get_log_context(entity_name)
         context['order_items'] = [
@@ -930,13 +998,30 @@ class Order(core_models.UuidMixin, TimeStampedModel, LoggableMixin):
             return f'<Order {self.pk}>'
 
 
+class ResourceDetailsMixin(
+    CostEstimateMixin, core_models.NameMixin, core_models.DescribableMixin,
+):
+    class Meta:
+        abstract = True
+
+    offering = models.ForeignKey(Offering, related_name='+', on_delete=models.PROTECT)
+    attributes = BetterJSONField(blank=True, default=dict)
+    end_date = models.DateField(
+        null=True,
+        blank=True,
+        help_text=_(
+            'The date is inclusive. Once reached, a resource will be scheduled for termination.'
+        ),
+    )
+
+
 class Resource(
-    CostEstimateMixin,
+    ResourceDetailsMixin,
     core_models.UuidMixin,
+    core_models.BackendMixin,
     TimeStampedModel,
     core_mixins.ScopeMixin,
     structure_models.StructureLoggableMixin,
-    core_models.NameMixin,
 ):
     """
     Core resource is abstract model, marketplace resource is not abstract,
@@ -975,9 +1060,8 @@ class Resource(
 
     state = FSMIntegerField(default=States.CREATING, choices=States.CHOICES)
     project = models.ForeignKey(structure_models.Project, on_delete=models.CASCADE)
-    offering = models.ForeignKey(Offering, related_name='+', on_delete=models.PROTECT)
-    attributes = BetterJSONField(blank=True, default=dict)
     backend_metadata = BetterJSONField(blank=True, default=dict)
+    report = BetterJSONField(blank=True, null=True)
     current_usages = BetterJSONField(blank=True, default=dict)
     tracker = FieldTracker()
     objects = managers.MixinManager('scope')
@@ -1018,16 +1102,12 @@ class Resource(
     @property
     def backend_type(self):
         if self.scope:
-            return self.scope.get_scope_type()
-
-    @property
-    def backend_id(self):
-        if self.scope:
-            return self.scope.backend_id
+            scope_type = self.scope.get_scope_type()
+            return scope_type if scope_type else 'Marketplace.Resource'
 
     def init_quotas(self):
         if self.limits:
-            components_map = self.offering.get_usage_components()
+            components_map = self.offering.get_limit_components()
             for key, value in self.limits.items():
                 component = components_map.get(key)
                 if component:
@@ -1052,6 +1132,22 @@ class Resource(
             'backend_uuid',
             'backend_type',
         )
+
+    @property
+    def invoice_registrator_key(self):
+        return self.offering.type
+
+    @classmethod
+    def get_scope_type(cls):
+        return 'Marketplace.Resource'
+
+    @classmethod
+    def get_url_name(cls):
+        return 'marketplace-resource'
+
+    @property
+    def is_expired(self):
+        return self.end_date and self.end_date <= timezone.datetime.today().date()
 
     def __str__(self):
         if self.name:
@@ -1083,6 +1179,7 @@ class ResourcePlanPeriod(TimeStampedModel, TimeFramedModel, core_models.UuidMixi
 
 class OrderItem(
     core_models.UuidMixin,
+    core_models.BackendMixin,
     core_models.ErrorMessageMixin,
     RequestTypeMixin,
     structure_models.StructureLoggableMixin,
@@ -1105,7 +1202,7 @@ class OrderItem(
             (TERMINATING, 'terminating'),
         )
 
-        TERMINAL_STATES = {DONE, ERRED}
+        TERMINAL_STATES = {DONE, ERRED, TERMINATED}
 
     order = models.ForeignKey(on_delete=models.CASCADE, to=Order, related_name='items')
     offering = models.ForeignKey(on_delete=models.CASCADE, to=Offering)
@@ -1161,8 +1258,12 @@ class OrderItem(
         pass
 
     def clean(self):
+        if self.order.items.count() and self.order.items.first().type != self.type:
+            raise ValidationError(_('Types of items in one order must be the same'))
+
         offering = self.offering
-        customer = self.order.project.customer
+        project = self.order.project
+        customer = project.customer
 
         if offering.shared:
             return
@@ -1170,7 +1271,7 @@ class OrderItem(
         if offering.customer == customer:
             return
 
-        if offering.allowed_customers.filter(pk=customer.pk).exists():
+        if offering.project == project:
             return
 
         raise ValidationError(
@@ -1207,8 +1308,9 @@ class OrderItem(
         }
 
     def __str__(self):
-        return 'type: %s, created_by: %s' % (
+        return 'type: %s, offering: %s, created_by: %s' % (
             self.get_type_display(),
+            self.offering,
             self.order.created_by,
         )
 
@@ -1217,11 +1319,7 @@ class ComponentQuota(models.Model):
     resource = models.ForeignKey(
         on_delete=models.CASCADE, to=Resource, related_name='quotas'
     )
-    component = models.ForeignKey(
-        on_delete=models.CASCADE,
-        to=OfferingComponent,
-        limit_choices_to={'billing_type': OfferingComponent.BillingTypes.USAGE},
-    )
+    component = models.ForeignKey(on_delete=models.CASCADE, to=OfferingComponent,)
     limit = models.BigIntegerField(default=-1)
     usage = models.BigIntegerField(default=0)
 
@@ -1233,16 +1331,16 @@ class ComponentQuota(models.Model):
 
 
 class ComponentUsage(
-    TimeStampedModel, core_models.DescribableMixin, core_models.UuidMixin, LoggableMixin
+    TimeStampedModel,
+    core_models.DescribableMixin,
+    core_models.BackendMixin,
+    core_models.UuidMixin,
+    LoggableMixin,
 ):
     resource = models.ForeignKey(
         on_delete=models.CASCADE, to=Resource, related_name='usages'
     )
-    component = models.ForeignKey(
-        on_delete=models.CASCADE,
-        to=OfferingComponent,
-        limit_choices_to={'billing_type': OfferingComponent.BillingTypes.USAGE},
-    )
+    component = models.ForeignKey(on_delete=models.CASCADE, to=OfferingComponent,)
     usage = models.BigIntegerField(default=0)
     date = models.DateTimeField()
     plan_period = models.ForeignKey(
@@ -1326,3 +1424,23 @@ class OfferingPermission(core_models.UuidMixin, structure_models.BasePermission)
 
     def revoke(self):
         self.offering.remove_user(self.user)
+
+
+class OfferingUser(models.Model):
+    offering = models.ForeignKey(Offering, on_delete=models.CASCADE)
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    username = models.CharField(max_length=100, blank=True, null=True)
+    created = AutoCreatedField()
+
+    class Meta:
+        unique_together = ('offering', 'user')
+
+    def get_log_fields(self):
+        return ('offering', 'user', 'username')
+
+
+reversion.register(Screenshot)
+reversion.register(OfferingComponent)
+reversion.register(PlanComponent)
+reversion.register(Plan, follow=('components',))
+reversion.register(Offering, follow=('components', 'plans', 'screenshots'))

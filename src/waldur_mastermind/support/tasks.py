@@ -2,7 +2,6 @@ import logging
 from smtplib import SMTPException
 
 from celery import shared_task
-from celery.task import Task as CeleryTask
 from django.conf import settings
 from django.core import signing
 from django.core.mail import send_mail
@@ -12,11 +11,13 @@ from django.template.loader import get_template
 from waldur_core.core import utils as core_utils
 
 from . import backend, models
+from .utils import get_feedback_link
 
 logger = logging.getLogger(__name__)
 
 
-class SupportUserPullTask(CeleryTask):
+@shared_task(name='waldur_mastermind.support.pull_support_users')
+def pull_support_users():
     """
     Pull support users from backend.
     Note that support users are not deleted in JIRA.
@@ -24,26 +25,23 @@ class SupportUserPullTask(CeleryTask):
     Therefore, Waldur replicates the same behaviour.
     """
 
-    name = 'support.SupportUserPullTask'
+    if not settings.WALDUR_SUPPORT['ENABLED']:
+        return
 
-    def run(self):
-        if not settings.WALDUR_SUPPORT['ENABLED']:
-            return
-
-        backend_users = backend.get_active_backend().get_users()
-        for backend_user in backend_users:
-            user, created = models.SupportUser.objects.get_or_create(
-                backend_id=backend_user.backend_id, defaults={'name': backend_user.name}
-            )
-            if not created and user.name != backend_user.name:
-                user.name = backend_user.name
-                user.save()
-            if not user.is_active:
-                user.is_active = True
-                user.save()
-        models.SupportUser.objects.exclude(
-            backend_id__in=[u.backend_id for u in backend_users]
-        ).update(is_active=False)
+    backend_users = backend.get_active_backend().get_users()
+    for backend_user in backend_users:
+        user, created = models.SupportUser.objects.get_or_create(
+            backend_id=backend_user.backend_id, defaults={'name': backend_user.name}
+        )
+        if not created and user.name != backend_user.name:
+            user.name = backend_user.name
+            user.save()
+        if not user.is_active:
+            user.is_active = True
+            user.save()
+    models.SupportUser.objects.exclude(
+        backend_id__in=[u.backend_id for u in backend_users]
+    ).update(is_active=False)
 
 
 @shared_task(name='waldur_mastermind.support.pull_priorities')
@@ -68,10 +66,10 @@ def create_issue(serialized_issue):
 
 
 @shared_task(name='waldur_mastermind.support.create_confirmation_comment')
-def create_confirmation_comment(serialized_issue):
+def create_confirmation_comment(serialized_issue, comment_tmpl=''):
     issue = core_utils.deserialize_instance(serialized_issue)
     try:
-        backend.get_active_backend().create_confirmation_comment(issue)
+        backend.get_active_backend().create_confirmation_comment(issue, comment_tmpl)
     except Exception as e:
         issue.error_message = str(e)
         issue.save(update_fields=['error_message'])
@@ -134,7 +132,9 @@ def _send_email(
         receiver = issue.caller
 
     context = {
-        'issue_url': settings.ISSUE_LINK_TEMPLATE.format(uuid=issue.uuid),
+        'issue_url': core_utils.format_homeport_link(
+            'support/issue/{uuid}/', uuid=issue.uuid
+        ),
         'site_name': settings.WALDUR_CORE['SITE_NAME'],
         'issue': issue,
     }
@@ -196,16 +196,9 @@ def send_issue_feedback_notification(serialized_issue):
     signer = signing.TimestampSigner()
     token = signer.sign(issue.uuid.hex)
     extra_context = {
-        'feedback_link': settings.ISSUE_FEEDBACK_LINK_TEMPLATE.format(
-            token=token, evaluation=''
-        ),
+        'feedback_link': get_feedback_link(token),
         'feedback_links': [
-            {
-                'label': value,
-                'link': settings.ISSUE_FEEDBACK_LINK_TEMPLATE.format(
-                    token=token, evaluation=key
-                ),
-            }
+            {'label': value, 'link': get_feedback_link(token, key),}
             for (key, value) in models.Feedback.Evaluation.CHOICES
         ],
     }

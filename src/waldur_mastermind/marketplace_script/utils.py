@@ -36,7 +36,7 @@ def execute_script(image, command, src, **kwargs):
 class DockerExecutorMixin:
     hook_type = NotImplemented
 
-    def send_request(self, user):
+    def send_request(self, user, resource=None):
         options = self.order_item.offering.secret_options
 
         serializer = serializers.OrderItemSerializer(instance=self.order_item)
@@ -47,7 +47,7 @@ class DockerExecutorMixin:
             key.upper(): str(input_parameters[key]) for key in input_parameters.keys()
         }
         # update environment with offering-specific parameters
-        for opt in options.get('environ'):
+        for opt in options.get('environ', []):
             if isinstance(opt, dict):
                 environment.update({opt['name']: opt['value']})
 
@@ -61,11 +61,14 @@ class DockerExecutorMixin:
         )
 
         try:
-            self.order_item.output = execute_script(
-                image=image,
-                command=language,
-                src=options[self.hook_type],
-                environment=environment,
+            self.order_item.output = str(
+                execute_script(
+                    image=image,
+                    command=language,
+                    src=options[self.hook_type],
+                    environment=environment,
+                ),
+                'utf-8',
             )
             self.order_item.save(update_fields=['output'])
         except DockerException as exc:

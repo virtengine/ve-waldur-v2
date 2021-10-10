@@ -8,17 +8,6 @@ from waldur_openstack.openstack_tenant.utils import get_valid_availability_zones
 from . import models
 
 
-class OpenStackTenantServiceProjectLinkFilter(
-    structure_filters.BaseServiceProjectLinkFilter
-):
-    service = core_filters.URLFilter(
-        view_name='openstacktenant-detail', field_name='service__uuid'
-    )
-
-    class Meta(structure_filters.BaseServiceProjectLinkFilter.Meta):
-        model = models.OpenStackTenantServiceProjectLink
-
-
 class FlavorFilter(structure_filters.ServicePropertySettingsFilter):
 
     name_iregex = django_filters.CharFilter(field_name='name', lookup_expr='iregex')
@@ -93,6 +82,35 @@ class VolumeFilter(structure_filters.BaseResourceFilter):
         field_name='availability_zone__name'
     )
 
+    attach_instance_uuid = django_filters.UUIDFilter(method='filter_attach_instance')
+
+    def filter_attach_instance(self, queryset, name, value):
+        """
+        This filter is used by volume attachment dialog for instance.
+        It allows to filter out volumes that could be attached to the given instance.
+        """
+        try:
+            instance = models.Instance.objects.get(uuid=value)
+        except models.Volume.DoesNotExist:
+            return queryset.none()
+
+        queryset = queryset.filter(
+            service_settings=instance.service_settings, project=instance.project,
+        ).exclude(instance=instance)
+
+        zones_map = get_valid_availability_zones(instance)
+        if instance.availability_zone and zones_map:
+            zone_names = {
+                nova_zone
+                for (nova_zone, cinder_zone) in zones_map.items()
+                if cinder_zone == instance.availability_zone.name
+            }
+            nova_zones = models.InstanceAvailabilityZone.objects.filter(
+                settings=instance.service_settings, name__in=zone_names, available=True,
+            )
+            queryset = queryset.filter(availability_zone__in=nova_zones)
+        return queryset
+
     class Meta(structure_filters.BaseResourceFilter.Meta):
         model = models.Volume
         fields = structure_filters.BaseResourceFilter.Meta.fields + ('runtime_state',)
@@ -147,7 +165,7 @@ class InstanceFilter(structure_filters.BaseResourceFilter):
 
     def filter_attach_volume(self, queryset, name, value):
         """
-        This filter is used for in volume attachment dialog.
+        This filter is used by volume attachment dialog.
         It allows to filter out instances that could be attached to the given volume.
         """
         try:
@@ -155,7 +173,9 @@ class InstanceFilter(structure_filters.BaseResourceFilter):
         except models.Volume.DoesNotExist:
             return queryset.none()
 
-        queryset = queryset.filter(service_project_link=volume.service_project_link)
+        queryset = queryset.filter(
+            service_settings=volume.service_settings, project=volume.project
+        )
 
         zones_map = get_valid_availability_zones(volume)
         if volume.availability_zone and zones_map:
@@ -165,9 +185,7 @@ class InstanceFilter(structure_filters.BaseResourceFilter):
                 if cinder_zone == volume.availability_zone.name
             }
             nova_zones = models.InstanceAvailabilityZone.objects.filter(
-                settings=volume.service_project_link.service.settings,
-                name__in=zone_names,
-                available=True,
+                settings=volume.service_settings, name__in=zone_names, available=True,
             )
             queryset = queryset.filter(availability_zone__in=nova_zones)
         return queryset
@@ -180,7 +198,7 @@ class InstanceFilter(structure_filters.BaseResourceFilter):
         )
 
     ORDERING_FIELDS = structure_filters.BaseResourceFilter.ORDERING_FIELDS + (
-        ('internal_ips_set__ip4_address', 'internal_ips'),
+        ('internal_ips_set__fixed_ips__0__ip_address', 'ip_address'),
         ('internal_ips_set__floating_ips__address', 'external_ips'),
     )
 

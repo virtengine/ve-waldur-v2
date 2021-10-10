@@ -3,20 +3,18 @@ import os
 import tempfile
 from calendar import timegm
 from datetime import datetime
-from urllib.parse import urlparse
 
 import jwt
+import magic
 from django.apps import apps
 from django.conf import settings
 from django.http import HttpResponse
 from rest_framework.exceptions import ValidationError
 from rest_framework.generics import get_object_or_404
-from rest_framework.request import Request
 from rest_framework.reverse import reverse
 
 from waldur_core.core import utils
 from waldur_core.core.models import User
-from waldur_core.media import magic
 from waldur_core.structure.managers import filter_queryset_for_user
 
 
@@ -31,7 +29,7 @@ def encode_attachment_token(user_uuid, obj, field):
         'field': field,
         'exp': expires_at,
     }
-    return str(utils.encode_jwt_token(payload), 'utf-8')
+    return utils.encode_jwt_token(payload)
 
 
 def decode_attachment_token(token):
@@ -78,14 +76,6 @@ def encode_protected_url(obj, field, request=None, user_uuid=None):
     return reverse('media-download', request=request, kwargs={'token': token})
 
 
-def s3_to_waldur_media_url(url: str, request: Request):
-    s3_url = urlparse(url)
-    current_netloc = urlparse(request.build_absolute_uri()).netloc
-    media_netloc = f"{current_netloc}/media"
-    waldur_media_url = s3_url._replace(netloc=media_netloc).geturl()
-    return waldur_media_url
-
-
 def get_file_from_token(token):
     user_uuid, content_type, object_uuid, field = decode_attachment_token(token)
     user = get_object_or_404(User, uuid=user_uuid)
@@ -101,7 +91,7 @@ def get_file_from_token(token):
 
 
 def send_file(file):
-    _, file_name = os.path.split(file.path)
+    _, file_name = os.path.split(file.name)
     response = HttpResponse()
     response['Content-Disposition'] = 'attachment; filename=' + file_name
     response['X-Accel-Redirect'] = file.url

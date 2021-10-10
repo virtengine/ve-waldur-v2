@@ -3,12 +3,13 @@ from django.contrib import admin
 from django.core.exceptions import ValidationError
 from django.forms.models import ModelForm
 from django.http import HttpResponse
-from django.shortcuts import redirect
 from django.urls import resolve, reverse
 from django.utils.html import format_html
 from django.utils.translation import ugettext_lazy as _
 from django.utils.translation import ungettext
 from modeltranslation import admin as modeltranslation_admin
+from rest_framework.reverse import reverse as rest_reverse
+from reversion.admin import VersionAdmin
 
 from waldur_core.core import admin as core_admin
 from waldur_core.core import utils as core_utils
@@ -24,14 +25,14 @@ from waldur_core.structure.models import (
     ServiceSettings,
     SharedServiceSettings,
 )
-from waldur_mastermind.google.models import GoogleCredentials
+from waldur_mastermind.google.models import GoogleCalendar, GoogleCredentials
 from waldur_mastermind.marketplace_openstack import (
     executors as marketplace_openstack_executors,
 )
 from waldur_pid import tasks as pid_tasks
 from waldur_pid import utils as pid_utils
 
-from . import executors, models, tasks
+from . import executors, models, utils
 
 
 class GoogleCredentialsAdminForm(ModelForm):
@@ -114,6 +115,12 @@ class ScreenshotsInline(admin.StackedInline):
     extra = 1
 
 
+class DivisionsInline(admin.StackedInline):
+    model = models.Offering.divisions.through
+    classes = ['collapse']
+    extra = 1
+
+
 class PlansInline(admin.StackedInline):
     model = models.Plan
     classes = ['collapse']
@@ -122,7 +129,6 @@ class PlansInline(admin.StackedInline):
         'description',
         'unit_price',
         'unit',
-        'product_code',
         'article_code',
         'archived',
         'max_amount',
@@ -188,19 +194,18 @@ class PlanComponentInline(
             return super(PlanComponentInline, self).get_extra(request, obj, **kwargs)
 
 
-class PlanAdmin(ConnectedResourceMixin, admin.ModelAdmin):
+class PlanAdmin(ConnectedResourceMixin, VersionAdmin, admin.ModelAdmin):
     list_display = ('name', 'offering', 'archived', 'unit', 'unit_price')
     list_filter = ('offering', 'archived')
     search_fields = ('name', 'offering__name')
     inlines = [PlanComponentInline]
-    protected_fields = ('unit', 'unit_price', 'product_code', 'article_code')
+    protected_fields = ('unit', 'unit_price', 'article_code')
     readonly_fields = ('scope_link', 'backend_id')
     fields = (
         'name',
         'description',
         'unit',
         'unit_price',
-        'product_code',
         'article_code',
         'max_amount',
         'archived',
@@ -229,6 +234,11 @@ class OfferingComponentInline(admin.StackedInline):
     extra = 1
 
 
+class GoogleCalendarInline(admin.StackedInline):
+    model = GoogleCalendar
+    classes = ['collapse']
+
+
 def get_admin_url_for_scope(scope):
     if isinstance(scope, ServiceSettings):
         model = scope.shared and SharedServiceSettings or PrivateServiceSettings
@@ -244,9 +254,35 @@ def get_admin_link_for_scope(scope):
     return format_html('<a href="{}">{}</a>', get_admin_url_for_scope(scope), scope)
 
 
-class OfferingAdmin(admin.ModelAdmin):
+class OfferingPermissionInline(admin.TabularInline):
+    model = models.OfferingPermission
+    fields = ('user', 'is_active', 'created_by')
+    readonly_fields = ('created_by',)
+    ordering = (
+        '-user__first_name',
+        '-user__last_name',
+    )
+    extra = 1
+
+
+class OfferingUserInline(admin.TabularInline):
+    model = models.OfferingUser
+    fields = ('user', 'username', 'created')
+    readonly_fields = ('created',)
+    extra = 1
+
+
+class OfferingAdmin(VersionAdmin, admin.ModelAdmin):
     form = OfferingAdminForm
-    inlines = [ScreenshotsInline, PlansInline, OfferingComponentInline]
+    inlines = [
+        OfferingPermissionInline,
+        ScreenshotsInline,
+        PlansInline,
+        OfferingComponentInline,
+        GoogleCalendarInline,
+        OfferingUserInline,
+        DivisionsInline,
+    ]
     list_display = ('name', 'uuid', 'customer', 'state', 'category', 'billable')
     list_filter = (
         'state',
@@ -272,7 +308,6 @@ class OfferingAdmin(admin.ModelAdmin):
         'secret_options',
         'shared',
         'billable',
-        'allowed_customers',
         'type',
         'scope_link',
         'vendor_details',
@@ -281,6 +316,7 @@ class OfferingAdmin(admin.ModelAdmin):
         'citation_count',
         'latitude',
         'longitude',
+        'image',
     )
     readonly_fields = (
         'rating',
@@ -401,12 +437,10 @@ class OfferingAdmin(admin.ModelAdmin):
 class OrderItemInline(admin.TabularInline):
     model = models.OrderItem
     fields = ('offering', 'state', 'attributes', 'cost', 'plan', 'resource')
-    readonly_fields = fields
+    readonly_fields = ('offering', 'attributes', 'cost', 'plan', 'resource')
 
 
-class OrderAdmin(
-    core_admin.ReadOnlyAdminMixin, core_admin.ExtraActionsMixin, admin.ModelAdmin
-):
+class OrderAdmin(core_admin.ExtraActionsMixin, admin.ModelAdmin):
     list_display = ('uuid', 'project', 'created', 'created_by', 'state', 'total_cost')
     fields = [
         'created_by',
@@ -436,9 +470,7 @@ class OrderAdmin(
     inlines = [OrderItemInline]
 
     def get_extra_actions(self):
-        return [
-            self.create_pdf_for_all,
-        ]
+        return []
 
     def get_urls(self):
         my_urls = [
@@ -449,15 +481,11 @@ class OrderAdmin(
         ]
         return my_urls + super(OrderAdmin, self).get_urls()
 
-    def create_pdf_for_all(self, request):
-        tasks.create_pdf_for_all.delay()
-        message = _('PDF creation has been scheduled')
-        self.message_user(request, message)
-        return redirect(reverse('admin:marketplace_order_changelist'))
-
     def pdf_file_view(self, request, pk=None):
         order = models.Order.objects.get(id=pk)
-        file_response = HttpResponse(order.file, content_type='application/pdf')
+
+        file = utils.create_order_pdf(order)
+        file_response = HttpResponse(file, content_type='application/pdf')
         filename = order.get_filename()
         file_response[
             'Content-Disposition'
@@ -465,12 +493,9 @@ class OrderAdmin(
         return file_response
 
     def pdf_file(self, obj):
-        if not obj.file:
-            return ''
+        pdf_ref = rest_reverse('marketplace-order-pdf', kwargs={'uuid': obj.uuid.hex},)
 
-        return format_html('<a href="./pdf_file">download</a>')
-
-    create_pdf_for_all.name = _('Create PDF for all orders')
+        return format_html('<a href="%s">download</a>' % pdf_ref)
 
 
 class ResourceForm(ModelForm):
@@ -512,7 +537,6 @@ class ResourceAdmin(admin.ModelAdmin):
         SharedOfferingFilter,
     )
     readonly_fields = (
-        'state',
         'scope_link',
         'project_link',
         'offering_link',
@@ -521,7 +545,7 @@ class ResourceAdmin(admin.ModelAdmin):
         'formatted_attributes',
         'formatted_limits',
     )
-    fields = readonly_fields + ('plan',)
+    fields = readonly_fields + ('plan', 'state')
     date_hierarchy = 'created'
     search_fields = ('name', 'uuid')
 

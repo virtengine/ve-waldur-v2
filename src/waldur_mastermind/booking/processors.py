@@ -4,16 +4,20 @@ from django.utils.dateparse import datetime_re, parse_datetime
 from django.utils.translation import ugettext_lazy as _
 from rest_framework.serializers import ValidationError
 
-from waldur_mastermind.booking.utils import get_offering_bookings
+from waldur_mastermind.booking.utils import (
+    get_offering_bookings,
+    get_other_offering_booking_requests,
+)
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import processors
 
-from .utils import TimePeriod, is_interval_in_schedules
+from .utils import TimePeriod, is_interval_in_schedules, sort_attributes_schedules
 
 
 class BookingCreateProcessor(processors.BaseOrderItemProcessor):
     def process_order_item(self, user):
         with transaction.atomic():
+            sort_attributes_schedules(self.order_item.attributes)
             resource = marketplace_models.Resource(
                 project=self.order_item.order.project,
                 offering=self.order_item.offering,
@@ -99,6 +103,19 @@ class BookingCreateProcessor(processors.BaseOrderItemProcessor):
                     % (period['start'], period['end'])
                 )
 
+        # Check that there are no other booking requests.
+        booking_requests = get_other_offering_booking_requests(self.order_item)
+        for period in schedules:
+            if is_interval_in_schedules(
+                TimePeriod(period['start'], period['end']), booking_requests
+            ):
+                raise ValidationError(
+                    _(
+                        'Time period from %s to %s is not available. Other booking request exists.'
+                    )
+                    % (period['start'], period['end'])
+                )
 
-class BookingDeleteProcessor(processors.DeleteResourceProcessor):
+
+class BookingDeleteProcessor(processors.DeleteScopedResourceProcessor):
     pass

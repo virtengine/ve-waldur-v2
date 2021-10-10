@@ -2,7 +2,8 @@
 set -e
 
 echo "[+] Install dependencies in case of absence"
-poetry install
+pip3 install poetry==1.1.6
+poetry install -vvv
 
 echo "[+] Setup test settings"
 cat > src/waldur_mastermind/test_settings.py <<-EOF
@@ -31,5 +32,10 @@ pytest \
     --test-group=$CI_NODE_INDEX \
     --test-group-random-seed=12345 \
     --reuse-db \
+    --junitxml=report.xml \
+    --cov=src/ \
     --ds=waldur_mastermind.test_settings \
     src
+
+# Check default configuration
+DJANGO_SETTINGS_MODULE=waldur_mastermind.test_settings waldur print_settings > /dev/null

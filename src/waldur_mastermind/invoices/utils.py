@@ -99,7 +99,7 @@ def filter_invoice_items(items):
 
 
 def create_invoice_pdf(invoice):
-    all_items = filter_invoice_items(invoice.items)
+    all_items = filter_invoice_items(invoice.items.all())
     logo_path = settings.WALDUR_CORE['SITE_LOGO']
     if logo_path:
         with open(logo_path, 'rb') as image_file:
@@ -116,8 +116,7 @@ def create_invoice_pdf(invoice):
     )
     html = render_to_string('invoices/invoice.html', context)
     pdf = pdfkit.from_string(html, False)
-    invoice.file = str(base64.b64encode(pdf), 'utf-8')
-    invoice.save()
+    return pdf
 
 
 def get_price_per_day(price, unit):

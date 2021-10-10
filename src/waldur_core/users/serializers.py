@@ -17,6 +17,8 @@ class InvitationSerializer(serializers.HyperlinkedModelSerializer):
         allow_null=True,
     )
     project_name = serializers.ReadOnlyField(source='project.name')
+    created_by_full_name = serializers.ReadOnlyField(source='created_by.full_name')
+    created_by_username = serializers.ReadOnlyField(source='created_by.username')
     customer = serializers.HyperlinkedRelatedField(
         view_name='customer-detail',
         lookup_field='uuid',
@@ -41,7 +43,6 @@ class InvitationSerializer(serializers.HyperlinkedModelSerializer):
         fields = (
             'url',
             'uuid',
-            'link_template',
             'email',
             'civil_number',
             'project',
@@ -54,6 +55,8 @@ class InvitationSerializer(serializers.HyperlinkedModelSerializer):
             'error_message',
             'created',
             'expires',
+            'created_by_full_name',
+            'created_by_username',
         ) + detail_fields
         read_only_fields = (
             'url',
@@ -70,12 +73,6 @@ class InvitationSerializer(serializers.HyperlinkedModelSerializer):
         }
 
     def validate(self, attrs):
-        link_template = attrs['link_template']
-        if '{uuid}' not in link_template:
-            raise serializers.ValidationError(
-                {'link_template': _("Link template must include '{uuid}' parameter.")}
-            )
-
         project = attrs.get('project')
         customer = attrs.get('customer')
 
@@ -107,3 +104,22 @@ class InvitationSerializer(serializers.HyperlinkedModelSerializer):
         if project:
             validated_data['customer'] = project.customer
         return super(InvitationSerializer, self).create(validated_data)
+
+
+class PendingInvitationDetailsSerializer(serializers.ModelSerializer):
+    project_name = serializers.ReadOnlyField(source='project.name')
+    customer_name = serializers.ReadOnlyField(source='customer.name')
+    created_by_full_name = serializers.ReadOnlyField(source='created_by.full_name')
+    created_by_username = serializers.ReadOnlyField(source='created_by.username')
+
+    class Meta:
+        model = models.Invitation
+        fields = (
+            'email',
+            'project_name',
+            'project_role',
+            'customer_name',
+            'customer_role',
+            'created_by_full_name',
+            'created_by_username',
+        )

@@ -1,17 +1,23 @@
 from unittest import mock
 
 from ddt import data, ddt
+from freezegun import freeze_time
 from rest_framework import status, test
 
 from waldur_core.core import utils as core_utils
+from waldur_core.logging import models as logging_models
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.tests import fixtures
-from waldur_core.structure.tests.factories import UserFactory
+from waldur_core.structure.tests.factories import ProjectFactory, UserFactory
+from waldur_mastermind.common.utils import parse_date
+from waldur_mastermind.invoices import models as invoices_models
+from waldur_mastermind.invoices.tests import factories as invoices_factories
+from waldur_mastermind.marketplace import callbacks, log, models, plugins, tasks, utils
+from waldur_mastermind.marketplace.tests import factories
+from waldur_mastermind.marketplace.tests import utils as test_utils
+from waldur_mastermind.marketplace.tests.fixtures import MarketplaceFixture
 from waldur_mastermind.support.tests.base import override_support_settings
-
-from .. import callbacks, log, models, plugins, tasks, utils
-from . import factories
-from . import utils as test_utils
+from waldur_openstack.openstack.tests import factories as openstack_factories
 
 
 class ResourceGetTest(test.APITransactionTestCase):
@@ -60,6 +66,37 @@ class ResourceGetTest(test.APITransactionTestCase):
     def test_other_user_can_not_get_resource_data(self):
         response = self.get_resource(UserFactory())
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_filter_resources_for_service_manager(self):
+        # Arrange
+        offering = factories.OfferingFactory(customer=self.fixture.customer)
+        offering.add_user(self.fixture.user)
+        resource = factories.ResourceFactory(project=self.project, offering=offering)
+
+        # Act
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.ResourceFactory.get_list_url()
+        response = self.client.get(
+            url, {'service_manager_uuid': self.fixture.user.uuid.hex}
+        )
+
+        # Assert
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['uuid'], resource.uuid.hex)
+
+    def test_resource_contains_project_and_customer_data_after_project_deletion(self):
+        expected_data = {
+            'project_name': self.project.name,
+            'project_uuid': self.project.uuid,
+            'project_description': self.project.description,
+            'customer_name': self.project.customer.name,
+            'customer_uuid': self.project.customer.uuid,
+        }
+
+        self.project.delete()
+        response_data = self.get_resource().data
+        for key, value in expected_data.items():
+            self.assertEqual(value, response_data[key])
 
 
 class ResourceSwitchPlanTest(test.APITransactionTestCase):
@@ -343,6 +380,12 @@ class ResourceTerminateTest(test.APITransactionTestCase):
         item = order.items.first()
         self.assertTrue(item.attributes.get('param'))
 
+    def test_user_can_terminate_resource_if_project_has_been_soft_deleted(self):
+        self.project.is_removed = True
+        self.project.save()
+        response = self.terminate(self.fixture.staff)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
 
 class PlanUsageTest(test.APITransactionTestCase):
     def setUp(self):
@@ -580,12 +623,192 @@ class ResourceNotificationTest(test.APITransactionTestCase):
             mock_tasks.notify_about_resource_change.delay.assert_not_called()
 
 
+class ResourceUpdateTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.url = factories.ResourceFactory.get_url(self.resource)
+
+    def make_request(self, user, payload=None):
+        self.client.force_authenticate(user)
+        payload = payload or {'name': 'new name', 'description': 'new description'}
+        return self.client.patch(self.url, payload)
+
+    def test_authorized_user_can_update_resource(self):
+        response = self.make_request(self.fixture.staff)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.name, 'new name')
+        self.assertEqual(self.resource.description, 'new description')
+
+    def test_unauthorized_user_can_not_update_resource(self):
+        response = self.make_request(self.fixture.user)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_renaming_of_resource_should_generate_audit_log(self):
+        old_name = self.resource.name
+        response = self.make_request(self.fixture.staff)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertTrue(
+            logging_models.Event.objects.filter(
+                message='Marketplace resource %s has been renamed. Old name: %s.'
+                % (self.resource.name, old_name)
+            ).exists()
+        )
+
+    def test_authorized_user_can_update_end_date(self):
+        with freeze_time('2020-01-01'):
+            response = self.make_request(self.fixture.staff, {'end_date': '2021-01-01'})
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.resource.refresh_from_db()
+            self.assertTrue(self.resource.end_date)
+
+    def test_authorized_user_can_set_current_past_date(self):
+        with freeze_time('2020-01-01'):
+            response = self.make_request(self.fixture.staff, {'end_date': '2020-01-01'})
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.resource.refresh_from_db()
+            self.assertTrue(self.resource.end_date)
+
+    def test_user_cannot_set_past_date(self):
+        with freeze_time('2022-01-01'):
+            response = self.make_request(self.fixture.staff, {'end_date': '2020-01-01'})
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_update_end_date_should_generate_audit_log(self):
+        with freeze_time('2020-01-01'):
+            response = self.make_request(self.fixture.staff, {'end_date': '2021-01-01'})
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.resource.refresh_from_db()
+            self.assertTrue(
+                logging_models.Event.objects.filter(
+                    message='End date of marketplace resource %s has been updated. End date: %s. User: %s.'
+                    % (self.resource.name, self.resource.end_date, self.fixture.staff)
+                ).exists()
+            )
+
+
+class ResourceSetEndDateByProviderTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.url = factories.ResourceFactory.get_url(
+            self.resource, 'set_end_date_by_provider'
+        )
+
+    def make_request(self, user, payload):
+        self.client.force_authenticate(user)
+        return self.client.post(self.url, payload)
+
+    @freeze_time('2020-01-01')
+    def test_resource_is_not_used_for_last_3_months_and_end_date_is_7_days_in_future(
+        self,
+    ):
+        self.resource.state = models.Resource.States.OK
+        self.resource.save()
+        with freeze_time('2020-05-01'):
+            response = self.make_request(
+                self.fixture.offering_owner, {'end_date': '2020-05-08'}
+            )
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.resource.refresh_from_db()
+            self.assertEqual(self.resource.end_date, parse_date('2020-05-08'))
+
+            self.assertTrue(
+                logging_models.Event.objects.filter(
+                    message__contains='End date of marketplace resource %s has been updated by provider.'
+                    % self.resource.name
+                ).exists()
+            )
+
+    @freeze_time('2020-01-01')
+    def test_resource_is_not_used_for_last_3_months_and_end_date_is_not_7_days_in_future(
+        self,
+    ):
+        self.resource.state = models.Resource.States.OK
+        self.resource.save()
+        with freeze_time('2020-05-01'):
+            response = self.make_request(
+                self.fixture.offering_owner, {'end_date': '2020-05-05'}
+            )
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @freeze_time('2020-01-01')
+    def test_resource_is_used_for_last_3_months_and_end_date_is_not_7_days_in_future(
+        self,
+    ):
+        self.resource.state = models.Resource.States.OK
+        self.resource.save()
+        response = self.make_request(
+            self.fixture.offering_owner, {'end_date': '2020-01-05'}
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @freeze_time('2020-01-01')
+    def test_resource_is_used_for_last_3_months_and_end_date_is_more_than_7_days_in_future(
+        self,
+    ):
+        self.resource.state = models.Resource.States.OK
+        self.resource.save()
+        response = self.make_request(
+            self.fixture.offering_owner, {'end_date': '2020-01-10'}
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+@ddt
+class ResourceSetEndDateByStaffTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.url = factories.ResourceFactory.get_url(
+            self.resource, 'set_end_date_by_staff'
+        )
+
+    def make_request(self, user, payload):
+        self.client.force_authenticate(user)
+        return self.client.post(self.url, payload)
+
+    @freeze_time('2020-01-01')
+    @data('staff',)
+    def test_user_can_set_end_date(self, user):
+        self.resource.state = models.Resource.States.OK
+        self.resource.save()
+        with freeze_time('2020-05-01'):
+            response = self.make_request(
+                getattr(self.fixture, user), {'end_date': '2020-05-08'}
+            )
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.resource.refresh_from_db()
+            self.assertEqual(self.resource.end_date, parse_date('2020-05-08'))
+
+            self.assertTrue(
+                logging_models.Event.objects.filter(
+                    message__contains='End date of marketplace resource %s has been updated by staff.'
+                    % self.resource.name
+                ).exists()
+            )
+
+    @freeze_time('2020-01-01')
+    @data('offering_owner', 'service_manager')
+    def test_user_cannot_set_end_date(self, user):
+        self.resource.state = models.Resource.States.OK
+        self.resource.save()
+        with freeze_time('2020-05-01'):
+            response = self.make_request(
+                getattr(self.fixture, user), {'end_date': '2020-05-08'}
+            )
+            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
 class ResourceUpdateLimitsTest(test.APITransactionTestCase):
     def setUp(self):
         plugins.manager.register(
             offering_type='TEST_TYPE',
             create_resource_processor=test_utils.TestCreateProcessor,
-            update_resource_processor=test_utils.TestUpdateProcessor,
+            update_resource_processor=test_utils.TestUpdateScopedProcessor,
+            can_update_limits=True,
         )
 
         self.fixture = fixtures.ServiceFixture()
@@ -706,3 +929,216 @@ class ResourceUpdateLimitsTest(test.APITransactionTestCase):
         utils.process_order_item(order_item, self.fixture.staff)
         self.resource.refresh_from_db()
         self.assertEqual(self.resource.limits['vcpu'], 10)
+
+
+class ResourceMoveTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.tenant = openstack_factories.TenantFactory()
+        self.fixture = fixtures.ProjectFixture()
+        self.new_project = ProjectFactory()
+        self.project = self.fixture.project
+
+        self.resource = factories.ResourceFactory(project=self.project)
+        self.resource.scope = self.tenant
+        self.resource.save()
+
+        self.url = factories.ResourceFactory.get_url(
+            self.resource, action='move_resource'
+        )
+
+    def get_response(self, role):
+        self.client.force_authenticate(role)
+        payload = {'project': {'url': ProjectFactory.get_url(self.new_project)}}
+        return self.client.post(self.url, payload)
+
+    def test_move_resource_rest(self):
+        response = self.get_response(self.fixture.staff)
+
+        self.resource.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.resource.project, self.new_project)
+
+    def test_move_resource_is_not_possible_for_project_owner(self):
+        response = self.get_response(self.fixture.owner)
+
+        self.resource.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.resource.project, self.project)
+
+    def test_move_resource_is_not_possible_when_new_customer_is_blocked(self):
+        new_customer = self.new_project.customer
+        new_customer.blocked = True
+        new_customer.save()
+
+        response = self.get_response(self.fixture.staff)
+
+        self.resource.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.resource.project, self.project)
+
+    def test_move_resource_exception_handling(self):
+        start_invoice = invoices_factories.InvoiceFactory(
+            customer=self.project.customer,
+            year=2020,
+            month=1,
+            state=invoices_models.Invoice.States.PENDING,
+        )
+        invoices_factories.InvoiceItemFactory(
+            invoice=start_invoice, project=self.project, resource=self.resource,
+        )
+
+        invoices_factories.InvoiceFactory(
+            customer=self.new_project.customer,
+            year=2020,
+            month=1,
+            state=invoices_models.Invoice.States.CREATED,
+        )
+
+        response = self.get_response(self.fixture.staff)
+
+        self.resource.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(
+            response.json(),
+            {
+                'error_message': 'Resource moving is not possible, because invoice items moving is not possible.'
+            },
+        )
+        self.assertEqual(self.resource.project, self.project)
+
+
+@ddt
+class ResourceBackendIDTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.project = self.fixture.project
+        self.resource = factories.ResourceFactory(project=self.project)
+        self.url = factories.ResourceFactory.get_url(
+            self.resource, action='set_backend_id'
+        )
+
+        service_manager = UserFactory()
+        self.resource.offering.customer.add_user(
+            service_manager, role=structure_models.CustomerRole.SERVICE_MANAGER
+        )
+        setattr(self.fixture, 'service_manager', service_manager)
+
+    def make_request(self, role):
+        self.client.force_authenticate(role)
+        payload = {'backend_id': 'new_backend_id'}
+        return self.client.post(self.url, payload)
+
+    @data('staff', 'owner', 'service_manager')
+    def test_user_can_set_backend_id_of_resource(self, user):
+        response = self.make_request(getattr(self.fixture, user))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.backend_id, 'new_backend_id')
+
+    def test_admin_can_not_set_backend_id_of_resource(self):
+        response = self.make_request(self.fixture.admin)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+@ddt
+class ResourceReportTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.project = self.fixture.project
+        self.resource = factories.ResourceFactory(project=self.project)
+        self.url = factories.ResourceFactory.get_url(
+            self.resource, action='submit_report'
+        )
+        self.valid_report = [{'header': 'Section header', 'body': 'Section body'}]
+
+        service_manager = UserFactory()
+        self.resource.offering.customer.add_user(
+            service_manager, role=structure_models.CustomerRole.SERVICE_MANAGER
+        )
+        setattr(self.fixture, 'service_manager', service_manager)
+
+        service_owner = UserFactory()
+        self.resource.offering.customer.add_user(
+            service_owner, role=structure_models.CustomerRole.OWNER
+        )
+        setattr(self.fixture, 'service_owner', service_manager)
+
+    def make_request(self, role, payload):
+        self.client.force_authenticate(role)
+        return self.client.post(self.url, {'report': payload})
+
+    @data('staff', 'service_owner', 'service_manager')
+    def test_user_can_submit_report(self, user):
+        response = self.make_request(getattr(self.fixture, user), self.valid_report)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.report, self.valid_report)
+
+    def test_admin_can_not_submit_report(self):
+        response = self.make_request(self.fixture.admin, self.valid_report)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_report_should_contain_at_least_one_section(self):
+        response = self.make_request(self.fixture.staff, [])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_report_section_should_contain_header_and_body(self):
+        response = self.make_request(self.fixture.staff, [1, 2])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class ResourceDetailsTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.project = self.fixture.project
+        self.offering = factories.OfferingFactory(customer=self.fixture.customer)
+        self.offering.add_user(self.fixture.user)
+        self.resource = factories.ResourceFactory(
+            project=self.project, offering=self.offering
+        )
+
+    def make_request(self):
+        url = factories.ResourceFactory.get_url(self.resource, action='details')
+        self.client.force_authenticate(self.fixture.user)
+        return self.client.get(url)
+
+    def test_resource_without_scope_returns_error_404(self):
+        response = self.make_request()
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_resource_with_scope_returns_valid_resource_details(self):
+        self.resource.scope = openstack_factories.TenantFactory(project=self.project)
+        self.resource.save()
+        response = self.make_request()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+
+class ResourceGetTeamTest(test.APITransactionTestCase):
+    def setUp(self) -> None:
+        self.fixture = fixtures.ProjectFixture()
+        self.project = self.fixture.project
+        self.offering = factories.OfferingFactory(customer=self.fixture.customer)
+        self.service_owner = self.fixture.owner
+        self.admin = self.fixture.admin
+
+        self.resource = factories.ResourceFactory(
+            project=self.project, offering=self.offering
+        )
+
+        self.url = factories.ResourceFactory.get_url(self.resource, action='team')
+
+    def test_service_owner_can_get_resource_team(self):
+        self.client.force_authenticate(self.service_owner)
+
+        response = self.client.get(self.url)
+        users = response.data
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(1, len(users))
+        user = users[0]
+        self.assertEqual(self.admin.full_name, user['full_name'])
+
+    def test_user_can_not_get_resource_team(self):
+        self.client.force_authenticate(self.admin)
+
+        response = self.client.get(self.url)
+        self.assertEqual(403, response.status_code)

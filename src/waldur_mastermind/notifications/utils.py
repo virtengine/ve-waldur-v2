@@ -41,13 +41,20 @@ def get_users_for_query(query):
         )
 
     if offerings:
-        projects.extend(
-            [
-                r.project
-                for r in Resource.objects.filter(
-                    Q(offering__in=offerings) | Q(offering__parent__in=offerings)
-                ).exclude(state=Resource.States.TERMINATED)
-            ]
+        related_resources = Resource.objects.filter(
+            Q(offering__in=offerings) | Q(offering__parent__in=offerings)
+        ).exclude(state=Resource.States.TERMINATED)
+
+        projects = filter(
+            lambda project: project.id
+            in related_resources.values_list('project_id', flat=True),
+            projects,
+        )
+
+        customers = filter(
+            lambda customer: customer.id
+            in related_resources.values_list('project__customer_id', flat=True),
+            customers,
         )
 
     for customer in customers:

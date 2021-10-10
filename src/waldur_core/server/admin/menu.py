@@ -43,13 +43,11 @@ class CustomMenu(Menu):
     """
 
     IAAS_CLOUDS = (
-        'waldur_mastermind.packages.*',
         'waldur_azure.*',
         'waldur_openstack.*',
         'waldur_aws.*',
         'waldur_digitalocean.*',
         'waldur_slurm.*',
-        'waldur_mastermind.slurm_invoices.*',
         'waldur_vmware.*',
         'waldur_rancher.*',
     )
@@ -57,6 +55,7 @@ class CustomMenu(Menu):
     USERS = (
         'waldur_core.core.models.*',
         'waldur_core.users.models.*',
+        'waldur_freeipa.models.*',
     )
 
     ACCOUNTING = (
@@ -64,17 +63,12 @@ class CustomMenu(Menu):
         'waldur_paypal.*',
     )
 
-    APPLICATION_PROVIDERS = (
-        'waldur_ansible.*',
-        'waldur_zabbix.*',
-        'waldur_jira.*',
-    )
+    APPLICATION_PROVIDERS = ('waldur_jira.*',)
 
     SUPPORT_MODULES = ('waldur_mastermind.support.*',)
 
     MARKETPLACE = (
         'waldur_mastermind.marketplace.*',
-        'waldur_mastermind.marketplace_packages.*',
         'waldur_mastermind.marketplace_support.*',
         'waldur_pid.*',
     )
@@ -84,6 +78,7 @@ class CustomMenu(Menu):
         'rest_framework.authtoken.*',
         'waldur_core.core.*',
         'waldur_core.structure.*',
+        'django.contrib.sites.*',
     )
 
     def __init__(self, **kwargs):

@@ -9,9 +9,9 @@ from rest_framework.reverse import reverse
 from waldur_core.core import utils as core_utils
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.common.mixins import UnitPriceMixin
+from waldur_mastermind.marketplace import models
+from waldur_mastermind.marketplace_support import PLUGIN_NAME
 from waldur_pid import models as pid_models
-
-from .. import models
 
 OFFERING_OPTIONS = {
     'order': ['storage', 'ram', 'cpu_count'],
@@ -36,6 +36,13 @@ OFFERING_OPTIONS = {
         },
     },
 }
+
+
+def backend_metadata_generator(number):
+    return {
+        'internal_ips': [f'10.40.1.{number}', f'10.40.2.{number}'],
+        'external_ips': [f'193.40.1.{number}', f'193.40.2.{number}'],
+    }
 
 
 class ServiceProviderFactory(factory.DjangoModelFactory):
@@ -97,6 +104,7 @@ class OfferingFactory(factory.DjangoModelFactory):
     name = factory.Sequence(lambda n: 'offering-%s' % n)
     category = factory.SubFactory(CategoryFactory)
     customer = factory.SubFactory(structure_factories.CustomerFactory)
+    type = PLUGIN_NAME
 
     @classmethod
     def get_url(cls, offering=None, action=None):
@@ -254,6 +262,7 @@ class OfferingComponentFactory(factory.DjangoModelFactory):
 
     offering = factory.SubFactory(OfferingFactory)
     type = 'cpu'
+    name = 'CPU'
     billing_type = models.OfferingComponent.BillingTypes.FIXED
 
 
@@ -265,6 +274,11 @@ class PlanComponentFactory(factory.DjangoModelFactory):
     component = factory.SubFactory(OfferingComponentFactory)
     price = Decimal(10)
     amount = 1
+
+    @classmethod
+    def get_list_url(cls, action=None):
+        url = 'http://testserver' + reverse('marketplace-plan-component-list')
+        return url if action is None else url + action + '/'
 
 
 class OrderItemFactory(factory.DjangoModelFactory):
@@ -316,6 +330,8 @@ class ResourceFactory(factory.DjangoModelFactory):
 
     offering = factory.SubFactory(OfferingFactory)
     project = factory.SubFactory(structure_factories.ProjectFactory)
+    backend_metadata = factory.Sequence(backend_metadata_generator)
+    name = factory.Sequence(lambda n: 'resource-%s' % n)
 
     @classmethod
     def get_url(cls, resource=None, action=None):
@@ -362,3 +378,34 @@ class ComponentUsageFactory(factory.DjangoModelFactory):
     usage = 1
     date = timezone.now()
     billing_period = core_utils.month_start(timezone.now())
+
+
+class ResourcePlanPeriodFactory(factory.DjangoModelFactory):
+    class Meta:
+        model = models.ResourcePlanPeriod
+
+    resource = factory.SubFactory(ResourceFactory)
+    plan = factory.SubFactory(PlanFactory)
+    start = core_utils.month_start(timezone.now())
+
+
+class OfferingPermissionFactory(factory.DjangoModelFactory):
+    class Meta:
+        model = models.OfferingPermission
+
+    offering = factory.SubFactory(OfferingFactory)
+    user = factory.SubFactory(structure_factories.UserFactory)
+
+    @classmethod
+    def get_url(cls, permission=None, action=None):
+        if permission is None:
+            permission = OfferingPermissionFactory()
+        url = 'http://testserver' + reverse(
+            'marketplace-offering-permission-detail', kwargs={'pk': permission.id}
+        )
+        return url if action is None else url + action + '/'
+
+    @classmethod
+    def get_list_url(cls, action=None):
+        url = 'http://testserver' + reverse('marketplace-offering-permission-list')
+        return url if action is None else url + action + '/'

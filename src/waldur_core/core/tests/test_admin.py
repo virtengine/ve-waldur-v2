@@ -1,7 +1,9 @@
 from django.contrib.admin.sites import AdminSite
-from django.test import TestCase
+from django.contrib.contenttypes.models import ContentType
+from django.test import TestCase, override_settings
+from reversion.models import Version
 
-from waldur_core.core.admin import UserAdmin, UserChangeForm
+from waldur_core.core.admin import UserAdmin
 from waldur_core.core.models import User
 from waldur_core.core.tests.helpers import override_waldur_core_settings
 from waldur_core.structure.admin import CustomerAdmin
@@ -25,6 +27,8 @@ request.user = MockSuperUser()
 class UserAdminTest(TestCase):
     def change_user(self, **kwargs):
         user = UserFactory()
+        ma = UserAdmin(User, AdminSite())
+        UserChangeForm = ma.get_form(request, user, change=True)
         form_for_data = UserChangeForm(instance=user)
 
         post_data = form_for_data.initial
@@ -40,7 +44,7 @@ class UserAdminTest(TestCase):
         user = self.change_user(civil_number='  NEW_CIVIL_NUMBER  ')
         self.assertEqual(user.civil_number, 'NEW_CIVIL_NUMBER')
 
-    def test_whitspace_civil_number_converts_to_none(self):
+    def test_whitespace_civil_number_converts_to_none(self):
         user = self.change_user(civil_number='  ')
         self.assertEqual(user.civil_number, None)
 
@@ -87,3 +91,42 @@ class NativeNameAdminTest(TestCase):
         customer = CustomerFactory()
         ma = CustomerAdmin(Customer, AdminSite())
         self.assertTrue('native_name' in ma.get_fields(request, customer))
+
+
+class UserReversionTest(TestCase):
+    @override_settings(
+        AUTHENTICATION_BACKENDS=('django.contrib.auth.backends.ModelBackend',)
+    )
+    def test_new_revisions_are_not_created_on_each_authentication(self):
+        staff = UserFactory(is_staff=True, is_superuser=True)
+        staff_password = User.objects.make_random_password()
+        staff.set_password(staff_password)
+        staff.save()
+        self.assertTrue(
+            self.client.login(username=staff.username, password=staff_password)
+        )
+
+        url = '/admin/core/user/add/'
+        user_password = User.objects.make_random_password()
+        self.client.post(
+            url,
+            {
+                'username': 'test',
+                'password1': user_password,
+                'password2': user_password,
+            },
+        )
+        user = User.objects.get(username='test')
+        ct = ContentType.objects.get_for_model(user)
+        self.assertEqual(
+            Version.objects.filter(object_id=user.id, content_type=ct).count(), 1
+        )
+
+        user.is_staff = True
+        user.save()
+        self.assertTrue(
+            self.client.login(username=user.username, password=user_password)
+        )
+        self.assertEqual(
+            Version.objects.filter(object_id=user.id, content_type=ct).count(), 1
+        )

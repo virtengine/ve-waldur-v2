@@ -1,7 +1,7 @@
 import unittest
 from unittest import mock
 
-from django.conf import settings
+from ddt import data, ddt
 from django.utils import timezone
 from freezegun import freeze_time
 from rest_framework import status, test
@@ -9,12 +9,12 @@ from rest_framework import status, test
 from waldur_core.core import utils as core_utils
 from waldur_core.core.models import User
 from waldur_core.core.tests.helpers import override_waldur_core_settings
+from waldur_core.core.utils import format_homeport_link
 from waldur_core.structure.models import CustomerRole
 from waldur_core.structure.serializers import PasswordSerializer
-from waldur_core.structure.tests import factories
+from waldur_core.structure.tests import factories, fixtures
 
 from .. import tasks
-from . import fixtures
 
 
 class UserPermissionApiTest(test.APITransactionTestCase):
@@ -54,21 +54,21 @@ class UserPermissionApiTest(test.APITransactionTestCase):
         response = self.client.get(factories.UserFactory.get_list_url())
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-    def test_staff_can_see_token_in_the_list(self):
+    def test_staff_cannot_see_token_in_the_list(self):
         self.client.force_authenticate(self.users['staff'])
 
         response = self.client.get(factories.UserFactory.get_list_url())
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data), len(self.users))
-        self.assertIsNotNone(response.data[0]['token'])
+        self.assertIsNone(response.data[0].get('token'))
 
-    def test_staff_can_see_token_and_its_lifetime_of_the_other_user(self):
+    def test_staff_cannot_see_token_and_its_lifetime_of_the_other_user(self):
         self.client.force_authenticate(self.users['staff'])
 
         response = self.client.get(factories.UserFactory.get_url(self.users['owner']))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertIsNotNone(response.data['token'])
-        self.assertIn('token_lifetime', response.data)
+        self.assertIsNone(response.data.get('token'))
+        self.assertNotIn('token_lifetime', response.data)
 
     def test_owner_cannot_see_token_and_its_lifetime_field_in_the_list_of_users(self):
         self.client.force_authenticate(self.users['owner'])
@@ -106,13 +106,10 @@ class UserPermissionApiTest(test.APITransactionTestCase):
     def test_user_can_see_his_token_via_current_filter(self):
         self.client.force_authenticate(self.users['owner'])
 
-        response = self.client.get(
-            factories.UserFactory.get_list_url(), {'current': True}
-        )
+        response = self.client.get(factories.UserFactory.get_list_url('me'))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(1, len(response.data))
-        self.assertIsNotNone('token', response.data[0])
-        self.assertIsNotNone('token_lifetime', response.data[0])
+        self.assertIsNotNone('token', response.data)
+        self.assertIsNotNone('token_lifetime', response.data)
 
     # Creation tests
     def test_anonymous_user_cannot_create_account(self):
@@ -731,8 +728,8 @@ class UserConfirmEmailTest(test.APITransactionTestCase):
         request_serialized = core_utils.serialize_instance(self.user.changeemailrequest)
         tasks.send_change_email_notification(request_serialized)
 
-        link = settings.WALDUR_CORE['EMAIL_CHANGE_URL'].format(
-            code=self.user.changeemailrequest.uuid.hex
+        link = format_homeport_link(
+            'user_email_change/{code}/', code=self.user.changeemailrequest.uuid.hex
         )
         context = {'request': self.user.changeemailrequest, 'link': link}
         mock_mail.assert_called_once_with(
@@ -798,3 +795,20 @@ class NotificationsProfileChangesTest(test.APITransactionTestCase):
         self.user.email = new_email
         self.user.save()
         self.assertEqual(mock_event_logger.user.info.call_count, 0)
+
+
+@ddt
+class UserFullnameTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.user = factories.UserFactory()
+
+    @data(
+        ('', '', ''),
+        ('John', 'John', ''),
+        ('John Smith', 'John', 'Smith'),
+        ('John A Smith', 'John', 'A Smith'),
+    )
+    def test_split_full_name(self, names):
+        self.user.full_name = names[0]
+        self.assertEqual(self.user.first_name, names[1])
+        self.assertEqual(self.user.last_name, names[2])

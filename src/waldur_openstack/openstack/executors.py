@@ -33,7 +33,34 @@ class SecurityGroupUpdateExecutor(core_executors.UpdateExecutor):
         )
 
 
-class SecurityGroupDeleteExecutor(core_executors.DeleteExecutor):
+class SecurityGroupPullExecutor(core_executors.ActionExecutor):
+    @classmethod
+    def get_task_signature(cls, security_group, serialized_security_group, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_security_group,
+            'pull_security_group',
+            state_transition='begin_updating',
+        )
+
+
+class SecurityGroupDeleteExecutor(core_executors.BaseExecutor):
+    """
+    Security group is being deleted in the last task instead of
+    using separate DeleteTask from DeleteExecutorMixin so that
+    deletion is performed transactionally.
+    """
+
+    @classmethod
+    def pre_apply(cls, instance, **kwargs):
+        instance.schedule_deleting()
+        instance.save(update_fields=['state'])
+
+    @classmethod
+    def get_failure_signature(
+        cls, instance, serialized_instance, force=False, **kwargs
+    ):
+        return core_tasks.ErrorStateTransitionTask().s(serialized_instance)
+
     @classmethod
     def get_task_signature(cls, security_group, serialized_security_group, **kwargs):
         state_transition_task = core_tasks.StateTransitionTask().si(
@@ -100,7 +127,7 @@ class TenantCreateExecutor(core_executors.CreateExecutor):
             )
         )
         # handle security groups
-        # XXX: Create default security groups that was connected to SPL earlier.
+        # XXX: Create default security groups
         for security_group in tenant.security_groups.all():
             creation_tasks.append(
                 SecurityGroupCreateExecutor.as_signature(security_group)
@@ -114,8 +141,8 @@ class TenantCreateExecutor(core_executors.CreateExecutor):
             )
 
         # initialize external network if it defined in service settings
-        service_settings = tenant.service_project_link.service.settings
-        customer = tenant.service_project_link.project.customer
+        service_settings = tenant.service_settings
+        customer = tenant.project.customer
         external_network_id = service_settings.get_option('external_network_id')
 
         try:
@@ -345,6 +372,27 @@ class FloatingIPPullExecutor(core_executors.ActionExecutor):
         )
 
 
+class FloatingIPAttachExecutor(core_executors.ActionExecutor):
+    @classmethod
+    def get_task_signature(cls, floating_ip, serialized_floating_ip, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_floating_ip,
+            'attach_floating_ip_to_port',
+            state_transition='begin_updating',
+            serialized_port=kwargs.get('port'),
+        )
+
+
+class FloatingIPDetachExecutor(core_executors.ActionExecutor):
+    @classmethod
+    def get_task_signature(cls, floating_ip, serialized_floating_ip, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_floating_ip,
+            'detach_floating_ip_from_port',
+            state_transition='begin_updating',
+        )
+
+
 class TenantPullFloatingIPsExecutor(core_executors.ActionExecutor):
     @classmethod
     def get_task_signature(cls, tenant, serialized_tenant, **kwargs):
@@ -392,8 +440,8 @@ class TenantPullExecutor(core_executors.ActionExecutor):
             core_tasks.BackendMethodTask().si(
                 serialized_tenant, 'pull_tenant_security_groups'
             ),
-            core_tasks.IndependentBackendMethodTask().si(
-                serialized_tenant, 'pull_networks'
+            core_tasks.BackendMethodTask().si(
+                serialized_tenant, 'pull_tenant_networks'
             ),
             core_tasks.IndependentBackendMethodTask().si(
                 serialized_settings, 'pull_images'
@@ -404,15 +452,25 @@ class TenantPullExecutor(core_executors.ActionExecutor):
             core_tasks.IndependentBackendMethodTask().si(
                 serialized_settings, 'pull_volume_types'
             ),
-            core_tasks.IndependentBackendMethodTask().si(
-                serialized_tenant, 'pull_subnets'
-            ),
+            core_tasks.BackendMethodTask().si(serialized_tenant, 'pull_subnets'),
             core_tasks.BackendMethodTask().si(
                 serialized_tenant, backend_method='pull_tenant_routers'
             ),
             core_tasks.BackendMethodTask().si(
                 serialized_tenant, backend_method='pull_tenant_ports'
             ),
+        )
+
+    @classmethod
+    def get_success_signature(cls, instance, serialized_instance, **kwargs):
+        return chain(
+            core_tasks.StateTransitionTask().si(
+                serialized_instance,
+                state_transition='set_ok',
+                action='',
+                action_details={},
+            ),
+            tasks.SendSignalTenantPullSucceeded().si(serialized_instance),
         )
 
 
@@ -508,13 +566,28 @@ class SetMtuExecutor(core_executors.ActionExecutor):
 class SubNetCreateExecutor(core_executors.CreateExecutor):
     @classmethod
     def get_task_signature(cls, subnet, serialized_subnet, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_subnet, 'create_subnet', state_transition='begin_creating',
+        )
+
+
+class SubNetUpdateExecutor(core_executors.UpdateExecutor):
+    @classmethod
+    def get_task_signature(cls, subnet, serialized_subnet, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_subnet, 'update_subnet', state_transition='begin_updating',
+        )
+
+
+class SubnetConnectExecutor(core_executors.ActionExecutor):
+    action = 'connect'
+
+    @classmethod
+    def get_task_signature(cls, subnet, serialized_subnet, **kwargs):
         serialized_tenant = core_utils.serialize_instance(subnet.network.tenant)
         return chain(
             core_tasks.BackendMethodTask().si(
-                serialized_subnet,
-                'create_subnet',
-                state_transition='begin_creating',
-                enable_default_gateway=kwargs.get('enable_default_gateway', True),
+                serialized_subnet, 'connect_subnet', state_transition='begin_updating',
             ),
             core_tasks.BackendMethodTask().si(
                 serialized_tenant, backend_method='pull_tenant_routers'
@@ -522,16 +595,17 @@ class SubNetCreateExecutor(core_executors.CreateExecutor):
         )
 
 
-class SubNetUpdateExecutor(core_executors.UpdateExecutor):
+class SubnetDisconnectExecutor(core_executors.ActionExecutor):
+    action = 'disconnect'
+
     @classmethod
     def get_task_signature(cls, subnet, serialized_subnet, **kwargs):
         serialized_tenant = core_utils.serialize_instance(subnet.network.tenant)
         return chain(
             core_tasks.BackendMethodTask().si(
                 serialized_subnet,
-                'update_subnet',
+                'disconnect_subnet',
                 state_transition='begin_updating',
-                enable_default_gateway=kwargs.get('enable_default_gateway', True),
             ),
             core_tasks.BackendMethodTask().si(
                 serialized_tenant, backend_method='pull_tenant_routers'
@@ -570,3 +644,22 @@ class OpenStackCleanupExecutor(structure_executors.BaseCleanupExecutor):
         (models.Network, NetworkDeleteExecutor),
         (models.Tenant, TenantDeleteExecutor),
     )
+
+
+class PortCreateExecutor(core_executors.CreateExecutor):
+    @classmethod
+    def get_task_signature(cls, port, serialized_port, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_port,
+            'create_port',
+            state_transition='begin_creating',
+            serialized_network=kwargs.get('network'),
+        )
+
+
+class PortDeleteExecutor(core_executors.DeleteExecutor):
+    @classmethod
+    def get_task_signature(cls, port, serialized_port, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_port, 'delete_port', state_transition='begin_deleting',
+        )

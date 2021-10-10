@@ -23,10 +23,11 @@ from waldur_core.core import permissions as core_permissions
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core import utils as core_utils
 from waldur_core.core import views as core_views
-from waldur_core.structure import SupportedServices
 from waldur_core.structure import filters as structure_filters
+from waldur_core.structure.registry import SupportedServices
 
 from ..core.api_groups_mapping import API_GROUPS
+from .models import User
 
 
 # XXX: Drop after removing HEAD requests
@@ -430,6 +431,13 @@ class WaldurSchemaView(APIView):
     renderer_classes = [renderers.OpenAPIRenderer, renderers.SwaggerUIRenderer]
 
     def get(self, request):
+        if request.user.is_anonymous:
+            request.user = User(
+                id=0,
+                username='API docs user',
+                email='api_docs_user@example.com',
+                is_staff=True,
+            )
         url = urlparse(request.get_full_path())
         group = url.path.split('/')[2]
         if group and group not in API_GROUPS:

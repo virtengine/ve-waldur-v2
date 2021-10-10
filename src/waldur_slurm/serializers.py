@@ -7,74 +7,57 @@ from rest_framework import serializers as rf_serializers
 
 from waldur_core.core import serializers as core_serializers
 from waldur_core.structure import serializers as structure_serializers
-from waldur_core.structure.permissions import _has_owner_access
+from waldur_core.structure.permissions import _has_admin_access
 from waldur_freeipa import models as freeipa_models
-from waldur_slurm import mixins as slurm_mixins
 
 from . import models
 
 
-class ServiceSerializer(
-    core_serializers.ExtraFieldOptionsMixin,
-    core_serializers.RequiredFieldsMixin,
-    structure_serializers.BaseServiceSerializer,
-):
-    SERVICE_ACCOUNT_FIELDS = {
-        'username': '',
-    }
-    SERVICE_ACCOUNT_EXTRA_FIELDS = {
-        'hostname': _('Hostname or IP address of master node'),
-        'port': '',
-        'use_sudo': _('Set to true to activate privilege escalation'),
-        'gateway': _('Hostname or IP address of gateway node'),
-        'default_account': _('Default SLURM account for user'),
-        'batch_service': _('Batch service, SLURM or MOAB'),
-    }
+class SlurmServiceSerializer(structure_serializers.ServiceOptionsSerializer):
+    class Meta:
+        secret_fields = ('hostname', 'username', 'port', 'gateway')
 
-    class Meta(structure_serializers.BaseServiceSerializer.Meta):
-        model = models.SlurmService
-        required_fields = ('hostname', 'username', 'batch_service')
-        extra_field_options = {
-            'username': {'default_value': 'root',},
-            'use_sudo': {'default_value': False,},
-            'default_account': {'required': True,},
-        }
+    username = rf_serializers.CharField(
+        max_length=100, help_text=_('Administrative user'), default='root'
+    )
 
+    hostname = rf_serializers.CharField(
+        source='options.hostname', label=_('Hostname or IP address of master node')
+    )
 
-class ServiceProjectLinkSerializer(
-    structure_serializers.BaseServiceProjectLinkSerializer
-):
-    class Meta(structure_serializers.BaseServiceProjectLinkSerializer.Meta):
-        model = models.SlurmServiceProjectLink
-        extra_kwargs = {
-            'service': {'lookup_field': 'uuid', 'view_name': 'slurm-detail'},
-        }
+    default_account = rf_serializers.CharField(
+        source='options.default_account', label=_('Default SLURM account for user')
+    )
+
+    port = rf_serializers.IntegerField(source='options.port', required=False)
+
+    use_sudo = rf_serializers.BooleanField(
+        source='options.use_sudo',
+        default=False,
+        help_text=_('Set to true to activate privilege escalation'),
+        required=False,
+    )
+
+    gateway = rf_serializers.CharField(
+        source='options.gateway',
+        label=_('Hostname or IP address of gateway node'),
+        required=False,
+    )
+
+    firecrest_api_url = rf_serializers.CharField(
+        source='options.firecrest_api_url',
+        label=_('FirecREST API base URL'),
+        required=False,
+    )
 
 
 class AllocationSerializer(
     structure_serializers.BaseResourceSerializer,
     core_serializers.AugmentedSerializerMixin,
 ):
-    service = rf_serializers.HyperlinkedRelatedField(
-        source='service_project_link.service',
-        view_name='slurm-detail',
-        read_only=True,
-        lookup_field='uuid',
-    )
-
-    service_project_link = rf_serializers.HyperlinkedRelatedField(
-        view_name='slurm-spl-detail',
-        queryset=models.SlurmServiceProjectLink.objects.all(),
-        allow_null=True,
-        required=False,
-    )
-
     username = rf_serializers.SerializerMethodField()
     gateway = rf_serializers.SerializerMethodField()
-    batch_service = rf_serializers.ReadOnlyField()
-    homepage = rf_serializers.ReadOnlyField(
-        source='service_project_link.service.settings.homepage'
-    )
+    homepage = rf_serializers.ReadOnlyField(source='service_settings.homepage')
 
     def get_username(self, allocation):
         request = self.context['request']
@@ -85,7 +68,7 @@ class AllocationSerializer(
             return None
 
     def get_gateway(self, allocation):
-        options = allocation.service_project_link.service.settings.options
+        options = allocation.service_settings.options
         return options.get('gateway') or options.get('hostname')
 
     class Meta(structure_serializers.BaseResourceSerializer.Meta):
@@ -97,12 +80,9 @@ class AllocationSerializer(
             'gpu_usage',
             'ram_limit',
             'ram_usage',
-            'deposit_limit',
-            'deposit_usage',
             'username',
             'gateway',
             'is_active',
-            'batch_service',
             'homepage',
         )
         read_only_fields = (
@@ -115,8 +95,6 @@ class AllocationSerializer(
                 'gpu_limit',
                 'ram_limit',
                 'is_active',
-                'deposit_limit',
-                'deposit_usage',
             )
         )
         extra_kwargs = dict(
@@ -135,7 +113,7 @@ class AllocationSerializer(
         correct_name_regex = '^([%s]{1,63})$' % models.SLURM_ALLOCATION_REGEX
         name = attrs.get('name')
         if not re.match(correct_name_regex, name):
-            raise core_serializers.ValidationError(
+            raise rf_serializers.ValidationError(
                 _(
                     "Name '%s' must be 1-63 characters long, each of "
                     "which can only be alphanumeric or a hyphen"
@@ -143,53 +121,61 @@ class AllocationSerializer(
                 % name
             )
 
-        spl = attrs['service_project_link']
+        project = attrs['project']
         user = self.context['request'].user
-        if not _has_owner_access(user, spl.project.customer):
+        if not _has_admin_access(user, project):
             raise rf_exceptions.PermissionDenied(
                 _('You do not have permissions to create allocation for given project.')
             )
         return attrs
 
 
-class AllocationUsageSerializer(slurm_mixins.AllocationUsageSerializerMixin):
-    class Meta(slurm_mixins.AllocationUsageSerializerMixin.Meta):
-        model = models.AllocationUsage
-        lookup_field = 'uuid'
+class AllocationSetLimitsSerializer(rf_serializers.ModelSerializer):
+    cpu_limit = rf_serializers.IntegerField(min_value=-1)
+    gpu_limit = rf_serializers.IntegerField(min_value=-1)
+    ram_limit = rf_serializers.IntegerField(min_value=-1)
+
+    class Meta:
+        model = models.Allocation
+        fields = ('cpu_limit', 'gpu_limit', 'ram_limit')
+
+
+class AllocationUserUsageSerializer(rf_serializers.HyperlinkedModelSerializer):
+    full_name = rf_serializers.ReadOnlyField(source='user.full_name')
+
+    class Meta:
+        model = models.AllocationUserUsage
         fields = (
-            'url',
-            'uuid',
+            'cpu_usage',
+            'ram_usage',
+            'gpu_usage',
+            'month',
+            'year',
             'allocation',
-        ) + slurm_mixins.AllocationUsageSerializerMixin.Meta.fields
+            'user',
+            'username',
+            'full_name',
+        )
         extra_kwargs = {
-            'url': {
-                'lookup_field': 'uuid',
-                'view_name': 'slurm-allocation-usage-detail',
-            },
             'allocation': {
                 'lookup_field': 'uuid',
                 'view_name': 'slurm-allocation-detail',
             },
-        }
-
-
-class AllocationUserUsageSerializer(slurm_mixins.AllocationUsageSerializerMixin):
-    full_name = rf_serializers.ReadOnlyField(source='user.full_name')
-    month = rf_serializers.ReadOnlyField(source='allocation_usage.month')
-    year = rf_serializers.ReadOnlyField(source='allocation_usage.year')
-
-    class Meta(slurm_mixins.AllocationUsageSerializerMixin.Meta):
-        model = models.AllocationUserUsage
-        fields = (
-            'allocation_usage',
-            'user',
-            'username',
-            'full_name',
-        ) + slurm_mixins.AllocationUsageSerializerMixin.Meta.fields
-        extra_kwargs = {
-            'allocation_usage': {
-                'lookup_field': 'uuid',
-                'view_name': 'slurm-allocation-usage-detail',
-            },
             'user': {'lookup_field': 'uuid', 'view_name': 'user-detail',},
         }
+
+
+class AssociationSerializer(rf_serializers.HyperlinkedModelSerializer):
+    allocation = rf_serializers.HyperlinkedRelatedField(
+        queryset=models.Allocation.objects.all(),
+        view_name='slurm-allocation-detail',
+        lookup_field='uuid',
+    )
+
+    class Meta:
+        model = models.Association
+        fields = (
+            'uuid',
+            'username',
+            'allocation',
+        )

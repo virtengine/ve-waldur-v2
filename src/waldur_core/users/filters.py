@@ -1,8 +1,9 @@
 import uuid
 
 import django_filters
+from django.conf import settings
 from django.db.models import Q
-from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework.filters import BaseFilterBackend
 
 from waldur_core.core import filters as core_filters
 from waldur_core.users import models
@@ -27,7 +28,7 @@ class InvitationFilter(django_filters.FilterSet):
         ]
 
 
-class InvitationCustomerFilterBackend(DjangoFilterBackend):
+class InvitationCustomerFilterBackend(BaseFilterBackend):
     url_filter = core_filters.URLFilter(
         view_name='customer-detail', field_name='customer__uuid',
     )
@@ -52,3 +53,15 @@ class InvitationCustomerFilterBackend(DjangoFilterBackend):
 
         if 'customer' in request.query_params:
             return request.query_params['customer']
+
+
+class PendingInvitationFilter(BaseFilterBackend):
+    def filter_queryset(self, request, queryset, view):
+        queryset = queryset.filter(state=models.Invitation.State.PENDING)
+        queryset = queryset.filter(
+            Q(civil_number='') | Q(civil_number=request.user.civil_number)
+        )
+        if settings.WALDUR_CORE['VALIDATE_INVITATION_EMAIL']:
+            queryset = queryset.filter(email=request.user.email)
+
+        return queryset

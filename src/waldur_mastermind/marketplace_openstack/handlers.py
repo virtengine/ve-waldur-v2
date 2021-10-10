@@ -1,164 +1,22 @@
-import decimal
 import logging
 
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
-from django.core.exceptions import MultipleObjectsReturned, ObjectDoesNotExist
+from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 
 from waldur_core.core import utils as core_utils
 from waldur_core.structure import models as structure_models
-from waldur_mastermind.invoices import registrators
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.utils import get_resource_state
-from waldur_mastermind.packages import models as package_models
 from waldur_openstack.openstack import models as openstack_models
-from waldur_openstack.openstack.apps import OpenStackConfig
 from waldur_openstack.openstack_tenant import apps as openstack_tenant_apps
 from waldur_openstack.openstack_tenant import models as openstack_tenant_models
 
-from . import (
-    INSTANCE_TYPE,
-    PACKAGE_TYPE,
-    RAM_TYPE,
-    STORAGE_TYPE,
-    VOLUME_TYPE,
-    tasks,
-    utils,
-)
+from . import INSTANCE_TYPE, STORAGE_MODE_FIXED, TENANT_TYPE, VOLUME_TYPE, tasks, utils
 
 logger = logging.getLogger(__name__)
 States = marketplace_models.Resource.States
-
-
-def create_template_for_plan(sender, instance, created=False, **kwargs):
-    plan = instance
-
-    if plan.scope:
-        return
-
-    if not created:
-        return
-
-    if plan.offering.type != PACKAGE_TYPE:
-        return
-
-    if not isinstance(plan.offering.scope, structure_models.ServiceSettings):
-        logger.warning(
-            'Skipping plan synchronization because offering scope is not service settings. '
-            'Plan ID: %s',
-            plan.id,
-        )
-        return
-
-    if plan.offering.scope.type != OpenStackConfig.service_name:
-        logger.warning(
-            'Skipping plan synchronization because service settings type is not OpenStack. '
-            'Plan ID: %s',
-            plan.id,
-        )
-        return
-
-    with transaction.atomic():
-        template = package_models.PackageTemplate.objects.create(
-            service_settings=plan.offering.scope,
-            name=plan.name,
-            description=plan.description,
-            product_code=plan.product_code,
-            article_code=plan.article_code,
-            unit=plan.unit,
-        )
-        plan.scope = template
-        plan.save()
-
-
-PLAN_FIELDS = {'name', 'archived', 'product_code', 'article_code'}
-
-
-def update_template_for_plan(sender, instance, created=False, **kwargs):
-    plan = instance
-
-    if plan.offering.type != PACKAGE_TYPE:
-        return
-
-    if created:
-        return
-
-    update_fields = set(plan.tracker.changed()) & PLAN_FIELDS
-    if not update_fields:
-        return
-
-    if not plan.scope:
-        return
-
-    template = plan.scope
-    for field in update_fields:
-        setattr(template, field, getattr(plan, field))
-    template.save(update_fields=update_fields)
-
-
-def update_plan_for_template(sender, instance, created=False, **kwargs):
-    template = instance
-
-    if created:
-        return
-
-    update_fields = set(template.tracker.changed()) & PLAN_FIELDS
-    if not update_fields:
-        return
-
-    try:
-        plan = marketplace_models.Plan.objects.get(scope=template)
-    except (ObjectDoesNotExist, MultipleObjectsReturned):
-        return
-
-    for field in update_fields:
-        setattr(plan, field, getattr(template, field))
-    plan.save(update_fields=update_fields)
-
-
-def synchronize_plan_component(sender, instance, created=False, **kwargs):
-    component = instance
-
-    if not created and not set(instance.tracker.changed()) & {'amount', 'price'}:
-        return
-
-    if component.plan.offering.type != PACKAGE_TYPE:
-        return
-
-    template = component.plan.scope
-    if not template:
-        logger.warning(
-            'Skipping plan component synchronization because offering does not have scope. '
-            'Offering ID: %s',
-            component.plan.offering.id,
-        )
-        return
-
-    amount = component.amount
-    price = component.price
-
-    # In marketplace RAM and storage is stored in GB, but in package plugin it is stored in MB.
-    if component.component.type in (RAM_TYPE, STORAGE_TYPE):
-        amount = amount * 1024
-        price = decimal.Decimal(price) / decimal.Decimal(1024.0)
-
-    package_component = package_models.PackageComponent.objects.filter(
-        template=template, type=component.component.type
-    ).first()
-
-    if package_component:
-        package_component.amount = amount
-        package_component.price = price
-        package_component.save(update_fields=['amount', 'price'])
-
-    elif created:
-        package_models.PackageComponent.objects.create(
-            template=template,
-            type=component.component.type,
-            amount=amount,
-            price=price,
-        )
 
 
 def create_offering_from_tenant(sender, instance, created=False, **kwargs):
@@ -217,6 +75,7 @@ def create_offerings_for_volume_and_instance(tenant):
                 'for instances and volumes is not yet defined.'
             )
             continue
+        actual_customer = tenant.project.customer
         payload = dict(
             type=offering_type,
             name=offering_name,
@@ -226,11 +85,12 @@ def create_offerings_for_volume_and_instance(tenant):
             # OpenStack instance and volume offerings are charged as a part of its tenant
             billable=False,
             parent=parent_offering,
+            customer=actual_customer,
+            project=tenant.project,
         )
 
         fields = (
             'state',
-            'customer',
             'attributes',
             'thumbnail',
             'vendor_details',
@@ -240,9 +100,7 @@ def create_offerings_for_volume_and_instance(tenant):
         for field in fields:
             payload[field] = getattr(parent_offering, field)
 
-        with transaction.atomic():
-            offering = marketplace_models.Offering.objects.create(**payload)
-            offering.allowed_customers.add(tenant.service_project_link.project.customer)
+        marketplace_models.Offering.objects.create(**payload)
 
 
 def archive_offering(sender, instance, **kwargs):
@@ -317,7 +175,7 @@ def synchronize_instance_after_pull(sender, instance, **kwargs):
 def synchronize_internal_ips(sender, instance, created=False, **kwargs):
     internal_ip = instance
     if not created and not set(internal_ip.tracker.changed()) & {
-        'ip4_address',
+        'fixed_ips',
         'instance_id',
     }:
         return
@@ -414,7 +272,11 @@ def create_resource_of_volume_if_instance_created(
 ):
     resource = instance
 
-    if not created or not resource.scope or not resource.offering.scope:
+    if (
+        not created
+        or not resource.scope
+        or not getattr(resource.offering, 'scope', None)
+    ):
         return
 
     if resource.offering.type != INSTANCE_TYPE:
@@ -422,7 +284,9 @@ def create_resource_of_volume_if_instance_created(
 
     instance = resource.scope
 
-    volume_offering = utils.get_offering(VOLUME_TYPE, resource.offering.scope)
+    volume_offering = utils.get_offering(
+        VOLUME_TYPE, getattr(resource.offering, 'scope', None)
+    )
     if not volume_offering:
         return
 
@@ -448,7 +312,11 @@ def create_marketplace_resource_for_imported_resources(
     sender, instance, offering=None, plan=None, **kwargs
 ):
     resource = marketplace_models.Resource(
-        project=instance.service_project_link.project,
+        # backend_id is None if instance is being restored from backup because
+        # on database level there's uniqueness constraint enforced for backend_id
+        # but in marketplace resource backend_is not nullable
+        backend_id=instance.backend_id or '',
+        project=instance.project,
         state=get_resource_state(instance.state),
         name=instance.name,
         scope=instance,
@@ -489,7 +357,7 @@ def create_marketplace_resource_for_imported_resources(
 
     if isinstance(instance, openstack_models.Tenant):
         offering = offering or utils.get_offering(
-            PACKAGE_TYPE, instance.service_settings
+            TENANT_TYPE, instance.service_settings
         )
 
         if not offering:
@@ -539,31 +407,6 @@ def update_openstack_tenant_usages(sender, instance, created=False, **kwargs):
     utils.import_usage(resource)
 
 
-def update_invoice_when_resource_is_created(sender, instance, **kwargs):
-    if not settings.WALDUR_MARKETPLACE_OPENSTACK['BILLING_ENABLED']:
-        return
-
-    if instance.offering.type == PACKAGE_TYPE:
-        registrators.RegistrationManager.register(instance)
-
-
-def update_invoice_when_resource_is_updated(sender, order_item, **kwargs):
-    if not settings.WALDUR_MARKETPLACE_OPENSTACK['BILLING_ENABLED']:
-        return
-
-    if order_item.offering.type == PACKAGE_TYPE:
-        registrators.RegistrationManager.terminate(order_item.resource)
-        registrators.RegistrationManager.register(order_item.resource)
-
-
-def update_invoice_when_resource_is_deleted(sender, instance, **kwargs):
-    if not settings.WALDUR_MARKETPLACE_OPENSTACK['BILLING_ENABLED']:
-        return
-
-    if instance.offering.type == PACKAGE_TYPE:
-        registrators.RegistrationManager.terminate(instance)
-
-
 def create_offering_component_for_volume_type(
     sender, instance, created=False, **kwargs
 ):
@@ -577,6 +420,16 @@ def create_offering_component_for_volume_type(
             'marketplace because offering for service settings is not have found. '
             'Settings ID: %s',
             instance.settings.id,
+        )
+        return
+
+    storage_mode = offering.plugin_options.get('storage_mode') or STORAGE_MODE_FIXED
+    if storage_mode == STORAGE_MODE_FIXED:
+        logger.debug(
+            'Skipping synchronization of volume type with '
+            'marketplace because offering has fixed storage mode enabled. '
+            'Offering ID: %s',
+            offering.id,
         )
         return
 
@@ -594,8 +447,7 @@ def create_offering_component_for_volume_type(
             type='gigabytes_' + instance.name,
             measured_unit='GB',
             description=instance.description,
-            billing_type=marketplace_models.OfferingComponent.BillingTypes.USAGE,
-            use_limit_for_billing=True,
+            billing_type=marketplace_models.OfferingComponent.BillingTypes.LIMIT,
         ),
     )
 
@@ -612,7 +464,7 @@ def synchronize_limits_when_storage_mode_is_switched(
     if created:
         return
 
-    if offering.type != PACKAGE_TYPE:
+    if offering.type != TENANT_TYPE:
         return
 
     if not offering.tracker.has_changed('plugin_options'):
@@ -646,10 +498,54 @@ def synchronize_limits_when_storage_mode_is_switched(
     for resource in resources:
         utils.import_limits_when_storage_mode_is_switched(resource)
         utils.import_usage(resource)
-        registrators.RegistrationManager.terminate(resource)
-        registrators.RegistrationManager.register(resource)
 
         serialized_resource = core_utils.serialize_instance(resource)
         transaction.on_commit(
             lambda: tasks.push_tenant_limits.delay(serialized_resource)
         )
+
+
+def import_instances_and_volumes_if_tenant_has_been_imported(
+    sender, instance, offering=None, plan=None, **kwargs
+):
+    tenant = instance
+
+    if not (
+        marketplace_models.Category.objects.filter(default_vm_category=True).exists()
+        and marketplace_models.Category.objects.filter(
+            default_volume_category=True
+        ).exists()
+    ):
+        logger.info(
+            'An import of instances and volumes is impossible because categories for them are not setted.'
+        )
+        return
+
+    serialized_resource = core_utils.serialize_instance(tenant)
+    transaction.on_commit(
+        lambda: tasks.import_instances_and_volumes_of_tenant.delay(serialized_resource)
+    )
+
+
+def synchronize_tenant_name(sender, instance, offering=None, plan=None, **kwargs):
+    tenant = instance
+
+    if not instance.tracker.has_changed('name'):
+        return
+
+    service_settings = structure_models.ServiceSettings.objects.filter(
+        object_id=tenant.id, content_type=ContentType.objects.get_for_model(tenant)
+    )
+
+    for ss in service_settings:
+        offerings = marketplace_models.Offering.objects.filter(
+            object_id=ss.id, content_type=ContentType.objects.get_for_model(ss)
+        )
+
+        for offering in offerings.filter(type=INSTANCE_TYPE):
+            offering.name = utils.get_offering_name_for_instance(tenant)
+            offering.save(update_fields=['name'])
+
+        for offering in offerings.filter(type=VOLUME_TYPE):
+            offering.name = utils.get_offering_name_for_volume(tenant)
+            offering.save(update_fields=['name'])

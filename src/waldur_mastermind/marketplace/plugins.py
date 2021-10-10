@@ -1,18 +1,17 @@
 import logging
-
-from waldur_core.structure import SupportedServices
+from typing import List
 
 
 class Component:
     def __init__(
-        self, type, name, measured_unit, billing_type, factor=1, disable_quotas=False
+        self, type, name, measured_unit, billing_type, factor=1, description='',
     ):
         self.type = type
         self.name = name
         self.measured_unit = measured_unit
         self.billing_type = billing_type
         self.factor = factor
-        self.disable_quotas = disable_quotas
+        self.description = description
 
     def _asdict(self):
         # Note that factor is not serialized to dict because it is not stored in the database.
@@ -22,7 +21,6 @@ class Component:
             'name': self.name,
             'measured_unit': self.measured_unit,
             'billing_type': self.billing_type,
-            'disable_quotas': self.disable_quotas,
         }
 
 
@@ -49,10 +47,17 @@ class PluginManager:
         for example, VPC username and password.
         :key available_limits: optional list of strings each of which corresponds to offering component type,
         which supports user-defined limits, such as VPC RAM and vCPU.
+        :key: can_update_limits: boolean which indicates whether plugin allows user to set limits on resource.
         :key resource_model: optional Django model class which corresponds to resource.
         :key get_filtered_components: optional function to filter out enabled offering components.
         :key change_attributes_for_view: optional function to change the display of attributes in a view. An attributes
         of offering do not change.
+        :key enable_usage_notifications: optional boolean indicated whether usage notifications
+        should be sent to a customer.
+        :key enable_remote_support: optional boolean indicated whether offering can be imported in remote Waldur.
+        :key get_importable_resources_backend_method:
+        :key import_resource_backend_method:
+        :key import_resource_executor:
         """
         self.backends[offering_type] = kwargs
 
@@ -70,7 +75,7 @@ class PluginManager:
         """
         return self.backends.get(offering_type, {}).get('service_type')
 
-    def get_components(self, offering_type):
+    def get_components(self, offering_type: str) -> List[Component]:
         """
         Return a list of components for given offering_type.
         :param offering_type: offering type name
@@ -112,33 +117,47 @@ class PluginManager:
         """
         return self.backends.get(offering_type, {}).get('available_limits') or []
 
+    def can_update_limits(self, offering_type):
+        """
+        Returns true if plugin allows user to set limits on resource.
+        """
+        return self.backends.get(offering_type, {}).get('can_update_limits', False)
+
     def get_resource_model(self, offering_type):
         """
         Returns Django model class which corresponds to resource.
         """
-        return self.backends.get(offering_type, {}).get('resource_model')
+        processor = self.get_processor(offering_type, 'create_resource_processor')
 
-    def get_resource_viewset(self, offering_type):
-        resource_model = self.get_resource_model(offering_type)
-        return SupportedServices.get_resource_view(resource_model)
+        if not processor:
+            return
 
-    def get_spl_model(self, offering_type):
-        resource_model = self.get_resource_model(offering_type)
-        return SupportedServices.get_related_models(resource_model)[
-            'service_project_link'
-        ]
+        if getattr(processor, 'get_resource_model', None):
+            resource_model = processor.get_resource_model()
+        else:
+            return
 
-    def get_service_model(self, offering_type):
-        resource_model = self.get_resource_model(offering_type)
-        return SupportedServices.get_related_models(resource_model)['service']
+        return resource_model
 
-    def get_importable_resources(self, offering):
-        try:
-            resource_viewset = self.get_resource_viewset(offering.type)
-        except AttributeError:
-            return []
-        backend = offering.scope.get_backend()
-        return getattr(backend, resource_viewset.importable_resources_backend_method)()
+    def get_importable_offering_types(self):
+        return {
+            offering_type
+            for offering_type in self.get_offering_types()
+            if self.get_importable_resources_backend_method(offering_type)
+        }
+
+    def get_importable_resources_backend_method(self, offering_type):
+        return self.backends.get(offering_type, {}).get(
+            'get_importable_resources_backend_method'
+        )
+
+    def import_resource_backend_method(self, offering_type):
+        return self.backends.get(offering_type, {}).get(
+            'import_resource_backend_method'
+        )
+
+    def get_import_resource_executor(self, offering_type):
+        return self.backends.get(offering_type, {}).get('import_resource_executor')
 
     def get_processor(self, offering_type, processor_type):
         """
@@ -148,9 +167,25 @@ class PluginManager:
 
     def get_change_attributes_for_view(self, offering_type):
         """
-        Return a function for attributes showing.
+        Return a function for showing attributes.
         """
         return self.backends.get(offering_type, {}).get('change_attributes_for_view')
+
+    def get_components_filter(self, offering_type):
+        """
+        Return a function for filtering offering components.
+        This function is expected to receive offering and components queryset.
+        It should return filtered components queryset as a result.
+        """
+        return self.backends.get(offering_type, {}).get('components_filter')
+
+    def enable_usage_notifications(self, offering_type):
+        return self.backends.get(offering_type, {}).get(
+            'enable_usage_notifications', False
+        )
+
+    def enable_remote_support(self, offering_type):
+        return self.backends.get(offering_type, {}).get('enable_remote_support', False)
 
 
 manager = PluginManager()

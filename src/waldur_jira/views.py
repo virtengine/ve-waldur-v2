@@ -13,16 +13,6 @@ from . import executors, filters, models, serializers
 logger = logging.getLogger(__name__)
 
 
-class JiraServiceViewSet(structure_views.BaseServiceViewSet):
-    queryset = models.JiraService.objects.all()
-    serializer_class = serializers.ServiceSerializer
-
-
-class JiraServiceProjectLinkViewSet(structure_views.BaseServiceProjectLinkViewSet):
-    queryset = models.JiraServiceProjectLink.objects.all()
-    serializer_class = serializers.ServiceProjectLinkSerializer
-
-
 class JiraPermissionMixin:
     def get_queryset(self):
         user = self.request.user
@@ -34,14 +24,14 @@ class JiraPermissionMixin:
 
 
 class ProjectTemplateViewSet(structure_views.BaseServicePropertyViewSet):
-    queryset = models.ProjectTemplate.objects.all()
+    queryset = models.ProjectTemplate.objects.all().order_by('name')
     filterset_class = filters.ProjectTemplateFilter
     serializer_class = serializers.ProjectTemplateSerializer
     lookup_field = 'uuid'
 
 
-class ProjectViewSet(structure_views.ImportableResourceViewSet):
-    queryset = models.Project.objects.all()
+class ProjectViewSet(structure_views.ResourceViewSet):
+    queryset = models.Project.objects.all().order_by('name')
     filterset_class = filters.ProjectFilter
     serializer_class = serializers.ProjectSerializer
     create_executor = executors.ProjectCreateExecutor
@@ -51,20 +41,16 @@ class ProjectViewSet(structure_views.ImportableResourceViewSet):
 
     destroy_permissions = [structure_permissions.is_staff]
 
-    importable_resources_backend_method = 'get_resources_for_import'
-    importable_resources_serializer_class = serializers.ProjectImportableSerializer
-    import_resource_serializer_class = serializers.ProjectImportSerializer
-
 
 class IssueTypeViewSet(structure_views.BaseServicePropertyViewSet):
-    queryset = models.IssueType.objects.all()
+    queryset = models.IssueType.objects.all().order_by('name')
     filterset_class = filters.IssueTypeFilter
     serializer_class = serializers.IssueTypeSerializer
     lookup_field = 'uuid'
 
 
 class PriorityViewSet(structure_views.BaseServicePropertyViewSet):
-    queryset = models.Priority.objects.all()
+    queryset = models.Priority.objects.all().order_by('name')
     serializer_class = serializers.PrioritySerializer
     filterset_class = filters.PriorityFilter
     lookup_field = 'uuid'
@@ -122,12 +108,3 @@ class WebHookReceiverViewSet(generics.CreateAPIView):
             # Throw validation errors to the logs
             logger.error("Can't parse JIRA WebHook request: %s" % e)
             raise
-
-
-def get_jira_projects_count(project):
-    return project.quotas.get(name='nc_jira_project_count').usage
-
-
-structure_views.ProjectCountersView.register_counter(
-    'jira-projects', get_jira_projects_count
-)

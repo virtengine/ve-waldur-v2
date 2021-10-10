@@ -1,3 +1,4 @@
+from django.db.models import Count
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import decorators, mixins, permissions, response, status, viewsets
 
@@ -150,43 +151,6 @@ class EmailHookViewSet(BaseHookViewSet):
         return super(EmailHookViewSet, self).create(request, *args, **kwargs)
 
 
-class PushHookViewSet(BaseHookViewSet):
-    queryset = models.PushHook.objects.all()
-    filterset_class = filters.PushHookFilter
-    serializer_class = serializers.PushHookSerializer
-
-    def create(self, request, *args, **kwargs):
-        """
-        To create new push hook issue **POST** against */api/hooks-push/* as an authenticated user.
-        You should specify list of event_types or event_groups.
-
-        Example of a request:
-
-        .. code-block:: http
-
-            POST /api/hooks-push/ HTTP/1.1
-            Content-Type: application/json
-            Accept: application/json
-            Authorization: Token c84d653b9ec92c6cbac41c706593e66f567a7fa4
-            Host: example.com
-
-            {
-                "event_types": ["resource_start_succeeded"],
-                "event_groups": ["users"],
-                "type": "Android"
-            }
-
-        You may temporarily disable hook without deleting it by issuing following **PATCH** request against hook URL:
-
-        .. code-block:: javascript
-
-            {
-                "is_active": "false"
-            }
-        """
-        return super(PushHookViewSet, self).create(request, *args, **kwargs)
-
-
 class HookSummary(mixins.ListModelMixin, viewsets.GenericViewSet):
     """
     Use */api/hooks/* to get a list of all the hooks of any type that a user can see.
@@ -197,3 +161,30 @@ class HookSummary(mixins.ListModelMixin, viewsets.GenericViewSet):
 
     def get_queryset(self):
         return SummaryQuerySet(models.BaseHook.get_all_models())
+
+
+class EventsStatsViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = models.Event.objects.all()
+    filter_backends = (filters.EventFilterBackend,)
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        aggregated_result = (
+            queryset.values('created__year', 'created__month')
+            .annotate(count=Count('*'))
+            .order_by('-created__year', '-created__month')
+        )
+        paginated_result = self.paginate_queryset(aggregated_result)
+        final_result = [
+            {
+                'year': item['created__year'],
+                'month': item['created__month'],
+                'count': item['count'],
+            }
+            for item in paginated_result
+        ]
+
+        return self.get_paginated_response(final_result)
+
+    def retrieve(self, request, *args, **kwargs):
+        return response.Response(status=status.HTTP_405_METHOD_NOT_ALLOWED)

@@ -3,35 +3,29 @@ from unittest.mock import patch
 from rest_framework import status, test
 
 from waldur_core.structure.tests import factories as structure_factories
-
-from .. import models
-from . import factories, fixtures
+from waldur_openstack.openstack_tenant import models
+from waldur_openstack.openstack_tenant.tests import factories, fixtures
 
 
 def _instance_data(user, instance=None):
     if instance is None:
         instance = factories.InstanceFactory()
     factories.FloatingIPFactory(
-        settings=instance.service_project_link.service.settings, runtime_state='DOWN'
+        settings=instance.service_settings, runtime_state='DOWN'
     )
-    image = factories.ImageFactory(
-        settings=instance.service_project_link.service.settings
-    )
-    flavor = factories.FlavorFactory(
-        settings=instance.service_project_link.service.settings
-    )
+    image = factories.ImageFactory(settings=instance.service_settings)
+    flavor = factories.FlavorFactory(settings=instance.service_settings)
     ssh_public_key = structure_factories.SshPublicKeyFactory(user=user)
-    subnet = factories.SubNetFactory(
-        settings=instance.service_project_link.service.settings
-    )
+    subnet = factories.SubNetFactory(settings=instance.service_settings)
     return {
         'name': 'test-host',
         'description': 'test description',
         'flavor': factories.FlavorFactory.get_url(flavor),
         'image': factories.ImageFactory.get_url(image),
-        'service_project_link': factories.OpenStackTenantServiceProjectLinkFactory.get_url(
-            instance.service_project_link
+        'service_settings': factories.OpenStackTenantServiceSettingsFactory.get_url(
+            instance.service_settings
         ),
+        'project': structure_factories.ProjectFactory.get_url(instance.project),
         'ssh_public_key': structure_factories.SshPublicKeyFactory.get_url(
             ssh_public_key
         ),

@@ -8,8 +8,8 @@ from django.utils import timezone
 from waldur_core.core import models as core_models
 from waldur_core.core import tasks as core_tasks
 from waldur_core.quotas import exceptions as quotas_exceptions
-from waldur_core.structure import SupportedServices
 from waldur_core.structure import tasks as structure_tasks
+from waldur_core.structure.registry import get_resource_type
 
 from . import log, models, serializers
 
@@ -59,7 +59,7 @@ class SetBackupErredTask(core_tasks.ErrorStateTransitionTask):
     def execute(self, backup):
         super(SetBackupErredTask, self).execute(backup)
         for snapshot in backup.snapshots.all():
-            # If snapshot creation was not started - delete it from NC DB.
+            # If snapshot creation was not started - delete it from waldur DB.
             if snapshot.state == models.Snapshot.States.CREATION_SCHEDULED:
                 snapshot.decrease_backend_quotas_usage()
                 snapshot.delete()
@@ -165,7 +165,10 @@ class BaseScheduleTask(core_tasks.BackgroundTask):
         )
         for schedule in schedules:
             existing_resources = self._get_resources(schedule)
-            if existing_resources.count() >= schedule.maximal_number_of_resources:
+            if (
+                schedule.maximal_number_of_resources > 0
+                and existing_resources.count() >= schedule.maximal_number_of_resources
+            ):
                 self._schedule_exceeding_resources_deletion(
                     schedule, existing_resources
                 )
@@ -259,7 +262,8 @@ class ScheduleBackups(BaseScheduleTask):
         backup = models.Backup.objects.create(
             name='Backup#%s of %s' % (schedule.call_count, schedule.instance.name),
             description='Scheduled backup of instance "%s"' % schedule.instance,
-            service_project_link=schedule.instance.service_project_link,
+            service_settings=schedule.instance.service_settings,
+            project=schedule.instance.project,
             instance=schedule.instance,
             backup_schedule=schedule,
             metadata=serializers.BackupSerializer.get_backup_metadata(
@@ -333,7 +337,8 @@ class ScheduleSnapshots(BaseScheduleTask):
             name='Snapshot#%s of %s'
             % (schedule.call_count, schedule.source_volume.name),
             description='Scheduled snapshot of volume "%s"' % schedule.source_volume,
-            service_project_link=schedule.source_volume.service_project_link,
+            service_settings=schedule.source_volume.service_settings,
+            project=schedule.source_volume.project,
             source_volume=schedule.source_volume,
             snapshot_schedule=schedule,
             size=schedule.source_volume.size,
@@ -382,7 +387,7 @@ class LimitedPerTypeThrottleMixin:
     def get_limit(self, resource):
         nc_settings = getattr(settings, 'WALDUR_OPENSTACK', {})
         limit_per_type = nc_settings.get('MAX_CONCURRENT_PROVISION', {})
-        model_name = SupportedServices.get_name_for_model(resource)
+        model_name = get_resource_type(resource)
         return limit_per_type.get(
             model_name, super(LimitedPerTypeThrottleMixin, self).get_limit(resource)
         )

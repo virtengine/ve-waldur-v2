@@ -1,4 +1,5 @@
 from django.apps import AppConfig
+from django.db.models import signals
 
 
 class MarketplaceRancherConfig(AppConfig):
@@ -13,7 +14,9 @@ class MarketplaceRancherConfig(AppConfig):
         from waldur_rancher.apps import RancherConfig
         from waldur_rancher import models as rancher_models
 
-        from . import handlers, PLUGIN_NAME, processors
+        from . import handlers, PLUGIN_NAME, processors, registrators
+
+        registrators.RancherRegistrator.connect()
 
         USAGE = marketplace_models.OfferingComponent.BillingTypes.USAGE
         manager.register(
@@ -22,11 +25,15 @@ class MarketplaceRancherConfig(AppConfig):
             delete_resource_processor=processors.RancherDeleteProcessor,
             components=(
                 Component(
-                    type='node', name='K8S node', measured_unit='', billing_type=USAGE
+                    type='node',
+                    name='K8S node',
+                    measured_unit='nodes',
+                    billing_type=USAGE,
                 ),
             ),
             service_type=RancherConfig.service_name,
-            resource_model=rancher_models.Cluster,
+            get_importable_resources_backend_method='get_importable_clusters',
+            import_resource_backend_method='import_cluster',
         )
 
         marketplace_handlers.connect_resource_metadata_handlers(rancher_models.Cluster)
@@ -35,6 +42,24 @@ class MarketplaceRancherConfig(AppConfig):
         structure_signals.resource_imported.connect(
             handlers.create_marketplace_resource_for_imported_cluster,
             sender=rancher_models.Cluster,
-            dispatch_uid='waldur_mastermind.marketpace_rancher.'
+            dispatch_uid='waldur_mastermind.marketplace_rancher.'
             'create_resource_for_imported_cluster',
+        )
+
+        signals.post_save.connect(
+            handlers.update_node_usage,
+            sender=rancher_models.Node,
+            dispatch_uid='waldur_mastermind.marketplace_rancher.update_node_usage',
+        )
+
+        signals.post_save.connect(
+            handlers.create_offering_user_for_rancher_user,
+            sender=rancher_models.RancherUser,
+            dispatch_uid='waldur_mastermind.marketplace_rancher.create_offering_user_for_rancher_user',
+        )
+
+        signals.pre_delete.connect(
+            handlers.drop_offering_user_for_rancher_user,
+            sender=rancher_models.RancherUser,
+            dispatch_uid='waldur_mastermind.marketplace_rancher.drop_offering_user_for_rancher_user',
         )

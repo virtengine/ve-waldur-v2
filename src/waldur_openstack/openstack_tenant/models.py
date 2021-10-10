@@ -10,7 +10,6 @@ from model_utils.models import TimeStampedModel
 from waldur_core.core import models as core_models
 from waldur_core.core.fields import JSONField
 from waldur_core.logging.loggers import LoggableMixin
-from waldur_core.quotas import fields as quotas_fields
 from waldur_core.quotas import models as quotas_models
 from waldur_core.structure import models as structure_models
 from waldur_core.structure import utils as structure_utils
@@ -22,52 +21,6 @@ logger = logging.getLogger(__name__)
 
 
 TenantQuotas = openstack_models.Tenant.Quotas
-
-
-class OpenStackTenantService(structure_models.Service):
-    projects = models.ManyToManyField(
-        structure_models.Project,
-        related_name='openstack_tenant_services',
-        through='OpenStackTenantServiceProjectLink',
-    )
-
-    class Meta:
-        unique_together = ('customer', 'settings')
-        verbose_name = _('OpenStackTenant provider')
-        verbose_name_plural = _('OpenStackTenant providers')
-
-    @classmethod
-    def get_url_name(cls):
-        return 'openstacktenant'
-
-
-class OpenStackTenantServiceProjectLink(structure_models.CloudServiceProjectLink):
-    service = models.ForeignKey(on_delete=models.CASCADE, to=OpenStackTenantService)
-
-    class Meta(structure_models.CloudServiceProjectLink.Meta):
-        verbose_name = _('OpenStackTenant provider project link')
-        verbose_name_plural = _('OpenStackTenant provider project links')
-
-    class Quotas(quotas_models.QuotaModelMixin.Quotas):
-        vcpu = quotas_fields.TotalQuotaField(
-            target_models=lambda: [Instance],
-            path_to_scope='service_project_link',
-            target_field='cores',
-        )
-        ram = quotas_fields.TotalQuotaField(
-            target_models=lambda: [Instance],
-            path_to_scope='service_project_link',
-            target_field='ram',
-        )
-        storage = quotas_fields.TotalQuotaField(
-            target_models=lambda: [Volume, Snapshot],
-            path_to_scope='service_project_link',
-            target_field='size',
-        )
-
-    @classmethod
-    def get_url_name(cls):
-        return 'openstacktenant-spl'
 
 
 class Flavor(LoggableMixin, structure_models.ServiceProperty):
@@ -103,8 +56,18 @@ class SecurityGroup(core_models.DescribableMixin, structure_models.ServiceProper
 
 
 class SecurityGroupRule(openstack_base_models.BaseSecurityGroupRule):
+    class Meta:
+        unique_together = ('security_group', 'backend_id')
+
     security_group = models.ForeignKey(
         on_delete=models.CASCADE, to=SecurityGroup, related_name='rules'
+    )
+    remote_group = models.ForeignKey(
+        on_delete=models.CASCADE,
+        to=SecurityGroup,
+        related_name='+',
+        null=True,
+        blank=True,
     )
 
 
@@ -114,11 +77,11 @@ class TenantQuotaMixin(quotas_models.SharedQuotaMixin):
     """
 
     def get_quota_scopes(self):
-        service_settings = self.service_project_link.service.settings
+        service_settings = self.service_settings
         return service_settings, service_settings.scope
 
 
-class FloatingIP(structure_models.ServiceProperty):
+class FloatingIP(core_models.LoggableMixin, structure_models.ServiceProperty):
     address = models.GenericIPAddressField(protocol='IPv4', null=True, default=None)
     runtime_state = models.CharField(max_length=30)
     backend_network_id = models.CharField(max_length=255, editable=False)
@@ -162,17 +125,15 @@ class FloatingIP(structure_models.ServiceProperty):
             'backend_network_id',
         )
 
+    def get_log_fields(self):
+        return ('address', 'runtime_state', 'backend_id', 'backend_network_id')
+
 
 class Volume(TenantQuotaMixin, structure_models.Volume):
     # backend_id is nullable on purpose, otherwise
     # it wouldn't be possible to put a unique constraint on it
     backend_id = models.CharField(max_length=255, blank=True, null=True)
 
-    service_project_link = models.ForeignKey(
-        OpenStackTenantServiceProjectLink,
-        related_name='volumes',
-        on_delete=models.PROTECT,
-    )
     instance = models.ForeignKey(
         on_delete=models.CASCADE,
         to='Instance',
@@ -216,7 +177,7 @@ class Volume(TenantQuotaMixin, structure_models.Volume):
     tracker = FieldTracker()
 
     class Meta:
-        unique_together = ('service_project_link', 'backend_id')
+        unique_together = ('service_settings', 'backend_id')
 
     def get_quota_deltas(self):
         deltas = {
@@ -225,7 +186,7 @@ class Volume(TenantQuotaMixin, structure_models.Volume):
             TenantQuotas.storage: self.size,
         }
         if self.type:
-            deltas['gigabytes_' + self.type.backend_id] = self.size / 1024
+            deltas['gigabytes_' + self.type.name] = self.size / 1024
         return deltas
 
     @classmethod
@@ -256,11 +217,6 @@ class Snapshot(TenantQuotaMixin, structure_models.Snapshot):
     # it wouldn't be possible to put a unique constraint on it
     backend_id = models.CharField(max_length=255, blank=True, null=True)
 
-    service_project_link = models.ForeignKey(
-        OpenStackTenantServiceProjectLink,
-        related_name='snapshots',
-        on_delete=models.PROTECT,
-    )
     source_volume: Volume = models.ForeignKey(
         Volume, related_name='snapshots', null=True, on_delete=models.PROTECT
     )
@@ -285,7 +241,7 @@ class Snapshot(TenantQuotaMixin, structure_models.Snapshot):
     )
 
     class Meta:
-        unique_together = ('service_project_link', 'backend_id')
+        unique_together = ('service_settings', 'backend_id')
 
     @classmethod
     def get_url_name(cls):
@@ -295,10 +251,7 @@ class Snapshot(TenantQuotaMixin, structure_models.Snapshot):
         deltas = {
             TenantQuotas.snapshots: 1,
             TenantQuotas.snapshots_size: self.size,
-            TenantQuotas.storage: self.size,
         }
-        if self.source_volume and self.source_volume.type:
-            deltas['gigabytes_' + self.source_volume.type.backend_id] = self.size / 1024
         return deltas
 
     @classmethod
@@ -322,8 +275,8 @@ class SnapshotRestoration(core_models.UuidMixin, TimeStampedModel):
     )
 
     class Permissions:
-        customer_path = 'snapshot__service_project_link__project__customer'
-        project_path = 'snapshot__service_project_link__project'
+        customer_path = 'snapshot__project__customer'
+        project_path = 'snapshot__project'
 
 
 class InstanceAvailabilityZone(structure_models.BaseServiceProperty):
@@ -369,11 +322,6 @@ class Instance(TenantQuotaMixin, structure_models.VirtualMachine):
     # backend_id is nullable on purpose, otherwise
     # it wouldn't be possible to put a unique constraint on it
     backend_id = models.CharField(max_length=255, blank=True, null=True)
-    service_project_link = models.ForeignKey(
-        OpenStackTenantServiceProjectLink,
-        related_name='instances',
-        on_delete=models.PROTECT,
-    )
 
     availability_zone = models.ForeignKey(
         InstanceAvailabilityZone, blank=True, null=True, on_delete=models.SET_NULL
@@ -391,7 +339,7 @@ class Instance(TenantQuotaMixin, structure_models.VirtualMachine):
     tracker = FieldTracker()
 
     class Meta:
-        unique_together = ('service_project_link', 'backend_id')
+        unique_together = ('service_settings', 'backend_id')
         ordering = ['name', 'created']
 
     @property
@@ -400,7 +348,11 @@ class Instance(TenantQuotaMixin, structure_models.VirtualMachine):
 
     @property
     def internal_ips(self):
-        return list(self.internal_ips_set.values_list('ip4_address', flat=True))
+        return [
+            val['ip_address']
+            for ip_list in self.internal_ips_set.values_list('fixed_ips', flat=True)
+            for val in ip_list
+        ]
 
     @property
     def size(self):
@@ -415,13 +367,14 @@ class Instance(TenantQuotaMixin, structure_models.VirtualMachine):
             'uuid',
             'name',
             'type',
-            'service_project_link',
+            'service_settings',
+            'project',
             'ram',
             'cores',
         )
 
     def detect_coordinates(self):
-        settings = self.service_project_link.service.settings
+        settings = self.service_settings
         options = settings.options or {}
         if 'latitude' in options and 'longitude' in options:
             return structure_utils.Coordinates(
@@ -465,11 +418,6 @@ class Instance(TenantQuotaMixin, structure_models.VirtualMachine):
 
 
 class Backup(structure_models.SubResource):
-    service_project_link = models.ForeignKey(
-        OpenStackTenantServiceProjectLink,
-        related_name='backups',
-        on_delete=models.PROTECT,
-    )
     instance = models.ForeignKey(
         Instance, related_name='backups', on_delete=models.PROTECT
     )
@@ -512,11 +460,11 @@ class BackupRestoration(core_models.UuidMixin, TimeStampedModel):
     )
 
     class Permissions:
-        customer_path = 'backup__service_project_link__project__customer'
-        project_path = 'backup__service_project_link__project'
+        customer_path = 'backup__project__customer'
+        project_path = 'backup__project'
 
 
-class BaseSchedule(structure_models.NewResource, core_models.ScheduleMixin):
+class BaseSchedule(structure_models.BaseResource, core_models.ScheduleMixin):
     retention_time = models.PositiveIntegerField(
         help_text=_('Retention time in days, if 0 - resource will be kept forever')
     )
@@ -530,11 +478,6 @@ class BaseSchedule(structure_models.NewResource, core_models.ScheduleMixin):
 
 
 class BackupSchedule(BaseSchedule):
-    service_project_link = models.ForeignKey(
-        OpenStackTenantServiceProjectLink,
-        related_name='backup_schedules',
-        on_delete=models.PROTECT,
-    )
     instance = models.ForeignKey(
         on_delete=models.CASCADE, to=Instance, related_name='backup_schedules'
     )
@@ -550,11 +493,6 @@ class BackupSchedule(BaseSchedule):
 
 
 class SnapshotSchedule(BaseSchedule):
-    service_project_link = models.ForeignKey(
-        OpenStackTenantServiceProjectLink,
-        related_name='snapshot_schedules',
-        on_delete=models.PROTECT,
-    )
     source_volume = models.ForeignKey(
         on_delete=models.CASCADE, to=Volume, related_name='snapshot_schedules'
     )
@@ -635,6 +573,9 @@ class InternalIP(openstack_base_models.Port):
         on_delete=models.CASCADE, to=structure_models.ServiceSettings, related_name='+'
     )
     tracker = FieldTracker()
+
+    def __str__(self):
+        return self.backend_id
 
     class Meta:
         unique_together = ('backend_id', 'settings')

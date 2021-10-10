@@ -10,9 +10,9 @@ class TestCreateProcessor(processors.BaseCreateResourceProcessor):
         pass
 
 
-class TestUpdateProcessor(processors.UpdateResourceProcessor):
+class TestUpdateScopedProcessor(processors.UpdateScopedResourceProcessor):
     def validate_order_item(self, request):
         pass
 
     def update_limits_process(self, user):
-        pass
+        return True

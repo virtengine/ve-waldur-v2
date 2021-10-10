@@ -1,4 +1,3 @@
-from django.contrib.contenttypes.models import ContentType
 from django.db import models as django_models
 from django.db.models import Q
 
@@ -15,46 +14,36 @@ class OfferingQuerySet(django_models.QuerySet):
         if user.is_anonymous or user.is_staff or user.is_support:
             return self
 
-        connected_customers = set(
-            structure_models.Customer.objects.all()
-            .filter(
-                Q(permissions__user=user, permissions__is_active=True)
-                | Q(
-                    projects__permissions__user=user,
-                    projects__permissions__is_active=True,
-                )
-            )
-            .distinct()
+        connected_customers = structure_models.Customer.objects.all().filter(
+            permissions__user=user, permissions__is_active=True
+        )
+
+        connected_projects = structure_models.Project.objects.all().filter(
+            permissions__user=user, permissions__is_active=True
         )
 
         return self.filter(
             Q(shared=True)
-            | Q(shared=False, allowed_customers__in=connected_customers)
             | Q(shared=False, customer__in=connected_customers)
+            | Q(shared=False, project__in=connected_projects)
             | Q(shared=True, permissions__user=user, permissions__is_active=True),
-        )
+        ).distinct()
 
     def filter_for_customer(self, value):
+        customer = structure_models.Customer.objects.get(uuid=value)
         return self.filter(
-            Q(shared=True) | Q(customer__uuid=value) | Q(allowed_customers__uuid=value)
+            Q(shared=True, divisions__isnull=True)
+            | Q(shared=True, divisions__isnull=False, divisions=customer.division)
+            | Q(customer__uuid=value)
+        )
+
+    def filter_for_service_manager(self, value):
+        return self.filter(
+            shared=True, permissions__user__uuid=value, permissions__is_active=True
         )
 
     def filter_for_project(self, value):
-        settings_ct = ContentType.objects.get_for_model(
-            structure_models.ServiceSettings
-        )
-        service_settings = {
-            pk
-            for spl in structure_models.ServiceProjectLink.get_all_models()
-            for pk in spl.objects.filter(project__uuid=value).values_list(
-                'service__settings_id', flat=True
-            )
-        }
-
-        return self.filter(
-            Q(content_type=settings_ct, object_id__in=service_settings)
-            | ~Q(content_type=settings_ct)
-        )
+        return self.filter(Q(shared=True) | Q(project__uuid=value))
 
     def filter_importable(self, user):
         # Import is limited to staff for shared offerings and to staff/owners for private offerings
@@ -72,10 +61,7 @@ class OfferingQuerySet(django_models.QuerySet):
             .distinct()
         )
 
-        return self.filter(
-            Q(shared=False, allowed_customers__in=owned_customers)
-            | Q(shared=False, customer__in=owned_customers)
-        )
+        return self.filter(shared=False, customer__in=owned_customers)
 
 
 class OfferingManager(MixinManager):

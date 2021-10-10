@@ -7,7 +7,7 @@ from ... import models
 
 ## Class to define parameters importing AWS AMI
 class Command(BaseCommand):
-    help_text = "Import catalog of Amazon images."
+    help = "Import catalog of Amazon images."
 
     def add_arguments(self, parser):
         parser.add_argument(

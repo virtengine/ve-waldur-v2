@@ -8,10 +8,9 @@ from waldur_core.structure.tests.factories import SshPublicKeyFactory
 from waldur_openstack.openstack_tenant.tests import (
     factories as openstack_tenant_factories,
 )
+from waldur_rancher import models, tasks
 from waldur_rancher import utils as rancher_utils
-
-from .. import models, tasks
-from . import factories, fixtures, test_cluster, utils
+from waldur_rancher.tests import factories, fixtures, test_cluster, utils
 
 
 class NodeGetTest(test.APITransactionTestCase):
@@ -78,7 +77,7 @@ class NodeCreateTest(test_cluster.BaseClusterCreateTest):
     @mock.patch('waldur_rancher.executors.tasks')
     def test_use_data_volumes(self, mock_tasks):
         volume_type = openstack_tenant_factories.VolumeTypeFactory(
-            settings=self.fixture.tenant_spl.service.settings
+            settings=self.fixture.tenant_settings
         )
         self.payload = {
             'cluster': factories.ClusterFactory.get_url(self.fixture.cluster),
@@ -100,14 +99,16 @@ class NodeCreateTest(test_cluster.BaseClusterCreateTest):
         response = self.create_node(self.fixture.staff)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(self.fixture.cluster.node_set.count(), 2)
-        node = self.fixture.cluster.node_set.exclude(name='').get()
+        node = self.fixture.cluster.node_set.filter(
+            name='my-cluster-rancher-node-1'
+        ).get()
         self.assertEqual(len(node.initial_data['data_volumes']), 1)
 
     @utils.override_plugin_settings(MOUNT_POINT_CHOICE_IS_MANDATORY=False)
     @mock.patch('waldur_rancher.executors.tasks')
     def test_use_data_volumes_without_mount_point(self, mock_tasks):
         volume_type = openstack_tenant_factories.VolumeTypeFactory(
-            settings=self.fixture.tenant_spl.service.settings
+            settings=self.fixture.tenant_settings
         )
         self.payload = {
             'cluster': factories.ClusterFactory.get_url(self.fixture.cluster),
@@ -128,14 +129,16 @@ class NodeCreateTest(test_cluster.BaseClusterCreateTest):
         response = self.create_node(self.fixture.staff)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(self.fixture.cluster.node_set.count(), 2)
-        node = self.fixture.cluster.node_set.exclude(name='').get()
+        node = self.fixture.cluster.node_set.filter(
+            name='my-cluster-rancher-node-1'
+        ).get()
         self.assertEqual(len(node.initial_data['data_volumes']), 1)
 
     @utils.override_plugin_settings(MOUNT_POINT_CHOICE_IS_MANDATORY=True)
     @mock.patch('waldur_rancher.executors.tasks')
     def test_if_mount_point_is_required(self, mock_tasks):
         volume_type = openstack_tenant_factories.VolumeTypeFactory(
-            settings=self.fixture.tenant_spl.service.settings
+            settings=self.fixture.tenant_settings
         )
         self.payload = {
             'cluster': factories.ClusterFactory.get_url(self.fixture.cluster),
@@ -245,7 +248,9 @@ class NodeCreateTest(test_cluster.BaseClusterCreateTest):
         response = self.create_node(self.fixture.staff)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(self.fixture.cluster.node_set.count(), 2)
-        node = self.fixture.cluster.node_set.exclude(name='').get()
+        node = self.fixture.cluster.node_set.filter(
+            name='my-cluster-rancher-node-1'
+        ).get()
         self.assertEqual(node.initial_data['ssh_public_key'], ssh_public_key.uuid.hex)
 
     def test_node_config_formatting(self):
@@ -262,10 +267,8 @@ class NodeCreateTest(test_cluster.BaseClusterCreateTest):
         service_settings = factories.RancherServiceSettingsFactory(
             options={'cloud_init_template': template}
         )
-        service = factories.RancherServiceFactory(settings=service_settings)
-        spl = factories.RancherServiceProjectLinkFactory(service=service)
         cluster = factories.ClusterFactory(
-            settings=self.fixture.settings, service_project_link=spl
+            settings=self.fixture.settings, service_settings=service_settings
         )
         node = factories.NodeFactory(
             cluster=cluster, initial_data={'data_volumes': [{'mount_point': 'path'}]}
@@ -435,6 +438,12 @@ class NodeLinkTest(test_cluster.BaseClusterCreateTest):
     def test_link_is_disabled_when_node_is_already_linked(self):
         self.node.instance = self.instance
         self.node.save()
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(self.url, {'instance': self.instance_url})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_link_is_disabled_when_instance_is_already_linked(self):
+        factories.NodeFactory(cluster=self.cluster, instance=self.instance)
         self.client.force_authenticate(self.fixture.staff)
         response = self.client.post(self.url, {'instance': self.instance_url})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)

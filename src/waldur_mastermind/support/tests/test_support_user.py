@@ -5,12 +5,10 @@ from ddt import data, ddt
 from rest_framework import status
 
 from waldur_core.structure.tests import factories as structure_factories
-from waldur_mastermind.support import models, tasks
+from waldur_mastermind.support import exceptions, models, tasks
 from waldur_mastermind.support.backend.atlassian import ServiceDeskBackend
+from waldur_mastermind.support.tests import base, factories
 from waldur_mastermind.support.tests.base import override_support_settings
-
-from .. import exceptions
-from . import base, factories
 
 
 @ddt
@@ -57,7 +55,7 @@ class SupportUserPullTest(base.BaseTest):
         bob = factories.SupportUserFactory(backend_id='bob')
 
         # Act
-        tasks.SupportUserPullTask().run()
+        tasks.pull_support_users()
 
         # Assert
         alice.refresh_from_db()
@@ -73,7 +71,7 @@ class SupportUserPullTest(base.BaseTest):
         alice = factories.SupportUserFactory(backend_id='alice', is_active=False)
 
         # Act
-        tasks.SupportUserPullTask().run()
+        tasks.pull_support_users()
 
         # Assert
         alice.refresh_from_db()

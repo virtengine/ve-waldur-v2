@@ -5,11 +5,10 @@ from python_freeipa import exceptions as freeipa_exceptions
 from rest_framework import status, test
 
 from waldur_core.structure.tests import factories as structure_factories
+from waldur_freeipa import tasks
+from waldur_freeipa.backend import FreeIPABackend
+from waldur_freeipa.tests import factories
 from waldur_freeipa.tests.helpers import override_plugin_settings
-
-from .. import tasks
-from ..backend import FreeIPABackend
-from . import factories
 
 
 @override_plugin_settings(ENABLED=True)
@@ -292,9 +291,7 @@ class ProfileUpdateTest(test.APITransactionTestCase):
         self.profile = factories.ProfileFactory(user=self.user, is_active=False)
 
     @data(
-        ('Alex Bloggs', 'Alex', 'Bloggs', 'AB'),
-        ('Alex', 'Alex', 'N/A', 'A'),
-        ('', 'N/A', 'N/A', ''),
+        ('Alex Bloggs', 'Alex', 'Bloggs'), ('Alex', 'Alex', ''), ('', '', ''),
     )
     def test_backend_is_called_with_correct_parameters_if_update_full_name(
         self, names, mock_client
@@ -302,10 +299,11 @@ class ProfileUpdateTest(test.APITransactionTestCase):
         full_name = names[0]
         first_name = names[1]
         last_name = names[2]
-        initials = names[3]
 
         user = self.profile.user
         user.full_name = full_name
+        user.first_name = first_name
+        user.last_name = last_name
         user.save()
         self.profile.refresh_from_db()
 
@@ -314,9 +312,8 @@ class ProfileUpdateTest(test.APITransactionTestCase):
             self.profile.username,
             cn=full_name,
             displayname=full_name,
-            givenname=first_name,
-            initials=initials,
-            sn=last_name,
+            givenname=first_name or 'N/A',
+            sn=last_name or 'N/A',
         )
 
     def test_backend_is_called_with_correct_parameters_if_update_gecos(

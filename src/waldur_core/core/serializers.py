@@ -10,14 +10,12 @@ from django.core.exceptions import (
 from django.urls import Resolver404, reverse
 from django.utils.translation import ugettext_lazy as _
 from rest_framework import serializers
-from rest_framework.exceptions import ValidationError
 from rest_framework.fields import Field, ReadOnlyField
 
 from waldur_core.core import utils as core_utils
-from waldur_core.core.fields import TimestampField
 from waldur_core.core.signals import pre_serializer_fields
 
-from . import fields
+from . import fields as core_fields
 
 logger = logging.getLogger(__name__)
 
@@ -328,44 +326,22 @@ class RestrictedSerializerMixin:
         query_params = self.context['request'].query_params
         keys = query_params.getlist(self.FIELDS_PARAM_NAME)
         keys = set(key for key in keys if key in fields.keys())
+        optional_fields = set(self.get_optional_fields()) - keys
+        fields = OrderedDict(
+            (
+                (key, value)
+                for key, value in fields.items()
+                if key not in optional_fields
+            )
+        )
         if not keys:
             return fields
         return OrderedDict(
             ((key, value) for key, value in fields.items() if key in keys)
         )
 
-
-class RequiredFieldsMixin:
-    """
-    This mixin allows to specify list of required fields.
-    It expects list of field names as Meta.required_fields attribute.
-    """
-
-    def get_fields(self):
-        fields = super(RequiredFieldsMixin, self).get_fields()
-        required_fields = getattr(self.Meta, 'required_fields') or []
-        for name in required_fields:
-            field = fields.get(name)
-            if field:
-                field.required = True
-        return fields
-
-
-class ExtraFieldOptionsMixin:
-    """
-    This mixin allows to specify extra fields metadata.
-    It expects dictionary of field name and options as Meta.extra_field_options attribute.
-    """
-
-    def get_fields(self):
-        fields = super(ExtraFieldOptionsMixin, self).get_fields()
-        extra_field_options = getattr(self.Meta, 'extra_field_options', {})
-        for name, options in extra_field_options.items():
-            field = fields.get(name)
-            if field:
-                for key, val in options.items():
-                    setattr(field, key, val)
-        return fields
+    def get_optional_fields(self):
+        return []
 
 
 class HyperlinkedRelatedModelSerializer(serializers.HyperlinkedModelSerializer):
@@ -404,133 +380,6 @@ class HyperlinkedRelatedModelSerializer(serializers.HyperlinkedModelSerializer):
         return url.to_internal_value(data['url'])
 
 
-class TimestampIntervalSerializer(serializers.Serializer):
-    start = TimestampField(required=False)
-    end = TimestampField(required=False)
-
-    def validate(self, data):
-        """
-        Check that the start is before the end.
-        """
-        if 'start' in data and 'end' in data and data['start'] >= data['end']:
-            raise serializers.ValidationError(_('End must occur after start.'))
-        return data
-
-    # TimeInterval serializer is used for validation only. We are providing custom method for such serializers
-    # to avoid confusion with to_internal_value or to_representation DRF methods.
-    def get_filter_data(self):
-        """ Return start and end as datetime """
-        return self.validated_data
-
-
-class HistorySerializer(serializers.Serializer):
-    """
-    Receive datetime as timestamps and converts them to list of datetimes
-
-    Support 2 types of input data:
-     - start, end and points_count - interval from <start> to <end> will be automatically split into
-                                     <points_count> pieces
-     - point_list - list of timestamps that will be converted to datetime points
-
-    """
-
-    start = TimestampField(required=False)
-    end = TimestampField(required=False)
-    points_count = serializers.IntegerField(min_value=2, required=False)
-    point_list = serializers.ListField(child=TimestampField(), required=False)
-
-    def validate(self, attrs):
-        autosplit_fields = {'start', 'end', 'points_count'}
-        if (
-            'point_list' not in attrs or not attrs['point_list']
-        ) and not autosplit_fields == set(attrs.keys()):
-            raise serializers.ValidationError(
-                _(
-                    'Not enough parameters for historical data. '
-                    '(Either "point" or "start" + "end" + "points_count" parameters have to be provided).'
-                )
-            )
-        if 'point_list' in attrs and autosplit_fields & set(attrs.keys()):
-            raise serializers.ValidationError(
-                _(
-                    'Too many parameters for historical data. '
-                    '(Either "point" or "start" + "end" + "points_count" parameters have to be provided).'
-                )
-            )
-        if 'point_list' not in attrs and not attrs['start'] < attrs['end']:
-            raise serializers.ValidationError(
-                _('Start timestamps have to be later than end timestamps.')
-            )
-        return attrs
-
-    # History serializer is used for validation only. We are providing custom method for such serializers
-    # to avoid confusion with to_internal_value or to_representation DRF methods.
-    def get_filter_data(self):
-        if 'point_list' in self.validated_data:
-            return self.validated_data['point_list']
-        else:
-            interval = (self.validated_data['end'] - self.validated_data['start']) / (
-                self.validated_data['points_count'] - 1
-            )
-            return [
-                self.validated_data['start'] + interval * i
-                for i in range(self.validated_data['points_count'])
-            ]
-
-
-class BaseSummarySerializer(serializers.Serializer):
-    """ Serializer that renders each instance with its own specific serializer """
-
-    @classmethod
-    def get_serializer(cls, model):
-        raise NotImplementedError(
-            'Method `get_serializer` should be implemented for SummarySerializer.'
-        )
-
-    @classmethod
-    def eager_load(cls, summary_queryset, request):
-        optimized_querysets = []
-        for queryset in summary_queryset.querysets:
-            serializer = cls.get_serializer(queryset.model)
-            optimized_querysets.append(serializer.eager_load(queryset, request))
-        summary_queryset.querysets = optimized_querysets
-        return summary_queryset
-
-    def to_representation(self, instance):
-        serializer = self.get_serializer(instance.__class__)
-        return serializer(instance, context=self.context).data
-
-
-class GeoLocationField(serializers.JSONField):
-    def __init__(self, *args, **kwargs):
-        validators = kwargs.get('validators', [])
-
-        def geo_location_validator(value):
-            if value is not None:
-                if not isinstance(value, list):
-                    raise ValidationError(
-                        _('GeoLocationField should be a list of dictionaries.')
-                    )
-                else:
-                    for location in value:
-                        if not isinstance(location, dict):
-                            raise ValidationError(
-                                _('GeoLocationField should be a list of dictionaries.')
-                            )
-                        if not {'latitude', 'longitude'}.issubset(location.keys()):
-                            raise ValidationError(
-                                _(
-                                    'GeoLocationField should be a list of dictionaries. For example: '
-                                    '[{"latitude": 123, "longitude": 345}, '
-                                    '{"latitude": 456, "longitude": 678}]'
-                                )
-                            )
-            return value
-
-        validators.append(geo_location_validator)
-        super(GeoLocationField, self).__init__(validators=validators, *args, **kwargs)
-
-
 class UnicodeIntegerField(serializers.IntegerField):
     def to_internal_value(self, data):
         if isinstance(data, str):
@@ -539,8 +388,8 @@ class UnicodeIntegerField(serializers.IntegerField):
 
 
 class DateRangeFilterSerializer(serializers.Serializer):
-    start = fields.YearMonthField(required=False)
-    end = fields.YearMonthField(required=False)
+    start = core_fields.YearMonthField(required=False)
+    end = core_fields.YearMonthField(required=False)
 
     def validate(self, data):
         if 'start' in data and 'end' in data and data['start'] > data['end']:

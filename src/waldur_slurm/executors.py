@@ -14,12 +14,14 @@ class AllocationCreateExecutor(core_executors.CreateExecutor):
             state_transition='begin_creating',
         )
 
-## Class to update Allocation
-class AllocationUpdateExecutor(core_executors.UpdateExecutor):
+
+class AllocationSetLimitsExecutor(core_executors.ActionExecutor):
     @classmethod
-    def get_task_signature(cls, volume, serialized_volume, **kwargs):
+    def get_task_signature(cls, allocation, serialized_allocation, **kwargs):
         return core_tasks.BackendMethodTask().si(
-            serialized_volume, 'set_resource_limits', state_transition='begin_updating'
+            serialized_allocation,
+            'set_resource_limits',
+            state_transition='begin_updating',
         )
 
 

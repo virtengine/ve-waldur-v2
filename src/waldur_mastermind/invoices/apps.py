@@ -32,12 +32,6 @@ class InvoiceConfig(AppConfig):
         )
 
         signals.post_save.connect(
-            handlers.update_invoice_pdf,
-            sender=models.Invoice,
-            dispatch_uid='waldur_mastermind.invoices.update_invoice_pdf',
-        )
-
-        signals.post_save.connect(
             handlers.set_project_name_on_invoice_item_creation,
             sender=models.InvoiceItem,
             dispatch_uid='waldur_mastermind.invoices.set_project_name_on_invoice_item_creation',
@@ -67,20 +61,14 @@ class InvoiceConfig(AppConfig):
             dispatch_uid='waldur_mastermind.invoices.prevent_deletion_of_customer_with_invoice',
         )
 
-        signals.post_save.connect(
-            handlers.adjust_invoice_items_for_downtime,
-            sender=models.ServiceDowntime,
-            dispatch_uid='waldur_mastermind.invoices.adjust_invoice_items_for_downtime',
-        )
-
-        signals.post_delete.connect(
-            handlers.downtime_has_been_deleted,
-            sender=models.ServiceDowntime,
-            dispatch_uid='waldur_mastermind.invoices.downtime_has_been_deleted',
-        )
-
         structure_signals.project_moved.connect(
             handlers.projects_customer_has_been_changed,
             sender=structure_models.Project,
             dispatch_uid='waldur_mastermind.invoices.projects_customer_has_been_changed',
+        )
+
+        signals.post_save.connect(
+            handlers.create_recurring_usage_if_invoice_has_been_created,
+            sender=models.Invoice,
+            dispatch_uid='waldur_mastermind.invoices.create_recurring_usage_if_invoice_has_been_created',
         )

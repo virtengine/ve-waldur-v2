@@ -23,23 +23,22 @@ from waldur_core.structure import views as structure_views
 from waldur_core.structure.managers import filter_queryset_for_user
 from waldur_core.structure.models import ServiceSettings
 from waldur_core.structure.permissions import is_administrator
+from waldur_mastermind.common import utils as common_utils
+from waldur_openstack.openstack import models as openstack_models
+from waldur_openstack.openstack import views as openstack_views
+from waldur_rancher import (
+    exceptions,
+    executors,
+    filters,
+    models,
+    serializers,
+    utils,
+    validators,
+)
 from waldur_rancher.apps import RancherConfig
 from waldur_rancher.exceptions import RancherException
 
-from . import exceptions, executors, filters, models, serializers, utils, validators
-
 logger = logging.getLogger(__name__)
-
-
-class RancherServiceViewSet(structure_views.BaseServiceViewSet):
-    queryset = models.RancherService.objects.all()
-    serializer_class = serializers.RancherServiceSerializer
-
-
-class ServiceProjectLinkViewSet(structure_views.BaseServiceProjectLinkViewSet):
-    queryset = models.RancherServiceProjectLink.objects.all()
-    serializer_class = serializers.ServiceProjectLinkSerializer
-    filterset_class = filters.ServiceProjectLinkFilter
 
 
 class OptionalReadonlyViewset:
@@ -53,10 +52,8 @@ class OptionalReadonlyViewset:
             raise MethodNotAllowed(method=request.method)
 
 
-class ClusterViewSet(
-    OptionalReadonlyViewset, structure_views.ImportableResourceViewSet
-):
-    queryset = models.Cluster.objects.all()
+class ClusterViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
+    queryset = models.Cluster.objects.all().order_by('name')
     serializer_class = serializers.ClusterSerializer
     filterset_class = filters.ClusterFilter
     update_executor = executors.ClusterUpdateExecutor
@@ -93,13 +90,9 @@ class ClusterViewSet(
     update_validators = partial_update_validators = [
         core_validators.StateValidator(models.Cluster.States.OK),
     ]
-    destroy_validators = (
-        structure_views.ImportableResourceViewSet.destroy_validators
-        + [validators.all_cluster_related_vms_can_be_deleted,]
-    )
-    importable_resources_backend_method = 'get_clusters_for_import'
-    importable_resources_serializer_class = serializers.ClusterImportableSerializer
-    import_resource_serializer_class = serializers.ClusterImportSerializer
+    destroy_validators = structure_views.ResourceViewSet.destroy_validators + [
+        validators.all_cluster_related_vms_can_be_deleted,
+    ]
     pull_executor = executors.ClusterPullExecutor
 
     @decorators.action(detail=True, methods=['get'])
@@ -116,6 +109,7 @@ class ClusterViewSet(
     kubeconfig_file_validators = [
         core_validators.StateValidator(models.Cluster.States.OK)
     ]
+    kubeconfig_file_permissions = [structure_permissions.is_staff]
 
     @decorators.action(detail=True, methods=['post'])
     def import_yaml(self, request, uuid=None):
@@ -142,6 +136,61 @@ class ClusterViewSet(
         return response.Response(status.HTTP_200_OK)
 
     import_yaml_serializer_class = serializers.ImportYamlSerializer
+
+    @decorators.action(detail=True, methods=['post'])
+    def create_management_security_group(self, request, uuid=None):
+        serializer = serializers.CreateManagementSecurityGroupSerializer(
+            data=request.data, many=True
+        )
+        serializer.is_valid(raise_exception=True)
+        cluster = self.get_object()
+        user = request.user
+        tenant = utils.get_management_tenant(cluster)
+        port = cluster.settings.get_option('management_tenant_access_port')
+
+        rules = []
+
+        for rule in serializer.validated_data:
+            rules.append(
+                {
+                    'protocol': 'tcp',
+                    'from_port': port,
+                    'to_port': port,
+                    'direction': openstack_models.SecurityGroupRule.INGRESS,
+                    'ethertype': rule['ethertype'],
+                    'cidr': rule['cidr'],
+                }
+            )
+
+        post_data = {
+            'name': cluster.name,
+            'description': 'Access for management of cluster %s' % cluster.name,
+            'rules': rules,
+        }
+        view = openstack_views.TenantViewSet.as_view({'post': 'create_security_group'})
+        group_response = common_utils.create_request(
+            view, user, post_data, uuid=tenant.uuid.hex
+        )
+
+        if group_response.status_code != status.HTTP_201_CREATED:
+            return response.Response(
+                group_response.data, status=group_response.status_code
+            )
+
+        security_group = openstack_models.SecurityGroup.objects.get(
+            uuid=group_response.data.get('uuid')
+        )
+        cluster.management_security_group = security_group
+        cluster.save()
+        return response.Response(
+            {'security_group_uuid': security_group.uuid.hex},
+            status=status.HTTP_201_CREATED,
+        )
+
+    create_management_security_group_validators = (
+        validators.creation_of_management_security_group_is_available,
+        core_validators.StateValidator(models.Cluster.States.OK),
+    )
 
 
 class NodeViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
@@ -178,14 +227,24 @@ class NodeViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
     @decorators.action(detail=True, methods=['post'])
     def link_openstack(self, request, uuid=None):
         node = self.get_object()
+
         if node.content_type and node.object_id:
-            raise ValidationError('Node is already linked.')
+            raise ValidationError(_('Node is already linked to OpenStack instance.'))
+
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         instance = serializer.validated_data['instance']
-        node.content_type = ContentType.objects.get_for_model(instance)
+        instance_type = ContentType.objects.get_for_model(instance)
+
+        if models.Node.objects.filter(
+            content_type=instance_type, object_id=instance.id
+        ).exists():
+            raise ValidationError(
+                _('OpenStack instance is already linked to another node.')
+            )
+
+        node.content_type = instance_type
         node.object_id = instance.id
-        node.name = instance.name
         node.save()
         return response.Response(status=status.HTTP_200_OK)
 
@@ -196,7 +255,9 @@ class NodeViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
     def unlink_openstack(self, request, uuid=None):
         node = self.get_object()
         if not node.content_type or not node.object_id:
-            raise ValidationError('Node is not linked to any OpenStack instance yet.')
+            raise ValidationError(
+                _('Node is not linked to any OpenStack instance yet.')
+            )
         node.content_type = None
         node.object_id = None
         node.save()
@@ -287,7 +348,7 @@ class CatalogViewSet(OptionalReadonlyViewset, core_views.ActionsViewSet):
             )
             | Q(
                 content_type=ContentType.objects.get_for_model(ServiceSettings),
-                object_id=cluster.service_project_link.service.settings.id,
+                object_id=cluster.service_settings.id,
             )
         )
 
@@ -363,11 +424,11 @@ class CatalogViewSet(OptionalReadonlyViewset, core_views.ActionsViewSet):
         if isinstance(scope, ServiceSettings) and not self.request.user.is_staff:
             raise ValidationError(_('Only staff is allowed to manage global catalogs.'))
         if isinstance(scope, models.Cluster):
-            is_administrator(self.request.user, scope.service_project_link.project)
+            is_administrator(self.request.user, scope.project)
 
 
 class ProjectViewSet(structure_views.BaseServicePropertyViewSet):
-    queryset = models.Project.objects.all()
+    queryset = models.Project.objects.all().order_by('name')
     serializer_class = serializers.ProjectSerializer
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.ProjectFilter
@@ -383,7 +444,7 @@ class ProjectViewSet(structure_views.BaseServicePropertyViewSet):
 
 
 class NamespaceViewSet(structure_views.BaseServicePropertyViewSet):
-    queryset = models.Namespace.objects.all()
+    queryset = models.Namespace.objects.all().order_by('name')
     serializer_class = serializers.NamespaceSerializer
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.NamespaceFilter
@@ -419,7 +480,7 @@ class TemplateVersionView(APIView):
 
 
 class ApplicationViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
-    queryset = models.Application.objects.all()
+    queryset = models.Application.objects.all().order_by('name')
     serializer_class = serializers.ApplicationSerializer
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.ApplicationFilter
@@ -517,7 +578,7 @@ class IngressViewSet(
     SyncDestroyMixin,
     structure_views.ResourceViewSet,
 ):
-    queryset = models.Ingress.objects.all()
+    queryset = models.Ingress.objects.all().order_by('name')
     serializer_class = serializers.IngressSerializer
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.IngressFilter
@@ -533,7 +594,7 @@ class ServiceViewSet(
     SyncDestroyMixin,
     structure_views.ResourceViewSet,
 ):
-    queryset = models.Service.objects.all()
+    queryset = models.Service.objects.all().order_by('name')
     serializer_class = serializers.ServiceSerializer
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.ServiceFilter

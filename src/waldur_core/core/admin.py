@@ -7,8 +7,8 @@ from django.conf import settings
 from django.conf.urls import url
 from django.contrib import admin, messages
 from django.contrib.admin import forms as admin_forms
-from django.contrib.admin import widgets
 from django.contrib.auth import admin as auth_admin
+from django.contrib.auth import forms as auth_forms
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
@@ -22,8 +22,10 @@ from django.utils.safestring import mark_safe
 from django.utils.translation import ugettext_lazy as _
 from jsoneditor.forms import JSONEditor
 from rest_framework import permissions as rf_permissions
+from rest_framework.exceptions import ParseError
 from reversion.admin import VersionAdmin
 
+from waldur_auth_social.utils import pull_remote_eduteams_user
 from waldur_core.core import models
 from waldur_core.core.authentication import can_access_admin_site
 
@@ -118,7 +120,7 @@ class OptionalChoiceField(forms.ChoiceField):
         super(OptionalChoiceField, self).__init__(choices=choices, *args, **kwargs)
 
 
-class UserCreationForm(auth_admin.UserCreationForm):
+class UserCreationForm(auth_forms.UserCreationForm):
     class Meta:
         model = get_user_model()
         fields = ("username",)
@@ -137,7 +139,7 @@ class UserCreationForm(auth_admin.UserCreationForm):
         )
 
 
-class UserChangeForm(auth_admin.UserChangeForm):
+class UserChangeForm(auth_forms.UserChangeForm):
     class Meta:
         model = get_user_model()
         exclude = ('details',)
@@ -206,21 +208,24 @@ class NativeNameAdminMixin(ExcludedFieldsAdminMixin):
         return []
 
 
-class UserAdmin(NativeNameAdminMixin, auth_admin.UserAdmin):
+class UserAdmin(NativeNameAdminMixin, auth_admin.UserAdmin, VersionAdmin):
     list_display = (
         'username',
         'uuid',
         'email',
-        'full_name',
+        'first_name',
+        'last_name',
         'native_name',
         'is_active',
         'is_staff',
         'is_support',
+        'is_identity_manager',
     )
     search_fields = (
         'username',
         'uuid',
-        'full_name',
+        'first_name',
+        'last_name',
         'native_name',
         'email',
         'civil_number',
@@ -234,7 +239,8 @@ class UserAdmin(NativeNameAdminMixin, auth_admin.UserAdmin):
             {
                 'fields': (
                     'civil_number',
-                    'full_name',
+                    'first_name',
+                    'last_name',
                     'native_name',
                     'email',
                     'preferred_language',
@@ -243,7 +249,7 @@ class UserAdmin(NativeNameAdminMixin, auth_admin.UserAdmin):
                 )
             },
         ),
-        (_('Organization'), {'fields': ('organization', 'job_title',)}),
+        (_('Organization'), {'fields': ('organization', 'job_title', 'affiliations')}),
         (
             _('Permissions'),
             {
@@ -251,6 +257,7 @@ class UserAdmin(NativeNameAdminMixin, auth_admin.UserAdmin):
                     'is_active',
                     'is_staff',
                     'is_support',
+                    'is_identity_manager',
                     'customer_roles',
                     'project_roles',
                 )
@@ -258,7 +265,7 @@ class UserAdmin(NativeNameAdminMixin, auth_admin.UserAdmin):
         ),
         (
             _('Important dates'),
-            {'fields': ('last_login', 'date_joined', 'agreement_date')},
+            {'fields': ('last_login', 'date_joined', 'agreement_date', 'last_sync')},
         ),
         (
             _('Authentication backend details'),
@@ -267,11 +274,13 @@ class UserAdmin(NativeNameAdminMixin, auth_admin.UserAdmin):
     )
     readonly_fields = (
         'registration_method',
+        'affiliations',
         'agreement_date',
         'customer_roles',
         'project_roles',
         'uuid',
         'last_login',
+        'last_sync',
         'date_joined',
         'format_details',
     )
@@ -325,8 +334,30 @@ class UserAdmin(NativeNameAdminMixin, auth_admin.UserAdmin):
     format_details.allow_tags = True
     format_details.short_description = _('Details')
 
+    actions = ['pull_remote_user']
 
-class SshPublicKeyAdmin(admin.ModelAdmin):
+    def pull_remote_user(self, request, queryset):
+        if not settings.WALDUR_AUTH_SOCIAL['REMOTE_EDUTEAMS_ENABLED']:
+            messages.error(
+                request,
+                _('Remote eduTEAMS account synchronization extension is disabled.'),
+            )
+            return
+        for remote_user in queryset:
+            if remote_user.registration_method == 'eduteams':
+                try:
+                    pull_remote_eduteams_user(remote_user.username)
+                except ParseError:
+                    messages.error(
+                        request,
+                        _('Unable to pull remote eduTEAMS account %s.')
+                        % remote_user.username,
+                    )
+
+    pull_remote_user.short_description = 'Pull remote eduTEAMS users'
+
+
+class SshPublicKeyAdmin(VersionAdmin):
     list_display = ('user', 'name', 'fingerprint')
     search_fields = ('user__username', 'name', 'fingerprint')
     readonly_fields = ('user', 'name', 'fingerprint', 'public_key')
@@ -615,20 +646,6 @@ class UpdateOnlyModelAdmin:
         if request.user.is_staff:
             return True
         return False
-
-
-class GBtoMBWidget(widgets.AdminIntegerFieldWidget):
-    def value_from_datadict(self, data, files, name):
-        value = super(GBtoMBWidget, self).value_from_datadict(data, files, name) or 0
-        value = int(value) * 1024
-        return value
-
-    def format_value(self, value):
-        return int(value) / 1024
-
-    def render(self, name, value, attrs=None, renderer=None):
-        result = super(GBtoMBWidget, self).render(name, value, attrs)
-        return '<label>%s GB</label>' % result
 
 
 class HideAdminOriginalMixin(admin.ModelAdmin):

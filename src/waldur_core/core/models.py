@@ -4,9 +4,6 @@ from datetime import datetime
 
 import pytz
 from croniter.croniter import croniter
-from cryptography.exceptions import UnsupportedAlgorithm
-from cryptography.hazmat import backends
-from cryptography.hazmat.primitives import serialization
 from django.apps import apps
 from django.conf import settings
 from django.contrib.auth.models import PermissionsMixin, UserManager
@@ -19,14 +16,17 @@ from django.utils import timezone as django_timezone
 from django.utils.encoding import force_text
 from django.utils.lru_cache import lru_cache
 from django.utils.translation import ugettext_lazy as _
-from django_fsm import FSMIntegerField, transition
+from django_fsm import ConcurrentTransitionMixin, FSMIntegerField, transition
 from model_utils import FieldTracker
 from model_utils.models import TimeStampedModel
 from reversion import revisions as reversion
-from reversion.models import Version
 
 from waldur_core.core.fields import CronScheduleField, UUIDField
-from waldur_core.core.validators import MinCronValueValidator, validate_name
+from waldur_core.core.validators import (
+    MinCronValueValidator,
+    validate_name,
+    validate_ssh_public_key,
+)
 from waldur_core.logging.loggers import LoggableMixin
 
 from .shims import AbstractBaseUser
@@ -144,13 +144,26 @@ class UserDetailsMixin(models.Model):
     class Meta:
         abstract = True
 
-    full_name = models.CharField(_('full name'), max_length=100, blank=True)
     native_name = models.CharField(_('native name'), max_length=100, blank=True)
     phone_number = models.CharField(_('phone number'), max_length=255, blank=True)
     organization = models.CharField(_('organization'), max_length=255, blank=True)
     job_title = models.CharField(_('job title'), max_length=40, blank=True)
+    affiliations = BetterJSONField(
+        default=list,
+        blank=True,
+        help_text="Person's affiliation within organization such as student, faculty, staff.",
+    )
+
+    def _process_saml2_affiliations(self, affiliations):
+        """
+        Due to djangosaml2 assumption that attributes list should have at most one element
+        we have to implement custom method to process affiliations fetched from SAML2 IdP.
+        See also: https://github.com/peppelinux/djangosaml2/issues/28
+        """
+        self.affiliations = affiliations
 
 
+@reversion.register()
 class User(
     LoggableMixin,
     UuidMixin,
@@ -183,7 +196,7 @@ class User(
         null=True,
         default=None,
     )
-    email = models.EmailField(_('email address'), max_length=75, blank=True)
+    email = models.EmailField(_('email address'), max_length=320, blank=True)
 
     is_staff = models.BooleanField(
         _('staff status'),
@@ -203,7 +216,14 @@ class User(
         default=False,
         help_text=_('Designates whether the user is a global support user.'),
     )
+    is_identity_manager = models.BooleanField(
+        default=False,
+        help_text=_(
+            'Designates whether the user is allowed to manage remote user identities.'
+        ),
+    )
     date_joined = models.DateTimeField(_('date joined'), default=django_timezone.now)
+    last_sync = models.DateTimeField(default=django_timezone.now, editable=False)
     registration_method = models.CharField(
         _('registration method'),
         max_length=50,
@@ -230,6 +250,38 @@ class User(
         help_text=_('Extra details from authentication backend.'),
     )
     backend_id = models.CharField(max_length=255, blank=True)
+    first_name = models.CharField(_('first name'), max_length=100, blank=True)
+    last_name = models.CharField(_('last name'), max_length=100, blank=True)
+    WHITELIST_FIELDS = [
+        'is_superuser',
+        'description',
+        'username',
+        'civil_number',
+        'native_name',
+        'phone_number',
+        'organization',
+        'job_title',
+        'email',
+        'is_staff',
+        'is_support',
+        'preferred_language',
+        'competence',
+        'backend_id',
+        'is_identity_manager',
+        'affiliations',
+        'first_name',
+        'last_name',
+    ]
+
+    @property
+    def full_name(self):
+        return ('%s %s' % (self.first_name, self.last_name)).strip()
+
+    @full_name.setter
+    def full_name(self, value):
+        names = value.split()
+        self.first_name = ' '.join(names[:1])
+        self.last_name = ' '.join(names[1:])
 
     tracker = FieldTracker()
     objects = UserManager()
@@ -314,17 +366,6 @@ class ChangeEmailRequest(UuidMixin, TimeStampedModel):
         verbose_name_plural = _('change email requests')
 
 
-def validate_ssh_public_key(ssh_key):
-    if isinstance(ssh_key, str):
-        ssh_key = ssh_key.encode('utf-8')
-
-    try:
-        serialization.load_ssh_public_key(ssh_key, backends.default_backend())
-    except (ValueError, UnsupportedAlgorithm) as e:
-        logger.debug('Invalid SSH public key %s. Error: %s', ssh_key, e)
-        raise ValidationError(_('Invalid SSH public key.'))
-
-
 def get_ssh_key_fingerprint(ssh_key):
     # How to get fingerprint from ssh key:
     # http://stackoverflow.com/a/6682934/175349
@@ -337,6 +378,7 @@ def get_ssh_key_fingerprint(ssh_key):
     return ':'.join(a + b for a, b in zip(fp_plain[::2], fp_plain[1::2]))
 
 
+@reversion.register()
 class SshPublicKey(LoggableMixin, UuidMixin, models.Model):
     """
     User public key.
@@ -354,6 +396,11 @@ class SshPublicKey(LoggableMixin, UuidMixin, models.Model):
         validators=[validators.MaxLengthValidator(2000), validate_ssh_public_key]
     )
     is_shared = models.BooleanField(default=False)
+
+    @property
+    def type(self):
+        key_parts = self.public_key.split(' ', 1)
+        return key_parts[0]
 
     class Meta:
         unique_together = ('user', 'name')
@@ -411,7 +458,7 @@ class RuntimeStateMixin(models.Model):
         return cls.RuntimeStates.OFFLINE
 
 
-class StateMixin(ErrorMessageMixin):
+class StateMixin(ErrorMessageMixin, ConcurrentTransitionMixin):
     class States:
         CREATION_SCHEDULED = 5
         CREATING = 6
@@ -466,9 +513,7 @@ class StateMixin(ErrorMessageMixin):
     def schedule_deleting(self):
         pass
 
-    @transition(
-        field=state, source=[States.UPDATING, States.CREATING], target=States.OK
-    )
+    @transition(field=state, source='*', target=States.OK)
     def set_ok(self):
         pass
 
@@ -484,50 +529,6 @@ class StateMixin(ErrorMessageMixin):
     @lru_cache(maxsize=1)
     def get_all_models(cls):
         return [model for model in apps.get_models() if issubclass(model, cls)]
-
-
-class ReversionMixin:
-    """ Store historical values of instance, using django-reversion.
-
-        Note: `ReversionMixin` model should be registered in django-reversion,
-              using one of supported methods:
-              http://django-reversion.readthedocs.org/en/latest/api.html#registering-models-with-django-reversion
-    """
-
-    def get_version_fields(self):
-        """ Get field that are tracked in object history versions. """
-        options = reversion._get_options(self)
-        return options.fields or [
-            f.name for f in self._meta.fields if f not in options.exclude
-        ]
-
-    def _is_version_duplicate(self):
-        """ Define should new version be created for object or no.
-
-            Reasons to provide custom check instead of default `ignore_revision_duplicates`:
-             - no need to compare all revisions - it is OK if right object version exists in any revision;
-             - need to compare object attributes (not serialized data) to avoid
-               version creation on wrong <float> vs <int> comparison;
-        """
-        if self.id is None:
-            return False
-        try:
-            latest_version = Version.objects.get_for_object(self).latest(
-                'revision__date_created'
-            )
-        except Version.DoesNotExist:
-            return False
-        latest_version_object = latest_version._object_version.object
-        fields = self.get_version_fields()
-        return all(
-            [getattr(self, f) == getattr(latest_version_object, f) for f in fields]
-        )
-
-    def save(self, **kwargs):
-        if self._is_version_duplicate():
-            return super(ReversionMixin, self).save(**kwargs)
-        with reversion.create_revision():
-            return super(ReversionMixin, self).save(**kwargs)
 
 
 # XXX: consider renaming it to AffinityMixin
@@ -593,3 +594,19 @@ class BackendModelMixin:
         Returns a list of fields that are handled on backend.
         """
         return ()
+
+
+class BackendMixin(models.Model):
+    """
+    Mixin to add standard backend_id field.
+    """
+
+    class Meta:
+        abstract = True
+
+    backend_id = models.CharField(max_length=255, blank=True)
+
+
+class Feature(models.Model):
+    key = models.TextField(max_length=255, unique=True)
+    value = models.BooleanField(default=False)

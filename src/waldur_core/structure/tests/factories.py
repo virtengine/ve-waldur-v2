@@ -17,7 +17,8 @@ class UserFactory(factory.DjangoModelFactory):
     username = factory.Sequence(lambda n: 'john%s' % n)
     civil_number = factory.Sequence(lambda n: '%08d' % n)
     email = factory.LazyAttribute(lambda o: '%s@example.org' % o.username)
-    full_name = factory.Sequence(lambda n: 'John Doe%s' % n)
+    first_name = factory.Sequence(lambda n: 'John%s' % n)
+    last_name = factory.Sequence(lambda n: 'Doe%s' % n)
     native_name = factory.Sequence(lambda n: 'Jöhn Dõe%s' % n)
     organization = factory.Sequence(lambda n: 'Organization %s' % n)
     phone_number = factory.Sequence(lambda n: '555-555-%s-2' % n)
@@ -195,50 +196,6 @@ class ServiceSettingsFactory(factory.DjangoModelFactory):
         return 'http://testserver' + reverse('servicesettings-list')
 
 
-class TestServiceFactory(factory.DjangoModelFactory):
-    class Meta:
-        model = test_models.TestService
-
-    settings = factory.SubFactory(ServiceSettingsFactory)
-    customer = factory.SubFactory(CustomerFactory)
-
-    @classmethod
-    def get_url(cls, service=None, action=None):
-        if service is None:
-            service = TestServiceFactory()
-        url = 'http://testserver' + reverse(
-            'test-detail', kwargs={'uuid': service.uuid.hex}
-        )
-        return url if action is None else url + action + '/'
-
-    @classmethod
-    def get_list_url(cls):
-        return 'http://testserver' + reverse('test-list')
-
-
-class TestServiceProjectLinkFactory(factory.DjangoModelFactory):
-    __test__ = False
-
-    class Meta:
-        model = test_models.TestServiceProjectLink
-
-    service = factory.SubFactory(TestServiceFactory)
-    project = factory.LazyAttribute(
-        lambda spl: ProjectFactory(customer=spl.service.customer)
-    )
-
-    @classmethod
-    def get_url(cls, spl=None, action=None):
-        if spl is None:
-            spl = TestServiceProjectLinkFactory()
-        url = 'http://testserver' + reverse('test-spl-detail', kwargs={'pk': spl.pk})
-        return url if action is None else url + action + '/'
-
-    @classmethod
-    def get_list_url(cls):
-        return 'http://testserver' + reverse('test-spl-list')
-
-
 class TestNewInstanceFactory(factory.DjangoModelFactory):
     __test__ = False
 
@@ -246,7 +203,8 @@ class TestNewInstanceFactory(factory.DjangoModelFactory):
         model = test_models.TestNewInstance
 
     name = factory.Sequence(lambda n: 'instance%s' % n)
-    service_project_link = factory.SubFactory(TestServiceProjectLinkFactory)
+    service_settings = factory.SubFactory(ServiceSettingsFactory)
+    project = factory.SubFactory(ProjectFactory)
 
     @classmethod
     def get_url(cls, instance=None, action=None):
@@ -262,37 +220,6 @@ class TestNewInstanceFactory(factory.DjangoModelFactory):
         return 'http://testserver' + reverse('test-new-instances-list')
 
 
-class ServiceCertificationFactory(factory.DjangoModelFactory):
-    class Meta:
-        model = models.ServiceCertification
-
-    name = factory.Sequence(lambda n: 'certification%s' % n)
-    link = factory.Sequence(lambda n: 'https://www.test.com/certification%s' % n)
-    description = factory.Sequence(lambda n: 'description of the certification%s' % n)
-
-    @classmethod
-    def get_url(cls, instance=None, action=None):
-        if instance is None:
-            instance = ServiceCertificationFactory()
-        url = 'http://testserver' + reverse(
-            'service-certification-detail', kwargs={'uuid': instance.uuid.hex}
-        )
-        return url if action is None else url + action + '/'
-
-    @classmethod
-    def get_list_url(cls):
-        return 'http://testserver' + reverse('service-certification-list')
-
-    @factory.post_generation
-    def service_settings(self, create, extracted, **kwargs):
-        if not create:
-            return
-
-        if extracted:
-            for service_settings in extracted:
-                self.service_settings.add(service_settings)
-
-
 class TestSubResourceFactory(factory.DjangoModelFactory):
     class Meta:
         model = test_models.TestSubResource
@@ -300,7 +227,8 @@ class TestSubResourceFactory(factory.DjangoModelFactory):
 
 class TestVolumeFactory(factory.DjangoModelFactory):
     size = factory.fuzzy.FuzzyInteger(1024, 102400, step=1024)
-    service_project_link = factory.SubFactory(TestServiceProjectLinkFactory)
+    service_settings = factory.SubFactory(ServiceSettingsFactory)
+    project = factory.SubFactory(ProjectFactory)
 
     class Meta:
         model = test_models.TestVolume
@@ -308,7 +236,8 @@ class TestVolumeFactory(factory.DjangoModelFactory):
 
 class TestSnapshotFactory(factory.DjangoModelFactory):
     size = factory.fuzzy.FuzzyInteger(1024, 102400, step=1024)
-    service_project_link = factory.SubFactory(TestServiceProjectLinkFactory)
+    service_settings = factory.SubFactory(ServiceSettingsFactory)
+    project = factory.SubFactory(ProjectFactory)
 
     class Meta:
         model = test_models.TestSnapshot

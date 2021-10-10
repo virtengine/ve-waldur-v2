@@ -6,7 +6,7 @@ from ... import models
 
 ## Class to define parameters exporting AWS AMI
 class Command(BaseCommand):
-    help_text = 'Export catalog of Amazon images.'
+    help = 'Export catalog of Amazon images.'
     args = '[ami_catalog.csv]'
 
     def handle(self, *args, **options):

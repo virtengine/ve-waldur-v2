@@ -8,12 +8,12 @@ def register_in(router):
         r'marketplace-service-providers',
         views.ServiceProviderViewSet,
         basename='marketplace-service-provider',
-    ),
+    )
     router.register(
         r'marketplace-categories',
         views.CategoryViewSet,
         basename='marketplace-category',
-    ),
+    )
     router.register(
         r'marketplace-offerings', views.OfferingViewSet, basename='marketplace-offering'
     )
@@ -29,6 +29,11 @@ def register_in(router):
     )
     router.register(
         r'marketplace-plans', views.PlanViewSet, basename='marketplace-plan'
+    )
+    router.register(
+        r'marketplace-plan-components',
+        views.PlanComponentViewSet,
+        basename='marketplace-plan-component',
     )
     router.register(
         r'marketplace-screenshots',
@@ -65,24 +70,25 @@ def register_in(router):
         r'marketplace-public-api',
         views.MarketplaceAPIViewSet,
         basename='marketplace-public-api',
-    ),
+    )
     router.register(
         r'marketplace-offering-files',
         views.OfferingFileViewSet,
         basename='marketplace-offering-file',
-    ),
+    )
     router.register(
         r'marketplace-offering-referrals',
         views.OfferingReferralsViewSet,
         basename='marketplace-offering-referral',
-    ),
+    )
+    router.register(
+        r'marketplace-offering-users',
+        views.OfferingUsersViewSet,
+        basename='marketplace-offering-user',
+    )
 
 
 urlpatterns = [
-    url(
-        r'^api/customers/(?P<uuid>[a-f0-9]+)/offerings/$',
-        views.CustomerOfferingViewSet.as_view(),
-    ),
     url(r'^api/marketplace-plugins/$', views.PluginViewSet.as_view()),
     url(
         r'^api/marketplace-resource-offerings/(?P<project_uuid>[a-f0-9]+)/(?P<category_uuid>[a-f0-9]+)/$',

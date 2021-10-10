@@ -14,6 +14,12 @@ class BookingExtension(WaldurExtension):
         return True
 
     @staticmethod
+    def django_urls():
+        from .urls import urlpatterns
+
+        return urlpatterns
+
+    @staticmethod
     def rest_urls():
         from .urls import register_in
 
@@ -28,5 +34,10 @@ class BookingExtension(WaldurExtension):
                 'task': 'waldur_mastermind.booking.send_notifications_about_upcoming_bookings',
                 'schedule': crontab(minute=0, hour=9),
                 'args': (),
-            }
+            },
+            'waldur-mastermind-reject-past-bookings': {
+                'task': 'waldur_mastermind.booking.reject_past_bookings',
+                'schedule': crontab(minute=0, hour=10),
+                'args': (),
+            },
         }

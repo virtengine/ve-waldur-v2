@@ -4,7 +4,7 @@ from django.forms import ModelForm
 from django.urls import reverse
 from django.utils.translation import ugettext_lazy as _
 
-from waldur_core.core.admin import ExecutorAdminAction, JsonWidget, PasswordWidget
+from waldur_core.core.admin import ExecutorAdminAction, PasswordWidget
 from waldur_core.quotas.admin import QuotaInline
 from waldur_core.structure import admin as structure_admin
 
@@ -24,27 +24,9 @@ def _get_list_admin_url(model):
     )
 
 
-class ServiceProjectLinkAdmin(structure_admin.ServiceProjectLinkAdmin):
-    readonly_fields = (
-        'get_service_settings_username',
-        'get_service_settings_password',
-    ) + structure_admin.ServiceProjectLinkAdmin.readonly_fields
-
-    def get_service_settings_username(self, obj):
-        return obj.service.settings.username
-
-    get_service_settings_username.short_description = _('Username')
-
-    def get_service_settings_password(self, obj):
-        return obj.service.settings.password
-
-    get_service_settings_password.short_description = _('Password')
-
-
 class TenantAdminForm(ModelForm):
     class Meta:
         widgets = {
-            'extra_configuration': JsonWidget(),
             'user_password': PasswordWidget(),
         }
 
@@ -196,7 +178,5 @@ admin.site.register(models.Tenant, TenantAdmin)
 admin.site.register(models.Flavor, FlavorAdmin)
 admin.site.register(models.Image, ImageAdmin)
 admin.site.register(models.VolumeType, structure_admin.ServicePropertyAdmin)
-admin.site.register(models.OpenStackService, structure_admin.ServiceAdmin)
-admin.site.register(models.OpenStackServiceProjectLink, ServiceProjectLinkAdmin)
 admin.site.register(models.FloatingIP, structure_admin.ResourceAdmin)
 structure_admin.CustomerAdmin.inlines += [CustomerOpenStackInline]

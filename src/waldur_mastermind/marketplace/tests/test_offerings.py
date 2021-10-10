@@ -11,19 +11,25 @@ from rest_framework import exceptions as rest_exceptions
 from rest_framework import status, test
 
 from waldur_core.media.utils import dummy_image
+from waldur_core.structure.models import ProjectRole
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures
-from waldur_core.structure.tests.fixtures import ServiceFixture
+from waldur_core.structure.tests.factories import UserFactory
 from waldur_mastermind.common.mixins import UnitPriceMixin
-from waldur_mastermind.marketplace import models
+from waldur_mastermind.marketplace import models, serializers
+from waldur_mastermind.marketplace.management.commands.export_offering import (
+    export_offering,
+)
+from waldur_mastermind.marketplace.management.commands.import_offering import (
+    create_offering,
+    update_offering,
+)
+from waldur_mastermind.marketplace.tests import factories
 from waldur_mastermind.marketplace.tests.factories import OFFERING_OPTIONS
+from waldur_mastermind.marketplace.tests.helpers import override_marketplace_settings
 from waldur_mastermind.marketplace_vmware import VIRTUAL_MACHINE_TYPE
 
-from .. import serializers
-from ..management.commands.export_offering import export_offering
-from ..management.commands.import_offering import create_offering, update_offering
-from . import factories
-from .helpers import override_marketplace_settings
+from . import fixtures as marketplace_fixtures
 
 
 @ddt
@@ -41,10 +47,112 @@ class OfferingGetTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.json()), 1)
 
+    @override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=False)
     def test_offerings_should_be_invisible_to_unauthenticated_users(self):
         url = factories.OfferingFactory.get_list_url()
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+class OfferingPlanInfoTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.offering = factories.OfferingFactory(shared=True)
+        self.url = factories.OfferingFactory.get_url(self.offering)
+
+        self.offering_component = factories.OfferingComponentFactory(
+            offering=self.offering,
+            billing_type=models.OfferingComponent.BillingTypes.FIXED,
+        )
+        self.plan = factories.PlanFactory(offering=self.offering)
+        self.plan_component = factories.PlanComponentFactory(
+            plan=self.plan, component=self.offering_component
+        )
+
+    def test_plan_info(self):
+        self.client.force_authenticate(self.fixture.staff)
+        self._check_plan_info(models.OfferingComponent.BillingTypes.FIXED, 'fixed')
+        self._check_plan_info(
+            models.OfferingComponent.BillingTypes.USAGE, 'usage-based'
+        )
+        self._check_plan_info(
+            models.OfferingComponent.BillingTypes.ONE_TIME, 'one-time'
+        )
+        self._check_plan_info(
+            models.OfferingComponent.BillingTypes.ON_PLAN_SWITCH, 'on-plan-switch'
+        )
+        self._check_plan_info(models.OfferingComponent.BillingTypes.LIMIT, 'limit')
+
+        offering_component = factories.OfferingComponentFactory(
+            offering=self.offering,
+            billing_type=models.OfferingComponent.BillingTypes.FIXED,
+            type='ram',
+            name='RAM',
+        )
+        self.plan_component = factories.PlanComponentFactory(
+            plan=self.plan, component=offering_component
+        )
+
+        self._check_plan_info(
+            models.OfferingComponent.BillingTypes.ON_PLAN_SWITCH, 'mixed'
+        )
+
+    def test_minimal_price(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        self.offering_component.billing_type = (
+            models.OfferingComponent.BillingTypes.LIMIT
+        )
+        self.plan_component.price = 10
+        self._check_minimal_price(10)
+
+        self.offering_component.billing_type = (
+            models.OfferingComponent.BillingTypes.FIXED
+        )
+        self.plan_component.price = 100
+        self.plan_component.amount = 0
+        self._check_minimal_price(100)
+
+        self.offering_component.billing_type = (
+            models.OfferingComponent.BillingTypes.FIXED
+        )
+        self.plan_component.price = 100
+        self.plan_component.amount = 1
+        self._check_minimal_price(100)
+
+        self.offering_component.billing_type = (
+            models.OfferingComponent.BillingTypes.ONE_TIME
+        )
+        self.plan_component.price = 200
+        self._check_minimal_price(200)
+
+        self.offering_component.billing_type = (
+            models.OfferingComponent.BillingTypes.ON_PLAN_SWITCH
+        )
+        self.plan_component.price = 300
+        self._check_minimal_price(0)
+
+        self.offering_component.billing_type = (
+            models.OfferingComponent.BillingTypes.USAGE
+        )
+        self.plan_component.price = 500
+        self._check_minimal_price(0)
+
+    def _check_minimal_price(self, minimal_price):
+        self.offering_component.save()
+        self.plan_component.save()
+
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['plans'][0]['minimal_price'], minimal_price)
+
+    def _check_plan_info(self, billing_type, plan_type):
+        self.offering_component.billing_type = billing_type
+        self.offering_component.save()
+
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['plans'][0]['plan_type'], plan_type)
 
 
 @ddt
@@ -129,27 +237,36 @@ class OfferingFilterTest(test.APITransactionTestCase):
         # Assert
         self.assertEqual(len(response.data), 1)
 
-    def test_private_offerings_are_available_for_users_in_allowed_customers(self):
-        fixture = fixtures.CustomerFixture()
-        self.offering.allowed_customers.add(fixture.customer)
-
-        self.client.force_authenticate(fixture.owner)
-        response = self.client.get(self.url)
-        self.assertEqual(len(response.data), 1)
-
     def test_private_offerings_are_not_available_for_users_in_other_customers(self):
         fixture = fixtures.CustomerFixture()
         self.client.force_authenticate(fixture.owner)
         response = self.client.get(self.url)
         self.assertEqual(len(response.data), 0)
 
-    def test_private_offerings_are_available_for_users_in_allowed_projects(self):
+    def test_private_offering_is_available_for_users_in_related_project(self):
         fixture = fixtures.ProjectFixture()
-        self.offering.allowed_customers.add(fixture.customer)
-
+        self.offering.project = fixture.project
+        self.offering.save()
         self.client.force_authenticate(fixture.manager)
         response = self.client.get(self.url)
         self.assertEqual(len(response.data), 1)
+
+    def test_private_offering_is_not_available_for_users_in_other_project_of_the_same_customer(
+        self,
+    ):
+        fixture = fixtures.ProjectFixture()
+        self.offering.project = fixture.project
+        self.offering.save()
+
+        other_manager = structure_factories.UserFactory()
+        other_project = structure_factories.ProjectFactory(
+            customer=fixture.project.customer
+        )
+        other_project.add_user(other_manager, ProjectRole.MANAGER)
+
+        self.client.force_authenticate(other_manager)
+        response = self.client.get(self.url)
+        self.assertEqual(len(response.data), 0)
 
     def test_private_offerings_are_not_available_for_users_in_other_projects(self):
         fixture = fixtures.ProjectFixture()
@@ -172,20 +289,78 @@ class OfferingFilterTest(test.APITransactionTestCase):
         response = self.client.get(self.url)
         self.assertEqual(len(response.data), 1)
 
-    def test_filter_offerings_by_project(self):
-        fixture = ServiceFixture()
-        self.offering.scope = fixture.service_settings
+    def test_filter_offerings_for_service_manager(self):
+        # Arrange
+        factories.OfferingFactory(customer=self.fixture.customer, shared=False)
+
+        self.offering.shared = True
         self.offering.save()
-        fixture.service_project_link
+        self.offering.add_user(self.fixture.user)
 
-        self.client.force_authenticate(self.fixture.staff)
-        response = self.client.get(self.url, {'project_uuid': fixture.project.uuid.hex})
-        self.assertEqual(len(response.data), 1)
-
+        # Act
+        self.client.force_authenticate(self.fixture.owner)
         response = self.client.get(
-            self.url, {'project_uuid': self.fixture.project.uuid.hex}
+            self.url, {'service_manager_uuid': self.fixture.user.uuid.hex}
         )
+
+        # Assert
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['uuid'], self.offering.uuid.hex)
+
+    def test_filter_limited_shared_offerings_for_customer_uuid_if_divisions_match(
+        self,
+    ):
+        # Arrange
+        self.offering.delete()
+        offering = factories.OfferingFactory(shared=True)
+        url = factories.OfferingFactory.get_list_url()
+        division = structure_factories.DivisionFactory()
+        offering.divisions.add(division)
+
+        self.fixture.customer.division = division
+        self.fixture.customer.save()
+
+        # Act
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.get(
+            url, {'allowed_customer_uuid': self.fixture.customer.uuid.hex}
+        )
+
+        # Assert
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['uuid'], offering.uuid.hex)
+
+    def test_filter_limited_shared_offerings_for_customer_uuid_if_divisions_do_not_match(
+        self,
+    ):
+        # Arrange
+        self.offering.delete()
+        offering = factories.OfferingFactory(shared=True)
+        url = factories.OfferingFactory.get_list_url()
+        division = structure_factories.DivisionFactory()
+        offering.divisions.add(division)
+
+        # Act
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.get(
+            url, {'allowed_customer_uuid': self.fixture.customer.uuid.hex}
+        )
+
+        # Assert
         self.assertEqual(len(response.data), 0)
+
+    def test_filter_keyword(self):
+        factories.OfferingFactory(name='name keyword')
+        factories.OfferingFactory(description='description Keyword')
+        offering = factories.OfferingFactory()
+        offering.customer.name = 'name keyword'
+        offering.customer.save()
+        url = factories.OfferingFactory.get_list_url()
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(url)
+        self.assertEqual(len(response.data), 4)
+        response = self.client.get(url, {'keyword': 'keyword'})
+        self.assertEqual(len(response.data), 3)
 
 
 @ddt
@@ -683,6 +858,46 @@ class OfferingUpdateTest(test.APITransactionTestCase):
         response = self.client.patch(self.url, {'name': 'new_offering'})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_authorized_user_can_update_offering_attributes_in_valid_state(self):
+        self.fixture.service_manager = UserFactory()
+        self.offering.add_user(self.fixture.service_manager)
+
+        url = factories.OfferingFactory.get_url(self.offering, 'update_attributes')
+
+        for state in (
+            models.Offering.States.DRAFT,
+            models.Offering.States.ACTIVE,
+            models.Offering.States.PAUSED,
+        ):
+            for user in ('staff', 'owner', 'service_manager'):
+                with self.subTest():
+                    # Arrange
+                    self.offering.state = state
+                    self.offering.save()
+
+                    # Act
+                    self.client.force_authenticate(getattr(self.fixture, user))
+                    response = self.client.post(url, {'key': 'value'})
+                    self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+                    self.offering.refresh_from_db()
+                    self.assertEqual(self.offering.attributes, {'key': 'value'})
+
+    def test_authorized_user_can_not_update_offering_attributes_in_archived_state(self):
+        self.fixture.service_manager = UserFactory()
+        self.offering.add_user(self.fixture.service_manager)
+
+        self.offering.state = models.Offering.States.ARCHIVED
+        self.offering.save()
+
+        url = factories.OfferingFactory.get_url(self.offering, 'update_attributes')
+
+        for user in ('staff', 'owner', 'service_manager'):
+            with self.subTest():
+                self.client.force_authenticate(getattr(self.fixture, user))
+                response = self.client.post(url, {'key': 'value'})
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
     def test_offering_updating_is_not_available_for_blocked_organization(self):
         self.customer.blocked = True
         self.customer.save()
@@ -937,6 +1152,65 @@ class OfferingUpdateTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(1, self.offering.plans.count())
 
+    def test_update_offering_backend_id(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.patch(self.url, {'backend_id': 'new_backend_id'})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.backend_id, 'new_backend_id')
+
+
+@ddt
+class OfferingDivisionsTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.customer = self.fixture.customer
+
+        factories.ServiceProviderFactory(customer=self.customer)
+        self.offering = factories.OfferingFactory(customer=self.customer, shared=True)
+        self.url = factories.OfferingFactory.get_url(
+            self.offering, action='update_divisions'
+        )
+        self.delete_url = factories.OfferingFactory.get_url(
+            self.offering, action='delete_divisions'
+        )
+        self.division = structure_factories.DivisionFactory()
+        self.division_url = structure_factories.DivisionFactory.get_url(self.division)
+
+    @data('staff', 'owner')
+    def test_user_can_update_divisions(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.post(self.url, {'divisions': [self.division_url]})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.divisions.count(), 1)
+
+    @data('user', 'customer_support', 'admin', 'manager')
+    def test_user_cannot_update_divisions(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.post(self.url, {'divisions': [self.division_url]})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @data('staff', 'owner')
+    def test_user_can_delete_divisions(self, user):
+        self.offering.divisions.add(self.division)
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.post(self.delete_url)
+        self.assertEqual(
+            response.status_code, status.HTTP_204_NO_CONTENT, response.data
+        )
+
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.divisions.count(), 0)
+
+    @data('user', 'customer_support', 'admin', 'manager')
+    def test_user_cannot_delete_divisions(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.post(self.delete_url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
 
 @ddt
 class OfferingDeleteTest(test.APITransactionTestCase):
@@ -1092,13 +1366,14 @@ class OfferingCountTest(test.APITransactionTestCase):
         self.category = factories.CategoryFactory()
         self.url = factories.CategoryFactory.get_url(self.category)
 
-    def assert_count(self, user, value, shared=False):
+    def assert_count(self, user, value, shared=False, project=None):
         factories.OfferingFactory.create_batch(
             2,
             customer=self.customer,
             category=self.category,
             shared=shared,
             state=models.Offering.States.ACTIVE,
+            project=project,
         )
         self.client.force_authenticate(user)
         response = self.client.get(self.url)
@@ -1106,11 +1381,13 @@ class OfferingCountTest(test.APITransactionTestCase):
 
     @data('staff', 'owner', 'admin', 'manager')
     def test_authorized_user_can_see_private_offering(self, user):
-        self.assert_count(getattr(self.fixture, user), 2)
+        self.assert_count(getattr(self.fixture, user), 2, project=self.fixture.project)
 
     @data('owner', 'admin', 'manager')
     def test_unauthorized_user_can_not_see_private_offering(self, user):
-        self.assert_count(getattr(fixtures.ProjectFixture(), user), 0)
+        self.assert_count(
+            getattr(fixtures.ProjectFixture(), user), 0, project=self.fixture.project
+        )
 
     @data('staff', 'owner', 'admin', 'manager')
     def test_anyone_can_see_public_offering(self, user):
@@ -1124,18 +1401,56 @@ class OfferingStateTest(test.APITransactionTestCase):
         self.customer = self.fixture.customer
         factories.ServiceProviderFactory(customer=self.customer)
         self.offering = factories.OfferingFactory(customer=self.customer, shared=True)
+        self.fixture.service_manager = UserFactory()
+        self.offering.add_user(self.fixture.service_manager)
 
     @data('staff',)
-    def test_authorized_user_can_update_state(self, user):
+    def test_authorized_user_can_activate_offering(self, user):
         response, offering = self.update_offering_state(user, 'activate')
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertEqual(offering.state, offering.States.ACTIVE)
 
-    @data('owner', 'user', 'customer_support', 'admin', 'manager')
-    def test_unauthorized_user_can_not_update_state(self, user):
+    @data('owner', 'user', 'customer_support', 'admin', 'manager', 'service_manager')
+    def test_unauthorized_user_can_not_activate_offering(self, user):
         response, offering = self.update_offering_state(user, 'activate')
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         self.assertEqual(offering.state, offering.States.DRAFT)
+
+    @data('owner', 'service_manager')
+    def test_authorized_user_can_pause_offering(self, user):
+        self.offering.state = models.Offering.States.ACTIVE
+        self.offering.save()
+
+        response, offering = self.update_offering_state(user, 'pause')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(offering.state, models.Offering.States.PAUSED)
+
+    @data('user', 'customer_support', 'admin', 'manager')
+    def test_unauthorized_user_can_not_pause_offering(self, user):
+        self.offering.state = models.Offering.States.ACTIVE
+        self.offering.save()
+
+        response, offering = self.update_offering_state(user, 'pause')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+        self.assertEqual(offering.state, offering.States.ACTIVE)
+
+    @data('owner', 'service_manager')
+    def test_authorized_user_can_unpause_offering(self, user):
+        self.offering.state = models.Offering.States.PAUSED
+        self.offering.save()
+
+        response, offering = self.update_offering_state(user, 'unpause')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(offering.state, models.Offering.States.ACTIVE)
+
+    @data('user', 'customer_support', 'admin', 'manager')
+    def test_unauthorized_user_can_not_unpause_offering(self, user):
+        self.offering.state = models.Offering.States.PAUSED
+        self.offering.save()
+
+        response, offering = self.update_offering_state(user, 'unpause')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(offering.state, models.Offering.States.PAUSED)
 
     def test_invalid_state(self):
         response, offering = self.update_offering_state('staff', 'pause')
@@ -1177,46 +1492,6 @@ class OfferingStateTest(test.APITransactionTestCase):
         return response, self.offering
 
 
-class AllowedCustomersTest(test.APITransactionTestCase):
-    def setUp(self):
-        self.fixture = fixtures.ProjectFixture()
-        self.customer = self.fixture.customer
-
-    def test_staff_can_update_allowed_customers(self):
-        url = structure_factories.CustomerFactory.get_url(self.customer, 'offerings')
-        user = getattr(self.fixture, 'staff')
-        self.client.force_authenticate(user)
-        response = self.client.post(
-            url,
-            {
-                "offering_set": [
-                    factories.OfferingFactory.get_url(),
-                    factories.OfferingFactory.get_url(),
-                ]
-            },
-        )
-        self.customer.refresh_from_db()
-        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        self.assertEqual(len(self.customer.offering_set.all()), 2)
-
-    def test_other_users_not_can_update_allowed_customers(self):
-        url = structure_factories.CustomerFactory.get_url(self.customer, 'offerings')
-        user = getattr(self.fixture, 'owner')
-        self.client.force_authenticate(user)
-        response = self.client.post(
-            url,
-            {
-                "offering_set": [
-                    factories.OfferingFactory.get_url(),
-                    factories.OfferingFactory.get_url(),
-                ]
-            },
-        )
-        self.customer.refresh_from_db()
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
-        self.assertEqual(len(self.customer.offering_set.all()), 0)
-
-
 @ddt
 class OfferingPublicGetTest(test.APITransactionTestCase):
     def setUp(self):
@@ -1235,27 +1510,23 @@ class OfferingPublicGetTest(test.APITransactionTestCase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
-    @override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=True)
     def test_anonymous_cannot_view_draft_offerings(self):
         url = factories.OfferingFactory.get_list_url()
         response = self.client.get(url)
         for offering in response.data:
             self.assertNotEqual(models.Offering.States.DRAFT, offering['state'])
 
-    @override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=True)
     def test_anonymous_cannot_view_offering_scope(self):
         url = factories.OfferingFactory.get_list_url()
         response = self.client.get(url)
         for offering in response.data:
             self.assertNotIn('scope', offering)
 
-    @override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=True)
     def test_anonymous_can_view_offering_scope(self):
         url = factories.OfferingFactory.get_url(self.offerings[0])
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-    @override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=True)
     @data('staff', 'owner', 'user', 'customer_support', 'admin')
     def test_authenticated_user_can_view_offering_scope(self, user):
         user = getattr(self.fixture, user)
@@ -1265,7 +1536,6 @@ class OfferingPublicGetTest(test.APITransactionTestCase):
         for offering in response.data:
             self.assertIn('scope', offering)
 
-    @override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=True)
     @data('staff', 'owner', 'user', 'customer_support', 'admin', 'manager', None)
     def test_private_offerings_are_hidden(self, user):
         if user:
@@ -1395,6 +1665,7 @@ class OfferingDoiTest(test.APITransactionTestCase):
         self.assertTrue('pid' in response[0])
         self.assertTrue(len(response) == 1)
 
+    @override_marketplace_settings(ANONYMOUS_USER_CAN_VIEW_OFFERINGS=False)
     def test_anonymous_user_cannot_lookup_offering_referrals(self):
         url = factories.OfferingReferralFactory.get_list_url()
 
@@ -1402,3 +1673,65 @@ class OfferingDoiTest(test.APITransactionTestCase):
             url, {'scope': factories.OfferingFactory.get_url(self.offering)}
         )
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+@ddt
+class OfferingThumbnailTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = marketplace_fixtures.MarketplaceFixture()
+        self.offering = self.fixture.offering
+        self.offering.state = models.Offering.States.ACTIVE
+        self.offering.save()
+        self.url = factories.OfferingFactory.get_url(
+            offering=self.offering, action='update_thumbnail'
+        )
+        self.url_delete = factories.OfferingFactory.get_url(
+            offering=self.offering, action='delete_thumbnail'
+        )
+
+    @data('staff')
+    def test_staff_can_update_or_delete_thumbnail_of_archived_offering(self, user):
+        self.offering.state = models.Offering.States.ARCHIVED
+        self.offering.save()
+        self._user_have_access(user)
+
+    @data('offering_owner', 'service_manager', 'admin', 'manager')
+    def test_user_cannot_update_or_delete_thumbnail_of_archived_offering(self, user):
+        self.offering.state = models.Offering.States.ARCHIVED
+        self.offering.save()
+        self._user_does_not_have_access(user)
+
+    @data('staff', 'offering_owner', 'service_manager')
+    def test_user_can_update_or_delete_thumbnail(self, user):
+        self._user_have_access(user)
+
+    @data('admin', 'manager')
+    def test_user_cannot_update_or_delete_thumbnail(self, user):
+        self._user_does_not_have_access(user)
+
+    def _user_have_access(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.post(
+            self.url, {'thumbnail': dummy_image()}, format='multipart'
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.offering.refresh_from_db()
+        self.assertTrue(self.offering.thumbnail)
+
+        response = self.client.post(self.url_delete)
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+        self.offering.refresh_from_db()
+        self.assertFalse(self.offering.thumbnail)
+
+    def _user_does_not_have_access(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.post(
+            self.url, {'thumbnail': dummy_image()}, format='multipart'
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.offering.refresh_from_db()
+        self.assertFalse(self.offering.thumbnail)
+
+        response = self.client.post(self.url_delete)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)

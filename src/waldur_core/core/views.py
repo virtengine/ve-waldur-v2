@@ -2,6 +2,7 @@ import functools
 import logging
 from urllib.parse import urlencode
 
+import reversion
 from django.conf import settings
 from django.contrib import auth
 from django.core.cache import cache
@@ -9,8 +10,8 @@ from django.db.models import ProtectedError
 from django.http import HttpResponseRedirect, JsonResponse
 from django.utils import timezone
 from django.utils.encoding import force_text
-from django.utils.lru_cache import lru_cache
 from django.utils.translation import ugettext_lazy as _
+from django.views.generic import TemplateView
 from rest_framework import exceptions
 from rest_framework import mixins as rf_mixins
 from rest_framework import permissions as rf_permissions
@@ -22,10 +23,18 @@ from rest_framework.views import APIView
 from rest_framework.views import exception_handler as rf_exception_handler
 
 from waldur_core import __version__
-from waldur_core.core import WaldurExtension, permissions
+from waldur_core.core import (
+    WALDUR_DISABLED_EXTENSIONS,
+    WaldurExtension,
+    models,
+    permissions,
+)
 from waldur_core.core.exceptions import ExtensionDisabled, IncorrectStateException
+from waldur_core.core.features import FEATURES
+from waldur_core.core.metadata import WaldurConfiguration
 from waldur_core.core.mixins import ensure_atomic_transaction
 from waldur_core.core.serializers import AuthTokenSerializer
+from waldur_core.core.utils import format_homeport_link
 from waldur_core.logging.loggers import event_logger
 
 logger = logging.getLogger(__name__)
@@ -249,7 +258,7 @@ class ProtectedViewSet(
     rf_mixins.ListModelMixin,
     viewsets.GenericViewSet,
 ):
-    """ All default operations except update and delete """
+    """All default operations except update and delete"""
 
     pass
 
@@ -311,11 +320,10 @@ class ActionsViewSet(viewsets.ModelViewSet):
         # check if action is allowed
         if self.action in getattr(self, 'disabled_actions', []):
             raise exceptions.MethodNotAllowed(method=request.method)
-        if self.action != 'metadata':
-            self.validate_object_action(self.action)
+        self.validate_object_action(self.action)
 
     def validate_object_action(self, action_name, obj=None):
-        """ Execute validation for actions that are related to particular object """
+        """Execute validation for actions that are related to particular object"""
         action_method = getattr(self, action_name)
         if not getattr(action_method, 'detail', False) and action_name not in (
             'update',
@@ -334,18 +342,50 @@ class ReadOnlyActionsViewSet(ActionsViewSet):
     disabled_actions = ['create', 'update', 'partial_update', 'destroy']
 
 
-@lru_cache(maxsize=1)
+def get_feature_values():
+    feature_values = {
+        feature.key: feature.value for feature in models.Feature.objects.all()
+    }
+    return {
+        section['key']: {
+            feature['key']: feature_values.get(
+                f'{section["key"]}.{feature["key"]}', False
+            )
+            for feature in section['items']
+        }
+        for section in FEATURES
+    }
+
+
 def get_public_settings():
     public_settings = {}
 
-    # Processing a special extension WALDUR_CORE
-    public_settings['WALDUR_CORE'] = {}
-    extension_settings = settings.WALDUR_CORE
-    for s in settings.WALDUR_CORE_PUBLIC_SETTINGS:
+    public_settings['WALDUR_DISABLED_EXTENSIONS'] = WALDUR_DISABLED_EXTENSIONS
+    public_settings['FEATURES'] = get_feature_values()
+
+    try:
+        keys = WaldurConfiguration().Meta.public_settings
+    except AttributeError:
+        pass
+    else:
+        for s in keys:
+            public_settings[s] = getattr(settings, s, None)
+
+    for (settings_name, section) in WaldurConfiguration().__fields__.items():
+        type_ = section.type_
         try:
-            public_settings['WALDUR_CORE'][s] = extension_settings[s]
-        except KeyError:
-            pass
+            keys = type_.Meta.public_settings
+        except AttributeError:
+            continue
+        extension_settings = getattr(settings, settings_name, None)
+        if not extension_settings:
+            continue
+        public_settings[settings_name] = {}
+        for s in keys:
+            try:
+                public_settings[settings_name][s] = extension_settings[s]
+            except KeyError:
+                pass
 
     # Processing a others extensions
     for ext in WaldurExtension.get_extensions():
@@ -364,6 +404,9 @@ def get_public_settings():
                 except KeyError:
                     pass
 
+            for s, v in ext.get_dynamic_settings().items():
+                public_settings[settings_name][s] = v
+
     return public_settings
 
 
@@ -373,6 +416,32 @@ def configuration_detail(request):
     return Response(get_public_settings())
 
 
+@api_view(['GET'])
+@permission_classes((rf_permissions.AllowAny,))
+def features_description(request):
+    return Response(FEATURES)
+
+
+@api_view(['POST'])
+@permission_classes((rf_permissions.IsAdminUser,))
+def feature_values(request):
+    if not isinstance(request.data, dict):
+        return Response(
+            data='Dictionary is expected.', status=status.HTTP_400_BAD_REQUEST
+        )
+    updated = 0
+    for section in FEATURES:
+        for feature in section['items']:
+            feature_value = request.data.get(section['key'], {}).get(feature['key'])
+            if feature_value is not None:
+                models.Feature.objects.update_or_create(
+                    key=f'{section["key"]}.{feature["key"]}',
+                    defaults=dict(value=feature_value),
+                )
+                updated += 1
+    return Response(data=f'{updated} features are updated.', status=status.HTTP_200_OK)
+
+
 def redirect_with(url_template, **kwargs):
     params = urlencode(kwargs)
     url = '%s?%s' % (url_template, params)
@@ -380,27 +449,28 @@ def redirect_with(url_template, **kwargs):
 
 
 def login_completed(token, method='default'):
-    url_template = settings.WALDUR_CORE['LOGIN_COMPLETED_URL']
-    url = url_template.format(token=token, method=method)
+    url = format_homeport_link(
+        'login_completed/{token}/{method}/', token=token, method=method
+    )
     return HttpResponseRedirect(url)
 
 
 def login_failed(message):
-    url_template = settings.WALDUR_CORE['LOGIN_FAILED_URL']
+    url_template = format_homeport_link('login_failed/')
     return redirect_with(url_template, message=message)
 
 
 def logout_completed():
-    return HttpResponseRedirect(settings.WALDUR_CORE['LOGOUT_COMPLETED_URL'])
+    return HttpResponseRedirect(format_homeport_link('logout_completed/'))
 
 
 def logout_failed(message):
-    url_template = settings.WALDUR_CORE['LOGOUT_FAILED_URL']
+    url_template = format_homeport_link('logout_failed/')
     return redirect_with(url_template, message=message)
 
 
 class CheckExtensionMixin:
-    """ Raise exception if extension is disabled """
+    """Raise exception if extension is disabled"""
 
     extension_name = NotImplemented
 
@@ -409,3 +479,31 @@ class CheckExtensionMixin:
         if not conf or not conf['ENABLED']:
             raise ExtensionDisabled()
         return super(CheckExtensionMixin, self).initial(request, *args, **kwargs)
+
+
+class ExtraContextTemplateView(TemplateView):
+    extra_context = None
+
+    def get_context_data(self, *args, **kwargs):
+        context = super(ExtraContextTemplateView, self).get_context_data(
+            *args, **kwargs
+        )
+        if self.extra_context:
+            context.update(self.extra_context)
+        return context
+
+
+class CreateReversionMixin:
+    def perform_create(self, serializer):
+        with reversion.create_revision():
+            super(CreateReversionMixin, self).perform_update(serializer)
+            reversion.set_user(self.request.user)
+            reversion.set_comment('Created via REST API')
+
+
+class UpdateReversionMixin:
+    def perform_update(self, serializer):
+        with reversion.create_revision():
+            super(UpdateReversionMixin, self).perform_update(serializer)
+            reversion.set_user(self.request.user)
+            reversion.set_comment('Updated via REST API')

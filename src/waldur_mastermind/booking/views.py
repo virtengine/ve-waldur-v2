@@ -2,8 +2,7 @@ from django.db import transaction
 from django.shortcuts import get_object_or_404
 from django.utils.translation import ugettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
-from rest_framework import serializers as rf_serializers
-from rest_framework import status
+from rest_framework import status, views
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
@@ -11,21 +10,26 @@ from rest_framework.response import Response
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
 from waldur_mastermind.booking.utils import get_offering_bookings
-from waldur_mastermind.marketplace import filters as marketplace_filters
+from waldur_mastermind.google import models as google_models
 from waldur_mastermind.marketplace import models
-from waldur_mastermind.marketplace import serializers as marketplace_serializers
+from waldur_mastermind.marketplace import permissions as marketplace_permissions
+from waldur_mastermind.marketplace.callbacks import (
+    resource_creation_canceled,
+    resource_creation_succeeded,
+)
 
-from . import PLUGIN_NAME, filters, serializers, tasks
-from .log import event_logger
+from . import PLUGIN_NAME, executors, filters, serializers
 
 
 class ResourceViewSet(core_views.ReadOnlyActionsViewSet):
-    queryset = models.Resource.objects.filter(offering__type=PLUGIN_NAME)
+    queryset = models.Resource.objects.filter(offering__type=PLUGIN_NAME).order_by(
+        'name'
+    )
     filter_backends = (
         DjangoFilterBackend,
-        filters.OfferingCustomersFilterBackend,
+        filters.ResourceOwnerOrCreatorFilterBackend,
     )
-    filterset_class = marketplace_filters.ResourceFilter
+    filterset_class = filters.BookingResourceFilter
     lookup_field = 'uuid'
     serializer_class = serializers.BookingResourceSerializer
 
@@ -34,31 +38,7 @@ class ResourceViewSet(core_views.ReadOnlyActionsViewSet):
         resource = self.get_object()
 
         with transaction.atomic():
-            try:
-                order_item = models.OrderItem.objects.get(
-                    resource=resource,
-                    offering=resource.offering,
-                    type=models.OrderItem.Types.CREATE,
-                    state=models.OrderItem.States.EXECUTING,
-                )
-            except models.OrderItem.DoesNotExist:
-                raise rf_serializers.ValidationError(
-                    _(
-                        'Resource rejecting is not available because '
-                        'the reference order item is not found.'
-                    )
-                )
-            except models.OrderItem.MultipleObjectsReturned:
-                raise rf_serializers.ValidationError(
-                    _(
-                        'Resource rejecting is not available because '
-                        'several reference order items are found.'
-                    )
-                )
-            order_item.set_state_terminated()
-            order_item.save()
-            resource.set_state_terminated()
-            resource.save()
+            order_item = resource_creation_canceled(resource, validate=True)
 
         return Response(
             {'order_item_uuid': order_item.uuid.hex}, status=status.HTTP_200_OK
@@ -69,37 +49,7 @@ class ResourceViewSet(core_views.ReadOnlyActionsViewSet):
         resource = self.get_object()
 
         with transaction.atomic():
-            try:
-                order_item = models.OrderItem.objects.get(
-                    resource=resource,
-                    offering=resource.offering,
-                    type=models.OrderItem.Types.CREATE,
-                    state=models.OrderItem.States.EXECUTING,
-                )
-            except models.OrderItem.DoesNotExist:
-                raise rf_serializers.ValidationError(
-                    _(
-                        'Resource accepting is not available because '
-                        'the reference order item is not found.'
-                    )
-                )
-            except models.OrderItem.MultipleObjectsReturned:
-                raise rf_serializers.ValidationError(
-                    _(
-                        'Resource accepting is not available because '
-                        'several reference order items are found.'
-                    )
-                )
-            order_item.set_state_done()
-            order_item.save()
-            resource.set_state_ok()
-            resource.save()
-
-            event_logger.waldur_booking.info(
-                'Device booking {resource_name} has been accepted.',
-                event_type='device_booking_is_accepted',
-                event_context={'resource': resource,},
-            )
+            order_item = resource_creation_succeeded(resource, validate=True)
 
         return Response(
             {'order_item_uuid': order_item.uuid.hex}, status=status.HTTP_200_OK
@@ -109,30 +59,52 @@ class ResourceViewSet(core_views.ReadOnlyActionsViewSet):
         core_validators.StateValidator(models.Resource.States.CREATING)
     ]
 
+    accept_permissions = [marketplace_permissions.user_is_owner_or_service_manager]
 
-class OfferingBookingsViewSet(core_views.ReadOnlyActionsViewSet):
-    queryset = models.Offering.objects.filter(type=PLUGIN_NAME)
+
+class OfferingViewSet(core_views.ReadOnlyActionsViewSet):
+    queryset = models.Offering.objects.filter(type=PLUGIN_NAME).order_by('name')
     filter_backends = (
         DjangoFilterBackend,
         filters.CustomersFilterBackend,
     )
     lookup_field = 'uuid'
-    serializer_class = marketplace_serializers.OfferingDetailsSerializer
-
-    def retrieve(self, request, uuid=None):
-        offerings = models.Offering.objects.all().filter_for_user(request.user)
-        offering = get_object_or_404(offerings, uuid=uuid)
-        bookings = get_offering_bookings(offering)
-        serializer = serializers.BookingSerializer(instance=bookings, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+    serializer_class = serializers.OfferingSerializer
 
     @action(detail=True, methods=['post'])
     def google_calendar_sync(self, request, uuid=None):
         offering = self.get_object()
-        tasks.sync_bookings_to_google_calendar.delay(offering.uuid.hex)
-        return Response('OK', status=status.HTTP_200_OK)
+        self._get_or_create_google_calendar(offering)
+        transaction.on_commit(
+            lambda: executors.GoogleCalendarSyncExecutor.execute(
+                offering.googlecalendar, updated_fields=None
+            )
+        )
+        return Response('OK', status=status.HTTP_202_ACCEPTED)
 
-    def google_credential_exists(offering):
+    @action(detail=True, methods=['post'])
+    def share_google_calendar(self, request, uuid=None):
+        offering = self.get_object()
+        self._get_or_create_google_calendar(offering)
+        transaction.on_commit(
+            lambda: executors.GoogleCalendarShareExecutor.execute(
+                offering.googlecalendar, updated_fields=['public']
+            )
+        )
+        return Response('OK', status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=True, methods=['post'])
+    def unshare_google_calendar(self, request, uuid=None):
+        offering = self.get_object()
+        self._get_or_create_google_calendar(offering)
+        transaction.on_commit(
+            lambda: executors.GoogleCalendarUnShareExecutor.execute(
+                offering.googlecalendar, updated_fields=['public']
+            )
+        )
+        return Response('OK', status=status.HTTP_202_ACCEPTED)
+
+    def validate_google_credential(offering):
         service_provider = getattr(offering.customer, 'serviceprovider', None)
         credentials = getattr(service_provider, 'googlecredentials', None)
         if (
@@ -142,4 +114,72 @@ class OfferingBookingsViewSet(core_views.ReadOnlyActionsViewSet):
         ):
             raise ValidationError(_('Google credentials do not exist.'))
 
-    google_calendar_sync_validators = [google_credential_exists]
+    def validate_google_calendar_state(offering):
+        try:
+            google_calendar = google_models.GoogleCalendar.objects.get(
+                offering=offering
+            )
+
+            if google_calendar.state not in (
+                google_models.GoogleCalendar.States.OK,
+                google_models.GoogleCalendar.States.ERRED,
+            ):
+                raise ValidationError(_('The calendar cannot be updated.'))
+        except google_models.GoogleCalendar.DoesNotExist:
+            # a calendar will be created in waldur later
+            pass
+
+    def validate_sharing_available(offering):
+        try:
+            google_calendar = google_models.GoogleCalendar.objects.get(
+                offering=offering
+            )
+
+            if google_calendar.public:
+                raise ValidationError(_('The calendar is public already.'))
+        except google_models.GoogleCalendar.DoesNotExist:
+            # a calendar will be created in waldur later
+            pass
+
+    def validate_unsharing_available(offering):
+        try:
+            google_calendar = google_models.GoogleCalendar.objects.get(
+                offering=offering
+            )
+
+            if not google_calendar.public:
+                raise ValidationError(_('The calendar is private already.'))
+        except google_models.GoogleCalendar.DoesNotExist:
+            raise ValidationError(_('The calendar does not exist.'))
+
+    google_calendar_sync_validators = [
+        validate_google_credential,
+        validate_google_calendar_state,
+    ]
+    share_google_calendar_validators = [
+        validate_google_credential,
+        validate_google_calendar_state,
+        validate_sharing_available,
+    ]
+    unshare_google_calendar_validators = [
+        validate_google_credential,
+        validate_google_calendar_state,
+        validate_unsharing_available,
+    ]
+
+    def _get_or_create_google_calendar(self, offering):
+        google_calendar, _ = google_models.GoogleCalendar.objects.get_or_create(
+            offering=offering
+        )
+        return google_calendar
+
+
+class OfferingBookingsViewSet(views.APIView):
+    def get(self, request, uuid):
+        offerings = models.Offering.objects.all().filter_for_user(request.user)
+        offering = get_object_or_404(offerings, uuid=uuid)
+        bookings = get_offering_bookings(offering)
+        serializer = serializers.BookingSerializer(
+            instance=bookings, many=True, context={'request': request}
+        )
+        return Response(serializer.data, status=status.HTTP_200_OK)

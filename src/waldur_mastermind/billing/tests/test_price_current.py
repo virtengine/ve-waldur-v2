@@ -24,7 +24,7 @@ class PriceCurrentTest(test.APITransactionTestCase):
             project=self.fixture.project,
             unit=invoice_models.InvoiceItem.Units.PER_DAY,
             unit_price=3,
-            quantity=1,
+            quantity=31,
         )
 
     def test_current_price(self):
@@ -38,4 +38,4 @@ class PriceCurrentTest(test.APITransactionTestCase):
             data['billing_price_estimate']['total']
             - data['billing_price_estimate']['current']
         )
-        self.assertEqual(diff, (31 - 9) * 3)
+        self.assertEqual(diff, 22 * 3)

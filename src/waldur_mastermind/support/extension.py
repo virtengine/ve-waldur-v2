@@ -14,6 +14,7 @@ class SupportExtension(WaldurExtension):
             'USE_OLD_API': False,
             'USE_TEENAGE_API': False,
             'USE_AUTOMATIC_REQUEST_MAPPING': True,
+            'MAP_WALDUR_USERS_TO_SERVICEDESK_AGENTS': False,
             'STRANGE_SETTING': 1,
             'CREDENTIALS': {
                 'server': 'http://example.com/',
@@ -36,46 +37,21 @@ class SupportExtension(WaldurExtension):
                 'caller_field': 'Caller',
                 'sla_field': 'Time to first response',
                 'type_of_linked_issue': 'Relates',
-                # 'organisation_field': 'Reporter organization',
-                # 'project_field': 'Waldur project',
-                # 'affected_resource_field': 'Affected resource',
-                # 'template_field': 'Waldur template',
-                'summary': '{{issue.summary}}',
-                'description': (
-                    '{{issue.description}}\n\n'
-                    '---\n'
-                    'Additional Info: \n'
-                    '{% if issue.customer %}'
-                    '- Organization: {{issue.customer.name}}\n'
-                    '{% endif %}'
-                    '{% if issue.project %}'
-                    '- Project: {{issue.project.name}}\n'
-                    '{% endif %}'
-                    '{% if issue.resource %}'
-                    '{% if issue.resource.service_project_link and issue.resource.service_project_link.service %}'
-                    '{% if issue.resource.service_project_link.service.type %}'
-                    '- Service type: {{issue.resource.service_project_link.service.type}}\n'
-                    '{% endif %}'
-                    '- Offering name: {{ issue.resource.service_project_link.service.settings.name }}\n'
-                    '- Offering provided by: {{ issue.resource.service_project_link.service.settings.customer.name }}\n'
-                    '{% endif %}'
-                    '- Affected resource: {{issue.resource}}\n'
-                    '{% endif %}'
-                ),
                 'satisfaction_field': 'Customer satisfaction',
+                'request_feedback': 'Request feedback',  # a field of checkbox type and with a single option 'yes'.
             },
             'DEFAULT_OFFERING_ISSUE_TYPE': 'Service Request',
-            # TODO: OFFERINGS is a deprecated attribute, to be cleaned up after removal of squashed migrations
-            'OFFERINGS': {},
             'EXCLUDED_ATTACHMENT_TYPES': [],
         }
 
         SUPPRESS_NOTIFICATION_EMAILS = False
-        ISSUE_LINK_TEMPLATE = 'https://www.example.com/#/support/issue/{uuid}/'
-        ISSUE_FEEDBACK_LINK_TEMPLATE = 'https://www.example.com/#/support/feedback/?token={token}&evaluation={evaluation}'
         ISSUE_FEEDBACK_ENABLE = False
         # Measured in days
         ISSUE_FEEDBACK_TOKEN_PERIOD = 7
+
+    @staticmethod
+    def get_public_settings():
+        return ['ENABLED']
 
     @staticmethod
     def django_app():
@@ -101,7 +77,7 @@ class SupportExtension(WaldurExtension):
     def celery_tasks():
         return {
             'pull-support-users': {
-                'task': 'support.SupportUserPullTask',
+                'task': 'waldur_mastermind.support.pull_support_users',
                 'schedule': timedelta(hours=6),
                 'args': (),
             },
@@ -111,9 +87,3 @@ class SupportExtension(WaldurExtension):
                 'args': (),
             },
         }
-
-    @staticmethod
-    def get_cleanup_executor():
-        from waldur_mastermind.support.executors import SupportCleanupExecutor
-
-        return SupportCleanupExecutor

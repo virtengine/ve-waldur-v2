@@ -1,6 +1,9 @@
+from django.utils.translation import ugettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
-from rest_framework import permissions, viewsets
+from rest_framework import permissions, response, status, viewsets
+from rest_framework.decorators import action
 
+from waldur_core.core import executors as core_executors
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure import views as structure_views
@@ -8,53 +11,47 @@ from waldur_core.structure import views as structure_views
 from . import executors, filters, models, serializers
 
 
-class SlurmServiceViewSet(structure_views.BaseServiceViewSet):
-    queryset = models.SlurmService.objects.all()
-    serializer_class = serializers.ServiceSerializer
-
-
-class SlurmServiceProjectLinkViewSet(structure_views.BaseServiceProjectLinkViewSet):
-    queryset = models.SlurmServiceProjectLink.objects.all()
-    serializer_class = serializers.ServiceProjectLinkSerializer
-    filterset_class = filters.SlurmServiceProjectLinkFilter
-
-
-class AllocationViewSet(structure_views.BaseResourceViewSet):
-    queryset = models.Allocation.objects.all()
+class AllocationViewSet(structure_views.ResourceViewSet):
+    queryset = models.Allocation.objects.all().order_by('name')
     serializer_class = serializers.AllocationSerializer
     filterset_class = filters.AllocationFilter
 
     create_executor = executors.AllocationCreateExecutor
+    update_executor = core_executors.EmptyExecutor
     pull_executor = executors.AllocationPullExecutor
 
-    destroy_permissions = [structure_permissions.is_owner]
+    destroy_permissions = [structure_permissions.is_administrator]
     delete_executor = executors.AllocationDeleteExecutor
 
-    partial_update_permissions = update_permissions = [structure_permissions.is_owner]
-    update_executor = executors.AllocationUpdateExecutor
+    set_limits_permissions = [structure_permissions.is_staff]
+    set_limits_serializer_class = serializers.AllocationSetLimitsSerializer
 
+    @action(detail=True, methods=['post'])
+    def set_limits(self, request, uuid=None):
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
 
-class AllocationUsageViewSet(viewsets.ReadOnlyModelViewSet):
-    lookup_field = 'uuid'
-    queryset = models.AllocationUsage.objects.all()
-    serializer_class = serializers.AllocationUsageSerializer
-    permission_classes = (permissions.IsAuthenticated,)
-    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
-    filterset_class = filters.AllocationUsageFilter
+        executors.AllocationSetLimitsExecutor().execute(instance)
+        return response.Response(
+            {'status': _('Setting limits was scheduled.')},
+            status=status.HTTP_202_ACCEPTED,
+        )
 
 
 class AllocationUserUsageViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = models.AllocationUserUsage.objects.all()
+    queryset = models.AllocationUserUsage.objects.all().order_by('year', 'month')
     serializer_class = serializers.AllocationUserUsageSerializer
     permission_classes = (permissions.IsAuthenticated,)
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.AllocationUserUsageFilter
 
 
-def get_project_allocation_count(project):
-    return project.quotas.get(name='nc_allocation_count').usage
-
-
-structure_views.ProjectCountersView.register_counter(
-    'slurm', get_project_allocation_count
-)
+class AssociationViewSet(viewsets.ReadOnlyModelViewSet):
+    lookup_field = 'uuid'
+    queryset = models.Association.objects.all().order_by('username')
+    serializer_class = serializers.AssociationSerializer
+    permission_classes = (permissions.IsAuthenticated,)
+    filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
+    filterset_class = filters.AssociationFilter
