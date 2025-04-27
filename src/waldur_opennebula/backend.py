@@ -913,17 +913,6 @@ class OpenNebulaBackend(ServiceBackend):
             logger.exception('Failed to restore backup in OpenNebula')
             raise OpenNebulaBackendError(e)
 
-    def assign_floating_ip(self, vm, network_id, ip_address=None):
-        client = OpenNebulaClient(vm.service_settings.backend_url, vm.service_settings.username, vm.service_settings.password)
-        # This is a placeholder; actual implementation depends on OpenNebula's IP management
-        # For now, simulate assignment and return a dict
-        return {'vm_id': vm.backend_id, 'network_id': network_id, 'ip_address': ip_address or 'auto-assigned'}
-
-    def release_floating_ip(self, vm, ip_address):
-        client = OpenNebulaClient(vm.service_settings.backend_url, vm.service_settings.username, vm.service_settings.password)
-        # This is a placeholder; actual implementation depends on OpenNebula's IP management
-        return {'vm_id': vm.backend_id, 'ip_address': ip_address, 'released': True}
-
     def list_marketplace_offerings(self):
         client = OpenNebulaClient(self.settings.options.get("api_url"), self.settings.options.get("username"), self.settings.options.get("password"))
         templates = client.list_templates()
@@ -961,3 +950,155 @@ class OpenNebulaBackend(ServiceBackend):
         return getattr(info, 'QUOTAS', {})
 
     # Add methods for tenant and VM management, following OpenStack backend as a guide
+    
+    def attach_nic(self, vm, network_id, ip=None, model=None):
+        """
+        Attach a new network interface to a virtual machine.
+        
+        :param vm: OpenNebulaVirtualMachine instance
+        :type vm: OpenNebulaVirtualMachine
+        :param network_id: ID of the network to connect to
+        :type network_id: int or str
+        :param ip: Optional specific IP address to assign
+        :type ip: str or None
+        :param model: Optional NIC model (e.g., 'virtio')
+        :type model: str or None
+        :return: Success status
+        :raises OpenNebulaBackendError: If the operation fails
+        """
+        try:
+            # Build NIC template
+            nic_template = {'NETWORK_ID': int(network_id)}
+            
+            # Add optional parameters if provided
+            if ip:
+                nic_template['IP'] = ip
+            if model:
+                nic_template['MODEL'] = model
+                
+            result = self.client.attach_nic(int(vm.backend_id), nic_template)
+            
+            # Update VM state
+            vm.set_ok()
+            vm.save(update_fields=['state'])
+            
+            return result
+        except Exception as e:
+            logger.exception('Failed to attach NIC to VM in OpenNebula')
+            raise OpenNebulaBackendError(f"Failed to attach NIC: {str(e)}")
+    
+    def detach_nic(self, vm, nic_id):
+        """
+        Detach a network interface from a virtual machine.
+        
+        :param vm: OpenNebulaVirtualMachine instance
+        :type vm: OpenNebulaVirtualMachine
+        :param nic_id: ID of the NIC to detach
+        :type nic_id: int or str
+        :return: Success status
+        :raises OpenNebulaBackendError: If the operation fails
+        """
+        try:
+            result = self.client.detach_nic(int(vm.backend_id), int(nic_id))
+            
+            # Update VM state
+            vm.set_ok()
+            vm.save(update_fields=['state'])
+            
+            return result
+        except Exception as e:
+            logger.exception('Failed to detach NIC from VM in OpenNebula')
+            raise OpenNebulaBackendError(f"Failed to detach NIC: {str(e)}")
+    
+    def update_nic(self, vm, nic_id, **kwargs):
+        """
+        Update a network interface on a virtual machine.
+        
+        :param vm: OpenNebulaVirtualMachine instance
+        :type vm: OpenNebulaVirtualMachine
+        :param nic_id: ID of the NIC to update
+        :type nic_id: int or str
+        :param kwargs: Parameters to update (e.g., security_groups, network_qos, etc.)
+        :return: Success status
+        :raises OpenNebulaBackendError: If the operation fails
+        """
+        try:
+            # Build NIC template with provided parameters
+            nic_template = {}
+            
+            # Map common parameters to OpenNebula NIC attributes
+            if 'security_groups' in kwargs:
+                nic_template['SECURITY_GROUPS'] = kwargs['security_groups']
+            if 'network_qos' in kwargs:
+                nic_template['INBOUND_AVG_BW'] = kwargs['network_qos'].get('inbound_avg_bw')
+                nic_template['INBOUND_PEAK_BW'] = kwargs['network_qos'].get('inbound_peak_bw')
+                nic_template['OUTBOUND_AVG_BW'] = kwargs['network_qos'].get('outbound_avg_bw')
+                nic_template['OUTBOUND_PEAK_BW'] = kwargs['network_qos'].get('outbound_peak_bw')
+            if 'model' in kwargs:
+                nic_template['MODEL'] = kwargs['model']
+            
+            # Add any other parameters directly
+            for key, value in kwargs.items():
+                if key not in ['security_groups', 'network_qos', 'model'] and value is not None:
+                    nic_template[key.upper()] = value
+            
+            # Only proceed if we have parameters to update
+            if not nic_template:
+                logger.warning('No parameters provided for NIC update')
+                return False
+                
+            result = self.client.update_nic(int(vm.backend_id), int(nic_id), nic_template)
+            
+            # Update VM state
+            vm.set_ok()
+            vm.save(update_fields=['state'])
+            
+            return result
+        except Exception as e:
+            logger.exception('Failed to update NIC on VM in OpenNebula')
+            raise OpenNebulaBackendError(f"Failed to update NIC: {str(e)}")
+    
+    def list_nics(self, vm):
+        """
+        List all network interfaces attached to a virtual machine.
+        
+        :param vm: OpenNebulaVirtualMachine instance
+        :type vm: OpenNebulaVirtualMachine
+        :return: List of NIC information dictionaries
+        :raises OpenNebulaBackendError: If the operation fails
+        """
+        try:
+            # Get the VM info which contains NIC data
+            vm_info = self.client.get_vm(int(vm.backend_id))
+            
+            # Extract NIC information
+            nics = []
+            if hasattr(vm_info.TEMPLATE, 'NIC'):
+                # Handle both single NIC and multiple NICs
+                nic_data = vm_info.TEMPLATE.NIC
+                if isinstance(nic_data, list):
+                    for nic in nic_data:
+                        nics.append({
+                            'id': getattr(nic, 'NIC_ID', None),
+                            'network_id': getattr(nic, 'NETWORK_ID', None),
+                            'network': getattr(nic, 'NETWORK', None),
+                            'mac': getattr(nic, 'MAC', None),
+                            'ip': getattr(nic, 'IP', None),
+                            'model': getattr(nic, 'MODEL', None),
+                            'security_groups': getattr(nic, 'SECURITY_GROUPS', None),
+                        })
+                else:
+                    nics.append({
+                        'id': getattr(nic_data, 'NIC_ID', None),
+                        'network_id': getattr(nic_data, 'NETWORK_ID', None),
+                        'network': getattr(nic_data, 'NETWORK', None),
+                        'mac': getattr(nic_data, 'MAC', None),
+                        'ip': getattr(nic_data, 'IP', None),
+                        'model': getattr(nic_data, 'MODEL', None),
+                        'security_groups': getattr(nic_data, 'SECURITY_GROUPS', None),
+                    })
+            
+            return nics
+        except Exception as e:
+            logger.exception('Failed to list NICs for VM in OpenNebula')
+            raise OpenNebulaBackendError(f"Failed to list NICs: {str(e)}")

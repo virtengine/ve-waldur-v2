@@ -180,4 +180,32 @@ class OpenNebulaQuotaSerializer(serializers.Serializer):
 class OpenNebulaScheduledActionSerializer(serializers.ModelSerializer):
     class Meta:
         model = OpenNebulaScheduledAction
-        fields = '__all__' 
+        fields = '__all__'
+
+
+class OpenNebulaNetworkAttachSerializer(serializers.Serializer):
+    vm = serializers.PrimaryKeyRelatedField(queryset=OpenNebulaVirtualMachine.objects.all())
+    network_id = serializers.IntegerField()
+    ip_address = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    model = serializers.CharField(required=False, allow_blank=True, allow_null=True, 
+                                 help_text="Network card model, e.g., 'virtio'")
+
+
+class OpenNebulaNetworkReleaseSerializer(serializers.Serializer):
+    vm = serializers.PrimaryKeyRelatedField(queryset=OpenNebulaVirtualMachine.objects.all())
+    nic_id = serializers.IntegerField(help_text="ID of the network interface to detach")
+
+
+class OpenNebulaNetworkUpdateSerializer(serializers.Serializer):
+    vm = serializers.PrimaryKeyRelatedField(queryset=OpenNebulaVirtualMachine.objects.all())
+    nic_id = serializers.IntegerField(help_text="ID of the network interface to update")
+    security_groups = serializers.CharField(required=False, allow_blank=True, allow_null=True,
+                                          help_text="Security groups to apply to the interface")
+    network_qos = serializers.DictField(required=False, allow_null=True,
+                                      help_text="Quality of Service settings for the network interface")
+    model = serializers.CharField(required=False, allow_blank=True, allow_null=True,
+                                help_text="Network card model, e.g., 'virtio'")
+
+
+class OpenNebulaNetworkListSerializer(serializers.Serializer):
+    vm = serializers.PrimaryKeyRelatedField(queryset=OpenNebulaVirtualMachine.objects.all())

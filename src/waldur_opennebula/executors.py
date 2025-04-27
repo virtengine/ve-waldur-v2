@@ -2,6 +2,7 @@ from celery import chain
 from waldur_core.core import executors as core_executors
 from waldur_core.core import tasks as core_tasks
 from waldur_core.core import utils as core_utils
+from waldur_core.structure import executors as structure_executors
 from waldur_opennebula import tasks
 from . import models
 
@@ -143,6 +144,33 @@ class DetachDiskExecutor(core_executors.ActionExecutor):
         return tasks.detach_disk_task(vm.pk, disk_id)
 
 
+class NetworkDeleteExecutor(core_executors.DeleteExecutor):
+    @classmethod
+    def get_task_signature(cls, instance, serialized_instance, **kwargs):
+        if instance.backend_id:
+            return core_tasks.BackendMethodTask().si(
+                serialized_instance,
+                'delete_network',
+                state_transition='begin_deleting',
+            )
+        return core_tasks.StateTransitionTask().si(
+            serialized_instance, state_transition='begin_deleting'
+        )
+
+
+class VolumeDeleteExecutor(core_executors.DeleteExecutor):
+    @classmethod
+    def get_task_signature(cls, instance, serialized_instance, **kwargs):
+        if instance.backend_id:
+            return core_tasks.BackendMethodTask().si(
+                serialized_instance,
+                'delete_volume',
+                state_transition='begin_deleting',
+            )
+        return core_tasks.StateTransitionTask().si(
+            serialized_instance, state_transition='begin_deleting'
+        )
+
 class ResizeDiskExecutor(core_executors.ActionExecutor):
     action = 'Resize'
     @classmethod
@@ -204,3 +232,13 @@ class RestoreVMExecutor(core_executors.ActionExecutor):
     @classmethod
     def get_task_signature(cls, vm, backup_id, in_place=True, **kwargs):
         return tasks.restore_vm_task(vm.pk, backup_id, in_place)
+    
+
+
+class OpenNebulaCleanupExecutor(structure_executors.BaseCleanupExecutor):
+    executors = (
+        (models.OpenNebulaVolume, VolumeDeleteExecutor),
+        (models.OpenNebulaNetwork, NetworkDeleteExecutor),
+        (models.OpenNebulaVirtualMachine, VirtualMachineDeleteExecutor),
+        (models.OpenNebulaTenant, TenantDeleteExecutor),
+)

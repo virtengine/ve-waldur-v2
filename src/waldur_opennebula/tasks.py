@@ -536,3 +536,26 @@ def run_scheduled_actions():
         except Exception as e:
             action.error_message = str(e)
         action.save() 
+
+
+@shared_task
+def list_backups_task(vm_id):
+    """
+    Task to list all backups of a specific virtual machine.
+    
+    Args:
+        vm_id: ID of the OpenNebulaVirtualMachine
+        
+    Returns:
+        List of backups for the specified VM
+    """
+    vm = OpenNebulaVirtualMachine.objects.get(pk=vm_id)
+    backend = OpenNebulaBackend(vm.service_settings)
+    
+    try:
+        backups = backend.list_backups(vm)
+        return backups
+    except Exception as e:
+        vm.error_message = f"Failed to list backups: {str(e)}"
+        vm.save(update_fields=['error_message'])
+        raise

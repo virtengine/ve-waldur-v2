@@ -92,6 +92,7 @@ hvac = "^2.3.0"
 waldur-api-client = {git = "https://github.com/waldur/py-client.git"}
 python-keycloak = "^5.5.0"
 django-stubs-ext = "^5.1.3"
+pyone = "^6.10.3"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "7.2.0"
@@ -138,6 +139,7 @@ waldur_marketplace_support = "waldur_mastermind.marketplace_support.extension:Ma
 waldur_marketplace_vmware = "waldur_mastermind.marketplace_vmware.extension:MarketplaceVMwareExtension"
 waldur_marketplace_remote = "waldur_mastermind.marketplace_remote.extension:MarketplaceRemoteExtension"
 waldur_marketplace_promotions = "waldur_mastermind.promotions.extension:MarketplacePromotionsExtension"
+waldur_opennebula = "waldur_opennebula.extension:OpenNebulaExtension"
 waldur_openstack = "waldur_openstack.extension:OpenStackExtension"
 waldur_openstack_tenant = "waldur_openstack_tenant.extension:OpenStackTenantExtension"
 waldur_openstack_replication = "waldur_openstack_replication.extension:OpenStackReplicationExtension"

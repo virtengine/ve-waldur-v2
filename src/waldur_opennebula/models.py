@@ -17,6 +17,7 @@ class OpenNebulaTenant(UuidMixin, StateMixin, DescendantMixin, BackendModelMixin
         unique_together = ("service_settings", "backend_id")
         verbose_name = "OpenNebula Tenant"
         verbose_name_plural = "OpenNebula Tenants"
+        ordering = ["name", "created"]
 
     def __str__(self):
         return self.name
@@ -42,6 +43,7 @@ class OpenNebulaVirtualMachine(UuidMixin, StateMixin, DescendantMixin, BackendMo
         unique_together = ("service_settings", "backend_id")
         verbose_name = "OpenNebula Virtual Machine"
         verbose_name_plural = "OpenNebula Virtual Machines"
+        ordering = ["name", "created"]
 
     def __str__(self):
         return self.name
@@ -62,6 +64,7 @@ class OpenNebulaNetwork(UuidMixin, StateMixin, BackendModelMixin, StructureLogga
         unique_together = ("service_settings", "backend_id")
         verbose_name = "OpenNebula Network"
         verbose_name_plural = "OpenNebula Networks"
+        ordering = ["name", "created"]
 
     def __str__(self):
         return self.name
@@ -83,6 +86,7 @@ class OpenNebulaVolume(UuidMixin, StateMixin, BackendModelMixin, StructureLoggab
         unique_together = ("service_settings", "backend_id")
         verbose_name = "OpenNebula Volume"
         verbose_name_plural = "OpenNebula Volumes"
+        ordering = ["name", "created"]
 
     def __str__(self):
         return self.name
@@ -105,6 +109,7 @@ class OpenNebulaScheduledAction(models.Model):
     class Meta:
         verbose_name = 'OpenNebula Scheduled Action'
         verbose_name_plural = 'OpenNebula Scheduled Actions'
+        ordering = ["last_run", "next_run"]
 
     def __str__(self):
         return f"{self.action_type} for {self.vm} every {self.interval}" 

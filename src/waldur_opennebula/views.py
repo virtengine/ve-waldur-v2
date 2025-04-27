@@ -2,10 +2,18 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from .models import OpenNebulaTenant, OpenNebulaVirtualMachine, OpenNebulaNetwork, OpenNebulaVolume, OpenNebulaScheduledAction
-from .serializers import OpenNebulaTenantSerializer, OpenNebulaTenantCreateSerializer, OpenNebulaVirtualMachineSerializer, OpenNebulaNetworkSerializer, OpenNebulaVolumeSerializer, OpenNebulaVMCreateSerializer, OpenNebulaVMMigrateSerializer, OpenNebulaDiskAttachSerializer, OpenNebulaDiskResizeSerializer, OpenNebulaDiskSaveAsSerializer, OpenNebulaVMSnapshotSerializer, OpenNebulaVMListSnapshotsSerializer, OpenNebulaBackupCreateSerializer, OpenNebulaBackupListSerializer, OpenNebulaRestoreBackupSerializer, OpenNebulaFloatingIPAssignSerializer, OpenNebulaFloatingIPReleaseSerializer, OpenNebulaMarketplaceOfferingSerializer, OpenNebulaVMMonitoringSerializer, OpenNebulaQuotaSerializer, OpenNebulaScheduledActionSerializer
+from .serializers import OpenNebulaTenantSerializer, OpenNebulaTenantCreateSerializer, OpenNebulaVirtualMachineSerializer, OpenNebulaNetworkSerializer, OpenNebulaVolumeSerializer, OpenNebulaVMCreateSerializer, OpenNebulaVMMigrateSerializer, OpenNebulaDiskAttachSerializer, OpenNebulaDiskResizeSerializer, OpenNebulaDiskSaveAsSerializer, OpenNebulaVMSnapshotSerializer, OpenNebulaVMListSnapshotsSerializer, OpenNebulaBackupCreateSerializer, OpenNebulaBackupListSerializer, OpenNebulaRestoreBackupSerializer, OpenNebulaFloatingIPAssignSerializer, OpenNebulaFloatingIPReleaseSerializer, OpenNebulaMarketplaceOfferingSerializer, OpenNebulaVMMonitoringSerializer, OpenNebulaQuotaSerializer, OpenNebulaScheduledActionSerializer, OpenNebulaNetworkAttachSerializer, OpenNebulaNetworkReleaseSerializer, OpenNebulaNetworkUpdateSerializer, OpenNebulaNetworkListSerializer
 from .executors import (
-    StartVMExecutor, StopVMExecutor, DeleteVMExecutor, CreateVMExecutor,
-    CreateTenantExecutor, DeleteTenantExecutor, PullTenantsExecutor
+    AttachDiskExecutor, DetachDiskExecutor, NetworkDeleteExecutor,
+    VolumeDeleteExecutor, ResizeDiskExecutor,
+    CreateDiskSnapshotExecutor, DeleteDiskSnapshotExecutor,
+    RevertDiskSnapshotExecutor, RenameDiskSnapshotExecutor,
+    SaveDiskAsImageExecutor, BackupVMExecutor,
+    BackupCancelExecutor, RestoreVMExecutor, OpenNebulaCleanupExecutor,
+    VirtualMachineCreateExecutor, VirtualMachineDeleteExecutor,
+    VirtualMachinePullExecutor, VirtualMachineRebootExecutor,
+    VirtualMachineStartExecutor, VirtualMachineStopExecutor,
+    TenantPullExecutor, TenantDeleteExecutor
 )
 from .backend import OpenNebulaBackend
 from rest_framework.views import APIView
@@ -42,7 +50,7 @@ class OpenNebulaTenantViewSet(viewsets.ModelViewSet):
         service_settings_id = request.data.get('service_settings_id')
         if not service_settings_id:
             return Response({'detail': 'service_settings_id required.'}, status=status.HTTP_400_BAD_REQUEST)
-        PullTenantsExecutor.execute(service_settings_id)
+        TenantPullExecutor.execute(service_settings_id)
         return Response({'detail': 'Pull scheduled.'}, status=status.HTTP_202_ACCEPTED)
 
     @action(detail=True, methods=['post'])
@@ -151,26 +159,32 @@ class OpenNebulaVirtualMachineViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def start(self, request, pk=None):
         vm = self.get_object()
-        StartVMExecutor.execute(vm)
+        VirtualMachineStartExecutor.execute(vm)
+        return Response({'detail': 'Start scheduled.'}, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=True, methods=['post'])
+    def reboot(self, request, pk=None):
+        vm = self.get_object()
+        VirtualMachineRebootExecutor.execute(vm)
         return Response({'detail': 'Start scheduled.'}, status=status.HTTP_202_ACCEPTED)
 
     @action(detail=True, methods=['post'])
     def stop(self, request, pk=None):
         vm = self.get_object()
-        StopVMExecutor.execute(vm)
+        VirtualMachineStopExecutor.execute(vm)
         return Response({'detail': 'Stop scheduled.'}, status=status.HTTP_202_ACCEPTED)
 
     @action(detail=True, methods=['post'])
     def delete_vm(self, request, pk=None):
         vm = self.get_object()
-        DeleteVMExecutor.execute(vm)
+        VirtualMachineDeleteExecutor.execute(vm)
         return Response({'detail': 'Delete scheduled.'}, status=status.HTTP_202_ACCEPTED)
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         instance = serializer.save()
-        CreateVMExecutor.execute(instance)
+        VirtualMachineCreateExecutor.execute(instance)
         return Response(self.get_serializer(instance).data, status=status.HTTP_202_ACCEPTED)
 
     @action(detail=True, methods=['post'])
@@ -300,6 +314,298 @@ class OpenNebulaVirtualMachineViewSet(viewsets.ModelViewSet):
         except Exception as e:
             return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @extend_schema(
+        request=OpenNebulaVMCreateSerializer,
+        responses={201: OpenApiResponse(description='VM created'), 400: OpenApiResponse(description='Validation error')},
+        description="Create a new VM with the selected template, networks, and options."
+    )
+    @action(detail=False, methods=['post'])
+    def create_vm(self, request):
+        serializer = OpenNebulaVMCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        settings = data['service_settings']
+        # Create DB record for VM in 'creating' state
+        vm = OpenNebulaVirtualMachine.objects.create(
+            name=data['name'],
+            service_settings=settings,
+            state='creating',
+            # Add other required fields as needed (e.g., project, tenant)
+        )
+        # Schedule async Celery task
+        create_vm_task.delay(
+            vm.pk,
+            settings.pk,
+            data['template_id'],
+            data['name'],
+            data['networks'],
+            data.get('cpu'),
+            data.get('ram'),
+            data.get('disk'),
+            data.get('ssh_key'),
+            data.get('contextualization', False),
+            data.get('extra', {}),
+        )
+        # Return VM object (with state) for polling
+        return Response(OpenNebulaVirtualMachineSerializer(vm).data, status=status.HTTP_201_CREATED)
+
+    @extend_schema(
+        request=OpenNebulaVMMigrateSerializer,
+        responses={202: OpenApiResponse(description='Migration scheduled'), 400: OpenApiResponse(description='Validation error')},
+        description="Migrate a VM to a target host/datastore."
+    )
+    @action(detail=False, methods=['post'])
+    def migrate(self, request):
+        serializer = OpenNebulaVMMigrateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        vm = data['vm']
+        migrate_vm_task.delay(
+            vm.pk,
+            data['host_id'],
+            data.get('live', True),
+            data.get('enforce', False),
+            data.get('ds_id'),
+            data.get('migration_type', 0),
+        )
+        return Response({'detail': 'Migration scheduled.'}, status=status.HTTP_202_ACCEPTED)
+
+    @extend_schema(
+        request=OpenNebulaDiskAttachSerializer,
+        responses={202: OpenApiResponse(description='Disk attach scheduled'), 400: OpenApiResponse(description='Validation error')},
+        description="Attach a disk/image to a VM."
+    )
+    @action(detail=False, methods=['post'])
+    def attach_disk(self, request):
+        serializer = OpenNebulaDiskAttachSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        vm = data['vm']
+        disk_template = {
+            'IMAGE_ID': data['image_id'],
+        }
+        if data.get('size'):
+            disk_template['SIZE'] = data['size']
+        if data.get('type'):
+            disk_template['TYPE'] = data['type']
+        if data.get('target'):
+            disk_template['TARGET'] = data['target']
+        attach_disk_task.delay(vm.pk, disk_template)
+        return Response({'detail': 'Disk attach scheduled.'}, status=status.HTTP_202_ACCEPTED)
+
+    @extend_schema(
+        request=OpenNebulaDiskResizeSerializer,
+        responses={202: OpenApiResponse(description='Disk resize scheduled'), 400: OpenApiResponse(description='Validation error')},
+        description="Resize a disk attached to a VM."
+    )
+    @action(detail=False, methods=['post'])
+    def resize_disk(self, request):
+        serializer = OpenNebulaDiskResizeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        vm = data['vm']
+        resize_disk_task.delay(vm.pk, data['disk_id'], data['size'])
+        return Response({'detail': 'Disk resize scheduled.'}, status=status.HTTP_202_ACCEPTED)
+
+    @extend_schema(
+        request=OpenNebulaDiskSaveAsSerializer,
+        responses={202: OpenApiResponse(description='Save disk as image scheduled'), 400: OpenApiResponse(description='Validation error')},
+        description="Save a disk as a new image."
+    )
+    @action(detail=False, methods=['post'])
+    def save_disk_as_image(self, request):
+        serializer = OpenNebulaDiskSaveAsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        vm = data['vm']
+        save_disk_as_image_task.delay(
+            vm.pk,
+            data['disk_id'],
+            data['image_name'],
+            data.get('image_type', ''),
+            data.get('snapshot_id', -1),
+        )
+        return Response({'detail': 'Save as image scheduled.'}, status=status.HTTP_202_ACCEPTED)
+
+    @extend_schema(
+        request=OpenNebulaVMSnapshotSerializer,
+        responses={202: OpenApiResponse(description='Snapshot creation scheduled'), 400: OpenApiResponse(description='Validation error')},
+        description="Create a snapshot for a VM."
+    )
+    @action(detail=False, methods=['post'])
+    def create_snapshot(self, request):
+        serializer = OpenNebulaVMSnapshotSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        create_vm_snapshot_task.delay(data['vm'].pk, data['name'])
+        return Response({'detail': 'Snapshot creation scheduled.'}, status=status.HTTP_202_ACCEPTED)
+
+    @extend_schema(
+        request=OpenNebulaVMListSnapshotsSerializer,
+        responses={200: OpenApiResponse(description='List of VM snapshots'), 400: OpenApiResponse(description='Validation error')},
+        description="List all snapshots for a VM."
+    )
+    @action(detail=False, methods=['get'])
+    def list_snapshots(self, request):
+        serializer = OpenNebulaVMListSnapshotsSerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        vm = data['vm']
+        try:
+            backend = OpenNebulaBackend(vm.service_settings)
+            snapshots = backend.list_snapshots(vm)
+            return Response(snapshots, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @extend_schema(
+        request=OpenNebulaBackupCreateSerializer,
+        responses={202: OpenApiResponse(description='Backup creation scheduled'), 400: OpenApiResponse(description='Validation error')},
+        description="Create a backup for a VM."
+    )
+    @action(detail=False, methods=['post'])
+    def create_backup(self, request):
+        serializer = OpenNebulaBackupCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        create_backup_task.delay(data['vm'].pk, data['name'], data.get('description', ''))
+        return Response({'detail': 'Backup creation scheduled.'}, status=status.HTTP_202_ACCEPTED)
+
+    @extend_schema(
+        request=OpenNebulaBackupListSerializer,
+        responses={200: OpenApiResponse(description='List of VM backups'), 400: OpenApiResponse(description='Validation error')},
+        description="List all backups for a VM."
+    )
+    @action(detail=False, methods=['get'])
+    def list_backups(self, request):
+        serializer = OpenNebulaBackupListSerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        vm = data['vm']
+        try:
+            backend = OpenNebulaBackend(vm.service_settings)
+            backups = backend.list_backups(vm)
+            return Response(backups, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @extend_schema(
+        request=OpenNebulaRestoreBackupSerializer,
+        responses={202: OpenApiResponse(description='Backup restore scheduled'), 400: OpenApiResponse(description='Validation error')},
+        description="Restore a backup to a VM or as a new VM."
+    )
+    @action(detail=False, methods=['post'])
+    def restore_backup(self, request):
+        serializer = OpenNebulaRestoreBackupSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        restore_backup_task.delay(
+            data['backup_id'],
+            data.get('vm').pk if data.get('vm') else None,
+            data.get('in_place', True),
+            data.get('new_vm_name', ''),
+        )
+        return Response({'detail': 'Backup restore scheduled.'}, status=status.HTTP_202_ACCEPTED)
+
+    @extend_schema(
+        responses={200: OpenApiResponse(OpenNebulaVMMonitoringSerializer)},
+        description="Get monitoring data for a VM."
+    )
+    @action(detail=True, methods=['get'])
+    def monitoring(self, request, pk=None):
+        vm = self.get_object()
+        backend = OpenNebulaBackend(vm.service_settings)
+        data = backend.get_vm_monitoring(vm)
+        return Response(data, status=status.HTTP_200_OK)
+
+    @extend_schema(
+        responses={200: OpenApiResponse(OpenNebulaVMMonitoringSerializer(many=True))},
+        description="Get monitoring data for all VMs."
+    )
+    @action(detail=False, methods=['get'])
+    def pool_monitoring(self, request):
+        # Optionally filter by user/project
+        backend = OpenNebulaBackend(ServiceSettings.objects.filter(type='OpenNebula').first())
+        data = backend.get_vmpool_monitoring()
+        return Response(data, status=status.HTTP_200_OK)
+
+    @extend_schema(
+        request=OpenNebulaNetworkAttachSerializer,
+        responses={200: OpenApiResponse(description='NIC attached'), 400: OpenApiResponse(description='Validation error')},
+        description="Attach a network interface to a VM."
+    )
+    @action(detail=False, methods=['post'])
+    def attach_nic(self, request):
+        serializer = OpenNebulaNetworkAttachSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            backend = OpenNebulaBackend(data['vm'].service_settings)
+            result = backend.attach_nic(
+                data['vm'], 
+                data['network_id'], 
+                ip=data.get('ip_address'), 
+                model=data.get('model')
+            )
+            return Response(result, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @extend_schema(
+        request=OpenNebulaNetworkReleaseSerializer,
+        responses={200: OpenApiResponse(description='NIC detached'), 400: OpenApiResponse(description='Validation error')},
+        description="Detach a network interface from a VM."
+    )
+    @action(detail=False, methods=['post'])
+    def detach_nic(self, request):
+        serializer = OpenNebulaNetworkReleaseSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            backend = OpenNebulaBackend(data['vm'].service_settings)
+            result = backend.detach_nic(data['vm'], data['nic_id'])
+            return Response(result, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @extend_schema(
+        request=OpenNebulaNetworkUpdateSerializer,
+        responses={200: OpenApiResponse(description='NIC updated'), 400: OpenApiResponse(description='Validation error')},
+        description="Update a network interface configuration."
+    )
+    @action(detail=False, methods=['post'])
+    def update_nic(self, request):
+        serializer = OpenNebulaNetworkUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            backend = OpenNebulaBackend(data['vm'].service_settings)
+            
+            # Extract kwargs from the validated data, removing vm and nic_id
+            kwargs = {k: v for k, v in data.items() if k not in ['vm', 'nic_id']}
+            
+            result = backend.update_nic(data['vm'], data['nic_id'], **kwargs)
+            return Response(result, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @extend_schema(
+        request=OpenNebulaNetworkListSerializer,
+        responses={200: OpenApiResponse(description='List of NICs attached to VM')},
+        description="List all network interfaces attached to a VM."
+    )
+    @action(detail=False, methods=['get'])
+    def list_nics(self, request):
+        serializer = OpenNebulaNetworkListSerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            backend = OpenNebulaBackend(data['vm'].service_settings)
+            nics = backend.list_nics(data['vm'])
+            return Response(nics, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 class OpenNebulaNetworkViewSet(viewsets.ModelViewSet):
     queryset = OpenNebulaNetwork.objects.all()
@@ -368,6 +674,30 @@ class OpenNebulaNetworkViewSet(viewsets.ModelViewSet):
         try:
             backend.reserve_ar(network, reservation_template)
             return Response({'detail': 'Address reservation scheduled.'}, status=status.HTTP_202_ACCEPTED)
+        except Exception as e:
+            return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            
+    @extend_schema(
+        parameters=[OpenApiParameter('service_settings', type=int, required=True, location=OpenApiParameter.QUERY)],
+        responses={200: OpenApiResponse(description='List of networks')},
+        description="List available networks for VM deployment."
+    )
+    @action(detail=False, methods=['get'])
+    def list_all(self, request):
+        service_settings_id = request.query_params.get('service_settings')
+        if not service_settings_id:
+            return Response({'detail': 'service_settings is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            settings = ServiceSettings.objects.get(pk=service_settings_id)
+            client = OpenNebulaClient(settings.backend_url, settings.username, settings.password)
+            networks = client.list_networks()
+            data = [
+                {'id': n.ID, 'name': n.NAME, 'bridge': getattr(n, 'BRIDGE', None), 'vlan_id': getattr(n, 'VLAN_ID', None)}
+                for n in getattr(networks, 'VNET', [])
+            ]
+            return Response(data)
+        except ServiceSettings.DoesNotExist:
+            return Response({'detail': 'ServiceSettings not found.'}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
             return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -589,31 +919,6 @@ class OpenNebulaImageListView(APIView):
 
 
 @extend_schema(
-    parameters=[OpenApiParameter('service_settings', type=int, required=True, location=OpenApiParameter.QUERY)],
-    responses={200: OpenApiResponse(description='List of networks')},
-    description="List available networks for VM deployment."
-)
-class OpenNebulaNetworkListView(APIView):
-    def get(self, request):
-        service_settings_id = request.query_params.get('service_settings')
-        if not service_settings_id:
-            return Response({'detail': 'service_settings is required.'}, status=status.HTTP_400_BAD_REQUEST)
-        try:
-            settings = ServiceSettings.objects.get(pk=service_settings_id)
-            client = OpenNebulaClient(settings.backend_url, settings.username, settings.password)
-            networks = client.list_networks()
-            data = [
-                {'id': n.ID, 'name': n.NAME, 'bridge': getattr(n, 'BRIDGE', None), 'vlan_id': getattr(n, 'VLAN_ID', None)}
-                for n in getattr(networks, 'VNET', [])
-            ]
-            return Response(data)
-        except ServiceSettings.DoesNotExist:
-            return Response({'detail': 'ServiceSettings not found.'}, status=status.HTTP_404_NOT_FOUND)
-        except Exception as e:
-            return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-@extend_schema(
     request=OpenNebulaVMCreateSerializer,
     responses={201: OpenApiResponse(description='VM created'), 400: OpenApiResponse(description='Validation error'), 500: OpenApiResponse(description='Backend error')},
     description="Create a new VM with the selected template, networks, and options."
@@ -808,40 +1113,6 @@ class OpenNebulaRestoreBackupView(APIView):
         return Response({'detail': 'Backup restore scheduled.'}, status=status.HTTP_202_ACCEPTED)
 
 @extend_schema(
-    request=OpenNebulaFloatingIPAssignSerializer,
-    responses={200: OpenApiResponse(description='Floating IP assigned'), 400: OpenApiResponse(description='Validation error'), 500: OpenApiResponse(description='Backend error')},
-    description="Assign a floating IP to a VM."
-)
-class OpenNebulaFloatingIPAssignView(APIView):
-    def post(self, request):
-        serializer = OpenNebulaFloatingIPAssignSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = serializer.validated_data
-        try:
-            backend = OpenNebulaBackend(data['vm'].service_settings)
-            result = backend.assign_floating_ip(data['vm'], data['network_id'], data.get('ip_address'))
-            return Response(result, status=status.HTTP_200_OK)
-        except Exception as e:
-            return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-@extend_schema(
-    request=OpenNebulaFloatingIPReleaseSerializer,
-    responses={200: OpenApiResponse(description='Floating IP released'), 400: OpenApiResponse(description='Validation error'), 500: OpenApiResponse(description='Backend error')},
-    description="Release a floating IP from a VM."
-)
-class OpenNebulaFloatingIPReleaseView(APIView):
-    def post(self, request):
-        serializer = OpenNebulaFloatingIPReleaseSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = serializer.validated_data
-        try:
-            backend = OpenNebulaBackend(data['vm'].service_settings)
-            result = backend.release_floating_ip(data['vm'], data['ip_address'])
-            return Response(result, status=status.HTTP_200_OK)
-        except Exception as e:
-            return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-@extend_schema(
     responses={200: OpenApiResponse(OpenNebulaMarketplaceOfferingSerializer(many=True)), 500: OpenApiResponse(description='Backend error')},
     description="List available marketplace offerings (templates/images)."
 )
@@ -894,4 +1165,127 @@ class OpenNebulaQuotaView(APIView):
 
 class OpenNebulaScheduledActionViewSet(viewsets.ModelViewSet):
     queryset = OpenNebulaScheduledAction.objects.all()
-    serializer_class = OpenNebulaScheduledActionSerializer 
+    serializer_class = OpenNebulaScheduledActionSerializer
+
+
+class OpenNebulaTemplatesViewSet(viewsets.ViewSet):
+    @extend_schema(
+        parameters=[OpenApiParameter('service_settings', type=int, required=True, location=OpenApiParameter.QUERY)],
+        responses={200: OpenApiResponse(description='List of VM templates')},
+        description="List available VM templates for deployment."
+    )
+    def list(self, request):
+        service_settings_id = request.query_params.get('service_settings')
+        if not service_settings_id:
+            return Response({'detail': 'service_settings is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            settings = ServiceSettings.objects.get(pk=service_settings_id)
+            client = OpenNebulaClient(settings.backend_url, settings.username, settings.password)
+            templates = client.list_templates()
+            # Minimal serialization for wizard
+            data = [
+                {'id': t.ID, 'name': t.NAME, 'cpu': getattr(t.TEMPLATE, 'CPU', None), 'memory': getattr(t.TEMPLATE, 'MEMORY', None)}
+                for t in getattr(templates, 'VMTEMPLATE', [])
+            ]
+            return Response(data)
+        except ServiceSettings.DoesNotExist:
+            return Response({'detail': 'ServiceSettings not found.'}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            
+    @extend_schema(
+        parameters=[
+            OpenApiParameter('service_settings', type=int, required=True, location=OpenApiParameter.QUERY),
+            OpenApiParameter('id', type=int, required=True, location=OpenApiParameter.PATH)
+        ],
+        responses={200: OpenApiResponse(description='Template details')},
+        description="Get details of a specific VM template."
+    )
+    def retrieve(self, request, pk=None):  # TODO: Implentation
+        service_settings_id = request.query_params.get('service_settings')
+        if not service_settings_id:
+            return Response({'detail': 'service_settings is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            settings = ServiceSettings.objects.get(pk=service_settings_id)
+            client = OpenNebulaClient(settings.backend_url, settings.username, settings.password)
+            #template = client.get_template(pk) - TODO GET TEMPLATE
+            template = "";
+            if not template:
+                return Response({'detail': 'Template not found.'}, status=status.HTTP_404_NOT_FOUND)
+                
+            # Extract template details
+            data = {
+                'id': template.ID,
+                'name': template.NAME,
+                'cpu': getattr(template.TEMPLATE, 'CPU', None),
+                'memory': getattr(template.TEMPLATE, 'MEMORY', None),
+                'disk': getattr(template.TEMPLATE, 'DISK', []),
+                'nic': getattr(template.TEMPLATE, 'NIC', []),
+                'template_data': template.TEMPLATE.toxml()
+            }
+            return Response(data)
+        except ServiceSettings.DoesNotExist:
+            return Response({'detail': 'ServiceSettings not found.'}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class OpenNebulaImagesViewSet(viewsets.ViewSet):
+    @extend_schema(
+        parameters=[OpenApiParameter('service_settings', type=int, required=True, location=OpenApiParameter.QUERY)],
+        responses={200: OpenApiResponse(description='List of images')},
+        description="List available images for disk attach or VM creation."
+    )
+    def list(self, request):
+        service_settings_id = request.query_params.get('service_settings')
+        if not service_settings_id:
+            return Response({'detail': 'service_settings is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            settings = ServiceSettings.objects.get(pk=service_settings_id)
+            client = OpenNebulaClient(settings.backend_url, settings.username, settings.password)
+            images = client.list_images()
+            data = [
+                {'id': i.ID, 'name': i.NAME, 'size': getattr(i, 'SIZE', None), 'type': getattr(i, 'TYPE', None)}
+                for i in getattr(images, 'IMAGE', [])
+            ]
+            return Response(data)
+        except ServiceSettings.DoesNotExist:
+            return Response({'detail': 'ServiceSettings not found.'}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @extend_schema(
+        parameters=[
+            OpenApiParameter('service_settings', type=int, required=True, location=OpenApiParameter.QUERY),
+            OpenApiParameter('id', type=int, required=True, location=OpenApiParameter.PATH)
+        ],
+        responses={200: OpenApiResponse(description='Image details')},
+        description="Get details of a specific image."
+    )
+    def retrieve(self, request, pk=None):  # TODO: Implentation
+        service_settings_id = request.query_params.get('service_settings')
+        if not service_settings_id:
+            return Response({'detail': 'service_settings is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            settings = ServiceSettings.objects.get(pk=service_settings_id)
+            client = OpenNebulaClient(settings.backend_url, settings.username, settings.password)
+            #image = client.get_image(pk)
+            image = "";
+            if not image:
+                return Response({'detail': 'Image not found.'}, status=status.HTTP_404_NOT_FOUND)
+                
+            # Extract image details
+            data = {
+                'id': image.ID,
+                'name': image.NAME,
+                'size': getattr(image, 'SIZE', None),
+                'type': getattr(image, 'TYPE', None),
+                'persistent': getattr(image, 'PERSISTENT', None),
+                'format': getattr(image, 'FORMAT', None),
+                'state': getattr(image, 'STATE', None),
+                'image_data': image.toxml()
+            }
+            return Response(data)
+        except ServiceSettings.DoesNotExist:
+            return Response({'detail': 'ServiceSettings not found.'}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
