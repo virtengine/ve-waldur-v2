@@ -240,5 +240,4 @@ class OpenNebulaCleanupExecutor(structure_executors.BaseCleanupExecutor):
         (models.OpenNebulaVolume, VolumeDeleteExecutor),
         (models.OpenNebulaNetwork, NetworkDeleteExecutor),
         (models.OpenNebulaVirtualMachine, VirtualMachineDeleteExecutor),
-        (models.OpenNebulaTenant, TenantDeleteExecutor),
-)
+        (models.OpenNebulaTenant, TenantDeleteExecutor),)

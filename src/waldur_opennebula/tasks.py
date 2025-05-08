@@ -12,7 +12,7 @@ from .models import OpenNebulaScheduledAction
 @shared_task
 def create_vm_task(vm_id, service_settings_id, template_id, name, networks, cpu=None, ram=None, disk=None, ssh_key=None, contextualization=False, extra=None):
     settings = ServiceSettings.objects.get(pk=service_settings_id)
-    client = OpenNebulaClient(settings.backend_url, settings.username, settings.password)
+    client = OpenNebulaClient(settings.backend_url)
     params = extra.copy() if extra else {}
     if cpu is not None:
         params['CPU'] = cpu
@@ -108,7 +108,7 @@ def delete_tenant_task(tenant_id):
         pass
 
 
-@shared_task
+@shared_task(name='opennebula.pull_tenants_task')
 def pull_tenants_task(service_settings_id):
     settings = ServiceSettings.objects.get(pk=service_settings_id)
     backend = OpenNebulaBackend(settings)

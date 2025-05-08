@@ -5,10 +5,14 @@ from .exceptions import OpenNebulaError
 logger = logging.getLogger(__name__)
 
 
-class OpenNebulaClient:
-    def __init__(self, endpoint, username, password):
-        self.one = pyone.OneServer(endpoint, session="%s:%s" % (username, password))
+def _to_template_str(data_dict):
+    return '\n'.join([f'{key.upper()}="{value}"' if isinstance(value, str) else f'{key.upper()}={value}' for key, value in data_dict.items()])
 
+
+class OpenNebulaClient:
+    def __init__(self, settings):
+        self.one = pyone.OneServer(settings.backend_url, session="%s:%s" % (settings.username, settings.password))
+        
     def get_version(self):
         """
         Returns the OpenNebula system version.
@@ -54,20 +58,20 @@ class OpenNebulaClient:
         :type template_id: int
         :param name: Optional VM name
         :type name: str or None
-        :param extra: Optional extra attributes (CPU, RAM, etc.)
+        :param extra: Optional extra attributes (CPU, RAM, etc.) to be added/overridden in template
         :type extra: dict or None
         :return: VM identifier
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            params = {}
-            if name:
-                params['NAME'] = name
+            template_modifications = ""
             if extra:
-                params.update(extra)
-            return self.one.vm.allocate(template_id, params)
+                template_modifications = _to_template_str(extra)
+            # template.instantiate is suitable for creating a VM from a template ID 
+            # and applying modifications like CPU, MEMORY.
+            return self.one.template.instantiate(int(template_id), name, False, template_modifications)
         except pyone.OneException as e:
-            logger.exception('Failed to create VM')
+            logger.exception('Failed to create VM by instantiating template')
             raise OpenNebulaError(e)
 
     def delete_vm(self, vm_id):
@@ -139,12 +143,20 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            template = {}
+            template_parts = []
             if cpu is not None:
-                template['CPU'] = cpu
+                template_parts.append(f"CPU={cpu}")
             if ram is not None:
-                template['MEMORY'] = ram
-            return self.one.vm.update(vm_id, template, 1)  # 1 = merge
+                template_parts.append(f"MEMORY={ram}")
+            
+            if not template_parts:
+                logger.warning(f"Resize VM ({vm_id}) called without CPU or RAM changes.")
+                return True # No changes to apply
+
+            template_str = "\n".join(template_parts)
+            # Using mode 0 to merge/update existing attributes. 
+            # Mode 1 would replace the whole template.
+            return self.one.vm.update(vm_id, template_str, 0)  
         except pyone.OneException as e:
             logger.exception('Failed to resize VM')
             raise OpenNebulaError(e)
@@ -160,7 +172,7 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            return self.one.vm.attach(vm_id, disk_template)
+            return self.one.vm.attach(vm_id, _to_template_str(disk_template))
         except pyone.OneException as e:
             logger.exception('Failed to attach disk to VM')
             raise OpenNebulaError(e)
@@ -448,7 +460,7 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            return self.one.vn.update(network_id, template, 1)  # 1 = merge
+            return self.one.vn.update(network_id, _to_template_str(template), 1)  # 1 = merge
         except pyone.OneException as e:
             logger.exception('Failed to update network')
             raise OpenNebulaError(e)
@@ -464,7 +476,7 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            return self.one.vn.add_ar(network_id, ar_template)
+            return self.one.vn.add_ar(network_id, _to_template_str(ar_template))
         except pyone.OneException as e:
             logger.exception('Failed to add address range to network')
             raise OpenNebulaError(e)
@@ -498,7 +510,7 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            return self.one.vn.update_ar(network_id, ar_template)
+            return self.one.vn.update_ar(network_id, _to_template_str(ar_template))
         except pyone.OneException as e:
             logger.exception('Failed to update address range')
             raise OpenNebulaError(e)
@@ -514,7 +526,7 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            return self.one.vn.reserve(network_id, reservation_template)
+            return self.one.vn.reserve(network_id, _to_template_str(reservation_template))
         except pyone.OneException as e:
             logger.exception('Failed to reserve address range')
             raise OpenNebulaError(e)
@@ -1010,7 +1022,7 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            return self.one.vm.attachnic(vm_id, nic_template)
+            return self.one.vm.attachnic(vm_id, _to_template_str(nic_template))
         except pyone.OneException as e:
             logger.exception('Failed to attach NIC')
             raise OpenNebulaError(e)
@@ -1042,22 +1054,23 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            return self.one.vm.updatenic(vm_id, nic_id, nic_template)
+            return self.one.vm.updatenic(vm_id, nic_id, _to_template_str(nic_template))
         except pyone.OneException as e:
             logger.exception('Failed to update NIC')
             raise OpenNebulaError(e)
-    def get_cpu(self, vm_id):
-            """
-            Returns the CPU-related settings of a virtual machine.
 
-            :param vm_id: Virtual machine identifier
-            :type vm_id: string
-            """
-            try:
-                vm = self.one.vm.info(int(vm_id))
-            except pyone.OneException as e:
-                raise OpenNebulaError(e)
-            return vm.TEMPLATE.CPU
+    def get_cpu(self, vm_id):
+        """
+        Returns the CPU-related settings of a virtual machine.
+
+        :param vm_id: Virtual machine identifier
+        :type vm_id: string
+        """
+        try:
+            vm = self.one.vm.info(int(vm_id))
+        except pyone.OneException as e:
+            raise OpenNebulaError(e)
+        return vm.TEMPLATE.CPU
 
     def update_cpu(self, vm_id, spec):
         """

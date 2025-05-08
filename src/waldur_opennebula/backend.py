@@ -13,16 +13,11 @@ class OpenNebulaBackendError(ServiceBackendError):
 
 class OpenNebulaBackend(ServiceBackend):
     """Waldur interface to OpenNebula API using pyone."""
-
+    service_type = 'OpenNebula'
+    
     def __init__(self, settings):
-        super().__init__(settings)
-        self.settings = settings  # Explicitly assign settings for linter compliance
-        self.client = OpenNebulaClient(
-            endpoint=settings.options.get("api_url"),
-            username=settings.options.get("username"),
-            password=settings.options.get("password"),
-        )
-
+        self.settings = settings
+        self.client = OpenNebulaClient(settings)
 
     def ping(self, raise_exception=False):
         """
@@ -852,7 +847,7 @@ class OpenNebulaBackend(ServiceBackend):
             raise OpenNebulaBackendError(e)
 
     def list_snapshots(self, vm):
-        client = OpenNebulaClient(vm.service_settings.backend_url, vm.service_settings.username, vm.service_settings.password)
+        client = OpenNebulaClient(vm.service_settings)
         info = client.get_vm(vm.backend_id)
         # Assume info.SNAPSHOTS.SNAPSHOT is a list of snapshot objects
         snapshots = getattr(getattr(info, 'SNAPSHOTS', None), 'SNAPSHOT', [])
@@ -867,11 +862,11 @@ class OpenNebulaBackend(ServiceBackend):
         ]
 
     def create_snapshot(self, vm, name):
-        client = OpenNebulaClient(vm.service_settings.backend_url, vm.service_settings.username, vm.service_settings.password)
+        client = OpenNebulaClient(vm.service_settings)
         return client.snapshot_vm(vm.backend_id, name)
 
     def list_backups(self, vm):
-        client = OpenNebulaClient(vm.service_settings.backend_url, vm.service_settings.username, vm.service_settings.password)
+        client = OpenNebulaClient(vm.service_settings)
         # This is a placeholder; actual implementation depends on OpenNebula backup API
         # For now, return a list of backup dicts
         info = client.get_vm(vm.backend_id)
@@ -888,7 +883,7 @@ class OpenNebulaBackend(ServiceBackend):
         ]
 
     def create_backup(self, vm, name, description=None):
-        client = OpenNebulaClient(vm.service_settings.backend_url, vm.service_settings.username, vm.service_settings.password)
+        client = OpenNebulaClient(vm.service_settings)
         # This is a placeholder; actual implementation depends on OpenNebula backup API
         return client.backup_vm(vm.backend_id, name, description)
 
@@ -914,7 +909,7 @@ class OpenNebulaBackend(ServiceBackend):
             raise OpenNebulaBackendError(e)
 
     def list_marketplace_offerings(self):
-        client = OpenNebulaClient(self.settings.options.get("api_url"), self.settings.options.get("username"), self.settings.options.get("password"))
+        client = OpenNebulaClient(self.settings)
         templates = client.list_templates()
         images = client.list_images()
         # Aggregate templates/images into offering dicts

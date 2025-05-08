@@ -1,7 +1,30 @@
 from rest_framework import serializers
+from django.utils.translation import gettext_lazy as _
+
+from waldur_core.structure import serializers as structure_serializers
+
 from .models import OpenNebulaTenant, OpenNebulaVirtualMachine, OpenNebulaNetwork, OpenNebulaVolume, ServiceSettings, OpenNebulaScheduledAction
 
+class OpenNebulaServiceSerializer(structure_serializers.ServiceOptionsSerializer):
+    class Meta:
+        secret_fields = (
+            "backend_url",
+            "username",
+            "password"
+        )
 
+    backend_url = serializers.CharField(
+        label=_("OpenNebula API Endpoint"),
+    )
+
+    username = serializers.CharField(
+        label=_("OpenNebula Admin Username"),
+    )
+
+    password = serializers.CharField(
+        label=_("OpenNebula Admin Password"),
+    )
+    
 class OpenNebulaTenantSerializer(serializers.ModelSerializer):
     class Meta:
         model = OpenNebulaTenant

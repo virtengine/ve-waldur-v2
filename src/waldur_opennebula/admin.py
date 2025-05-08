@@ -1,26 +1,34 @@
 from django.contrib import admin
-from .models import OpenNebulaTenant, OpenNebulaVirtualMachine, OpenNebulaNetwork, OpenNebulaVolume
+from .models import OpenNebulaScheduledAction, OpenNebulaTenant, OpenNebulaVirtualMachine, OpenNebulaNetwork, OpenNebulaVolume
+from waldur_core.structure import admin as structure_admin
 
 
 @admin.register(OpenNebulaTenant)
-class OpenNebulaTenantAdmin(admin.ModelAdmin):
-    list_display = ("name", "backend_id", "service_settings", "project", "created", "modified")
-    search_fields = ("name", "backend_id")
-
+class OpenNebulaTenantAdmin(structure_admin.ResourceAdmin):
+    list_display = ('name', 'state', 'backend_id')
+    search_fields = ('name', 'backend_id')
+    list_filter = ('state',)
 
 @admin.register(OpenNebulaVirtualMachine)
-class OpenNebulaVirtualMachineAdmin(admin.ModelAdmin):
-    list_display = ("name", "tenant", "project", "service_settings", "backend_id", "cpu", "ram", "disk", "created", "modified")
-    search_fields = ("name", "backend_id")
-
+class OpenNebulaVirtualMachineAdmin(structure_admin.ResourceAdmin):
+    list_display = ('name', 'state', 'backend_id', 'cpu', 'ram')
+    search_fields = ('name', 'backend_id')
+    list_filter = ('state', 'cpu', 'ram')
 
 @admin.register(OpenNebulaNetwork)
-class OpenNebulaNetworkAdmin(admin.ModelAdmin):
-    list_display = ("name", "backend_id", "tenant", "service_settings", "created", "modified")
-    search_fields = ("name", "backend_id")
-
+class OpenNebulaNetworkAdmin(structure_admin.ResourceAdmin):
+    list_display = ('name', 'state', 'backend_id')
+    search_fields = ('name', 'backend_id')
+    list_filter = ('state',)
 
 @admin.register(OpenNebulaVolume)
-class OpenNebulaVolumeAdmin(admin.ModelAdmin):
-    list_display = ("name", "backend_id", "tenant", "service_settings", "size", "created", "modified")
-    search_fields = ("name", "backend_id") 
+class OpenNebulaVolumeAdmin(structure_admin.ResourceAdmin):
+    list_display = ('name', 'state', 'backend_id', 'size')
+    search_fields = ('name', 'backend_id')
+    list_filter = ('state', 'size')
+
+@admin.register(OpenNebulaScheduledAction)
+class OpenNebulaScheduledActionAdmin(admin.ModelAdmin):
+    list_display = ('id', 'vm', 'next_run', 'action_type', 'enabled', 'last_run')
+    list_filter = ('action_type', 'enabled')
+    search_fields = ('id', 'vm__name')

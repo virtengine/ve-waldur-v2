@@ -333,7 +333,7 @@ class OpenNebulaVirtualMachineViewSet(viewsets.ModelViewSet):
             # Add other required fields as needed (e.g., project, tenant)
         )
         # Schedule async Celery task
-        create_vm_task.delay(
+        create_vm_task(
             vm.pk,
             settings.pk,
             data['template_id'],
@@ -360,7 +360,7 @@ class OpenNebulaVirtualMachineViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         vm = data['vm']
-        migrate_vm_task.delay(
+        migrate_vm_task(
             vm.pk,
             data['host_id'],
             data.get('live', True),
@@ -390,7 +390,7 @@ class OpenNebulaVirtualMachineViewSet(viewsets.ModelViewSet):
             disk_template['TYPE'] = data['type']
         if data.get('target'):
             disk_template['TARGET'] = data['target']
-        attach_disk_task.delay(vm.pk, disk_template)
+        attach_disk_task(vm.pk, disk_template)
         return Response({'detail': 'Disk attach scheduled.'}, status=status.HTTP_202_ACCEPTED)
 
     @extend_schema(
@@ -404,7 +404,7 @@ class OpenNebulaVirtualMachineViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         vm = data['vm']
-        resize_disk_task.delay(vm.pk, data['disk_id'], data['size'])
+        resize_disk_task(vm.pk, data['disk_id'], data['size'])
         return Response({'detail': 'Disk resize scheduled.'}, status=status.HTTP_202_ACCEPTED)
 
     @extend_schema(
@@ -418,7 +418,7 @@ class OpenNebulaVirtualMachineViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         vm = data['vm']
-        save_disk_as_image_task.delay(
+        save_disk_as_image_task(
             vm.pk,
             data['disk_id'],
             data['image_name'],
@@ -437,7 +437,7 @@ class OpenNebulaVirtualMachineViewSet(viewsets.ModelViewSet):
         serializer = OpenNebulaVMSnapshotSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        create_vm_snapshot_task.delay(data['vm'].pk, data['name'])
+        create_vm_snapshot_task(data['vm'].pk, data['name'])
         return Response({'detail': 'Snapshot creation scheduled.'}, status=status.HTTP_202_ACCEPTED)
 
     @extend_schema(
@@ -468,7 +468,7 @@ class OpenNebulaVirtualMachineViewSet(viewsets.ModelViewSet):
         serializer = OpenNebulaBackupCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        create_backup_task.delay(data['vm'].pk, data['name'], data.get('description', ''))
+        create_backup_task(data['vm'].pk, data['name'], data.get('description', ''))
         return Response({'detail': 'Backup creation scheduled.'}, status=status.HTTP_202_ACCEPTED)
 
     @extend_schema(
@@ -499,7 +499,7 @@ class OpenNebulaVirtualMachineViewSet(viewsets.ModelViewSet):
         serializer = OpenNebulaRestoreBackupSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        restore_backup_task.delay(
+        restore_backup_task(
             data['backup_id'],
             data.get('vm').pk if data.get('vm') else None,
             data.get('in_place', True),
@@ -937,7 +937,7 @@ class OpenNebulaVMCreateView(APIView):
             # Add other required fields as needed (e.g., project, tenant)
         )
         # Schedule async Celery task
-        create_vm_task.delay(
+        create_vm_task(
             vm.pk,
             settings.pk,
             data['template_id'],
@@ -964,7 +964,7 @@ class OpenNebulaVMMigrateView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         vm = data['vm']
-        migrate_vm_task.delay(
+        migrate_vm_task(
             vm.pk,
             data['host_id'],
             data.get('live', True),
@@ -994,7 +994,7 @@ class OpenNebulaDiskAttachView(APIView):
             disk_template['TYPE'] = data['type']
         if data.get('target'):
             disk_template['TARGET'] = data['target']
-        attach_disk_task.delay(vm.pk, disk_template)
+        attach_disk_task(vm.pk, disk_template)
         return Response({'detail': 'Disk attach scheduled.'}, status=status.HTTP_202_ACCEPTED)
 
 @extend_schema(
@@ -1008,7 +1008,7 @@ class OpenNebulaDiskResizeView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         vm = data['vm']
-        resize_disk_task.delay(vm.pk, data['disk_id'], data['size'])
+        resize_disk_task(vm.pk, data['disk_id'], data['size'])
         return Response({'detail': 'Disk resize scheduled.'}, status=status.HTTP_202_ACCEPTED)
 
 @extend_schema(
@@ -1022,7 +1022,7 @@ class OpenNebulaDiskSaveAsView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         vm = data['vm']
-        save_disk_as_image_task.delay(
+        save_disk_as_image_task(
             vm.pk,
             data['disk_id'],
             data['image_name'],
@@ -1041,7 +1041,7 @@ class OpenNebulaVMSnapshotView(APIView):
         serializer = OpenNebulaVMSnapshotSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        create_vm_snapshot_task.delay(data['vm'].pk, data['name'])
+        create_vm_snapshot_task(data['vm'].pk, data['name'])
         return Response({'detail': 'Snapshot creation scheduled.'}, status=status.HTTP_202_ACCEPTED)
 
 @extend_schema(
@@ -1073,7 +1073,7 @@ class OpenNebulaBackupCreateView(APIView):
         serializer = OpenNebulaBackupCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        create_backup_task.delay(data['vm'].pk, data['name'], data.get('description', ''))
+        create_backup_task(data['vm'].pk, data['name'], data.get('description', ''))
         return Response({'detail': 'Backup creation scheduled.'}, status=status.HTTP_202_ACCEPTED)
 
 @extend_schema(
@@ -1104,7 +1104,7 @@ class OpenNebulaRestoreBackupView(APIView):
         serializer = OpenNebulaRestoreBackupSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        restore_backup_task.delay(
+        restore_backup_task(
             data['backup_id'],
             data.get('vm').pk if data.get('vm') else None,
             data.get('in_place', True),
