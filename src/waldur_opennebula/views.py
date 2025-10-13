@@ -320,7 +320,7 @@ class OpenNebulaVirtualMachineViewSet(viewsets.ModelViewSet):
             )
         backend = OpenNebulaBackend(vm.service_settings)
         try:
-            backend.attach_disk_to_vm(vm, volume)
+            backend.attach_disk(vm, volume)
             return Response(
                 {"detail": "Attach scheduled."}, status=status.HTTP_202_ACCEPTED
             )
@@ -339,7 +339,7 @@ class OpenNebulaVirtualMachineViewSet(viewsets.ModelViewSet):
             )
         backend = OpenNebulaBackend(vm.service_settings)
         try:
-            backend.detach_disk_from_vm(vm, disk_id)
+            backend.detach_disk(vm, disk_id)
             return Response(
                 {"detail": "Detach scheduled."}, status=status.HTTP_202_ACCEPTED
             )
@@ -969,6 +969,53 @@ class OpenNebulaNetworkViewSet(viewsets.ModelViewSet):
             )
 
 
+class OpenNebulaFloatingIPAssignView(APIView):
+    def post(self, request):
+        serializer = OpenNebulaFloatingIPAssignSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        vm = serializer.validated_data["vm"]
+        network_id = serializer.validated_data["network_id"]
+        ip_address = serializer.validated_data.get("ip_address")
+        backend = OpenNebulaBackend(vm.service_settings)
+        try:
+            result = backend.assign_floating_ip(
+                vm=vm, network_id=network_id, ip_address=ip_address
+            )
+        except NotImplementedError as exc:
+            return Response(
+                {"detail": str(exc)}, status=status.HTTP_501_NOT_IMPLEMENTED
+            )
+        if result is None:
+            result = {
+                "vm_id": vm.backend_id,
+                "network_id": network_id,
+                "ip_address": ip_address,
+            }
+        return Response(result, status=status.HTTP_200_OK)
+
+
+class OpenNebulaFloatingIPReleaseView(APIView):
+    def post(self, request):
+        serializer = OpenNebulaFloatingIPReleaseSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        vm = serializer.validated_data["vm"]
+        ip_address = serializer.validated_data["ip_address"]
+        backend = OpenNebulaBackend(vm.service_settings)
+        try:
+            result = backend.release_floating_ip(vm=vm, ip_address=ip_address)
+        except NotImplementedError as exc:
+            return Response(
+                {"detail": str(exc)}, status=status.HTTP_501_NOT_IMPLEMENTED
+            )
+        if result is None:
+            result = {
+                "vm_id": vm.backend_id,
+                "ip_address": ip_address,
+                "released": False,
+            }
+        return Response(result, status=status.HTTP_200_OK)
+
+
 class OpenNebulaVolumeViewSet(viewsets.ModelViewSet):
     queryset = OpenNebulaVolume.objects.all()
     serializer_class = OpenNebulaVolumeSerializer
@@ -991,8 +1038,9 @@ class OpenNebulaVolumeViewSet(viewsets.ModelViewSet):
             )
         backend = OpenNebulaBackend(volume.service_settings)
         try:
-            disk_template = request.data.get("disk_template")
-            backend.attach_disk_to_vm(vm, volume, disk_template=disk_template)
+            backend.attach_disk_to_vm(
+                vm=vm, volume=volume, disk_template=request.data.get("disk_template")
+            )
             return Response(
                 {"detail": "Attach scheduled."}, status=status.HTTP_202_ACCEPTED
             )
@@ -1021,7 +1069,7 @@ class OpenNebulaVolumeViewSet(viewsets.ModelViewSet):
             )
         backend = OpenNebulaBackend(volume.service_settings)
         try:
-            backend.detach_disk_from_vm(vm, disk_id)
+            backend.detach_disk_from_vm(vm=vm, disk_id=disk_id)
             return Response(
                 {"detail": "Detach scheduled."}, status=status.HTTP_202_ACCEPTED
             )
@@ -1215,65 +1263,6 @@ class OpenNebulaVolumeViewSet(viewsets.ModelViewSet):
             return Response(
                 {"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
-
-
-class OpenNebulaFloatingIPAssignView(APIView):
-    def post(self, request):
-        serializer = OpenNebulaFloatingIPAssignSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        vm = serializer.validated_data["vm"]
-        backend = OpenNebulaBackend(vm.service_settings)
-        try:
-            payload = backend.assign_floating_ip(
-                vm,
-                network_id=serializer.validated_data["network_id"],
-                ip_address=serializer.validated_data.get("ip_address"),
-            )
-        except NotImplementedError as exc:
-            return Response(
-                {"detail": str(exc)}, status=status.HTTP_501_NOT_IMPLEMENTED
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            return Response(
-                {"detail": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-
-        if payload is None:
-            payload = {
-                "vm_id": vm.backend_id,
-                "network_id": serializer.validated_data["network_id"],
-                "ip_address": serializer.validated_data.get("ip_address"),
-            }
-
-        return Response(payload, status=status.HTTP_200_OK)
-
-
-class OpenNebulaFloatingIPReleaseView(APIView):
-    def post(self, request):
-        serializer = OpenNebulaFloatingIPReleaseSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        vm = serializer.validated_data["vm"]
-        ip_address = serializer.validated_data["ip_address"]
-        backend = OpenNebulaBackend(vm.service_settings)
-        try:
-            payload = backend.release_floating_ip(vm, ip_address=ip_address)
-        except NotImplementedError as exc:
-            return Response(
-                {"detail": str(exc)}, status=status.HTTP_501_NOT_IMPLEMENTED
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            return Response(
-                {"detail": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-
-        if payload is None:
-            payload = {
-                "vm_id": vm.backend_id,
-                "ip_address": ip_address,
-                "released": True,
-            }
-
-        return Response(payload, status=status.HTTP_200_OK)
 
 
 @extend_schema(
@@ -1771,7 +1760,7 @@ class OpenNebulaTemplatesViewSet(viewsets.ViewSet):
             )
         try:
             settings = ServiceSettings.objects.get(pk=service_settings_id)
-            client = OpenNebulaClient(  # noqa: F841
+            client = OpenNebulaClient(
                 settings.backend_url, settings.username, settings.password
             )
             # template = client.get_template(pk) - TODO GET TEMPLATE
@@ -1873,7 +1862,7 @@ class OpenNebulaImagesViewSet(viewsets.ViewSet):
             )
         try:
             settings = ServiceSettings.objects.get(pk=service_settings_id)
-            client = OpenNebulaClient(  # noqa: F841
+            client = OpenNebulaClient(
                 settings.backend_url, settings.username, settings.password
             )
             # image = client.get_image(pk)
