@@ -72,13 +72,14 @@ class OpenNebulaTenantViewSet(viewsets.ModelViewSet):
             data=request.data, context={"request": request}
         )
         serializer.is_valid(raise_exception=True)
-        tenant = serializer.save()
-        backend = OpenNebulaBackend(tenant.service_settings)
-        backend.create_tenant(tenant)
-        response_serializer = OpenNebulaTenantSerializer(
-            tenant, context={"request": request}
+        backend = OpenNebulaBackend(request.user.service_settings)
+        tenant = backend.create_tenant(
+            name=serializer.validated_data["name"],
+            description=serializer.validated_data.get("description", ""),
         )
-        return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+        return Response(
+            OpenNebulaTenantSerializer(tenant).data, status=status.HTTP_201_CREATED
+        )
 
     @action(detail=True, methods=["delete"])
     def delete_tenant(self, request, pk=None):
@@ -476,7 +477,7 @@ class OpenNebulaVirtualMachineViewSet(viewsets.ModelViewSet):
             # Add other required fields as needed (e.g., project, tenant)
         )
         # Schedule async Celery task
-        create_vm_task(
+        create_vm_task.delay(
             vm.pk,
             settings.pk,
             data["template_id"],
@@ -508,7 +509,7 @@ class OpenNebulaVirtualMachineViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         vm = data["vm"]
-        migrate_vm_task(
+        migrate_vm_task.delay(
             vm.pk,
             data["host_id"],
             data.get("live", True),
@@ -543,7 +544,7 @@ class OpenNebulaVirtualMachineViewSet(viewsets.ModelViewSet):
             disk_template["TYPE"] = data["type"]
         if data.get("target"):
             disk_template["TARGET"] = data["target"]
-        attach_disk_task(vm.pk, disk_template)
+        attach_disk_task.delay(vm.pk, disk_template)
         return Response(
             {"detail": "Disk attach scheduled."}, status=status.HTTP_202_ACCEPTED
         )
@@ -562,7 +563,7 @@ class OpenNebulaVirtualMachineViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         vm = data["vm"]
-        resize_disk_task(vm.pk, data["disk_id"], data["size"])
+        resize_disk_task.delay(vm.pk, data["disk_id"], data["size"])
         return Response(
             {"detail": "Disk resize scheduled."}, status=status.HTTP_202_ACCEPTED
         )
@@ -581,7 +582,7 @@ class OpenNebulaVirtualMachineViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         vm = data["vm"]
-        save_disk_as_image_task(
+        save_disk_as_image_task.delay(
             vm.pk,
             data["disk_id"],
             data["image_name"],
@@ -605,7 +606,7 @@ class OpenNebulaVirtualMachineViewSet(viewsets.ModelViewSet):
         serializer = OpenNebulaVMSnapshotSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        create_vm_snapshot_task(data["vm"].pk, data["name"])
+        create_vm_snapshot_task.delay(data["vm"].pk, data["name"])
         return Response(
             {"detail": "Snapshot creation scheduled."}, status=status.HTTP_202_ACCEPTED
         )
@@ -646,7 +647,9 @@ class OpenNebulaVirtualMachineViewSet(viewsets.ModelViewSet):
         serializer = OpenNebulaBackupCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        create_backup_task(data["vm"].pk, data["name"], data.get("description", ""))
+        create_backup_task.delay(
+            data["vm"].pk, data["name"], data.get("description", "")
+        )
         return Response(
             {"detail": "Backup creation scheduled."}, status=status.HTTP_202_ACCEPTED
         )
@@ -687,7 +690,7 @@ class OpenNebulaVirtualMachineViewSet(viewsets.ModelViewSet):
         serializer = OpenNebulaRestoreBackupSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        restore_backup_task(
+        restore_backup_task.delay(
             data["backup_id"],
             data.get("vm").pk if data.get("vm") else None,
             data.get("in_place", True),
@@ -945,10 +948,8 @@ class OpenNebulaNetworkViewSet(viewsets.ModelViewSet):
             )
         try:
             settings = ServiceSettings.objects.get(pk=service_settings_id)
-            _client = OpenNebulaClient(
-                settings.backend_url, settings.username, settings.password
-            )
-            networks = _client.list_networks()
+            client = OpenNebulaClient(settings)
+            networks = client.list_networks()
             data = [
                 {
                     "id": n.ID,
@@ -1285,10 +1286,8 @@ class OpenNebulaTemplateListView(APIView):
             )
         try:
             settings = ServiceSettings.objects.get(pk=service_settings_id)
-            _client = OpenNebulaClient(
-                settings.backend_url, settings.username, settings.password
-            )
-            templates = _client.list_templates()
+            client = OpenNebulaClient(settings.backend_url, settings.username, settings.password)
+            templates = client.list_templates()
             # Minimal serialization for wizard
             data = [
                 {
@@ -1330,10 +1329,8 @@ class OpenNebulaImageListView(APIView):
             )
         try:
             settings = ServiceSettings.objects.get(pk=service_settings_id)
-            _client = OpenNebulaClient(
-                settings.backend_url, settings.username, settings.password
-            )
-            images = _client.list_images()
+            client = OpenNebulaClient(settings.backend_url, settings.username, settings.password)
+            images = client.list_images()
             data = [
                 {
                     "id": i.ID,
@@ -1370,31 +1367,58 @@ class OpenNebulaVMCreateView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         settings = data["service_settings"]
-        # Create DB record for VM in 'creating' state
-        vm = OpenNebulaVirtualMachine.objects.create(
-            name=data["name"],
-            service_settings=settings,
-            state="creating",
-            # Add other required fields as needed (e.g., project, tenant)
-        )
-        # Schedule async Celery task
-        create_vm_task(
-            vm.pk,
-            settings.pk,
-            data["template_id"],
-            data["name"],
-            data["networks"],
-            data.get("cpu"),
-            data.get("ram"),
-            data.get("disk"),
-            data.get("ssh_key"),
-            data.get("contextualization", False),
-            data.get("extra", {}),
-        )
-        # Return VM object (with state) for polling
-        return Response(
-            OpenNebulaVirtualMachineSerializer(vm).data, status=status.HTTP_201_CREATED
-        )
+        client = OpenNebulaClient(settings)
+
+        params = data.get("extra", {}).copy()
+        if data.get("cpu") is not None:
+            params["CPU"] = data["cpu"]
+        if data.get("ram") is not None:
+            params["MEMORY"] = data["ram"]
+        if data.get("disk") is not None:
+            params["DISK_SIZE"] = data["disk"]
+        ssh_key = data.get("ssh_key")
+        if ssh_key:
+            params["SSH_PUBLIC_KEY"] = ssh_key
+        if data.get("contextualization", False):
+            params["CONTEXT"] = {"SSH_PUBLIC_KEY": ssh_key} if ssh_key else {}
+        params["NIC"] = [{"NETWORK_ID": net_id} for net_id in data["networks"]]
+
+        try:
+            backend_vm_id = client.create_vm(
+                data["template_id"],
+                name=data["name"],
+                extra=params or None,
+            )
+        except Exception as exc:
+            return Response(
+                {"detail": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        vm = None
+        tenant = OpenNebulaTenant.objects.filter(service_settings=settings).first()
+        if tenant:
+            vm = OpenNebulaVirtualMachine.objects.create(
+                name=data["name"],
+                service_settings=settings,
+                tenant=tenant,
+                project=tenant.project,
+                backend_id=str(backend_vm_id),
+            )
+            create_vm_task.delay(
+                vm.pk,
+                settings.pk,
+                data["template_id"],
+                data["name"],
+                data["networks"],
+                data.get("cpu"),
+                data.get("ram"),
+                data.get("disk"),
+                ssh_key,
+                data.get("contextualization", False),
+                data.get("extra", {}),
+            )
+
+        return Response({"vm_id": backend_vm_id}, status=status.HTTP_201_CREATED)
 
 
 @extend_schema(
@@ -1412,7 +1436,7 @@ class OpenNebulaVMMigrateView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         vm = data["vm"]
-        migrate_vm_task(
+        migrate_vm_task.delay(
             vm.pk,
             data["host_id"],
             data.get("live", True),
@@ -1449,7 +1473,7 @@ class OpenNebulaDiskAttachView(APIView):
             disk_template["TYPE"] = data["type"]
         if data.get("target"):
             disk_template["TARGET"] = data["target"]
-        attach_disk_task(vm.pk, disk_template)
+        attach_disk_task.delay(vm.pk, disk_template)
         return Response(
             {"detail": "Disk attach scheduled."}, status=status.HTTP_202_ACCEPTED
         )
@@ -1470,7 +1494,7 @@ class OpenNebulaDiskResizeView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         vm = data["vm"]
-        resize_disk_task(vm.pk, data["disk_id"], data["size"])
+        resize_disk_task.delay(vm.pk, data["disk_id"], data["size"])
         return Response(
             {"detail": "Disk resize scheduled."}, status=status.HTTP_202_ACCEPTED
         )
@@ -1491,7 +1515,7 @@ class OpenNebulaDiskSaveAsView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         vm = data["vm"]
-        save_disk_as_image_task(
+        save_disk_as_image_task.delay(
             vm.pk,
             data["disk_id"],
             data["image_name"],
@@ -1517,7 +1541,7 @@ class OpenNebulaVMSnapshotView(APIView):
         serializer = OpenNebulaVMSnapshotSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        create_vm_snapshot_task(data["vm"].pk, data["name"])
+        create_vm_snapshot_task.delay(data["vm"].pk, data["name"])
         return Response(
             {"detail": "Snapshot creation scheduled."}, status=status.HTTP_202_ACCEPTED
         )
@@ -1563,7 +1587,9 @@ class OpenNebulaBackupCreateView(APIView):
         serializer = OpenNebulaBackupCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        create_backup_task(data["vm"].pk, data["name"], data.get("description", ""))
+        create_backup_task.delay(
+            data["vm"].pk, data["name"], data.get("description", "")
+        )
         return Response(
             {"detail": "Backup creation scheduled."}, status=status.HTTP_202_ACCEPTED
         )
@@ -1608,7 +1634,7 @@ class OpenNebulaRestoreBackupView(APIView):
         serializer = OpenNebulaRestoreBackupSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        restore_backup_task(
+        restore_backup_task.delay(
             data["backup_id"],
             data.get("vm").pk if data.get("vm") else None,
             data.get("in_place", True),
@@ -1749,10 +1775,8 @@ class OpenNebulaTemplatesViewSet(viewsets.ViewSet):
             )
         try:
             settings = ServiceSettings.objects.get(pk=service_settings_id)
-            _client = OpenNebulaClient(
-                settings.backend_url, settings.username, settings.password
-            )
-            templates = _client.list_templates()
+            client = OpenNebulaClient(settings.backend_url, settings.username, settings.password)
+            templates = client.list_templates()
             # Minimal serialization for wizard
             data = [
                 {
@@ -1798,7 +1822,7 @@ class OpenNebulaTemplatesViewSet(viewsets.ViewSet):
             )
         try:
             settings = ServiceSettings.objects.get(pk=service_settings_id)
-            _client = OpenNebulaClient(
+            client = OpenNebulaClient(
                 settings.backend_url, settings.username, settings.password
             )
             # template = client.get_template(pk) - TODO GET TEMPLATE
@@ -1852,10 +1876,10 @@ class OpenNebulaImagesViewSet(viewsets.ViewSet):
             )
         try:
             settings = ServiceSettings.objects.get(pk=service_settings_id)
-            _client = OpenNebulaClient(
+            client = OpenNebulaClient(
                 settings.backend_url, settings.username, settings.password
             )
-            images = _client.list_images()
+            images = client.list_images()
             data = [
                 {
                     "id": i.ID,
@@ -1900,10 +1924,10 @@ class OpenNebulaImagesViewSet(viewsets.ViewSet):
             )
         try:
             settings = ServiceSettings.objects.get(pk=service_settings_id)
-            _client = OpenNebulaClient(
+            client = OpenNebulaClient(
                 settings.backend_url, settings.username, settings.password
             )
-            # image = _client.get_image(pk)
+            # image = client.get_image(pk)
             image = ""
             if not image:
                 return Response(

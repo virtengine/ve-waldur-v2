@@ -30,7 +30,7 @@ def create_vm_task(
     extra=None,
 ):
     settings = ServiceSettings.objects.get(pk=service_settings_id)
-    client = OpenNebulaClient(settings.backend_url)
+    client = OpenNebulaClient(settings)
     params = extra.copy() if extra else {}
     if cpu is not None:
         params["CPU"] = cpu
@@ -51,7 +51,8 @@ def create_vm_task(
     try:
         vm.progress = 50
         vm.save(update_fields=["progress"])
-        vm.backend_id = client.create_vm(template_id, name=name, extra=params)
+        if not vm.backend_id:
+            vm.backend_id = client.create_vm(template_id, name=name, extra=params)
         vm.set_ok()
         vm.progress = 100
         vm.save(update_fields=["state", "backend_id", "progress"])

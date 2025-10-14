@@ -1,18 +1,30 @@
-import pyone
 import logging
+
+import pyone
+
 from .exceptions import OpenNebulaError
 
 logger = logging.getLogger(__name__)
 
 
 def _to_template_str(data_dict):
-    return '\n'.join([f'{key.upper()}="{value}"' if isinstance(value, str) else f'{key.upper()}={value}' for key, value in data_dict.items()])
+    return "\n".join(
+        [
+            f'{key.upper()}="{value}"'
+            if isinstance(value, str)
+            else f"{key.upper()}={value}"
+            for key, value in data_dict.items()
+        ]
+    )
 
 
 class OpenNebulaClient:
     def __init__(self, settings):
-        self.one = pyone.OneServer(settings.backend_url, session="%s:%s" % (settings.username, settings.password))
-        
+        self.one = pyone.OneServer(
+            settings.backend_url,
+            session=f"{settings.username}:{settings.password}",
+        )
+
     def get_version(self):
         """
         Returns the OpenNebula system version.
@@ -22,7 +34,7 @@ class OpenNebulaClient:
         try:
             return self.one.system.version()
         except pyone.OneException as e:
-            logger.exception('Failed to get OpenNebula version')
+            logger.exception("Failed to get OpenNebula version")
             raise OpenNebulaError(e)
 
     def list_vms(self):
@@ -34,7 +46,7 @@ class OpenNebulaClient:
         try:
             return self.one.vmpool.info(-2, -1, -1, -1, -1)
         except pyone.OneException as e:
-            logger.exception('Failed to list VMs')
+            logger.exception("Failed to list VMs")
             raise OpenNebulaError(e)
 
     def get_vm(self, vm_id):
@@ -48,7 +60,7 @@ class OpenNebulaClient:
         try:
             return self.one.vm.info(vm_id)
         except pyone.OneException as e:
-            logger.exception('Failed to get VM info')
+            logger.exception("Failed to get VM info")
             raise OpenNebulaError(e)
 
     def create_vm(self, template_id, name=None, extra=None):
@@ -67,11 +79,13 @@ class OpenNebulaClient:
             template_modifications = ""
             if extra:
                 template_modifications = _to_template_str(extra)
-            # template.instantiate is suitable for creating a VM from a template ID 
+            # template.instantiate is suitable for creating a VM from a template ID
             # and applying modifications like CPU, MEMORY.
-            return self.one.template.instantiate(int(template_id), name, False, template_modifications)
+            return self.one.template.instantiate(
+                int(template_id), name, False, template_modifications
+            )
         except pyone.OneException as e:
-            logger.exception('Failed to create VM by instantiating template')
+            logger.exception("Failed to create VM by instantiating template")
             raise OpenNebulaError(e)
 
     def delete_vm(self, vm_id):
@@ -83,9 +97,9 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            return self.one.vm.action('delete', vm_id)
+            return self.one.vm.action("delete", vm_id)
         except pyone.OneException as e:
-            logger.exception('Failed to delete VM')
+            logger.exception("Failed to delete VM")
             raise OpenNebulaError(e)
 
     def start_vm(self, vm_id):
@@ -97,9 +111,9 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            return self.one.vm.action('resume', vm_id)
+            return self.one.vm.action("resume", vm_id)
         except pyone.OneException as e:
-            logger.exception('Failed to start VM')
+            logger.exception("Failed to start VM")
             raise OpenNebulaError(e)
 
     def stop_vm(self, vm_id):
@@ -111,9 +125,9 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            return self.one.vm.action('poweroff', vm_id)
+            return self.one.vm.action("poweroff", vm_id)
         except pyone.OneException as e:
-            logger.exception('Failed to stop VM')
+            logger.exception("Failed to stop VM")
             raise OpenNebulaError(e)
 
     def reboot_vm(self, vm_id):
@@ -125,9 +139,9 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            return self.one.vm.action('reboot', vm_id)
+            return self.one.vm.action("reboot", vm_id)
         except pyone.OneException as e:
-            logger.exception('Failed to reboot VM')
+            logger.exception("Failed to reboot VM")
             raise OpenNebulaError(e)
 
     def resize_vm(self, vm_id, cpu=None, ram=None):
@@ -148,17 +162,19 @@ class OpenNebulaClient:
                 template_parts.append(f"CPU={cpu}")
             if ram is not None:
                 template_parts.append(f"MEMORY={ram}")
-            
+
             if not template_parts:
-                logger.warning(f"Resize VM ({vm_id}) called without CPU or RAM changes.")
-                return True # No changes to apply
+                logger.warning(
+                    f"Resize VM ({vm_id}) called without CPU or RAM changes."
+                )
+                return True  # No changes to apply
 
             template_str = "\n".join(template_parts)
-            # Using mode 0 to merge/update existing attributes. 
+            # Using mode 0 to merge/update existing attributes.
             # Mode 1 would replace the whole template.
-            return self.one.vm.update(vm_id, template_str, 0)  
+            return self.one.vm.update(vm_id, template_str, 0)
         except pyone.OneException as e:
-            logger.exception('Failed to resize VM')
+            logger.exception("Failed to resize VM")
             raise OpenNebulaError(e)
 
     def attach_disk(self, vm_id, disk_template):
@@ -174,7 +190,7 @@ class OpenNebulaClient:
         try:
             return self.one.vm.attach(vm_id, _to_template_str(disk_template))
         except pyone.OneException as e:
-            logger.exception('Failed to attach disk to VM')
+            logger.exception("Failed to attach disk to VM")
             raise OpenNebulaError(e)
 
     def detach_disk(self, vm_id, disk_id):
@@ -190,7 +206,7 @@ class OpenNebulaClient:
         try:
             return self.one.vm.detach(vm_id, disk_id)
         except pyone.OneException as e:
-            logger.exception('Failed to detach disk from VM')
+            logger.exception("Failed to detach disk from VM")
             raise OpenNebulaError(e)
 
     def snapshot_vm(self, vm_id, name):
@@ -206,7 +222,7 @@ class OpenNebulaClient:
         try:
             return self.one.vm.snapshot_create(vm_id, name)
         except pyone.OneException as e:
-            logger.exception('Failed to create VM snapshot')
+            logger.exception("Failed to create VM snapshot")
             raise OpenNebulaError(e)
 
     def restore_vm_snapshot(self, vm_id, snapshot_id):
@@ -222,7 +238,7 @@ class OpenNebulaClient:
         try:
             return self.one.vm.snapshot_revert(vm_id, snapshot_id)
         except pyone.OneException as e:
-            logger.exception('Failed to restore VM snapshot')
+            logger.exception("Failed to restore VM snapshot")
             raise OpenNebulaError(e)
 
     def get_console(self, vm_id):
@@ -236,7 +252,7 @@ class OpenNebulaClient:
         try:
             return self.one.vm.console(vm_id)
         except pyone.OneException as e:
-            logger.exception('Failed to get VM console info')
+            logger.exception("Failed to get VM console info")
             raise OpenNebulaError(e)
 
     # Tenant (group/project) management
@@ -249,7 +265,7 @@ class OpenNebulaClient:
         try:
             return self.one.grouppool.info()
         except pyone.OneException as e:
-            logger.exception('Failed to list groups')
+            logger.exception("Failed to list groups")
             raise OpenNebulaError(e)
 
     def get_group(self, group_id):
@@ -263,7 +279,7 @@ class OpenNebulaClient:
         try:
             return self.one.group.info(group_id)
         except pyone.OneException as e:
-            logger.exception('Failed to get group info')
+            logger.exception("Failed to get group info")
             raise OpenNebulaError(e)
 
     def create_group(self, name, description=None):
@@ -277,12 +293,12 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            params = {'NAME': name}
+            params = {"NAME": name}
             if description:
-                params['DESCRIPTION'] = description
+                params["DESCRIPTION"] = description
             return self.one.group.allocate(params)
         except pyone.OneException as e:
-            logger.exception('Failed to create group')
+            logger.exception("Failed to create group")
             raise OpenNebulaError(e)
 
     def delete_group(self, group_id):
@@ -296,7 +312,7 @@ class OpenNebulaClient:
         try:
             return self.one.group.delete(group_id)
         except pyone.OneException as e:
-            logger.exception('Failed to delete group')
+            logger.exception("Failed to delete group")
             raise OpenNebulaError(e)
 
     def list_networks(self):
@@ -308,7 +324,7 @@ class OpenNebulaClient:
         try:
             return self.one.vnpool.info()
         except pyone.OneException as e:
-            logger.exception('Failed to list networks')
+            logger.exception("Failed to list networks")
             raise OpenNebulaError(e)
 
     def get_network(self, network_id):
@@ -322,7 +338,7 @@ class OpenNebulaClient:
         try:
             return self.one.vn.info(network_id)
         except pyone.OneException as e:
-            logger.exception('Failed to get network info')
+            logger.exception("Failed to get network info")
             raise OpenNebulaError(e)
 
     def create_network(self, name, description=None):
@@ -336,12 +352,12 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            params = {'NAME': name}
+            params = {"NAME": name}
             if description:
-                params['DESCRIPTION'] = description
+                params["DESCRIPTION"] = description
             return self.one.vn.allocate(params)
         except pyone.OneException as e:
-            logger.exception('Failed to create network')
+            logger.exception("Failed to create network")
             raise OpenNebulaError(e)
 
     def delete_network(self, network_id):
@@ -355,7 +371,7 @@ class OpenNebulaClient:
         try:
             return self.one.vn.delete(network_id)
         except pyone.OneException as e:
-            logger.exception('Failed to delete network')
+            logger.exception("Failed to delete network")
             raise OpenNebulaError(e)
 
     def list_volumes(self):
@@ -367,7 +383,7 @@ class OpenNebulaClient:
         try:
             return self.one.imagepool.info(-2, -1, -1, -1)
         except pyone.OneException as e:
-            logger.exception('Failed to list volumes')
+            logger.exception("Failed to list volumes")
             raise OpenNebulaError(e)
 
     def get_volume(self, volume_id):
@@ -381,7 +397,7 @@ class OpenNebulaClient:
         try:
             return self.one.image.info(volume_id)
         except pyone.OneException as e:
-            logger.exception('Failed to get volume info')
+            logger.exception("Failed to get volume info")
             raise OpenNebulaError(e)
 
     def create_volume(self, name, size, description=None):
@@ -397,12 +413,12 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            params = {'NAME': name, 'SIZE': size}
+            params = {"NAME": name, "SIZE": size}
             if description:
-                params['DESCRIPTION'] = description
+                params["DESCRIPTION"] = description
             return self.one.image.allocate(params)
         except pyone.OneException as e:
-            logger.exception('Failed to create volume')
+            logger.exception("Failed to create volume")
             raise OpenNebulaError(e)
 
     def delete_volume(self, volume_id):
@@ -416,7 +432,7 @@ class OpenNebulaClient:
         try:
             return self.one.image.delete(volume_id)
         except pyone.OneException as e:
-            logger.exception('Failed to delete volume')
+            logger.exception("Failed to delete volume")
             raise OpenNebulaError(e)
 
     def set_group_quota(self, group_id, quota_template):
@@ -432,7 +448,7 @@ class OpenNebulaClient:
         try:
             return self.one.group.quota(group_id, quota_template)
         except pyone.OneException as e:
-            logger.exception('Failed to set group quota')
+            logger.exception("Failed to set group quota")
             raise OpenNebulaError(e)
 
     def get_group_quota(self, group_id):
@@ -446,7 +462,7 @@ class OpenNebulaClient:
         try:
             return self.one.group.info(group_id).QUOTAS
         except pyone.OneException as e:
-            logger.exception('Failed to get group quota')
+            logger.exception("Failed to get group quota")
             raise OpenNebulaError(e)
 
     def update_network(self, network_id, template):
@@ -460,9 +476,11 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            return self.one.vn.update(network_id, _to_template_str(template), 1)  # 1 = merge
+            return self.one.vn.update(
+                network_id, _to_template_str(template), 1
+            )  # 1 = merge
         except pyone.OneException as e:
-            logger.exception('Failed to update network')
+            logger.exception("Failed to update network")
             raise OpenNebulaError(e)
 
     def add_ar(self, network_id, ar_template):
@@ -478,7 +496,7 @@ class OpenNebulaClient:
         try:
             return self.one.vn.add_ar(network_id, _to_template_str(ar_template))
         except pyone.OneException as e:
-            logger.exception('Failed to add address range to network')
+            logger.exception("Failed to add address range to network")
             raise OpenNebulaError(e)
 
     def rm_ar(self, network_id, ar_id, force=False):
@@ -496,7 +514,7 @@ class OpenNebulaClient:
         try:
             return self.one.vn.rm_ar(network_id, ar_id, force)
         except pyone.OneException as e:
-            logger.exception('Failed to remove address range from network')
+            logger.exception("Failed to remove address range from network")
             raise OpenNebulaError(e)
 
     def update_ar(self, network_id, ar_template):
@@ -512,7 +530,7 @@ class OpenNebulaClient:
         try:
             return self.one.vn.update_ar(network_id, _to_template_str(ar_template))
         except pyone.OneException as e:
-            logger.exception('Failed to update address range')
+            logger.exception("Failed to update address range")
             raise OpenNebulaError(e)
 
     def reserve_ar(self, network_id, reservation_template):
@@ -526,9 +544,11 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            return self.one.vn.reserve(network_id, _to_template_str(reservation_template))
+            return self.one.vn.reserve(
+                network_id, _to_template_str(reservation_template)
+            )
         except pyone.OneException as e:
-            logger.exception('Failed to reserve address range')
+            logger.exception("Failed to reserve address range")
             raise OpenNebulaError(e)
 
     def create_disk_snapshot(self, vm_id, disk_id, description=None):
@@ -546,7 +566,7 @@ class OpenNebulaClient:
         try:
             return self.one.vm.disksnapshotcreate(vm_id, disk_id, description or "")
         except pyone.OneException as e:
-            logger.exception('Failed to create disk snapshot')
+            logger.exception("Failed to create disk snapshot")
             raise OpenNebulaError(e)
 
     def delete_disk_snapshot(self, vm_id, disk_id, snapshot_id):
@@ -564,7 +584,7 @@ class OpenNebulaClient:
         try:
             return self.one.vm.disksnapshotdelete(vm_id, disk_id, snapshot_id)
         except pyone.OneException as e:
-            logger.exception('Failed to delete disk snapshot')
+            logger.exception("Failed to delete disk snapshot")
             raise OpenNebulaError(e)
 
     def revert_disk_snapshot(self, vm_id, disk_id, snapshot_id):
@@ -582,7 +602,7 @@ class OpenNebulaClient:
         try:
             return self.one.vm.disksnapshotrevert(vm_id, disk_id, snapshot_id)
         except pyone.OneException as e:
-            logger.exception('Failed to revert disk snapshot')
+            logger.exception("Failed to revert disk snapshot")
             raise OpenNebulaError(e)
 
     def rename_disk_snapshot(self, vm_id, disk_id, snapshot_id, new_name):
@@ -602,7 +622,7 @@ class OpenNebulaClient:
         try:
             return self.one.vm.disksnapshotrename(vm_id, disk_id, snapshot_id, new_name)
         except pyone.OneException as e:
-            logger.exception('Failed to rename disk snapshot')
+            logger.exception("Failed to rename disk snapshot")
             raise OpenNebulaError(e)
 
     def resize_disk(self, vm_id, disk_id, size):
@@ -620,10 +640,12 @@ class OpenNebulaClient:
         try:
             return self.one.vm.diskresize(vm_id, disk_id, size)
         except pyone.OneException as e:
-            logger.exception('Failed to resize disk')
+            logger.exception("Failed to resize disk")
             raise OpenNebulaError(e)
 
-    def save_disk_as_image(self, vm_id, disk_id, image_name, image_type="", snapshot_id=-1):
+    def save_disk_as_image(
+        self, vm_id, disk_id, image_name, image_type="", snapshot_id=-1
+    ):
         """
         Saves the disk as a new image.
         :param vm_id: VM identifier
@@ -640,15 +662,19 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            return self.one.vm.disksaveas(vm_id, disk_id, image_name, image_type, snapshot_id)
+            return self.one.vm.disksaveas(
+                vm_id, disk_id, image_name, image_type, snapshot_id
+            )
         except pyone.OneException as e:
-            logger.exception('Failed to save disk as image')
+            logger.exception("Failed to save disk as image")
             raise OpenNebulaError(e)
 
-    def migrate_vm(self, vm_id, host_id, live=True, enforce=False, ds_id=None, migration_type=0):
+    def migrate_vm(
+        self, vm_id, host_id, live=True, enforce=False, ds_id=None, migration_type=0
+    ):
         """
         Migrate a VM to a target host.
-        
+
         :param vm_id: VM identifier
         :type vm_id: int
         :param host_id: Destination host identifier
@@ -665,15 +691,17 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            return self.one.vm.migrate(vm_id, host_id, live, enforce, ds_id, migration_type)
+            return self.one.vm.migrate(
+                vm_id, host_id, live, enforce, ds_id, migration_type
+            )
         except pyone.OneException as e:
-            logger.exception('Failed to migrate VM')
+            logger.exception("Failed to migrate VM")
             raise OpenNebulaError(e)
 
     def disksaveas(self, vm_id, disk_id, image_name, image_type=None, snapshot_id=None):
         """
         Save a disk as a new image.
-        
+
         :param vm_id: VM identifier
         :type vm_id: int
         :param disk_id: Disk identifier
@@ -688,15 +716,17 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            return self.one.vm.disksaveas(vm_id, disk_id, image_name, image_type or '', snapshot_id or -1)
+            return self.one.vm.disksaveas(
+                vm_id, disk_id, image_name, image_type or "", snapshot_id or -1
+            )
         except pyone.OneException as e:
-            logger.exception('Failed to save disk as image')
+            logger.exception("Failed to save disk as image")
             raise OpenNebulaError(e)
 
     def disksnapshotcreate(self, vm_id, disk_id, description=None):
         """
         Create a new snapshot of a disk.
-        
+
         :param vm_id: VM identifier
         :type vm_id: int
         :param disk_id: Disk identifier
@@ -709,13 +739,13 @@ class OpenNebulaClient:
         try:
             return self.one.vm.disksnapshotcreate(vm_id, disk_id, description or "")
         except pyone.OneException as e:
-            logger.exception('Failed to create disk snapshot')
+            logger.exception("Failed to create disk snapshot")
             raise OpenNebulaError(e)
 
     def disksnapshotdelete(self, vm_id, disk_id, snapshot_id):
         """
         Delete a disk snapshot.
-        
+
         :param vm_id: VM identifier
         :type vm_id: int
         :param disk_id: Disk identifier
@@ -728,13 +758,13 @@ class OpenNebulaClient:
         try:
             return self.one.vm.disksnapshotdelete(vm_id, disk_id, snapshot_id)
         except pyone.OneException as e:
-            logger.exception('Failed to delete disk snapshot')
+            logger.exception("Failed to delete disk snapshot")
             raise OpenNebulaError(e)
 
     def disksnapshotrevert(self, vm_id, disk_id, snapshot_id):
         """
         Revert disk state to a previously taken snapshot.
-        
+
         :param vm_id: VM identifier
         :type vm_id: int
         :param disk_id: Disk identifier
@@ -747,13 +777,13 @@ class OpenNebulaClient:
         try:
             return self.one.vm.disksnapshotrevert(vm_id, disk_id, snapshot_id)
         except pyone.OneException as e:
-            logger.exception('Failed to revert disk snapshot')
+            logger.exception("Failed to revert disk snapshot")
             raise OpenNebulaError(e)
 
     def disksnapshotrename(self, vm_id, disk_id, snapshot_id, new_name):
         """
         Rename a disk snapshot.
-        
+
         :param vm_id: VM identifier
         :type vm_id: int
         :param disk_id: Disk identifier
@@ -768,13 +798,13 @@ class OpenNebulaClient:
         try:
             return self.one.vm.disksnapshotrename(vm_id, disk_id, snapshot_id, new_name)
         except pyone.OneException as e:
-            logger.exception('Failed to rename disk snapshot')
+            logger.exception("Failed to rename disk snapshot")
             raise OpenNebulaError(e)
 
     def diskresize(self, vm_id, disk_id, size):
         """
         Resize a disk attached to a VM.
-        
+
         :param vm_id: VM identifier
         :type vm_id: int
         :param disk_id: Disk identifier
@@ -787,13 +817,13 @@ class OpenNebulaClient:
         try:
             return self.one.vm.diskresize(vm_id, disk_id, size)
         except pyone.OneException as e:
-            logger.exception('Failed to resize disk')
+            logger.exception("Failed to resize disk")
             raise OpenNebulaError(e)
 
     def backup_vm(self, vm_id, ds_id, reset=False):
         """
         Take a one-shot backup of a VM.
-        
+
         :param vm_id: VM identifier
         :type vm_id: int
         :param ds_id: Destination datastore identifier for the backup
@@ -806,13 +836,13 @@ class OpenNebulaClient:
         try:
             return self.one.vm.backup(vm_id, ds_id, reset)
         except pyone.OneException as e:
-            logger.exception('Failed to backup VM')
+            logger.exception("Failed to backup VM")
             raise OpenNebulaError(e)
 
     def backup_cancel(self, vm_id):
         """
         Cancel an ongoing backup operation for a VM.
-        
+
         :param vm_id: VM identifier
         :type vm_id: int
         :return: Success status
@@ -821,13 +851,13 @@ class OpenNebulaClient:
         try:
             return self.one.vm.backupcancel(vm_id)
         except pyone.OneException as e:
-            logger.exception('Failed to cancel VM backup')
+            logger.exception("Failed to cancel VM backup")
             raise OpenNebulaError(e)
 
     def restore_vm(self, vm_id, backup_id, in_place=True):
         """
         Restore a VM from a backup.
-        
+
         :param vm_id: VM identifier
         :type vm_id: int
         :param backup_id: Backup image or snapshot identifier
@@ -840,33 +870,33 @@ class OpenNebulaClient:
         try:
             return self.one.vm.restore(vm_id, backup_id, in_place)
         except pyone.OneException as e:
-            logger.exception('Failed to restore VM from backup')
+            logger.exception("Failed to restore VM from backup")
             raise OpenNebulaError(e)
 
     def list_templates(self):
         """
         List all available VM templates for deployment.
-        
+
         :return: Template pool information
         :raises OpenNebulaError: If the API call fails
         """
         try:
             return self.one.templatepool.info(-2, -1, -1, -1)
         except pyone.OneException as e:
-            logger.exception('Failed to list templates')
+            logger.exception("Failed to list templates")
             raise OpenNebulaError(e)
 
     def list_images(self):
         """
         List all available disk images for VM creation or disk attachment.
-        
+
         :return: Image pool information
         :raises OpenNebulaError: If the API call fails
         """
         try:
             return self.one.imagepool.info(-2, -1, -1, -1)
         except pyone.OneException as e:
-            logger.exception('Failed to list images')
+            logger.exception("Failed to list images")
             raise OpenNebulaError(e)
 
     def list_hosts(self):
@@ -878,7 +908,7 @@ class OpenNebulaClient:
         try:
             return self.one.hostpool.info()
         except pyone.OneException as e:
-            logger.exception('Failed to list hosts')
+            logger.exception("Failed to list hosts")
             raise OpenNebulaError(e)
 
     def get_host(self, host_id):
@@ -892,7 +922,7 @@ class OpenNebulaClient:
         try:
             return self.one.host.info(host_id)
         except pyone.OneException as e:
-            logger.exception('Failed to get host info')
+            logger.exception("Failed to get host info")
             raise OpenNebulaError(e)
 
     def create_host(self, name, im_mad, vmm_mad, vnm_mad, cluster_id=None):
@@ -914,7 +944,7 @@ class OpenNebulaClient:
         try:
             return self.one.host.allocate(name, im_mad, vmm_mad, vnm_mad, cluster_id)
         except pyone.OneException as e:
-            logger.exception('Failed to create host')
+            logger.exception("Failed to create host")
             raise OpenNebulaError(e)
 
     def delete_host(self, host_id):
@@ -927,7 +957,7 @@ class OpenNebulaClient:
         try:
             return self.one.host.delete(host_id)
         except pyone.OneException as e:
-            logger.exception('Failed to delete host')
+            logger.exception("Failed to delete host")
             raise OpenNebulaError(e)
 
     def update_host(self, host_id, template, append=True):
@@ -945,7 +975,7 @@ class OpenNebulaClient:
             mode = 1 if append else 0
             return self.one.host.update(host_id, template, mode)
         except pyone.OneException as e:
-            logger.exception('Failed to update host')
+            logger.exception("Failed to update host")
             raise OpenNebulaError(e)
 
     def rename_host(self, host_id, new_name):
@@ -960,7 +990,7 @@ class OpenNebulaClient:
         try:
             return self.one.host.rename(host_id, new_name)
         except pyone.OneException as e:
-            logger.exception('Failed to rename host')
+            logger.exception("Failed to rename host")
             raise OpenNebulaError(e)
 
     def set_host_status(self, host_id, status):
@@ -975,7 +1005,7 @@ class OpenNebulaClient:
         try:
             return self.one.host.status(host_id, status)
         except pyone.OneException as e:
-            logger.exception('Failed to set host status')
+            logger.exception("Failed to set host status")
             raise OpenNebulaError(e)
 
     def get_host_monitoring(self, host_id):
@@ -989,7 +1019,7 @@ class OpenNebulaClient:
         try:
             return self.one.host.monitoring(host_id)
         except pyone.OneException as e:
-            logger.exception('Failed to get host monitoring')
+            logger.exception("Failed to get host monitoring")
             raise OpenNebulaError(e)
 
     def calculate_showback(self, start_month, start_year, end_month, end_year):
@@ -1007,9 +1037,11 @@ class OpenNebulaClient:
         :raises OpenNebulaError: If the API call fails
         """
         try:
-            return self.one.vmpool.calculateshowback(start_month, start_year, end_month, end_year)
+            return self.one.vmpool.calculateshowback(
+                start_month, start_year, end_month, end_year
+            )
         except pyone.OneException as e:
-            logger.exception('Failed to calculate showback')
+            logger.exception("Failed to calculate showback")
             raise OpenNebulaError(e)
 
     def attach_nic(self, vm_id, nic_template):
@@ -1024,7 +1056,7 @@ class OpenNebulaClient:
         try:
             return self.one.vm.attachnic(vm_id, _to_template_str(nic_template))
         except pyone.OneException as e:
-            logger.exception('Failed to attach NIC')
+            logger.exception("Failed to attach NIC")
             raise OpenNebulaError(e)
 
     def detach_nic(self, vm_id, nic_id):
@@ -1039,7 +1071,7 @@ class OpenNebulaClient:
         try:
             return self.one.vm.detachnic(vm_id, nic_id)
         except pyone.OneException as e:
-            logger.exception('Failed to detach NIC')
+            logger.exception("Failed to detach NIC")
             raise OpenNebulaError(e)
 
     def update_nic(self, vm_id, nic_id, nic_template):
@@ -1056,7 +1088,7 @@ class OpenNebulaClient:
         try:
             return self.one.vm.updatenic(vm_id, nic_id, _to_template_str(nic_template))
         except pyone.OneException as e:
-            logger.exception('Failed to update NIC')
+            logger.exception("Failed to update NIC")
             raise OpenNebulaError(e)
 
     def get_cpu(self, vm_id):
@@ -1096,9 +1128,8 @@ class OpenNebulaClient:
         :type spec: dict
         """
         try:
-            self.one.vm.update(int(vm_id), 'MEMORY = {}'.format(spec['size_MiB']))
+            self.one.vm.update(int(vm_id), "MEMORY = {}".format(spec["size_MiB"]))
         except pyone.OneException as e:
             raise OpenNebulaError(e)
-        
 
     # Add more methods for VM, tenant, network, etc. management as needed
