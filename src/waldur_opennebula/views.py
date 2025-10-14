@@ -30,6 +30,8 @@ from .serializers import (
     OpenNebulaDiskAttachSerializer,
     OpenNebulaDiskResizeSerializer,
     OpenNebulaDiskSaveAsSerializer,
+    OpenNebulaFloatingIPAssignSerializer,
+    OpenNebulaFloatingIPReleaseSerializer,
     OpenNebulaMarketplaceOfferingSerializer,
     OpenNebulaNetworkAttachSerializer,
     OpenNebulaNetworkListSerializer,
@@ -943,7 +945,9 @@ class OpenNebulaNetworkViewSet(viewsets.ModelViewSet):
             )
         try:
             settings = ServiceSettings.objects.get(pk=service_settings_id)
-            client = OpenNebulaClient(settings)
+            client = OpenNebulaClient(
+                settings.backend_url, settings.username, settings.password
+            )
             networks = client.list_networks()
             data = [
                 {
@@ -1232,7 +1236,9 @@ class OpenNebulaTemplateListView(APIView):
             )
         try:
             settings = ServiceSettings.objects.get(pk=service_settings_id)
-            client = OpenNebulaClient(settings)
+            client = OpenNebulaClient(
+                settings.backend_url, settings.username, settings.password
+            )
             templates = client.list_templates()
             # Minimal serialization for wizard
             data = [
@@ -1564,6 +1570,58 @@ class OpenNebulaRestoreBackupView(APIView):
         )
 
 
+class OpenNebulaFloatingIPAssignView(APIView):
+    def post(self, request):
+        serializer = OpenNebulaFloatingIPAssignSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        vm = data["vm"]
+        backend = OpenNebulaBackend(vm.service_settings)
+        handler = getattr(backend, "assign_floating_ip", None)
+        if handler is None:
+            return Response(
+                {"detail": "Floating IP assignment is not supported by this backend."},
+                status=status.HTTP_501_NOT_IMPLEMENTED,
+            )
+        try:
+            result = handler(vm, data["network_id"], data.get("ip_address"))
+            return Response(result, status=status.HTTP_200_OK)
+        except NotImplementedError as exc:
+            return Response(
+                {"detail": str(exc)}, status=status.HTTP_501_NOT_IMPLEMENTED
+            )
+        except Exception as exc:
+            return Response(
+                {"detail": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+class OpenNebulaFloatingIPReleaseView(APIView):
+    def post(self, request):
+        serializer = OpenNebulaFloatingIPReleaseSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        vm = data["vm"]
+        backend = OpenNebulaBackend(vm.service_settings)
+        handler = getattr(backend, "release_floating_ip", None)
+        if handler is None:
+            return Response(
+                {"detail": "Floating IP release is not supported by this backend."},
+                status=status.HTTP_501_NOT_IMPLEMENTED,
+            )
+        try:
+            result = handler(vm, data["ip_address"])
+            return Response(result, status=status.HTTP_200_OK)
+        except NotImplementedError as exc:
+            return Response(
+                {"detail": str(exc)}, status=status.HTTP_501_NOT_IMPLEMENTED
+            )
+        except Exception as exc:
+            return Response(
+                {"detail": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
 @extend_schema(
     responses={
         200: OpenApiResponse(OpenNebulaMarketplaceOfferingSerializer(many=True)),
@@ -1590,6 +1648,43 @@ class OpenNebulaMarketplaceOfferingListView(APIView):
             return Response(
                 {"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+
+class OpenNebulaPingView(APIView):
+    def get(self, request):
+        service_settings_id = request.query_params.get("service_settings")
+        if service_settings_id:
+            try:
+                settings = ServiceSettings.objects.get(pk=service_settings_id)
+            except ServiceSettings.DoesNotExist:
+                return Response(
+                    {"error": "ServiceSettings not found."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+        else:
+            settings = ServiceSettings.objects.filter(type="OpenNebula").first()
+            if not settings:
+                return Response(
+                    {"error": "No OpenNebula service settings found."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+        backend = OpenNebulaBackend(settings)
+
+        try:
+            result = backend.ping()
+        except Exception as exc:
+            return Response(
+                {"error": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        if result:
+            return Response({"success": True}, status=status.HTTP_200_OK)
+
+        return Response(
+            {"error": "Unable to reach OpenNebula backend."},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
 
 
 @extend_schema(
@@ -1705,7 +1800,10 @@ class OpenNebulaTemplatesViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         try:
-            ServiceSettings.objects.get(pk=service_settings_id)
+            settings = ServiceSettings.objects.get(pk=service_settings_id)
+            _client = OpenNebulaClient(
+                settings.backend_url, settings.username, settings.password
+            )
             # template = client.get_template(pk) - TODO GET TEMPLATE
             template = ""
             if not template:
@@ -1804,8 +1902,11 @@ class OpenNebulaImagesViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         try:
-            ServiceSettings.objects.get(pk=service_settings_id)
-            # image = client.get_image(pk)
+            settings = ServiceSettings.objects.get(pk=service_settings_id)
+            _client = OpenNebulaClient(
+                settings.backend_url, settings.username, settings.password
+            )
+            # image = _client.get_image(pk)
             image = ""
             if not image:
                 return Response(
