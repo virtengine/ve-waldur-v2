@@ -1,6 +1,13 @@
 import factory
-from waldur_core.structure.tests.factories import ServiceSettingsFactory, ProjectFactory
-from ..models import OpenNebulaTenant, OpenNebulaVirtualMachine, OpenNebulaNetwork, OpenNebulaVolume
+
+from waldur_core.structure.tests.factories import ProjectFactory, ServiceSettingsFactory
+
+from ..models import (
+    OpenNebulaNetwork,
+    OpenNebulaTenant,
+    OpenNebulaVirtualMachine,
+    OpenNebulaVolume,
+)
 
 
 class OpenNebulaTenantFactory(factory.django.DjangoModelFactory):
@@ -10,7 +17,7 @@ class OpenNebulaTenantFactory(factory.django.DjangoModelFactory):
     name = factory.Sequence(lambda n: f"Tenant {n}")
     description = factory.Faker("sentence")
     backend_id = factory.Faker("uuid4")
-    service_settings = factory.SubFactory(ServiceSettingsFactory)
+    service_settings = factory.SubFactory(ServiceSettingsFactory, type="OpenNebula")
     project = factory.SubFactory(ProjectFactory)
 
 
@@ -21,8 +28,8 @@ class OpenNebulaVirtualMachineFactory(factory.django.DjangoModelFactory):
     name = factory.Sequence(lambda n: f"VM {n}")
     description = factory.Faker("sentence")
     tenant = factory.SubFactory(OpenNebulaTenantFactory)
-    service_settings = factory.SelfAttribute('tenant.service_settings')
-    project = factory.SelfAttribute('tenant.project')
+    service_settings = factory.SelfAttribute("tenant.service_settings")
+    project = factory.SelfAttribute("tenant.project")
     backend_id = factory.Faker("uuid4")
     cpu = 2
     ram = 2048
@@ -37,7 +44,7 @@ class OpenNebulaNetworkFactory(factory.django.DjangoModelFactory):
     description = factory.Faker("sentence")
     backend_id = factory.Faker("uuid4")
     tenant = factory.SubFactory(OpenNebulaTenantFactory)
-    service_settings = factory.SelfAttribute('tenant.service_settings')
+    service_settings = factory.SelfAttribute("tenant.service_settings")
 
 
 class OpenNebulaVolumeFactory(factory.django.DjangoModelFactory):
@@ -48,5 +55,5 @@ class OpenNebulaVolumeFactory(factory.django.DjangoModelFactory):
     description = factory.Faker("sentence")
     backend_id = factory.Faker("uuid4")
     tenant = factory.SubFactory(OpenNebulaTenantFactory)
-    service_settings = factory.SelfAttribute('tenant.service_settings')
-    size = 10 
+    service_settings = factory.SelfAttribute("tenant.service_settings")
+    size = 10

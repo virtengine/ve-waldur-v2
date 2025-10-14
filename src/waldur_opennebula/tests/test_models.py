@@ -1,9 +1,21 @@
 from django.test import TestCase
-from ..models import OpenNebulaTenant, OpenNebulaVirtualMachine, OpenNebulaNetwork, OpenNebulaVolume
-from .factories import OpenNebulaTenantFactory, OpenNebulaVirtualMachineFactory, OpenNebulaNetworkFactory, OpenNebulaVolumeFactory
-from ..backend import OpenNebulaBackend
+
 from waldur_core.structure.tests.factories import ServiceSettingsFactory
+
+from ..backend import OpenNebulaBackend
+from ..models import (
+    OpenNebulaNetwork,
+    OpenNebulaTenant,
+    OpenNebulaVirtualMachine,
+    OpenNebulaVolume,
+)
 from ..utils import generate_unique_tenant_name
+from .factories import (
+    OpenNebulaNetworkFactory,
+    OpenNebulaTenantFactory,
+    OpenNebulaVirtualMachineFactory,
+    OpenNebulaVolumeFactory,
+)
 
 
 class OpenNebulaTenantModelTest(TestCase):
@@ -14,14 +26,17 @@ class OpenNebulaTenantModelTest(TestCase):
     def test_unique_constraint(self):
         tenant1 = OpenNebulaTenantFactory(backend_id="id1")
         with self.assertRaises(Exception):
-            OpenNebulaTenantFactory(backend_id="id1", service_settings=tenant1.service_settings)
+            OpenNebulaTenantFactory(
+                backend_id="id1", service_settings=tenant1.service_settings
+            )
 
     def test_create_tenant_backend(self):
         settings = ServiceSettingsFactory()
         backend = OpenNebulaBackend(settings)
         # This will fail unless pyone is mocked, but demonstrates backend usage
         try:
-            backend.create_tenant(name="Backend Tenant", description="desc")
+            tenant = OpenNebulaTenantFactory(service_settings=settings)
+            backend.create_tenant(tenant)
         except Exception:
             pass
 
@@ -50,6 +65,7 @@ class OpenNebulaTenantModelTest(TestCase):
     def test_invalid_backend_id(self):
         tenant = OpenNebulaTenantFactory.build(backend_id=None)
         from django.core.exceptions import ValidationError
+
         with self.assertRaises(ValidationError):
             tenant.full_clean()
 
@@ -65,6 +81,7 @@ class OpenNebulaVirtualMachineModelTest(TestCase):
 
     def test_invalid_cpu_ram_disk(self):
         from django.core.exceptions import ValidationError
+
         vm = OpenNebulaVirtualMachineFactory.build(cpu=-1, ram=-1, disk=-1)
         with self.assertRaises(ValidationError):
             vm.full_clean()
@@ -78,7 +95,9 @@ class OpenNebulaNetworkModelTest(TestCase):
     def test_unique_constraint(self):
         network1 = OpenNebulaNetworkFactory(backend_id="id1")
         with self.assertRaises(Exception):
-            OpenNebulaNetworkFactory(backend_id="id1", service_settings=network1.service_settings)
+            OpenNebulaNetworkFactory(
+                backend_id="id1", service_settings=network1.service_settings
+            )
 
     def test_required_fields(self):
         with self.assertRaises(Exception):
@@ -86,6 +105,7 @@ class OpenNebulaNetworkModelTest(TestCase):
 
     def test_invalid_backend_id(self):
         from django.core.exceptions import ValidationError
+
         network = OpenNebulaNetworkFactory.build(backend_id=None)
         with self.assertRaises(ValidationError):
             network.full_clean()
@@ -99,7 +119,9 @@ class OpenNebulaVolumeModelTest(TestCase):
     def test_unique_constraint(self):
         volume1 = OpenNebulaVolumeFactory(backend_id="id1")
         with self.assertRaises(Exception):
-            OpenNebulaVolumeFactory(backend_id="id1", service_settings=volume1.service_settings)
+            OpenNebulaVolumeFactory(
+                backend_id="id1", service_settings=volume1.service_settings
+            )
 
     def test_required_fields(self):
         with self.assertRaises(Exception):
@@ -107,6 +129,7 @@ class OpenNebulaVolumeModelTest(TestCase):
 
     def test_invalid_size(self):
         from django.core.exceptions import ValidationError
+
         volume = OpenNebulaVolumeFactory.build(size=-1)
         with self.assertRaises(ValidationError):
-            volume.full_clean() 
+            volume.full_clean()
