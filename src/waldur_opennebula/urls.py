@@ -1,21 +1,190 @@
-from django.urls import path, include
+from django.urls import include, path
 from rest_framework.routers import DefaultRouter
+
 from .views import (
+    OpenNebulaFloatingIPAssignView,
+    OpenNebulaFloatingIPReleaseView,
+    OpenNebulaNetworkViewSet,
+    OpenNebulaScheduledActionViewSet,
     OpenNebulaTenantViewSet,
     OpenNebulaVirtualMachineViewSet,
+    OpenNebulaBackupCreateView,
+    OpenNebulaBackupListView,
+    OpenNebulaDiskAttachView,
+    OpenNebulaDiskResizeView,
+    OpenNebulaDiskSaveAsView,
+    OpenNebulaFloatingIPAssignView,
+    OpenNebulaFloatingIPReleaseView,
+    OpenNebulaImageListView,
+    OpenNebulaMarketplaceOfferingListView,
     OpenNebulaNetworkViewSet,
-    OpenNebulaVolumeViewSet,
+    OpenNebulaPingView,
+    OpenNebulaQuotaView,
+    OpenNebulaRestoreBackupView,
     OpenNebulaScheduledActionViewSet,
+    OpenNebulaTemplateListView,
+    OpenNebulaTenantViewSet,
+    OpenNebulaVirtualMachineViewSet,
+    OpenNebulaVMCreateView,
+    OpenNebulaVMListSnapshotsView,
+    OpenNebulaVMMigrateView,
+    OpenNebulaVMMonitoringView,
+    OpenNebulaVMPoolMonitoringView,
+    OpenNebulaVMSnapshotView,
+    OpenNebulaVolumeViewSet,
 )
 
 router = DefaultRouter()
 
+
 def register_in(router):
-    router.register(r'opennebula-tenants', OpenNebulaTenantViewSet, basename='opennebula-tenant')
-    router.register(r'opennebula-vms', OpenNebulaVirtualMachineViewSet, basename='opennebula-vm')
-    router.register(r'opennebula-networks', OpenNebulaNetworkViewSet, basename='opennebula-network')
-    router.register(r'opennebula-volumes', OpenNebulaVolumeViewSet, basename='opennebula-volume')
-    router.register(r'opennebula-scheduled-actions', OpenNebulaScheduledActionViewSet, basename='opennebula-scheduled-action')
+    router.register(
+        r"opennebula-tenants",
+        OpenNebulaTenantViewSet,
+        basename="opennebula-tenant",
+    )
+    router.register(
+        r"opennebula-vms",
+        OpenNebulaVirtualMachineViewSet,
+        basename="opennebula-vm",
+    )
+    router.register(
+        r"opennebula-networks",
+        OpenNebulaNetworkViewSet,
+        basename="opennebula-network",
+    )
+    router.register(
+        r"opennebula-volumes",
+        OpenNebulaVolumeViewSet,
+        basename="opennebula-volume",
+    )
+    router.register(
+        r"opennebula-scheduled-actions",
+        OpenNebulaScheduledActionViewSet,
+        basename="opennebula-scheduled-action",
+    )
+
+    router.register(
+        r"opennebulatenants",
+        OpenNebulaTenantViewSet,
+        basename="opennebulatenant",
+    )
+    router.register(
+        r"opennebulavirtualmachines",
+        OpenNebulaVirtualMachineViewSet,
+        basename="opennebulavirtualmachine",
+    )
+    router.register(
+        r"opennebulanetworks",
+        OpenNebulaNetworkViewSet,
+        basename="opennebulanetwork",
+    )
+    router.register(
+        r"opennebulavolumes",
+        OpenNebulaVolumeViewSet,
+        basename="opennebulavolume",
+    )
+    router.register(
+        r"opennebulascheduledactions",
+        OpenNebulaScheduledActionViewSet,
+        basename="opennebulascheduledaction",
+    )
 
 
-urlpatterns = []
+register_in(router)
+
+
+urlpatterns = [
+    path("", include(router.urls)),
+    path(
+        "opennebula/templates/",
+        OpenNebulaTemplateListView.as_view(),
+        name="opennebula-template-list",
+    ),
+    path(
+        "opennebula/images/",
+        OpenNebulaImageListView.as_view(),
+        name="opennebula-image-list",
+    ),
+    path(
+        "opennebula/vms/create/",
+        OpenNebulaVMCreateView.as_view(),
+        name="opennebula-vm-create",
+    ),
+    path(
+        "opennebula/vms/migrate/",
+        OpenNebulaVMMigrateView.as_view(),
+        name="opennebula-vm-migrate",
+    ),
+    path(
+        "opennebula/vms/attach-disk/",
+        OpenNebulaDiskAttachView.as_view(),
+        name="opennebula-vm-attach-disk",
+    ),
+    path(
+        "opennebula/vms/resize-disk/",
+        OpenNebulaDiskResizeView.as_view(),
+        name="opennebula-vm-resize-disk",
+    ),
+    path(
+        "opennebula/vms/save-disk-as-image/",
+        OpenNebulaDiskSaveAsView.as_view(),
+        name="opennebula-vm-save-disk-as-image",
+    ),
+    path(
+        "opennebula/vms/snapshot/",
+        OpenNebulaVMSnapshotView.as_view(),
+        name="opennebulavmsnapshotview",
+    ),
+    path(
+        "opennebula/vms/list-snapshots/",
+        OpenNebulaVMListSnapshotsView.as_view(),
+        name="opennebulavmlistsnapshotsview",
+    ),
+    path(
+        "opennebula/backups/create/",
+        OpenNebulaBackupCreateView.as_view(),
+        name="opennebulabackupcreateview",
+    ),
+    path(
+        "opennebula/backups/",
+        OpenNebulaBackupListView.as_view(),
+        name="opennebulabackuplistview",
+    ),
+    path(
+        "opennebula/backups/restore/",
+        OpenNebulaRestoreBackupView.as_view(),
+        name="opennebularestorebackupview",
+    ),
+    path(
+        "opennebula/floating-ips/assign/",
+        OpenNebulaFloatingIPAssignView.as_view(),
+        name="opennebula-floatingip-assign",
+    ),
+    path(
+        "opennebula/floating-ips/release/",
+        OpenNebulaFloatingIPReleaseView.as_view(),
+        name="opennebula-floatingip-release",
+    ),
+    path(
+        "opennebula/marketplace/offerings/",
+        OpenNebulaMarketplaceOfferingListView.as_view(),
+        name="opennebula-marketplace-offering-list",
+    ),
+    path(
+        "opennebula/vms/<int:pk>/monitoring/",
+        OpenNebulaVMMonitoringView.as_view(),
+        name="opennebula-vm-monitoring",
+    ),
+    path(
+        "opennebula/vms/pool-monitoring/",
+        OpenNebulaVMPoolMonitoringView.as_view(),
+        name="opennebula-vm-pool-monitoring",
+    ),
+    path(
+        "opennebula/tenants/<int:tenant_pk>/quota/",
+        OpenNebulaQuotaView.as_view(),
+        name="opennebula-tenant-quota",
+    ),
+    path("opennebula/ping/", OpenNebulaPingView.as_view(), name="opennebula-api-ping"),
+]

@@ -112,7 +112,7 @@ def create_tenant_task(tenant_id):
     tenant = OpenNebulaTenant.objects.get(pk=tenant_id)
     backend = OpenNebulaBackend(tenant.service_settings)
     try:
-        backend.create_tenant(tenant.name, tenant.description)
+        backend.create_tenant(tenant)
     except Exception:
         pass
 
