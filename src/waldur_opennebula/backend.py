@@ -78,11 +78,15 @@ class OpenNebulaBackend(ServiceBackend):
         :raises OpenNebulaBackendError: If the operation fails
         """
         try:
-            group_id = self.client.create_group(tenant.name, tenant.description or "")
-            tenant.backend_id = str(group_id)
-            if tenant.service_settings != self.settings:
-                tenant.service_settings = self.settings
-            tenant.save(update_fields=["backend_id", "service_settings"])
+            group_id = self.client.create_group(name, description)
+            group_info = self.client.get_group(group_id)
+            tenant = OpenNebulaTenant.objects.create(
+                backend_id=str(group_id),
+                name=name,
+                description=description or "",
+                service_settings=self.settings,
+                project=None,
+            )
             tenant.set_ok()
             tenant.save(update_fields=["state"])
             return tenant
@@ -397,6 +401,11 @@ class OpenNebulaBackend(ServiceBackend):
             logger.exception("Failed to attach disk to VM in OpenNebula")
             raise OpenNebulaBackendError(e)
 
+    def attach_disk_to_vm(self, vm, volume, disk_template=None):
+        """Convenience wrapper that delegates to :meth:`attach_disk`."""
+
+        return self.attach_disk(vm, volume)
+
     def detach_disk(self, vm, disk_id):
         """
         Detach a disk from a virtual machine.
@@ -422,6 +431,11 @@ class OpenNebulaBackend(ServiceBackend):
         except Exception as e:
             logger.exception("Failed to detach disk from VM in OpenNebula")
             raise OpenNebulaBackendError(e)
+
+    def detach_disk_from_vm(self, vm, disk_id):
+        """Convenience wrapper that delegates to :meth:`detach_disk`."""
+
+        return self.detach_disk(vm, disk_id)
 
     def snapshot_vm(self, vm, name):
         """
@@ -785,6 +799,20 @@ class OpenNebulaBackend(ServiceBackend):
         except Exception as e:
             logger.exception("Failed to save disk as image in OpenNebula")
             raise OpenNebulaBackendError(e)
+
+    def assign_floating_ip(self, vm, network_id, ip_address=None):
+        """Assign a floating IP to a VM. Not implemented for OpenNebula."""
+
+        raise NotImplementedError(
+            "Floating IP management is not supported by OpenNebula backend."
+        )
+
+    def release_floating_ip(self, vm, ip_address):
+        """Release a floating IP from a VM. Not implemented for OpenNebula."""
+
+        raise NotImplementedError(
+            "Floating IP management is not supported by OpenNebula backend."
+        )
 
     def pull_networks(self, tenant=None):
         # Pull all networks from OpenNebula and update/create local DB entries
