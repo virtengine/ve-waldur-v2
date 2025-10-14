@@ -36,7 +36,7 @@ class OpenNebulaBackend(ServiceBackend):
         :raises OpenNebulaBackendError: If ping fails and raise_exception is True
         """
         try:
-            version = self.client.get_version()
+            self.client.get_version()
             return True
         except Exception as e:
             logger.exception("Failed to ping OpenNebula backend")
@@ -69,13 +69,11 @@ class OpenNebulaBackend(ServiceBackend):
             logger.exception("Failed to pull tenants from OpenNebula")
             raise OpenNebulaBackendError(e)
 
-    def create_tenant(self, name, description=None):
+    def create_tenant(self, tenant):
         """
         Create a group/project in OpenNebula and a local DB entry.
-        :param name: Tenant name
-        :type name: str
-        :param description: Tenant description
-        :type description: str or None
+        :param tenant: OpenNebulaTenant instance that should be provisioned
+        :type tenant: OpenNebulaTenant
         :return: OpenNebulaTenant instance
         :raises OpenNebulaBackendError: If the operation fails
         """
@@ -159,7 +157,6 @@ class OpenNebulaBackend(ServiceBackend):
         try:
             extra = {"CPU": cpu, "MEMORY": ram}
             vm_id = self.client.create_vm(template_id, name=name, extra=extra)
-            vm_info = self.client.get_vm(vm_id)
             vm = OpenNebulaVirtualMachine.objects.create(
                 backend_id=str(vm_id),
                 name=name,
@@ -259,7 +256,6 @@ class OpenNebulaBackend(ServiceBackend):
         """
         try:
             vol_id = self.client.create_volume(name, size, description)
-            vol_info = self.client.get_volume(vol_id)
             volume = OpenNebulaVolume.objects.create(
                 backend_id=str(vol_id),
                 name=name,
@@ -838,7 +834,7 @@ class OpenNebulaBackend(ServiceBackend):
     def create_network(self, tenant, name, description=None):
         # Create a virtual network in OpenNebula and a local DB entry
         net_id = self.client.create_network(name, description)
-        net_info = self.client.get_network(net_id)
+        self.client.get_network(net_id)
         network = OpenNebulaNetwork.objects.create(
             backend_id=str(net_id),
             name=name,
@@ -969,7 +965,6 @@ class OpenNebulaBackend(ServiceBackend):
     def list_marketplace_offerings(self):
         client = OpenNebulaClient(self.settings)
         templates = client.list_templates()
-        images = client.list_images()
         # Aggregate templates/images into offering dicts
         offerings = []
         for t in getattr(templates, "VMTEMPLATE", []):

@@ -68,16 +68,17 @@ class OpenNebulaTenantViewSet(viewsets.ModelViewSet):
     serializer_class = OpenNebulaTenantSerializer
 
     def create(self, request, *args, **kwargs):
-        serializer = OpenNebulaTenantCreateSerializer(data=request.data)
+        serializer = OpenNebulaTenantCreateSerializer(
+            data=request.data, context={"request": request}
+        )
         serializer.is_valid(raise_exception=True)
-        backend = OpenNebulaBackend(request.user.service_settings)
-        tenant = backend.create_tenant(
-            name=serializer.validated_data["name"],
-            description=serializer.validated_data.get("description", ""),
+        tenant = serializer.save()
+        backend = OpenNebulaBackend(tenant.service_settings)
+        backend.create_tenant(tenant)
+        response_serializer = OpenNebulaTenantSerializer(
+            tenant, context={"request": request}
         )
-        return Response(
-            OpenNebulaTenantSerializer(tenant).data, status=status.HTTP_201_CREATED
-        )
+        return Response(response_serializer.data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["delete"])
     def delete_tenant(self, request, pk=None):
@@ -944,10 +945,10 @@ class OpenNebulaNetworkViewSet(viewsets.ModelViewSet):
             )
         try:
             settings = ServiceSettings.objects.get(pk=service_settings_id)
-            client = OpenNebulaClient(
+            _client = OpenNebulaClient(
                 settings.backend_url, settings.username, settings.password
             )
-            networks = client.list_networks()
+            networks = _client.list_networks()
             data = [
                 {
                     "id": n.ID,
@@ -1284,10 +1285,10 @@ class OpenNebulaTemplateListView(APIView):
             )
         try:
             settings = ServiceSettings.objects.get(pk=service_settings_id)
-            client = OpenNebulaClient(
+            _client = OpenNebulaClient(
                 settings.backend_url, settings.username, settings.password
             )
-            templates = client.list_templates()
+            templates = _client.list_templates()
             # Minimal serialization for wizard
             data = [
                 {
@@ -1329,10 +1330,10 @@ class OpenNebulaImageListView(APIView):
             )
         try:
             settings = ServiceSettings.objects.get(pk=service_settings_id)
-            client = OpenNebulaClient(
+            _client = OpenNebulaClient(
                 settings.backend_url, settings.username, settings.password
             )
-            images = client.list_images()
+            images = _client.list_images()
             data = [
                 {
                     "id": i.ID,
@@ -1646,6 +1647,43 @@ class OpenNebulaMarketplaceOfferingListView(APIView):
             )
 
 
+class OpenNebulaPingView(APIView):
+    def get(self, request):
+        service_settings_id = request.query_params.get("service_settings")
+        if service_settings_id:
+            try:
+                settings = ServiceSettings.objects.get(pk=service_settings_id)
+            except ServiceSettings.DoesNotExist:
+                return Response(
+                    {"error": "ServiceSettings not found."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+        else:
+            settings = ServiceSettings.objects.filter(type="OpenNebula").first()
+            if not settings:
+                return Response(
+                    {"error": "No OpenNebula service settings found."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+        backend = OpenNebulaBackend(settings)
+
+        try:
+            result = backend.ping()
+        except Exception as exc:
+            return Response(
+                {"error": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        if result:
+            return Response({"success": True}, status=status.HTTP_200_OK)
+
+        return Response(
+            {"error": "Unable to reach OpenNebula backend."},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+
 @extend_schema(
     responses={200: OpenApiResponse(OpenNebulaVMMonitoringSerializer)},
     description="Get monitoring data for a VM.",
@@ -1711,10 +1749,10 @@ class OpenNebulaTemplatesViewSet(viewsets.ViewSet):
             )
         try:
             settings = ServiceSettings.objects.get(pk=service_settings_id)
-            client = OpenNebulaClient(
+            _client = OpenNebulaClient(
                 settings.backend_url, settings.username, settings.password
             )
-            templates = client.list_templates()
+            templates = _client.list_templates()
             # Minimal serialization for wizard
             data = [
                 {
@@ -1760,7 +1798,7 @@ class OpenNebulaTemplatesViewSet(viewsets.ViewSet):
             )
         try:
             settings = ServiceSettings.objects.get(pk=service_settings_id)
-            client = OpenNebulaClient(
+            _client = OpenNebulaClient(
                 settings.backend_url, settings.username, settings.password
             )
             # template = client.get_template(pk) - TODO GET TEMPLATE
@@ -1814,10 +1852,10 @@ class OpenNebulaImagesViewSet(viewsets.ViewSet):
             )
         try:
             settings = ServiceSettings.objects.get(pk=service_settings_id)
-            client = OpenNebulaClient(
+            _client = OpenNebulaClient(
                 settings.backend_url, settings.username, settings.password
             )
-            images = client.list_images()
+            images = _client.list_images()
             data = [
                 {
                     "id": i.ID,
@@ -1862,10 +1900,10 @@ class OpenNebulaImagesViewSet(viewsets.ViewSet):
             )
         try:
             settings = ServiceSettings.objects.get(pk=service_settings_id)
-            client = OpenNebulaClient(
+            _client = OpenNebulaClient(
                 settings.backend_url, settings.username, settings.password
             )
-            # image = client.get_image(pk)
+            # image = _client.get_image(pk)
             image = ""
             if not image:
                 return Response(
