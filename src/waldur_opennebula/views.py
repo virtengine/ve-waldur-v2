@@ -68,16 +68,17 @@ class OpenNebulaTenantViewSet(viewsets.ModelViewSet):
     serializer_class = OpenNebulaTenantSerializer
 
     def create(self, request, *args, **kwargs):
-        serializer = OpenNebulaTenantCreateSerializer(data=request.data)
+        serializer = OpenNebulaTenantCreateSerializer(
+            data=request.data, context={"request": request}
+        )
         serializer.is_valid(raise_exception=True)
-        backend = OpenNebulaBackend(request.user.service_settings)
-        tenant = backend.create_tenant(
-            name=serializer.validated_data["name"],
-            description=serializer.validated_data.get("description", ""),
+        tenant = serializer.save()
+        backend = OpenNebulaBackend(tenant.service_settings)
+        backend.create_tenant(tenant)
+        response_serializer = OpenNebulaTenantSerializer(
+            tenant, context={"request": request}
         )
-        return Response(
-            OpenNebulaTenantSerializer(tenant).data, status=status.HTTP_201_CREATED
-        )
+        return Response(response_serializer.data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["delete"])
     def delete_tenant(self, request, pk=None):
