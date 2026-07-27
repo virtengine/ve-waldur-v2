@@ -1,4 +1,4 @@
-from unittest import mock, skip
+from unittest import mock
 
 from django.conf import settings
 from django.core import mail
@@ -11,8 +11,7 @@ from waldur_core.permissions.fixtures import CustomerRole
 from waldur_core.structure.tests import factories as structure_factories
 
 
-@skip("Fails in GitLab, works locally")
-class TestHookService(test.APITransactionTestCase):
+class TestHookService(test.APITestCase):
     def setUp(self):
         self.owner = structure_factories.UserFactory()
         self.customer = structure_factories.CustomerFactory()
@@ -64,11 +63,14 @@ class TestHookService(test.APITransactionTestCase):
         process_event(self.event.id)
 
         # Event is captured and POST request is triggered because event_type and user_uuid match
-        requests_post.assert_called_once_with(
-            self.web_hook.destination_url,
-            json=self.payload,
-            verify=settings.VERIFY_WEBHOOK_REQUESTS,
-        )
+        requests_post.assert_called_once()
+        args, kwargs = requests_post.call_args
+        self.assertEqual(args, (self.web_hook.destination_url,))
+        self.assertEqual(kwargs["json"], self.payload)
+        self.assertEqual(kwargs["verify"], settings.VERIFY_WEBHOOK_REQUESTS)
+        # SEC-C9: outbound webhooks must disable redirects and set a timeout.
+        self.assertEqual(kwargs["allow_redirects"], False)
+        self.assertIsNotNone(kwargs.get("timeout"))
 
     def test_email_hook_processor_can_be_called_twice(self):
         # Create email hook for customer owner

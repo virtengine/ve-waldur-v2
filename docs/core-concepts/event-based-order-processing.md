@@ -73,26 +73,49 @@ Offering user events are published when offering users are created, updated, or 
 - `send_offering_user_created_message` - Triggers when an OfferingUser is created
 - `send_offering_user_updated_message` - Triggers when an OfferingUser is updated
 - `send_offering_user_deleted_message` - Triggers when an OfferingUser is deleted
+- `send_user_attribute_update_message` - Triggers when a User's profile attributes change
+  (connected to `core.User` post_save, not `OfferingUser`)
 
-**Message Payload Structure for OfferingUser Events:**
+**Message Payload Structure for create/update/delete Events:**
 
 ```json
 {
   "offering_user_uuid": "uuid-hex-string",
   "user_uuid": "user-uuid-hex-string",
   "username": "generated-username",
-  "state": "OK|Requested|Creating|Pending account linking|Pending additional validation|Requested deletion|Deleting|Deleted|Error creating|Error deleting",
+  "state": "OK|Requested|Creating|...",
+  "runtime_state": "Active|Pending account linking|Pending additional validation",
   "action": "create|update|delete",
-  "offering_uuid": "offering-uuid",
-  "changed_fields": ["field1", "field2"]  // Only present for updates
+  "attributes": {"email": "user@example.com", "first_name": "Alice"},  // create only
+  "changed_fields": ["field1", "field2"]  // update only
+}
+```
+
+**Message Payload Structure for attribute_update Events:**
+
+When a User's profile fields change, a separate event is published for each offering
+the user belongs to. The `OfferingUserAttributeConfig` for the offering determines which
+changed fields are included.
+
+```json
+{
+  "offering_user_uuid": "uuid-hex-string",
+  "user_uuid": "user-uuid-hex-string",
+  "username": "generated-username",
+  "action": "attribute_update",
+  "changed_attributes": ["email", "first_name"],
+  "attributes": {"email": "new@example.com", "first_name": "Alice"}
 }
 ```
 
 **Event Triggers:**
 
 - **Create**: When a new offering user account is created for a user in an offering
-- **Update**: When any field of an existing offering user is modified (username, state, etc.)
+- **Update**: When any field of an existing offering user is modified (username, state, runtime_state, etc.)
 - **Delete**: When an offering user account is removed from an offering
+- **Attribute Update**: When a User's profile fields change, filtered through each offering's `OfferingUserAttributeConfig`
+
+**`runtime_state` field:** Both `create` and `update` messages include `runtime_state` alongside `state`. Consumers should use `runtime_state` to determine operational access status (e.g. TOU accepted, account linked) independently of the lifecycle `state`. See [OfferingUser States and Management](offering-users.md#runtime-states) for details.
 
 ### Resource Periodic Limits Event Messages
 
@@ -234,6 +257,22 @@ processor = marketplace_site_agent_services_register_processor.sync(
 - **Processor Tracking**: Monitor individual processors and their backend versions
 - **Configuration Management**: Store and version configuration files
 - **Statistics**: Collect and report agent performance metrics
+- **Unified Queue**: Single queue per agent via `register_queue` with enriched payloads
+
+**Unified Queue Registration:**
+
+A site agent can register a unified queue where one RabbitMQ queue receives all event types. This is the recommended approach for new agents. The queue's state lives on a generic `EventConsumer` (in `waldur_core.logging`) that the `AgentIdentity` links to, bound to the agent's offering:
+
+```python
+# Register a unified queue (one call replaces multiple create_queue calls)
+result = marketplace_site_agent_identities_register_queue.sync(
+    uuid=agent_identity.uuid.hex,
+    client=waldur_rest_client
+)
+# result contains: rmq_username, queue_name, vhost, observable_object_types
+```
+
+For the complete guide on unified queues, see [Unified Agent Queue](../guides/agent-pubsub.md).
 
 ### Message Processing (Consumer Side)
 
@@ -307,7 +346,31 @@ The event notification system provides REST API endpoints for managing event-bas
 - **PATCH /api/marketplace-site-agent-identities/{uuid}/** - Update agent identity
 - **DELETE /api/marketplace-site-agent-identities/{uuid}/** - Delete agent identity
 - **POST /api/marketplace-site-agent-identities/{uuid}/register_service/** - Register service within agent
-- **POST /api/marketplace-site-agent-identities/{uuid}/register_event_subscription/** - Register event subscription for agent
+- **POST /api/marketplace-site-agent-identities/{uuid}/register_event_subscription/** - Register event subscription for agent (legacy)
+- **POST /api/marketplace-site-agent-identities/{uuid}/register_queue/** - Register unified agent queue (recommended)
+
+#### Agent Identity Permissions
+
+Agent identity management uses a four-tier permission model checked by `_can_manage_offering_agent()`:
+
+| Tier | Who | Scope |
+|------|-----|-------|
+| 1. Staff | `user.is_staff` | All offerings, all identities |
+| 2. Customer owner | `CREATE_OFFERING` permission on offering's customer | All identities for customer's offerings |
+| 3. Offering manager | `UPDATE_OFFERING` permission on the offering | All identities for that offering |
+| 4. ISD identity manager | `is_identity_manager=True` + non-empty `managed_isds` | Own identities only, non-archived/draft offerings |
+
+ISD identity managers can create agent identities for offerings in Active, Paused, or Unavailable states without requiring pre-existing offering users. This enables bootstrapping: agents create offering users, so requiring offering users to register agents would be a chicken-and-egg problem.
+
+#### Agent Identity Ownership
+
+Each `AgentIdentity` has a `created_by` field tracking the user who created it. This field is used to scope ISD identity manager access:
+
+- **Create**: Any ISD identity manager can create an agent identity for an allowed offering
+- **Update/Delete**: ISD identity managers can only modify or delete their own agent identities (`created_by == request.user`)
+- **List**: ISD identity managers only see their own agent identities in query results
+
+Staff, customer owners, and offering managers are not restricted by `created_by` — they can manage all agent identities within their scope.
 
 ### Agent Services
 
@@ -339,12 +402,17 @@ The event notification system provides REST API endpoints for managing event-bas
 1. **WebSocket Transport**: The system uses STOMP over WebSockets for communication
 2. **TLS Security**: Connections can be secured with TLS
 3. **User Authentication**: Each subscription has its own credentials and permissions in RabbitMQ
-4. **Queue Structure**: Queue names follow the pattern `/queue/subscription_{subscription_uuid}_offering_{offering_uuid}_{observable_object_type}`
+4. **Queue Structure**: Two queue naming patterns are supported:
 
-   Example queue names:
-   - `/queue/subscription_abc123_offering_def456_order`
-   - `/queue/subscription_abc123_offering_def456_user_role`
-   - `/queue/subscription_abc123_offering_def456_resource_periodic_limits`
+   **Legacy (per-offering, per-object-type):**
+   - Pattern: `/queue/subscription_{subscription_uuid}_offering_{offering_uuid}_{object_type}`
+   - Example: `/queue/subscription_abc123_offering_def456_order`
+
+   **Unified (single queue per consumer):**
+   - Pattern: `/queue/consumer_{consumer_uuid}`
+   - Example: `/queue/consumer_a1b2c3d4e5f67890...`
+   - All event types delivered to one queue; agent routes by `object_type` in payload
+   - See [Unified Agent Queue guide](../guides/agent-pubsub.md) for details
 
 ## Error Handling and Resilience
 
@@ -352,7 +420,7 @@ The system includes:
 
 - Graceful connection handling
 - Signal handlers for proper shutdown
-- Retry mechanisms for order processing
+- Retry mechanisms for order processing — erred orders can be explicitly retried via `POST /api/marketplace-orders/{uuid}/retry/` for offering types that opt in with `supports_order_retry=True` (see [Retrying Erred Orders](marketplace.md#retrying-erred-orders))
 - Error logging and optional Sentry integration
 
 ## Integration Examples

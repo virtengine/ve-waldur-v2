@@ -159,6 +159,82 @@ class CategoryGroupFactory(
         return url if action is None else url + action + "/"
 
 
+class OfferingGroupFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.OfferingGroup]
+):
+    class Meta:
+        model = models.OfferingGroup
+
+    title = factory.Sequence(lambda n: "offering-group-%s" % n)
+    customer = factory.SubFactory(structure_factories.CustomerFactory)
+
+    @classmethod
+    def get_url(cls, group=None, action=None):
+        if group is None:
+            group = OfferingGroupFactory()
+        url = "http://testserver" + reverse(
+            "marketplace-offering-group-detail", kwargs={"uuid": group.uuid.hex}
+        )
+        return url if action is None else url + action + "/"
+
+    @classmethod
+    def get_list_url(cls, action=None):
+        url = "http://testserver" + reverse("marketplace-offering-group-list")
+        return url if action is None else url + action + "/"
+
+
+class PosixIdPoolFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.PosixIdPool]
+):
+    class Meta:
+        model = models.PosixIdPool
+
+    min_uid = 100000
+    max_uid = 199999
+    next_uid = 100000
+    min_gid = 100000
+    max_gid = 199999
+    next_gid = 100000
+
+    @classmethod
+    def get_url(cls, pool=None, action=None):
+        if pool is None:
+            pool = PosixIdPoolFactory()
+        url = "http://testserver" + reverse(
+            "marketplace-posix-id-pool-detail",
+            kwargs={"uuid": pool.uuid.hex},
+        )
+        return url if action is None else url + action + "/"
+
+    @classmethod
+    def get_list_url(cls, action=None):
+        url = "http://testserver" + reverse("marketplace-posix-id-pool-list")
+        return url if action is None else url + action + "/"
+
+
+class PosixIdentityFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.PosixIdentity],
+):
+    class Meta:
+        model = models.PosixIdentity
+
+    @classmethod
+    def get_url(cls, identity=None, action=None):
+        if identity is None:
+            identity = PosixIdentityFactory()
+        url = "http://testserver" + reverse(
+            "marketplace-posix-identity-detail",
+            kwargs={"uuid": identity.uuid.hex},
+        )
+        return url if action is None else url + action + "/"
+
+    @classmethod
+    def get_list_url(cls, action=None):
+        url = "http://testserver" + reverse("marketplace-posix-identity-list")
+        return url if action is None else url + action + "/"
+
+
 class TagFactory(
     factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Tag]
 ):
@@ -321,6 +397,46 @@ class AttributeFactory(
 
     key = factory.Sequence(lambda n: "attribute-%s" % n)
     section = factory.SubFactory(SectionFactory)
+    type = "string"
+
+    @classmethod
+    def get_url(cls, attribute=None):
+        if attribute is None:
+            attribute = AttributeFactory()
+        return "http://testserver" + reverse(
+            "marketplace-attribute-detail", kwargs={"uuid": attribute.uuid.hex}
+        )
+
+    @classmethod
+    def get_list_url(cls):
+        return "http://testserver" + reverse("marketplace-attribute-list")
+
+
+class AttributeOptionFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.AttributeOption],
+):
+    class Meta:
+        model = models.AttributeOption
+
+    key = factory.Sequence(lambda n: "option-%s" % n)
+    title = factory.Sequence(lambda n: "Option %s" % n)
+    attribute = factory.SubFactory(
+        AttributeFactory,
+        type="choice",
+    )
+
+    @classmethod
+    def get_url(cls, option=None):
+        if option is None:
+            option = AttributeOptionFactory()
+        return "http://testserver" + reverse(
+            "marketplace-attribute-option-detail", kwargs={"uuid": option.uuid.hex}
+        )
+
+    @classmethod
+    def get_list_url(cls):
+        return "http://testserver" + reverse("marketplace-attribute-option-list")
 
 
 @factory.django.mute_signals(signals.pre_save, signals.post_save)
@@ -547,6 +663,21 @@ class ComponentUsageFactory(
         return url if action is None else url + action + "/"
 
 
+class ComponentUsageMonthlyFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.ComponentUsageMonthly],
+):
+    class Meta:
+        model = models.ComponentUsageMonthly
+
+    component = factory.SubFactory(OfferingComponentFactory)
+    billing_period = factory.LazyFunction(
+        lambda: core_utils.month_start(timezone.now()).date()
+    )
+    total_consumed = Decimal("0")
+    total_allocated = Decimal("0")
+
+
 class ResourcePlanPeriodFactory(
     factory.django.DjangoModelFactory,
     metaclass=BaseMetaFactory[models.ResourcePlanPeriod],
@@ -699,6 +830,7 @@ class ComponentUserUsageLimitFactory(
 
     class Meta:
         model = models.ComponentUserUsageLimit
+        skip_postgeneration_save = True
 
     @classmethod
     def get_url(cls, integration_status=None, action=None):
@@ -949,6 +1081,21 @@ class SoftwarePackageFactory(
     description = factory.Faker("text", max_nb_chars=200)
     homepage = factory.Faker("url")
 
+    @factory.post_generation
+    def parent_softwares(self, create, extracted, **kwargs):
+        if not create:
+            return
+        if extracted:
+            self.parent_softwares.set(extracted)
+
+    @factory.post_generation
+    def parent_software(self, create, extracted, **kwargs):
+        """Backward-compatible hook: accepts a single parent and adds it."""
+        if not create:
+            return
+        if extracted:
+            self.parent_softwares.add(extracted)
+
     @classmethod
     def get_url(cls, package=None, action=None):
         if package is None:
@@ -1002,9 +1149,12 @@ class SoftwareTargetFactory(
     target_name = factory.Iterator(["x86_64", "aarch64", "ppc64le"])
     target_subtype = "generic"
     location = factory.LazyAttribute(
-        lambda obj: f"/cvmfs/software.eessi.io/versions/2023.06/software/linux/{obj.target_name}/{obj.target_subtype}"
+        lambda obj: (
+            f"/cvmfs/software.eessi.io/versions/2023.06/software/linux/{obj.target_name}/{obj.target_subtype}"
+        )
     )
     metadata = factory.LazyAttribute(lambda obj: {"full_arch": obj.target_name})
+    gpu_architectures = factory.LazyAttribute(lambda obj: [])
 
     @classmethod
     def get_url(cls, target=None, action=None):
@@ -1062,6 +1212,10 @@ class OfferingPartitionFactory(factory.django.DjangoModelFactory):
     offering = factory.SubFactory(OfferingFactory)
     partition_name = factory.Sequence(lambda n: f"partition-{n}")
 
+    # Architecture
+    cpu_arch = ""
+    gpu_arch = ""
+
     # CPU configuration
     cpu_bind = 1
     def_cpu_per_gpu = 2
@@ -1107,3 +1261,31 @@ class OfferingPartitionFactory(factory.django.DjangoModelFactory):
     def get_list_url(cls, action=None):
         url = "http://testserver" + reverse("marketplace-offering-partition-list")
         return url if action is None else url + action + "/"
+
+
+class ResourceLimitChangeRequestFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.ResourceLimitChangeRequest],
+):
+    class Meta:
+        model = models.ResourceLimitChangeRequest
+
+    resource = factory.SubFactory(ResourceFactory)
+    created_by = factory.SubFactory(structure_factories.UserFactory)
+    requested_limits = {"storage": 200}
+
+    @classmethod
+    def get_url(cls, request=None, action=None):
+        if request is None:
+            request = ResourceLimitChangeRequestFactory()
+        url = "http://testserver" + reverse(
+            "marketplace-resource-limit-change-request-detail",
+            kwargs={"uuid": request.uuid.hex},
+        )
+        return url if action is None else url + action + "/"
+
+    @classmethod
+    def get_list_url(cls):
+        return "http://testserver" + reverse(
+            "marketplace-resource-limit-change-request-list"
+        )

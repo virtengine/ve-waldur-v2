@@ -1,4 +1,3 @@
-import base64
 import datetime
 import logging
 import re
@@ -9,9 +8,7 @@ from constance import config
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db.models import F, QuerySet, Sum
-from django.db.models.expressions import Case, When
 from django.db.models.functions.comparison import Coalesce
-from django.db.models.functions.datetime import Extract
 from django.template.loader import render_to_string
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
@@ -22,6 +19,18 @@ from waldur_core.structure.models import Customer
 from . import models
 
 logger = logging.getLogger(__name__)
+
+
+def affiliates_feature_enabled() -> bool:
+    """The affiliate program is opt-in via the AFFILIATES_ENABLED Constance
+    setting, disabled by default.
+
+    Gates both the customer-affiliates API and fee accrual at invoice
+    finalization. Configured links are kept but stay dormant while the
+    feature is off. The `reseller.affiliates` entry in core features only
+    controls homeport element visibility and is not consulted here.
+    """
+    return config.AFFILIATES_ENABLED
 
 
 def get_current_month():
@@ -158,18 +167,10 @@ def filter_invoice_items(
 
 def create_invoice_html(invoice):
     all_items = filter_invoice_items(invoice.items.all())
-    logo_path = config.SITE_LOGO
-    if logo_path:
-        with open(logo_path, "rb") as image_file:
-            deployment_logo = base64.b64encode(image_file.read()).decode("utf-8")
-    else:
-        deployment_logo = None
-
     context = dict(
         invoice=invoice,
         issuer_details=settings.WALDUR_INVOICES["ISSUER_DETAILS"],
         currency=config.CURRENCY_NAME,
-        deployment_logo=deployment_logo,
         items=all_items,
     )
     return render_to_string("invoices/invoice.html", context)
@@ -266,7 +267,7 @@ def get_billing_price_estimate_for_resources(resources):
         resource__in=resources,
         invoice__year=get_current_year(),
         invoice__month=get_current_month(),
-    )
+    ).select_related("invoice")
     result = {
         "total": Decimal(0.0),
         "current": Decimal(0.0),
@@ -278,7 +279,7 @@ def get_billing_price_estimate_for_resources(resources):
         result["tax"] += item.tax
         result["tax_current"] += item.tax_current
         result["total"] += item.total
-    return result
+    return {k: f"{v:f}" for k, v in result.items()}
 
 
 def get_billing_price_estimate_for_provider(
@@ -309,6 +310,7 @@ def get_billing_price_estimate_for_provider(
         Exception: For any other unforeseen errors during processing.
 
     """
+    from waldur_mastermind.billing.utils import get_current_expression
 
     if not customer or not provider_uuid:
         raise ValidationError(_("Customer and provider UUID are required."))
@@ -324,94 +326,41 @@ def get_billing_price_estimate_for_provider(
         )
 
     try:
-        seconds_in_hour = 3600
-        seconds_in_day = 86400
-
-        aggregated_data = models.InvoiceItem.objects.filter(
-            resource__offering__customer__uuid=provider_uuid,
-            invoice__customer=customer,
-            invoice__year=get_current_year(),
-            invoice__month=get_current_month(),
-        ).aggregate(
-            total=Coalesce(
-                Sum(
-                    F("quantity") * F("unit_price")
-                    + (
-                        F("quantity")
-                        * F("unit_price")
-                        * F("invoice__tax_percent")
-                        / 100
-                    )
+        aggregated_data = (
+            models.InvoiceItem.objects.filter(
+                resource__offering__customer__uuid=provider_uuid,
+                invoice__customer=customer,
+                invoice__year=get_current_year(),
+                invoice__month=get_current_month(),
+            )
+            .annotate(
+                current_quantity=get_current_expression(),
+                tax_factor=F("invoice__tax_percent") / 100,
+            )
+            .aggregate(
+                total=Coalesce(
+                    Sum(F("quantity") * F("unit_price") * (1 + F("tax_factor"))),
+                    Decimal("0.00"),
                 ),
-                Decimal("0.00"),
-            ),
-            current=Coalesce(
-                Sum(
-                    Case(
-                        When(
-                            unit=models.InvoiceItem.Units.PER_HOUR,
-                            then=F("unit_price")
-                            * (
-                                Extract(F("end"), "epoch")
-                                - Extract(F("start"), "epoch")
-                            )
-                            / seconds_in_hour,
-                        ),
-                        When(
-                            unit=models.InvoiceItem.Units.PER_DAY,
-                            then=F("unit_price")
-                            * (
-                                Extract(F("end"), "epoch")
-                                - Extract(F("start"), "epoch")
-                            )
-                            / seconds_in_day,
-                        ),
-                        default=F("quantity") * F("unit_price"),
-                    )
+                current=Coalesce(
+                    Sum(F("current_quantity") * F("unit_price")),
+                    Decimal("0.00"),
                 ),
-                Decimal("0.00"),
-            ),
-            tax=Coalesce(
-                Sum(F("quantity") * F("unit_price") * F("invoice__tax_percent") / 100),
-                Decimal("0.00"),
-            ),
-            tax_current=Coalesce(
-                Sum(
-                    Case(
-                        When(
-                            unit=models.InvoiceItem.Units.PER_HOUR,
-                            then=F("unit_price")
-                            * (
-                                Extract(F("end"), "epoch")
-                                - Extract(F("start"), "epoch")
-                            )
-                            / seconds_in_hour
-                            * F("invoice__tax_percent")
-                            / 100,
-                        ),
-                        When(
-                            unit=models.InvoiceItem.Units.PER_DAY,
-                            then=F("unit_price")
-                            * (
-                                Extract(F("end"), "epoch")
-                                - Extract(F("start"), "epoch")
-                            )
-                            / seconds_in_day
-                            * F("invoice__tax_percent")
-                            / 100,
-                        ),
-                        default=F("quantity")
-                        * F("unit_price")
-                        * F("invoice__tax_percent")
-                        / 100,
-                    )
+                tax=Coalesce(
+                    Sum(F("quantity") * F("unit_price") * F("tax_factor")),
+                    Decimal("0.00"),
                 ),
-                Decimal("0.00"),
-            ),
+                tax_current=Coalesce(
+                    Sum(F("current_quantity") * F("unit_price") * F("tax_factor")),
+                    Decimal("0.00"),
+                ),
+            )
         )
 
         result = {
-            key: Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_UP)
+            key: "{:f}".format(
+                Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_UP)
+            )
             for key, value in aggregated_data.items()
         }
 

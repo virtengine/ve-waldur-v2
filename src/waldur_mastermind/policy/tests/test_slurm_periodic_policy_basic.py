@@ -6,8 +6,12 @@ from django.core.exceptions import ValidationError
 from django.test import TestCase
 
 from waldur_core.structure.tests import factories as structure_factories
+from waldur_mastermind.invoices.models import PeriodMixin
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
-from waldur_mastermind.policy.models import SlurmPeriodicUsagePolicy
+from waldur_mastermind.policy.models import (
+    OfferingUsagePolicy,
+    SlurmPeriodicUsagePolicy,
+)
 
 
 class TestSlurmPeriodicUsagePolicyBasic(TestCase):
@@ -73,8 +77,8 @@ class TestSlurmPeriodicUsagePolicyBasic(TestCase):
             # Verify basic settings structure
             self.assertIn("fairshare", settings)
             self.assertIn("grp_tres_mins", settings)
-            self.assertIn("qos_threshold", settings)
-            self.assertIn("grace_limit", settings)
+            self.assertNotIn("qos_threshold", settings)
+            self.assertNotIn("grace_limit", settings)
 
             # Verify reasonable values
             self.assertGreater(settings["fairshare"], 0)
@@ -85,6 +89,54 @@ class TestSlurmPeriodicUsagePolicyBasic(TestCase):
             self.assertGreater(settings["grp_tres_mins"]["mem"], 0)
 
         print("✅ Basic settings calculation working")
+
+    def test_grace_ratio_increases_slurm_limit(self):
+        """Test that SLURM GrpTRESMins includes grace ratio so jobs can run in the grace range."""
+        policy = SlurmPeriodicUsagePolicy.objects.create(
+            scope=self.offering,
+            apply_to_all=True,
+            grace_ratio=0.3,
+            carryover_enabled=False,
+            tres_billing_enabled=False,
+        )
+
+        with patch.object(policy, "_get_current_period", return_value="2024-Q2"):
+            settings = policy.calculate_slurm_settings(self.resource)
+
+            # Base allocation: cpu=64000h, mem=512000h → base minutes: cpu=3840000, mem=30720000
+            # With grace_ratio=0.3, SLURM limit should be 1.3x base
+            base_cpu_minutes = int(64000 * 60)
+            base_mem_minutes = int(512000 * 60)
+            self.assertEqual(
+                settings["grp_tres_mins"]["cpu"], int(base_cpu_minutes * 1.3)
+            )
+            self.assertEqual(
+                settings["grp_tres_mins"]["mem"], int(base_mem_minutes * 1.3)
+            )
+
+            # Invariant: the grace-multiplied SLURM hard limit must be at
+            # least the base allocation, so jobs can still run in the 100%-130%
+            # overrun band before SLURM itself blocks them.
+            slurm_total = sum(settings["grp_tres_mins"].values())
+            base_total = base_cpu_minutes + base_mem_minutes
+            self.assertGreaterEqual(slurm_total, base_total)
+
+    def test_zero_grace_ratio_does_not_change_slurm_limit(self):
+        """Test that with grace_ratio=0, SLURM limit equals base allocation."""
+        policy = SlurmPeriodicUsagePolicy.objects.create(
+            scope=self.offering,
+            apply_to_all=True,
+            grace_ratio=0,
+            carryover_enabled=False,
+            tres_billing_enabled=False,
+        )
+
+        with patch.object(policy, "_get_current_period", return_value="2024-Q2"):
+            settings = policy.calculate_slurm_settings(self.resource)
+
+            # With grace_ratio=0, SLURM limit should equal base minutes exactly
+            self.assertEqual(settings["grp_tres_mins"]["cpu"], int(64000 * 60))
+            self.assertEqual(settings["grp_tres_mins"]["mem"], int(512000 * 60))
 
     def test_decay_calculation_method(self):
         """Test decay calculation method directly."""
@@ -151,59 +203,6 @@ class TestSlurmPeriodicUsagePolicyBasic(TestCase):
 
         print(f"✅ TRES minutes with billing weights: {tres_minutes}")
 
-    def test_qos_threshold_calculation_scalar(self):
-        """Test QoS threshold calculation with scalar (backward compat)."""
-        policy = SlurmPeriodicUsagePolicy.objects.create(
-            scope=self.offering,
-            apply_to_all=True,
-            grace_ratio=0.25,
-            tres_billing_enabled=True,
-        )
-
-        total_allocation = 1500.0
-        config = {"grace_ratio": 0.25, "tres_billing_enabled": True}
-
-        qos_threshold, grace_limit = policy._calculate_qos_thresholds(
-            total_allocation, config
-        )
-
-        self.assertEqual(qos_threshold["billing"], 90000)
-        self.assertEqual(grace_limit["billing"], 112500)
-
-        print(
-            f"✅ QoS thresholds (scalar): {qos_threshold['billing']:,} / {grace_limit['billing']:,}"
-        )
-
-    def test_qos_threshold_calculation_dict(self):
-        """Test QoS threshold calculation with per-component dict."""
-        policy = SlurmPeriodicUsagePolicy.objects.create(
-            scope=self.offering,
-            apply_to_all=True,
-            grace_ratio=0.25,
-            tres_billing_enabled=True,
-        )
-
-        total_allocation = {"cpu": 100.0, "mem": 200.0}
-        weights = {"cpu": 0.5, "mem": 0.25}
-        config = {
-            "grace_ratio": 0.25,
-            "tres_billing_enabled": True,
-            "tres_billing_weights": weights,
-        }
-
-        qos_threshold, grace_limit = policy._calculate_qos_thresholds(
-            total_allocation, config
-        )
-
-        # scalar = 100*0.5 + 200*0.25 = 100
-        # threshold = 100 * 60 = 6000, grace = 100 * 1.25 * 60 = 7500
-        self.assertEqual(qos_threshold["billing"], 6000)
-        self.assertEqual(grace_limit["billing"], 7500)
-
-        print(
-            f"✅ QoS thresholds (dict): {qos_threshold['billing']:,} / {grace_limit['billing']:,}"
-        )
-
     def test_configuration_resolution(self):
         """Test configuration resolution without complex scenarios."""
         policy = SlurmPeriodicUsagePolicy.objects.create(
@@ -244,20 +243,44 @@ class TestSlurmPeriodicUsagePolicyBasic(TestCase):
         """Test period calculation methods."""
         policy = SlurmPeriodicUsagePolicy()
 
-        # Test previous period calculation
+        # Test previous period calculation for quarterly
         prev_q2 = policy._get_previous_period("2024-Q2")
         self.assertEqual(prev_q2, "2024-Q1")
 
         prev_q1 = policy._get_previous_period("2024-Q1")
         self.assertEqual(prev_q1, "2023-Q4")
 
+        # Test previous period calculation for monthly
+        prev_mar = policy._get_previous_period("2026-03")
+        self.assertEqual(prev_mar, "2026-02")
+
+        prev_jan = policy._get_previous_period("2026-01")
+        self.assertEqual(prev_jan, "2025-12")
+
+        # Test previous period calculation for annual
+        prev_year = policy._get_previous_period("2026")
+        self.assertEqual(prev_year, "2025")
+
         print("✅ Period calculation methods working")
 
-        # Test current period calculation (without mocking - just verify method works)
+        # Test current period - default period is MONTH_1 (monthly)
         current = policy._get_current_period()
-        self.assertRegex(current, r"^\d{4}-Q[1-4]$")  # Should match YYYY-Q# format
+        self.assertRegex(current, r"^\d{4}-\d{2}$")  # Should match YYYY-MM format
 
-        print(f"✅ Current period calculation working: {current}")
+        # Test current period with quarterly policy
+        quarterly_policy = SlurmPeriodicUsagePolicy.objects.create(
+            scope=self.offering,
+            apply_to_all=True,
+            period=PeriodMixin.Periods.MONTH_3,
+        )
+        current_quarterly = quarterly_policy._get_current_period()
+        self.assertRegex(
+            current_quarterly, r"^\d{4}-Q[1-4]$"
+        )  # Should match YYYY-Q# format
+
+        print(
+            f"✅ Current period calculation working: monthly={current}, quarterly={current_quarterly}"
+        )
 
     def test_fairshare_calculation(self):
         """Test fairshare calculation method with dict and scalar."""
@@ -284,8 +307,6 @@ class TestSlurmPeriodicUsagePolicyCore(TestCase):
 
     def test_policy_inheritance(self):
         """Test that policy correctly inherits from OfferingUsagePolicy."""
-        from waldur_mastermind.policy.models import OfferingUsagePolicy
-
         # Check inheritance
         self.assertTrue(issubclass(SlurmPeriodicUsagePolicy, OfferingUsagePolicy))
 

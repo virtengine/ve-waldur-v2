@@ -29,15 +29,21 @@ set -e
 
 # --- CONFIGURATION ---
 
-# The minimum number of discovered tests required to trigger parallel splitting.
-# This prevents the overhead of splitting a tiny number of tests across many runners.
-# For example, it's faster for one runner to execute 40 tests than for 10 runners
-# to start up, coordinate, and each run 4 tests.
-TEST_SPLITTING_THRESHOLD=300
+# The minimum number of affected application paths required to trigger parallel
+# splitting. Using app count instead of test count avoids the need for a full
+# Django/database setup during the pipeline generation stage. With fewer than
+# this many apps, the overhead of spinning up multiple runners outweighs the
+# benefit of parallelization.
+APP_SPLITTING_THRESHOLD=5
 
 # The absolute maximum number of parallel jobs to create. This acts as a ceiling
 # to prevent creating an excessive number of jobs even for a very large test suite.
-MAX_PARALLEL_JOBS=10
+MAX_PARALLEL_JOBS=15
+
+# Known heavy apps and their weight multipliers (based on test file counts).
+# Matched against the LAST path component (e.g. "marketplace" from
+# "src/waldur_mastermind/marketplace"). Default weight for unlisted apps is 1.
+HEAVY_APP_WEIGHTS="marketplace:8 openstack:4 structure:4 core:3 proposal:2"
 
 # The filename for the generated child pipeline configuration. This artifact is
 # used by the `trigger` keyword in the main CI configuration.
@@ -47,6 +53,31 @@ PIPELINE_OUTPUT_FILE="generated-pipeline.yml"
 # to the downstream "execution" stage (the child pipeline).
 VARS_OUTPUT_FILE="generated_vars.env"
 
+
+# --- FUNCTIONS ---
+
+# Calculate a weighted score for the given space-separated list of app paths.
+# Heavy apps (listed in HEAVY_APP_WEIGHTS) contribute more than 1 to the total,
+# so a small number of heavy apps can still trigger parallelization.
+calculate_weighted_score() {
+  local paths="$1"
+  local total=0
+  for p in $paths; do
+    local app_name
+    app_name=$(basename "$p")
+    local weight=1
+    for entry in $HEAVY_APP_WEIGHTS; do
+      local key="${entry%%:*}"
+      local val="${entry##*:}"
+      if [ "$app_name" = "$key" ]; then
+        weight=$val
+        break
+      fi
+    done
+    total=$((total + weight))
+  done
+  echo "$total"
+}
 
 echo "--- Dynamic Pipeline Generator ---"
 
@@ -101,44 +132,36 @@ if [ "${SELECTED_PATHS}" = "src" ]; then
   ENABLE_SPLITTING_VAR="true"
   PARALLEL_BLOCK="parallel: ${MAX_PARALLEL_JOBS}"
 else
-  # --- STEP 3: DISCOVER TEST COUNT FOR PARTIAL RUNS ---
-  # If it's not a full run, we need to determine the exact workload.
+  # --- STEP 3: DECIDE PARALLELIZATION FOR PARTIAL RUNS ---
+  # We use the number of affected application paths as a proxy for workload.
+  # This is fast, reliable, and avoids needing a full Django/database setup
+  # that `pytest --collect-only` would require (the "Generate test pipeline"
+  # job does not have a postgres service).
   echo "[+] STEP 2/4: Partial run detected."
-  uv sync --group dev
 
-  echo "[+] Discovering number of tests for selected paths..."
-  # Run pytest in "collect-only" mode. This is a dry run that finds all test
-  # functions without executing them. We count the lines to get the total.
-  # `|| true` prevents the script from failing if pytest encounters a collection error.
-  TEST_COUNT=$(uv run pytest --collect-only -q ${SELECTED_PATHS} | wc -l || true)
-  # Ensure TEST_COUNT is a valid integer, defaulting to 0 if the command failed.
-  TEST_COUNT=${TEST_COUNT:-0}
-  echo "[+] Discovered ${TEST_COUNT} tests."
+  PATH_COUNT=$(echo "${SELECTED_PATHS}" | wc -w | tr -d ' ')
+  WEIGHTED_SCORE=$(calculate_weighted_score "${SELECTED_PATHS}")
+  echo "[+] Number of affected app paths: ${PATH_COUNT} (weighted score: ${WEIGHTED_SCORE})"
 
-  # Decide on splitting based on the discovered count and our threshold.
-  if [ "${TEST_COUNT}" -ge "${TEST_SPLITTING_THRESHOLD}" ]; then
-    echo "[+] Test count (${TEST_COUNT}) is >= threshold (${TEST_SPLITTING_THRESHOLD}). Enabling parallelization."
+  if [ "${WEIGHTED_SCORE}" -ge "${APP_SPLITTING_THRESHOLD}" ]; then
+    echo "[+] Weighted score (${WEIGHTED_SCORE}) >= threshold (${APP_SPLITTING_THRESHOLD}). Enabling parallelization."
     ENABLE_SPLITTING_VAR="true"
 
-    # Calculate the desired number of parallel jobs. The goal is to have roughly
-    # TEST_SPLITTING_THRESHOLD tests per job. We use ceiling division to ensure
-    # we have enough jobs for all tests.
-    # Formula for shell integer ceiling division: (numerator + denominator - 1) / denominator
-    PARALLEL_COUNT=$(( (TEST_COUNT + TEST_SPLITTING_THRESHOLD - 1) / TEST_SPLITTING_THRESHOLD ))
+    # Use the weighted score directly as parallel count (1 weight-unit ≈ 1 job).
+    # This gives enough parallelism for heavy apps like marketplace to spread
+    # their slow tests across more runners.
+    PARALLEL_COUNT=${WEIGHTED_SCORE}
 
-    # Cap the parallel count at the configured maximum.
     if [ "${PARALLEL_COUNT}" -gt "${MAX_PARALLEL_JOBS}" ]; then
       echo "[+] Calculated parallel count (${PARALLEL_COUNT}) exceeds maximum (${MAX_PARALLEL_JOBS}). Capping at ${MAX_PARALLEL_JOBS}."
       PARALLEL_COUNT=${MAX_PARALLEL_JOBS}
     fi
     echo "[+] Setting parallel job count to ${PARALLEL_COUNT}."
 
-    # This variable will contain the `parallel: N` YAML keyword.
     PARALLEL_BLOCK="parallel: ${PARALLEL_COUNT}"
   else
-    echo "[+] Test count (${TEST_COUNT}) is < threshold (${TEST_SPLITTING_THRESHOLD}). Disabling parallelization."
+    echo "[+] Weighted score (${WEIGHTED_SCORE}) < threshold (${APP_SPLITTING_THRESHOLD}). Running as single job."
     ENABLE_SPLITTING_VAR="false"
-    # This variable will be empty, so no parallel keyword is added to the YAML.
     PARALLEL_BLOCK=""
   fi
 fi
@@ -166,6 +189,19 @@ run_unit_tests:
   # The Docker image name is passed from the parent CI job's configuration.
   image: registry.hpc.ut.ee/mirror/\${WALDUR_MASTERMIND_TEST_IMAGE}
   interruptible: true
+
+  # Auto-recover a shard that failed on infrastructure noise or a flaky test
+  # instead of reding the whole sharded suite and the parent MR pipeline. A
+  # single flaky shard was the dominant false-red source (~30% of MR pipeline
+  # failures self-healed on an unchanged re-run). max=1 bounds the extra cost on
+  # a genuinely broken shard to one rerun.
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+      - api_failure
+      - script_failure
 
   # This rule ensures the job only runs when triggered as part of a child pipeline.
   # The '\$' is escaped to prevent expansion now and let GitLab expand it in the child pipeline.
@@ -222,6 +258,8 @@ run_unit_tests:
       coverage_report:
         coverage_format: cobertura
         path: coverage.xml
+    paths:
+      - coverage.xml
 
   coverage: "/TOTAL.+ ([0-9]{1,3}%)/"
 EOF

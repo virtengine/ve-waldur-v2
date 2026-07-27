@@ -1,6 +1,6 @@
-import datetime
-
 from ddt import data, ddt
+from django.test import override_settings
+from django.utils import timezone
 from rest_framework import status, test
 
 from waldur_core.core import utils as core_utils
@@ -17,7 +17,7 @@ from waldur_mastermind.policy.tests import factories as policy_factories
 
 
 @ddt
-class CustomerComponentUsagePolicyCreateTest(test.APITransactionTestCase):
+class CustomerComponentUsagePolicyCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.customer = self.fixture.customer
@@ -56,7 +56,7 @@ class CustomerComponentUsagePolicyCreateTest(test.APITransactionTestCase):
 
 
 @ddt
-class CustomerComponentUsagePolicyUpdateTest(test.APITransactionTestCase):
+class CustomerComponentUsagePolicyUpdateTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.customer = self.fixture.customer
@@ -187,7 +187,7 @@ class CustomerComponentUsagePolicyUpdateTest(test.APITransactionTestCase):
 
 
 @ddt
-class CustomerComponentUsagePolicyDeleteTest(test.APITransactionTestCase):
+class CustomerComponentUsagePolicyDeleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.customer = self.fixture.customer
@@ -218,7 +218,7 @@ class CustomerComponentUsagePolicyDeleteTest(test.APITransactionTestCase):
 
 
 @ddt
-class CustomerComponentUsagePolicyValidationTest(test.APITransactionTestCase):
+class CustomerComponentUsagePolicyValidationTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.customer = self.fixture.customer
@@ -265,7 +265,8 @@ class CustomerComponentUsagePolicyValidationTest(test.APITransactionTestCase):
         )
 
 
-class CustomerComponentUsagePolicyTriggerTest(test.APITransactionTestCase):
+@override_settings(task_always_eager=True)
+class CustomerComponentUsagePolicyTriggerTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.customer = self.fixture.customer
@@ -293,8 +294,8 @@ class CustomerComponentUsagePolicyTriggerTest(test.APITransactionTestCase):
             resource=self.resource,
             component=self.component,
             usage=150,
-            billing_period=core_utils.month_start(datetime.date.today()),
-            date=datetime.datetime.now(),
+            billing_period=core_utils.month_start(timezone.now()),
+            date=timezone.now(),
         )
 
         self.policy.refresh_from_db()
@@ -308,8 +309,8 @@ class CustomerComponentUsagePolicyTriggerTest(test.APITransactionTestCase):
             resource=self.resource,
             component=self.component,
             usage=50,
-            billing_period=core_utils.month_start(datetime.date.today()),
-            date=datetime.datetime.now(),
+            billing_period=core_utils.month_start(timezone.now()),
+            date=timezone.now(),
         )
 
         self.policy.refresh_from_db()

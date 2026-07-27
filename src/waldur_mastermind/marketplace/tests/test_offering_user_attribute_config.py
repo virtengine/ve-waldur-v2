@@ -12,7 +12,7 @@ from waldur_mastermind.marketplace import models
 from waldur_mastermind.marketplace.tests import factories
 
 
-class OfferingUserAttributeConfigModelTest(test.APITransactionTestCase):
+class OfferingUserAttributeConfigModelTest(test.APITestCase):
     """Test OfferingUserAttributeConfig model."""
 
     def setUp(self):
@@ -61,7 +61,9 @@ class OfferingUserAttributeConfigModelTest(test.APITransactionTestCase):
         """Test that get_exposed_fields_for_offering falls back to Constance default."""
         # No config created for this offering
 
-        with mock.patch("constance.config") as mock_config:
+        with mock.patch(
+            "waldur_mastermind.marketplace.models.constance_config"
+        ) as mock_config:
             mock_config.DEFAULT_OFFERING_USER_ATTRIBUTES = [
                 "username",
                 "email",
@@ -80,7 +82,9 @@ class OfferingUserAttributeConfigModelTest(test.APITransactionTestCase):
         """Test hardcoded fallback when Constance is not configured."""
         # No config created for this offering
 
-        with mock.patch("constance.config") as mock_config:
+        with mock.patch(
+            "waldur_mastermind.marketplace.models.constance_config"
+        ) as mock_config:
             mock_config.DEFAULT_OFFERING_USER_ATTRIBUTES = None
 
             exposed = (
@@ -92,7 +96,7 @@ class OfferingUserAttributeConfigModelTest(test.APITransactionTestCase):
         self.assertEqual(exposed, ["username", "full_name", "email"])
 
 
-class OfferingUserAttributeConfigAPITest(test.APITransactionTestCase):
+class OfferingUserAttributeConfigAPITest(test.APITestCase):
     """Test OfferingUserAttributeConfig API endpoints under ProviderOfferingViewSet."""
 
     def setUp(self):
@@ -258,7 +262,7 @@ class OfferingUserAttributeConfigAPITest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
 
 
-class OfferingTermsOfServiceCollectedAttributesTest(test.APITransactionTestCase):
+class OfferingTermsOfServiceCollectedAttributesTest(test.APITestCase):
     """Test collected_attributes property on OfferingTermsOfService."""
 
     def setUp(self):
@@ -296,14 +300,16 @@ class OfferingTermsOfServiceCollectedAttributesTest(test.APITransactionTestCase)
             is_active=True,
         )
 
-        with mock.patch("constance.config") as mock_config:
+        with mock.patch(
+            "waldur_mastermind.marketplace.models.constance_config"
+        ) as mock_config:
             mock_config.DEFAULT_OFFERING_USER_ATTRIBUTES = ["username", "email"]
             collected = tos.collected_attributes
 
         self.assertEqual(collected, ["username", "email"])
 
 
-class UserOfferingConsentCollectedAttributesTest(test.APITransactionTestCase):
+class UserOfferingConsentCollectedAttributesTest(test.APITestCase):
     """Test collected_attributes in UserOfferingConsent API."""
 
     def setUp(self):
@@ -335,7 +341,7 @@ class UserOfferingConsentCollectedAttributesTest(test.APITransactionTestCase):
         self.assertIn("gender", response.data["collected_attributes"])
 
 
-class OfferingUserSerializerAttributeFilteringTest(test.APITransactionTestCase):
+class OfferingUserSerializerAttributeFilteringTest(test.APITestCase):
     """Test that OfferingUserSerializer filters user attributes based on config.
 
     All user_* fields are defined in the schema for SDK generation.
@@ -485,8 +491,76 @@ class OfferingUserSerializerAttributeFilteringTest(test.APITransactionTestCase):
         self.assertIn("user_birth_date", response.data)
         self.assertIn("user_identity_source", response.data)
 
+    def test_active_isds_exposed_when_enabled(self):
+        """Test that active_isds is exposed when expose_active_isds=True."""
+        self.fixture.user.active_isds = ["isd:puhuri"]
+        self.fixture.user.save()
 
-class OfferingUserListViewAttributeFilteringTest(test.APITransactionTestCase):
+        models.OfferingUserAttributeConfig.objects.create(
+            offering=self.offering,
+            expose_username=True,
+            expose_full_name=True,
+            expose_email=True,
+            expose_active_isds=True,
+        )
+        offering_user = self._create_offering_user()
+
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.get(f"{self.url}{offering_user.uuid}/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("user_active_isds", response.data)
+        self.assertEqual(response.data["user_active_isds"], ["isd:puhuri"])
+
+    def test_active_isds_hidden_by_default(self):
+        """Test that active_isds is hidden by default."""
+        self.fixture.user.active_isds = ["isd:puhuri"]
+        self.fixture.user.save()
+
+        offering_user = self._create_offering_user()
+
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.get(f"{self.url}{offering_user.uuid}/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertNotIn("user_active_isds", response.data)
+
+    def test_organization_registry_code_exposed_when_enabled(self):
+        """Test that organization_registry_code is exposed when enabled."""
+        self.fixture.user.organization_registry_code = "12345678"
+        self.fixture.user.save()
+
+        models.OfferingUserAttributeConfig.objects.create(
+            offering=self.offering,
+            expose_username=True,
+            expose_full_name=True,
+            expose_email=True,
+            expose_organization_registry_code=True,
+        )
+        offering_user = self._create_offering_user()
+
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.get(f"{self.url}{offering_user.uuid}/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("user_organization_registry_code", response.data)
+        self.assertEqual(response.data["user_organization_registry_code"], "12345678")
+
+    def test_organization_registry_code_hidden_by_default(self):
+        """Test that organization_registry_code is hidden by default."""
+        self.fixture.user.organization_registry_code = "12345678"
+        self.fixture.user.save()
+
+        offering_user = self._create_offering_user()
+
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.get(f"{self.url}{offering_user.uuid}/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertNotIn("user_organization_registry_code", response.data)
+
+
+class OfferingUserListViewAttributeFilteringTest(test.APITestCase):
     """Test that OfferingUserSerializer filters attributes consistently in list views.
 
     This is critical for PII protection - list views must apply the same filtering

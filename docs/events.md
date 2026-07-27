@@ -5,12 +5,23 @@
 - access_subnet_creation_succeeded
 - access_subnet_deletion_succeeded
 - access_subnet_update_succeeded
+- offering_access_subnet_creation_succeeded
+- offering_access_subnet_deletion_succeeded
+- offering_access_subnet_update_succeeded
+- resource_access_subnet_creation_succeeded
+- resource_access_subnet_deletion_succeeded
+- resource_access_subnet_update_succeeded
 
 ## Auth
 
 - auth_logged_in_with_username
 - auth_logged_out
 - auth_login_failed_with_username
+- pat_created
+- pat_expired
+- pat_revoked
+- pat_rotated
+- pat_used_from_new_ip
 - token_created
 - token_lifetime_updated
 
@@ -19,11 +30,22 @@
 - call_document_added
 - call_document_removed
 
+## Chat
+
+- chat_feedback_submitted
+- chat_injection_detected
+- chat_pii_detected
+- chat_session_accessed
+- chat_thread_accessed
+
 ## Credits
 
 - allowed_offerings_have_been_updated
 - automatic_credit_adjustment
+- create_of_affiliate_by_staff
 - create_of_credit_by_staff
+- create_of_project_credit_by_staff
+- increase_of_customer_credit_due_to_affiliate_fee
 - reduction_of_customer_credit
 - reduction_of_customer_credit_due_to_minimal_consumption
 - reduction_of_customer_expected_consumption
@@ -33,18 +55,23 @@
 - roll_back_customer_credit
 - roll_back_project_credit
 - set_to_zero_overdue_credit
+- update_of_affiliate_by_staff
 - update_of_credit_by_staff
+- update_of_project_credit_by_staff
 
 ## Customers
 
 - allowed_offerings_have_been_updated
 - automatic_credit_adjustment
+- create_of_affiliate_by_staff
 - create_of_credit_by_staff
+- create_of_project_credit_by_staff
 - customer_creation_succeeded
 - customer_deletion_succeeded
 - customer_permission_review_closed
 - customer_permission_review_created
 - customer_update_succeeded
+- increase_of_customer_credit_due_to_affiliate_fee
 - payment_added
 - payment_removed
 - reduction_of_customer_credit
@@ -56,13 +83,16 @@
 - roll_back_customer_credit
 - roll_back_project_credit
 - set_to_zero_overdue_credit
+- update_of_affiliate_by_staff
 - update_of_credit_by_staff
+- update_of_project_credit_by_staff
 
 ## Invoices
 
 - allowed_offerings_have_been_updated
 - automatic_credit_adjustment
 - create_of_credit_by_staff
+- create_of_project_credit_by_staff
 - invoice_canceled
 - invoice_created
 - invoice_item_created
@@ -81,12 +111,15 @@
 - roll_back_project_credit
 - set_to_zero_overdue_credit
 - update_of_credit_by_staff
+- update_of_project_credit_by_staff
 
 ## Offering_accounting
 
 - marketplace_offering_component_created
 - marketplace_offering_component_deleted
 - marketplace_offering_component_updated
+- marketplace_offering_options_updated
+- marketplace_offering_resource_options_updated
 - marketplace_plan_archived
 - marketplace_plan_component_current_price_updated
 - marketplace_plan_component_future_price_updated
@@ -94,6 +127,75 @@
 - marketplace_plan_created
 - marketplace_plan_deleted
 - marketplace_plan_updated
+
+## Onboarding
+
+- onboarding_verification_deleted
+- onboarding_verification_deleted_by_task
+
+## Openstack_floating_ip
+
+- openstack_floating_ip_attached
+- openstack_floating_ip_connected
+- openstack_floating_ip_description_updated
+- openstack_floating_ip_detached
+- openstack_floating_ip_disconnected
+
+## Openstack_network
+
+- openstack_network_cleaned
+- openstack_network_created
+- openstack_network_deleted
+- openstack_network_imported
+- openstack_network_pulled
+- openstack_network_updated
+
+## Openstack_port
+
+- openstack_port_allowed_address_pairs_changed
+- openstack_port_cleaned
+- openstack_port_created
+- openstack_port_deleted
+- openstack_port_imported
+- openstack_port_pulled
+- openstack_port_security_disabled
+- openstack_port_security_enabled
+- openstack_port_security_groups_changed
+- openstack_port_updated
+
+## Openstack_rbac
+
+- openstack_rbac_policy_created
+- openstack_rbac_policy_deleted
+
+## Openstack_router
+
+- openstack_router_interface_added
+- openstack_router_interface_removed
+- openstack_router_updated
+
+## Openstack_security_group
+
+- openstack_security_group_cleaned
+- openstack_security_group_created
+- openstack_security_group_deleted
+- openstack_security_group_imported
+- openstack_security_group_pulled
+- openstack_security_group_rule_created
+- openstack_security_group_rule_deleted
+- openstack_security_group_rule_updated
+- openstack_security_group_rules_changed
+- openstack_security_group_updated
+
+## Openstack_subnet
+
+- openstack_subnet_cleaned
+- openstack_subnet_created
+- openstack_subnet_deleted
+- openstack_subnet_host_routes_changed
+- openstack_subnet_imported
+- openstack_subnet_pulled
+- openstack_subnet_updated
 
 ## Permissions
 
@@ -118,13 +220,25 @@
 - proposal_canceled
 - proposal_document_added
 - proposal_document_removed
+- proposal_workflow_advanced
 
 ## Providers
 
+- maintenance_announcement_cancelled
+- maintenance_announcement_completed
+- maintenance_announcement_created
+- maintenance_announcement_deleted
+- maintenance_announcement_scheduled
+- maintenance_announcement_started
+- maintenance_announcement_unscheduled
+- maintenance_announcement_updated
 - marketplace_resource_create_canceled
 - marketplace_resource_create_failed
 - marketplace_resource_create_requested
 - marketplace_resource_create_succeeded
+- marketplace_resource_limit_change_request_approved
+- marketplace_resource_limit_change_request_created
+- marketplace_resource_limit_change_request_rejected
 - marketplace_resource_terminate_failed
 - marketplace_resource_terminate_requested
 - marketplace_resource_terminate_succeeded
@@ -146,12 +260,17 @@
 - marketplace_order_rejected
 - marketplace_order_terminated
 - marketplace_order_unlinked
+- marketplace_resource_api_key_revealed
+- marketplace_resource_api_key_rotated
 - marketplace_resource_create_canceled
 - marketplace_resource_create_failed
 - marketplace_resource_create_requested
 - marketplace_resource_create_succeeded
 - marketplace_resource_downscaled
 - marketplace_resource_erred_on_backend
+- marketplace_resource_limit_change_request_approved
+- marketplace_resource_limit_change_request_created
+- marketplace_resource_limit_change_request_rejected
 - marketplace_resource_paused
 - marketplace_resource_terminate_canceled
 - marketplace_resource_terminate_failed
@@ -170,18 +289,40 @@
 - openstack_floating_ip_description_updated
 - openstack_floating_ip_detached
 - openstack_floating_ip_disconnected
+- openstack_instance_security_groups_changed
+- openstack_listener_created
+- openstack_listener_deleted
+- openstack_listener_updated
+- openstack_load_balancer_created
+- openstack_load_balancer_deleted
+- openstack_load_balancer_security_groups_changed
+- openstack_load_balancer_updated
 - openstack_network_cleaned
 - openstack_network_created
 - openstack_network_deleted
 - openstack_network_imported
 - openstack_network_pulled
 - openstack_network_updated
+- openstack_pool_created
+- openstack_pool_deleted
+- openstack_pool_member_created
+- openstack_pool_member_deleted
+- openstack_pool_member_updated
+- openstack_pool_updated
+- openstack_port_allowed_address_pairs_changed
 - openstack_port_cleaned
 - openstack_port_created
 - openstack_port_deleted
 - openstack_port_imported
 - openstack_port_pulled
+- openstack_port_security_disabled
+- openstack_port_security_enabled
+- openstack_port_security_groups_changed
 - openstack_port_updated
+- openstack_rbac_policy_created
+- openstack_rbac_policy_deleted
+- openstack_router_interface_added
+- openstack_router_interface_removed
 - openstack_router_updated
 - openstack_security_group_cleaned
 - openstack_security_group_created
@@ -193,6 +334,7 @@
 - openstack_security_group_rule_deleted
 - openstack_security_group_rule_imported
 - openstack_security_group_rule_updated
+- openstack_security_group_rules_changed
 - openstack_security_group_updated
 - openstack_server_group_cleaned
 - openstack_server_group_created
@@ -202,10 +344,18 @@
 - openstack_subnet_cleaned
 - openstack_subnet_created
 - openstack_subnet_deleted
+- openstack_subnet_host_routes_changed
 - openstack_subnet_imported
 - openstack_subnet_pulled
 - openstack_subnet_updated
 - openstack_tenant_quota_limit_updated
+- request_downscaling
+- request_pausing
+- request_slurm_resource_downscaling
+- request_slurm_resource_pausing
+- reset_downscaling
+- reset_member_restriction
+- reset_pausing
 - resource_assign_floating_ip_failed
 - resource_assign_floating_ip_scheduled
 - resource_assign_floating_ip_succeeded
@@ -234,6 +384,9 @@
 - resource_pull_failed
 - resource_pull_scheduled
 - resource_pull_succeeded
+- resource_rescue_failed
+- resource_rescue_scheduled
+- resource_rescue_succeeded
 - resource_restart_failed
 - resource_restart_scheduled
 - resource_restart_succeeded
@@ -253,6 +406,9 @@
 - resource_unassign_floating_ip_failed
 - resource_unassign_floating_ip_scheduled
 - resource_unassign_floating_ip_succeeded
+- resource_unrescue_failed
+- resource_unrescue_scheduled
+- resource_unrescue_succeeded
 - resource_update_allowed_address_pairs_failed
 - resource_update_allowed_address_pairs_scheduled
 - resource_update_allowed_address_pairs_succeeded
@@ -266,6 +422,7 @@
 - resource_update_security_groups_scheduled
 - resource_update_security_groups_succeeded
 - resource_update_succeeded
+- restrict_members
 - slurm_policy_evaluation
 
 ## Review
@@ -310,9 +467,11 @@
 - user_deactivated
 - user_deletion_succeeded
 - user_details_update_succeeded
+- user_group_invitation_updated
 - user_has_been_created_by_staff
 - user_invitation_deleted
 - user_invitation_updated
+- user_password_removed_by_staff
 - user_password_updated
 - user_password_updated_by_staff
 - user_update_succeeded

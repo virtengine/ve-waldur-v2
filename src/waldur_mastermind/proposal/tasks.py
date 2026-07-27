@@ -1,8 +1,10 @@
 import logging
+from datetime import timedelta
 from typing import Any, cast
 
 from celery import shared_task
 from constance import config
+from django.db import transaction
 from django.db.models import Avg, Count, Q
 from django.utils import timezone
 
@@ -12,8 +14,12 @@ from waldur_core.logging.enums import EventType
 from waldur_core.structure.permissions import _get_customer
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.proposal import models as proposal_models
-from waldur_mastermind.proposal import utils
-from waldur_mastermind.proposal.enums import CallStates, ProposalStates
+from waldur_mastermind.proposal import utils, workflow_service
+from waldur_mastermind.proposal.enums import (
+    CallStates,
+    ProposalStates,
+    WorkflowStepInstanceStatuses,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -178,8 +184,7 @@ def notify_call_managers_about_new_review(review_uuid):
     context = {
         "site_name": config.SITE_NAME,
         "review_url": core_utils.format_homeport_link(
-            "call-management/{customer_uuid}/review/{review_uuid}/",
-            customer_uuid=review.proposal.round.call.manager.customer.uuid,
+            "proposal-review/{review_uuid}/",
             review_uuid=review.uuid,
         ),
         "proposal_name": review.proposal.name,
@@ -313,6 +318,52 @@ def notify_reviewer_about_assignment(review_uuid):
     )
 
 
+@shared_task(
+    name="waldur_mastermind.proposal.notify_reviewer_on_review_deadline_approaching"
+)
+def notify_reviewer_on_review_deadline_approaching():
+    now = timezone.now()
+    reviews = proposal_models.Review.objects.filter(
+        state=proposal_models.Review.States.IN_REVIEW,
+        proposal__round__call__state=CallStates.ACTIVE,
+    ).select_related("reviewer", "proposal", "proposal__round", "proposal__round__call")
+
+    for review in reviews:
+        review_deadline = review.review_end_date
+        if not review_deadline:
+            continue
+
+        if review_deadline <= now:
+            continue
+
+        time_remaining_days = (review_deadline.date() - now.date()).days
+        if time_remaining_days < 0 or time_remaining_days > 3:
+            continue
+
+        if not review.reviewer or not review.reviewer.email:
+            logger.warning(
+                f"Cannot send review deadline reminder. Review {review.uuid} reviewer has no valid email."
+            )
+            continue
+
+        context = {
+            "site_name": config.SITE_NAME,
+            "reviewer_name": review.reviewer.full_name,
+            "proposal_name": review.proposal.name,
+            "call_name": review.proposal.round.call.name,
+            "review_deadline": review_deadline,
+            "time_remaining_days": time_remaining_days,
+            "review_url": core_utils.format_homeport_link("reviews/"),
+        }
+
+        core_utils.broadcast_mail(
+            "proposal",
+            "review_deadline_approaching",
+            context,
+            [review.reviewer.email],
+        )
+
+
 @shared_task(name="waldur_mastermind.proposal.notify_reviewer_on_proposal_decision")
 def notify_reviewer_on_proposal_decision(proposal_uuid):
     proposal = proposal_models.Proposal.objects.get(uuid=proposal_uuid)
@@ -352,6 +403,22 @@ def notify_reviewer_on_proposal_decision(proposal_uuid):
             logger.warning(
                 f"Cannot send proposal decision notification to reviewer for review {review.uuid}. Reviewer has no valid email."
             )
+
+
+def notify_proposal_decision(proposal_uuid, previous_state, new_state):
+    """Enqueue the applicant + reviewer notifications for a proposal decision.
+
+    Every code path that accepts or rejects a proposal — the legacy
+    approve/reject actions, the workflow engine's terminal step, and any future
+    automatic allocator — must call this so the decision emails stay consistent
+    and cannot be silently dropped by a new caller. Call it after the state
+    change has been committed (or is about to be), never before allocation, so
+    the accepted email can include the provisioned project and resources.
+    """
+    notify_user_about_proposal_state_update.delay(
+        proposal_uuid, previous_state, new_state
+    )
+    notify_reviewer_on_proposal_decision.delay(proposal_uuid)
 
 
 @shared_task(
@@ -544,7 +611,6 @@ def notify_manager_on_round_cutoff():
             "round_name": round_obj.name,
             "total_proposals": r_any.total_proposals,
             "total_reviews": r_any.total_reviews,
-            "review_strategy": r_any.get_review_strategy_display(),
             "start_date": round_obj.start_time,
             "close_date": round_obj.cutoff_time,
             "round_url": round_url,
@@ -555,6 +621,61 @@ def notify_manager_on_round_cutoff():
             "round_closing_for_managers",
             context,
             manager_emails,
+        )
+
+
+@shared_task(
+    name="waldur_mastermind.proposal.notify_proposal_creator_on_submission_deadline_approaching"
+)
+def notify_proposal_creator_on_submission_deadline_approaching():
+    now = timezone.now()
+    proposals = proposal_models.Proposal.objects.filter(
+        state=ProposalStates.DRAFT,
+        round__call__state=CallStates.ACTIVE,
+        round__cutoff_time__gt=now,
+    ).select_related("round", "round__call", "created_by")
+
+    for proposal in proposals:
+        time_remaining = proposal.round.cutoff_time - now
+        if time_remaining.total_seconds() <= 0:
+            continue
+
+        if time_remaining > timedelta(days=3):
+            continue
+
+        total_seconds = int(time_remaining.total_seconds())
+        remaining_days, remainder = divmod(total_seconds, 24 * 60 * 60)
+
+        if not proposal.created_by or not proposal.created_by.email:
+            logger.warning(
+                f"Cannot send submission deadline reminder. Proposal {proposal.uuid} creator has no valid email."
+            )
+            continue
+
+        remaining_hours = remainder // (60 * 60)
+
+        proposal_url = core_utils.format_homeport_link(
+            "proposals/{proposal_uuid}/",
+            proposal_uuid=proposal.uuid,
+        )
+
+        context = {
+            "site_name": config.SITE_NAME,
+            "proposal_creator_name": proposal.created_by.full_name,
+            "proposal_name": proposal.name,
+            "call_name": proposal.round.call.name,
+            "round_name": proposal.round.name,
+            "deadline_date": proposal.round.cutoff_time,
+            "time_remaining_days": remaining_days,
+            "time_remaining_hours": remaining_hours,
+            "proposal_url": proposal_url,
+        }
+
+        core_utils.broadcast_mail(
+            "proposal",
+            "proposal_submission_deadline_approaching",
+            context,
+            [proposal.created_by.email],
         )
 
 
@@ -570,9 +691,14 @@ def notify_manager_when_reviews_are_completed(proposal_uuid):
         state=proposal_models.Review.States.IN_REVIEW
     )
 
-    if incomplete_reviews.exists() or completed_reviews.count() < (
-        proposal.round.minimum_number_of_reviewers or 0
-    ):
+    # The "enough reviewers" threshold is now sourced from the expert_review
+    # workflow step (single config track), not the removed Round field.
+    expert_step = proposal_models.CallWorkflowStep.objects.filter(
+        call=proposal.round.call, step="expert_review"
+    ).first()
+    min_reviewers = expert_step.min_reviewers if expert_step else None
+
+    if incomplete_reviews.exists() or completed_reviews.count() < (min_reviewers or 0):
         return
 
     call = proposal.round.call
@@ -618,6 +744,51 @@ def notify_manager_when_reviews_are_completed(proposal_uuid):
         context,
         manager_emails,
     )
+
+
+@shared_task(name="waldur_mastermind.proposal.mark_expired_workflow_steps")
+def mark_expired_workflow_steps():
+    """Expire ACTIVE workflow step instances past their deadline and advance the workflow.
+
+    For each overdue active step, marks it EXPIRED and either activates the
+    next enabled step or rejects the proposal when no further step exists.
+    Each transition runs in its own transaction so a single failure does not
+    block other expiries.
+    """
+    overdue_ids = list(
+        proposal_models.ProposalWorkflowStepInstance.objects.filter(
+            status=WorkflowStepInstanceStatuses.ACTIVE,
+            deadline__lt=timezone.now(),
+        ).values_list("id", flat=True)
+    )
+
+    expired_count = 0
+    for instance_id in overdue_ids:
+        try:
+            with transaction.atomic():
+                instance = (
+                    proposal_models.ProposalWorkflowStepInstance.objects.select_for_update()
+                    .filter(
+                        id=instance_id,
+                        status=WorkflowStepInstanceStatuses.ACTIVE,
+                        deadline__lt=timezone.now(),
+                    )
+                    .first()
+                )
+                if instance is None:
+                    continue
+                workflow_service.expire_step(instance)
+        except Exception:
+            logger.exception(
+                "Failed to expire workflow step instance id=%s", instance_id
+            )
+            continue
+
+        expired_count += 1
+
+    if expired_count:
+        logger.info("Expired %d workflow step instance(s)", expired_count)
+    return expired_count
 
 
 @shared_task(name="waldur_mastermind.proposal.mark_expired_assignment_batches")
@@ -820,3 +991,37 @@ def notify_managers_of_expired_batches():
 
     if count > 0:
         logger.info(f"Notified managers about {count} expired assignment batches")
+
+
+@shared_task(name="waldur_mastermind.proposal.send_reviewer_invitation_email")
+def send_reviewer_invitation_email(pool_member_uuid):
+    pool_member = proposal_models.CallReviewerPool.objects.select_related(
+        "call", "invited_by"
+    ).get(uuid=pool_member_uuid)
+
+    if not pool_member.invited_email:
+        logger.warning(
+            f"Cannot send reviewer invitation email. Pool member {pool_member_uuid} has no invited_email."
+        )
+        return
+
+    invitation_link = core_utils.format_homeport_link(
+        f"reviewer-invitation/{pool_member.invitation_token}/"
+    )
+    invited_by_name = (
+        pool_member.invited_by.full_name if pool_member.invited_by else config.SITE_NAME
+    )
+
+    context = {
+        "site_name": config.SITE_NAME,
+        "call_name": pool_member.call.name,
+        "invited_by_name": invited_by_name,
+        "invitation_link": invitation_link,
+    }
+
+    core_utils.broadcast_mail(
+        "proposal",
+        "reviewer_invitation",
+        context,
+        [pool_member.invited_email],
+    )

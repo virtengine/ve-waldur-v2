@@ -29,9 +29,30 @@ class MarketplaceExtension(WaldurExtension):
         from celery.schedules import crontab
 
         return {
+            "pull-service-properties": {
+                "task": "waldur_mastermind.marketplace.ServicePropertiesListPullTask",
+                "schedule": timedelta(hours=24),
+                "args": (),
+            },
+            "pull-service-resources": {
+                "task": "waldur_mastermind.marketplace.ServiceResourcesListPullTask",
+                # Pull resources strictly at the beginning of an hour
+                "schedule": crontab(minute=0),
+                "args": (),
+            },
             "waldur-marketplace-calculate-usage": {
                 "task": "waldur_mastermind.marketplace.calculate_usage_for_current_month",
                 "schedule": timedelta(hours=1),
+                "args": (),
+            },
+            "waldur-marketplace-re-evaluate-usage-limit-restrictions": {
+                "task": "waldur_mastermind.marketplace.re_evaluate_usage_limit_restrictions",
+                "schedule": timedelta(hours=1),
+                "args": (),
+            },
+            "waldur-marketplace-sync-component-usage-summaries": {
+                "task": "waldur_mastermind.marketplace.sync_component_usage_summaries",
+                "schedule": timedelta(days=1),
                 "args": (),
             },
             "terminate_resources_if_project_end_date_has_been_reached": {
@@ -78,6 +99,13 @@ class MarketplaceExtension(WaldurExtension):
                 "schedule": crontab(minute=20, hour=1),
                 "args": (),
             },
+            "process_maintenance_announcement_transitions": {
+                "task": "waldur_mastermind.marketplace.process_maintenance_announcement_transitions",
+                # Auto start/complete maintenance announcements when their
+                # scheduled window is reached; every 5 minutes keeps the lag low.
+                "schedule": crontab(minute="*/5"),
+                "args": (),
+            },
             "send_telemetry": {
                 "task": "waldur_mastermind.marketplace.send_metrics",
                 "schedule": timedelta(days=1),
@@ -111,6 +139,11 @@ class MarketplaceExtension(WaldurExtension):
             "reconcile_robot_account_access": {
                 "task": "waldur_mastermind.marketplace.reconcile_robot_account_access",
                 "schedule": crontab(minute=30, hour=2),  # Run daily at 2:30 AM
+                "args": (),
+            },
+            "cleanup_usage_poll_records": {
+                "task": "waldur_mastermind.marketplace.cleanup_usage_poll_records",
+                "schedule": timedelta(days=1),
                 "args": (),
             },
         }

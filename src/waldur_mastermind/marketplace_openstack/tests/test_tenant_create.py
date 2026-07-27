@@ -11,7 +11,7 @@ from waldur_openstack.tests.fixtures import OpenStackFixture
 
 
 @ddt
-class MarketplaceTenantCreateTest(test.APITransactionTestCase):
+class MarketplaceTenantCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = OpenStackFixture()
         self.view = views.MarketplaceTenantViewSet.as_view({"post": "create"})
@@ -25,7 +25,7 @@ class MarketplaceTenantCreateTest(test.APITransactionTestCase):
             "name": "test_tenant",
         }
 
-    @data("staff", "owner", "admin")
+    @data("staff", "owner", "admin", "manager", "member")
     def test_user_can_create_tenant(self, user):
         response = common_utils.create_request(
             self.view, getattr(self.fixture, user), self.get_valid_payload()

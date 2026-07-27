@@ -24,7 +24,16 @@ from waldur_core.users.enums import InvitationState
 from waldur_core.users.tests import factories as user_factories
 
 
-class OAuthViewInitTest(test.APITransactionTestCase):
+def assert_login_failed_redirect(test_case, response, expected_message):
+    """Assert the response redirects to the Homeport login-failed page with the message."""
+    test_case.assertEqual(response.status_code, status.HTTP_302_FOUND)
+    parsed_url = urlparse(response.url)
+    test_case.assertEqual(parsed_url.path, "/login_failed/")
+    query_params = parse_qs(parsed_url.query)
+    test_case.assertEqual(query_params["message"], [expected_message])
+
+
+class OAuthViewInitTest(test.APITestCase):
     def setUp(self):
         super().setUp()
         self.provider = models.IdentityProvider.objects.create(
@@ -182,10 +191,36 @@ class OAuthViewCompleteTest(test.APITransactionTestCase):
         )
         self.assertIsNotNone(user.last_login)
 
-        # Check token in redirect URL
+        # Check code in redirect URL
         parsed_url = urlparse(response.url)
-        token_key = parse_qs(parsed_url.query)["token"][0]
+        exchange_code = parse_qs(parsed_url.query)["code"][0]
+
+        # Exchange code for token
+        exchange_url = reverse("auth-token-exchange")
+        exchange_response = self.client.post(exchange_url, {"code": exchange_code})
+        self.assertEqual(exchange_response.status_code, status.HTTP_200_OK)
+
+        token_key = exchange_response.data["token"]
         self.assertTrue(Token.objects.filter(user=user, key=token_key).exists())
+
+    @override_config(ENABLED_USER_PROFILE_ATTRIBUTES=["birth_date"])
+    def test_new_user_oidc_iso_birthdate_string_succeeds_and_sets_birth_date(self):
+        """OIDC birthdate is an ISO string; it must become a date so reversion can serialize."""
+        user_info = {
+            "sub": "user_birthdate_ok_sub",
+            "given_name": "Test",
+            "family_name": "User",
+            "email": "birthdate_ok@example.com",
+            "birthdate": "1983-01-21",
+        }
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        user = User.objects.get(username=user_info["sub"])
+        self.assertEqual(user.birth_date.isoformat(), "1983-01-21")
 
     def test_successful_login_existing_user(self):
         user_info = {
@@ -234,6 +269,100 @@ class OAuthViewCompleteTest(test.APITransactionTestCase):
         response = self.client.get(self.url, {"state": self.state, "code": self.code})
 
         # Assert that the login fails with a specific error message
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertIn("User is deactivated", str(response.content))
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_deactivated_user_with_pending_invitation_can_login(self):
+        """
+        When DEACTIVATE_USER_IF_NO_ROLES is enabled and a user was auto-deactivated
+        due to losing all roles, they should still be able to log in via OIDC
+        if they have a pending invitation — otherwise they can never regain access.
+        """
+        user_info = {
+            "sub": "deactivated_invited_user",
+            "given_name": "Invited",
+            "family_name": "User",
+            "email": "invited@example.com",
+        }
+        user = structure_factories.UserFactory(
+            username=user_info["sub"],
+            email=user_info["email"],
+            is_active=False,
+            deactivation_reason="No active roles and no course accounts",
+        )
+        # Create a pending invitation for this user
+        user_factories.ProjectInvitationFactory(
+            email=user_info["email"],
+            state=InvitationState.PENDING,
+        )
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        # User should be allowed to log in and be reactivated
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        user.refresh_from_db()
+        self.assertTrue(user.is_active)
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_deactivated_user_with_matching_group_invitation_can_login(self):
+        """
+        When DEACTIVATE_USER_IF_NO_ROLES is enabled and a user was auto-deactivated,
+        they should still be able to log in if their email matches an active
+        group invitation pattern.
+        """
+        user_info = {
+            "sub": "deactivated_group_user",
+            "given_name": "Group",
+            "family_name": "User",
+            "email": "groupuser@example.com",
+        }
+        user = structure_factories.UserFactory(
+            username=user_info["sub"],
+            email=user_info["email"],
+            is_active=False,
+            deactivation_reason="No active roles and no course accounts",
+        )
+        # Create an active group invitation matching this email
+        user_factories.CustomerGroupInvitationFactory(
+            user_email_patterns=[".*@example.com"],
+            is_active=True,
+        )
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        # User should be allowed to log in and be reactivated
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        user.refresh_from_db()
+        self.assertTrue(user.is_active)
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_deactivated_user_without_invitation_still_blocked(self):
+        """
+        When DEACTIVATE_USER_IF_NO_ROLES is enabled but the deactivated user has
+        no pending invitation or matching group invitation, login should still fail.
+        """
+        user_info = {
+            "sub": "deactivated_no_invite",
+            "given_name": "No",
+            "family_name": "Invite",
+            "email": "noinvite@example.com",
+        }
+        structure_factories.UserFactory(
+            username=user_info["sub"],
+            email=user_info["email"],
+            is_active=False,
+            deactivation_reason="No active roles and no course accounts",
+        )
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
         self.assertIn("User is deactivated", str(response.content))
 
@@ -392,6 +521,9 @@ class OAuthViewCompleteTest(test.APITransactionTestCase):
         self.assertEqual(existing_user.civil_number, civil_number)
 
     @override_config(OIDC_BLOCK_CREATION_OF_UNINVITED_USERS=True)
+    @override_config(
+        OIDC_BLOCK_CREATION_OF_UNINVITED_USERS_RESPONSE_MESSAGE="It is blocked"
+    )
     def test_new_user_creation_is_blocked_if_uninvited_and_toggle_is_on(self):
         # Arrange: A new user with no invitation
         user_info = {
@@ -408,10 +540,7 @@ class OAuthViewCompleteTest(test.APITransactionTestCase):
         response = self.client.get(self.url, {"state": self.state, "code": self.code})
 
         # Assert
-        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
-        self.assertIn(
-            "Account creation is blocked for uninvited users.", str(response.content)
-        )
+        assert_login_failed_redirect(self, response, "It is blocked")
         self.assertEqual(User.objects.count(), 0)
 
     @override_config(OIDC_BLOCK_CREATION_OF_UNINVITED_USERS=True)
@@ -461,9 +590,8 @@ class OAuthViewCompleteTest(test.APITransactionTestCase):
         response = self.client.get(self.url, {"state": self.state, "code": self.code})
 
         # Assert
-        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
-        self.assertIn(
-            "Account creation is blocked for uninvited users.", str(response.content)
+        assert_login_failed_redirect(
+            self, response, "Account creation is blocked for uninvited users."
         )
         self.assertFalse(User.objects.filter(username=user_info["sub"]).exists())
 
@@ -484,12 +612,85 @@ class OAuthViewCompleteTest(test.APITransactionTestCase):
         response = self.client.get(self.url, {"state": self.state, "code": self.code})
 
         # Assert
-        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
-        self.assertIn(
-            "User email is not provided. Account creation is blocked.",
-            str(response.content),
+        assert_login_failed_redirect(
+            self, response, "User email is not provided. Account creation is blocked."
         )
         self.assertEqual(User.objects.count(), 0)
+
+    @override_config(OIDC_BLOCK_CREATION_OF_UNINVITED_USERS=True)
+    def test_new_user_creation_is_allowed_if_matching_group_invitation_exists(self):
+        # Arrange: A new user whose email matches an active group invitation pattern
+        user_info = {
+            "sub": "group_invited_user",
+            "given_name": "Group",
+            "family_name": "Invited",
+            "email": "groupuser@example.com",
+        }
+        user_factories.CustomerGroupInvitationFactory(
+            user_email_patterns=[".*@example.com"],
+            is_active=True,
+        )
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        # Act
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        # Assert: user should be created
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertTrue(User.objects.filter(username=user_info["sub"]).exists())
+
+    @override_config(OIDC_BLOCK_CREATION_OF_UNINVITED_USERS=True)
+    def test_new_user_creation_is_blocked_if_group_invitation_is_inactive(self):
+        # Arrange: A new user whose email matches an inactive group invitation pattern
+        user_info = {
+            "sub": "inactive_group_user",
+            "given_name": "Inactive",
+            "family_name": "Group",
+            "email": "inactivegroup@example.com",
+        }
+        user_factories.CustomerGroupInvitationFactory(
+            user_email_patterns=[".*@example.com"],
+            is_active=False,
+        )
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        # Act
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        # Assert: user should NOT be created
+        assert_login_failed_redirect(
+            self, response, "Account creation is blocked for uninvited users."
+        )
+        self.assertFalse(User.objects.filter(username=user_info["sub"]).exists())
+
+    @override_config(OIDC_BLOCK_CREATION_OF_UNINVITED_USERS=True)
+    def test_new_user_creation_is_blocked_if_email_does_not_match_group_invitation_pattern(
+        self,
+    ):
+        # Arrange: A new user whose email does NOT match the group invitation pattern
+        user_info = {
+            "sub": "nonmatching_user",
+            "given_name": "NonMatching",
+            "family_name": "User",
+            "email": "user@otherdomain.com",
+        }
+        user_factories.CustomerGroupInvitationFactory(
+            user_email_patterns=[".*@example.com"],
+            is_active=True,
+        )
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        # Act
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        # Assert: user should NOT be created
+        assert_login_failed_redirect(
+            self, response, "Account creation is blocked for uninvited users."
+        )
+        self.assertFalse(User.objects.filter(username=user_info["sub"]).exists())
 
     @override_config(WALDUR_AUTH_SOCIAL_ROLE_CLAIM="roles")
     def test_user_assigned_roles_from_claims(self):
@@ -1112,7 +1313,7 @@ class MultiHomeportRedirectTest(test.APITransactionTestCase):
         )
 
 
-class IdentityProviderValidationTest(test.APITransactionTestCase):
+class IdentityProviderValidationTest(test.APITestCase):
     """Tests for IdentityProvider serializer validation rules"""
 
     def setUp(self):
@@ -1248,7 +1449,7 @@ class IdentityProviderValidationTest(test.APITransactionTestCase):
         self.assertEqual(result[1], "https://test.example.com:8443")
 
 
-class SchacPersonalUniqueIDParsingTest(test.APITransactionTestCase):
+class SchacPersonalUniqueIDParsingTest(test.APITestCase):
     """Test parsing of schacPersonalUniqueID to civil_number format."""
 
     def test_parse_estonian_schac_id(self):
@@ -1493,3 +1694,409 @@ class EnabledUserProfileAttributesSyncTest(test.APITransactionTestCase):
         self.assertEqual(existing_user.phone_number, "+1111111111")
         # organization should be updated
         self.assertEqual(existing_user.organization, "New University")
+
+    @override_config(
+        ENABLED_USER_PROFILE_ATTRIBUTES=[
+            "country_of_residence",
+            "nationality",
+            "organization_country",
+        ]
+    )
+    def test_single_item_list_claims_are_unwrapped_for_scalar_fields(self):
+        user_info = {
+            "sub": "test_list_scalar",
+            "given_name": "List",
+            "family_name": "Scalar",
+            "email": "list_scalar@example.com",
+            "schacCountryOfResidence": ["EE"],
+            "schacCountryOfCitizenship": ["EE"],
+            "org_country": ["EE"],
+        }
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        user = User.objects.get(username=user_info["sub"])
+        self.assertEqual(user.country_of_residence, "EE")
+        self.assertEqual(user.nationality, "EE")
+        self.assertEqual(user.organization_country, "EE")
+
+    @override_config(ENABLED_USER_PROFILE_ATTRIBUTES=["country_of_residence"])
+    def test_multi_item_list_claims_are_skipped_for_scalar_fields(self):
+        existing_user = structure_factories.UserFactory(
+            username="test_multi_scalar",
+            country_of_residence="LV",
+        )
+        user_info = {
+            "sub": existing_user.username,
+            "given_name": existing_user.first_name,
+            "family_name": existing_user.last_name,
+            "email": existing_user.email,
+            "schacCountryOfResidence": ["EE", "FI"],
+        }
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        existing_user.refresh_from_db()
+        self.assertEqual(existing_user.country_of_residence, "LV")
+
+    @override_config(ENABLED_USER_PROFILE_ATTRIBUTES=["nationality"])
+    def test_overlong_scalar_claims_are_skipped(self):
+        user_info = {
+            "sub": "test_overlong_scalar",
+            "given_name": "Overlong",
+            "family_name": "User",
+            "email": "overlong@example.com",
+            # Alpha-3 value should not be written to alpha-2 field.
+            "schacCountryOfCitizenship": ["EST"],
+        }
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        user = User.objects.get(username=user_info["sub"])
+        self.assertEqual(user.nationality, "")
+
+    @override_config(ENABLED_USER_PROFILE_ATTRIBUTES=["gender"])
+    def test_uppercase_gender_claim_is_stored_as_lowercase(self):
+        """IdPs may return gender as 'MALE'/'FEMALE' — must be lowercased before save."""
+        user_info = {
+            "sub": "test_gender_case",
+            "given_name": "Test",
+            "family_name": "User",
+            "email": "gender_case@example.com",
+            "gender": "MALE",
+        }
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        user = User.objects.get(username=user_info["sub"])
+        self.assertEqual(user.gender, "male")
+
+    @override_config(ENABLED_USER_PROFILE_ATTRIBUTES=["gender"])
+    def test_invalid_gender_claim_is_skipped(self):
+        """Unrecognised gender values must not be written to the user."""
+        user_info = {
+            "sub": "test_gender_invalid",
+            "given_name": "Test",
+            "family_name": "User",
+            "email": "gender_invalid@example.com",
+            "gender": "enigmatic",
+        }
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        user = User.objects.get(username=user_info["sub"])
+        self.assertIsNone(user.gender)
+
+
+class OIDCEmailMatchmakingTest(test.APITransactionTestCase):
+    """Tests for OIDC email-based failover user matching."""
+
+    def setUp(self):
+        super().setUp()
+        self.provider = models.IdentityProvider.objects.create(
+            provider=ProviderChoices.KEYCLOAK,
+            client_id="test_client_id",
+            client_secret="test_client_secret",
+            discovery_url="http://keycloak.test/.well-known/openid-configuration",
+            userinfo_url="http://keycloak.test/userinfo",
+            token_url="http://keycloak.test/token",
+            auth_url="http://keycloak.test/auth",
+            **PROVIDER_DEFAULTS[ProviderChoices.KEYCLOAK],
+        )
+        self.url = reverse(f"auth_{self.provider.provider}_complete")
+        self.state = "test_state"
+        self.code = "test_code"
+
+        # Setup session
+        session = self.client.session
+        session[OIDC_STATE_KEY] = self.state
+        session.save()
+
+        # Mock external requests
+        responses.start()
+        self.addCleanup(responses.stop)
+
+    def _mock_token_request(self):
+        return responses.add(
+            method="POST",
+            url=self.provider.token_url,
+            json={
+                "access_token": "test_access_token",
+                "refresh_token": "test_refresh_token",
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    def _mock_userinfo_request(self, user_info):
+        responses.add(
+            method="GET",
+            url=self.provider.userinfo_url,
+            json=user_info,
+            status=status.HTTP_200_OK,
+        )
+
+    @override_config(OIDC_MATCHMAKING_BY_EMAIL=True)
+    def test_email_matchmaking_matches_user_by_email(self):
+        """Pre-provisioned user is matched by email and username is updated."""
+        existing_user = structure_factories.UserFactory(
+            username="old_username",
+            email="user@example.com",
+        )
+        user_info = {
+            "sub": "new_oidc_sub",
+            "given_name": "Test",
+            "family_name": "User",
+            "email": "user@example.com",
+        }
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        existing_user.refresh_from_db()
+        self.assertEqual(existing_user.username, "new_oidc_sub")
+        self.assertEqual(User.objects.count(), 1)
+
+    def test_email_matchmaking_disabled_by_default(self):
+        """Setting off -> new user created, no email match."""
+        structure_factories.UserFactory(
+            username="old_username",
+            email="user@example.com",
+        )
+        user_info = {
+            "sub": "new_oidc_sub",
+            "given_name": "Test",
+            "family_name": "User",
+            "email": "user@example.com",
+        }
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertEqual(User.objects.count(), 2)
+        self.assertTrue(User.objects.filter(username="new_oidc_sub").exists())
+
+    @override_config(OIDC_MATCHMAKING_BY_EMAIL=True)
+    def test_email_matchmaking_duplicate_emails_raises_error(self):
+        """Multiple users with same email -> OAuthException."""
+        structure_factories.UserFactory(
+            username="user1",
+            email="duplicate@example.com",
+        )
+        structure_factories.UserFactory(
+            username="user2",
+            email="duplicate@example.com",
+        )
+        user_info = {
+            "sub": "new_oidc_sub",
+            "given_name": "Test",
+            "family_name": "User",
+            "email": "duplicate@example.com",
+        }
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertIn("Multiple users found with the same email", str(response.content))
+
+    @override_config(OIDC_MATCHMAKING_BY_EMAIL=True)
+    def test_email_matchmaking_deactivated_user_raises_error(self):
+        """Deactivated user matched by email -> OAuthException."""
+        structure_factories.UserFactory(
+            username="old_username",
+            email="user@example.com",
+            is_active=False,
+        )
+        user_info = {
+            "sub": "new_oidc_sub",
+            "given_name": "Test",
+            "family_name": "User",
+            "email": "user@example.com",
+        }
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertIn("User is deactivated", str(response.content))
+
+    @override_config(OIDC_MATCHMAKING_BY_EMAIL=True)
+    def test_email_matchmaking_no_email_in_payload_skips(self):
+        """No email claim -> falls through to creation."""
+        structure_factories.UserFactory(
+            username="old_username",
+            email="user@example.com",
+        )
+        user_info = {
+            "sub": "new_oidc_sub",
+            "given_name": "Test",
+            "family_name": "User",
+            # no email claim
+        }
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertEqual(User.objects.count(), 2)
+
+    @override_config(OIDC_MATCHMAKING_BY_EMAIL=True)
+    def test_email_matchmaking_skipped_when_user_field_is_email(self):
+        """user_field='email' -> skip failover, use direct lookup."""
+        self.provider.user_field = "email"
+        self.provider.user_claim = "email"
+        self.provider.save()
+
+        structure_factories.UserFactory(
+            username="old_username",
+            email="user@example.com",
+        )
+        user_info = {
+            "sub": "new_oidc_sub",
+            "given_name": "Test",
+            "family_name": "User",
+            "email": "user@example.com",
+        }
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        # Should have matched via primary lookup (email field)
+        self.assertEqual(User.objects.count(), 1)
+
+    @override_config(OIDC_MATCHMAKING_BY_EMAIL=True)
+    def test_email_matchmaking_case_insensitive(self):
+        """Email case mismatch still matches."""
+        existing_user = structure_factories.UserFactory(
+            username="old_username",
+            email="User@Example.COM",
+        )
+        user_info = {
+            "sub": "new_oidc_sub",
+            "given_name": "Test",
+            "family_name": "User",
+            "email": "user@example.com",
+        }
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        existing_user.refresh_from_db()
+        self.assertEqual(existing_user.username, "new_oidc_sub")
+        self.assertEqual(User.objects.count(), 1)
+
+    @override_config(OIDC_MATCHMAKING_BY_EMAIL=True)
+    def test_email_matchmaking_no_match_creates_user(self):
+        """Email doesn't match any user -> normal creation."""
+        user_info = {
+            "sub": "new_oidc_sub",
+            "given_name": "Test",
+            "family_name": "User",
+            "email": "nomatch@example.com",
+        }
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertTrue(User.objects.filter(username="new_oidc_sub").exists())
+
+    @override_config(
+        OIDC_MATCHMAKING_BY_EMAIL=True,
+        OIDC_BLOCK_CREATION_OF_UNINVITED_USERS=True,
+    )
+    def test_email_matchmaking_with_uninvited_blocking(self):
+        """Both settings on, email matches -> user matched (not blocked)."""
+        existing_user = structure_factories.UserFactory(
+            username="old_username",
+            email="user@example.com",
+        )
+        user_info = {
+            "sub": "new_oidc_sub",
+            "given_name": "Test",
+            "family_name": "User",
+            "email": "user@example.com",
+        }
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        existing_user.refresh_from_db()
+        self.assertEqual(existing_user.username, "new_oidc_sub")
+        self.assertEqual(User.objects.count(), 1)
+
+    @override_config(
+        OIDC_MATCHMAKING_BY_EMAIL=True,
+        OIDC_BLOCK_CREATION_OF_UNINVITED_USERS=True,
+    )
+    def test_email_matchmaking_no_match_still_blocks_uninvited(self):
+        """Both settings on, no match -> creation blocked."""
+        user_info = {
+            "sub": "new_oidc_sub",
+            "given_name": "Test",
+            "family_name": "User",
+            "email": "uninvited@example.com",
+        }
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        assert_login_failed_redirect(
+            self, response, "Account creation is blocked for uninvited users."
+        )
+
+    @override_config(OIDC_MATCHMAKING_BY_EMAIL=True)
+    def test_email_matchmaking_updates_attributes(self):
+        """Matched user gets attribute updates from OIDC payload."""
+        existing_user = structure_factories.UserFactory(
+            username="old_username",
+            email="user@example.com",
+            first_name="OldFirst",
+            last_name="OldLast",
+        )
+        user_info = {
+            "sub": "new_oidc_sub",
+            "given_name": "NewFirst",
+            "family_name": "NewLast",
+            "email": "user@example.com",
+        }
+        self._mock_token_request()
+        self._mock_userinfo_request(user_info)
+
+        response = self.client.get(self.url, {"state": self.state, "code": self.code})
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        existing_user.refresh_from_db()
+        self.assertEqual(existing_user.username, "new_oidc_sub")
+        self.assertEqual(existing_user.first_name, "NewFirst")
+        self.assertEqual(existing_user.last_name, "NewLast")

@@ -6,6 +6,7 @@ from unittest import mock
 from ddt import data, ddt
 from django.contrib.contenttypes.models import ContentType
 from django.core import mail
+from django.core.files.base import ContentFile
 from django.template import Context, Template
 from django.test import override_settings
 from freezegun import freeze_time
@@ -24,6 +25,7 @@ from waldur_mastermind.marketplace.enums import (
     BillingTypes,
     OfferingStates,
     OrderStates,
+    OrderTypes,
     ResourceStates,
 )
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
@@ -58,6 +60,26 @@ class RequestCreateTest(BaseTest):
         self.assertTrue(isinstance(issue.resource, marketplace_models.Order))
         self.assertTrue(
             isinstance(issue.resource.resource, marketplace_models.Resource)
+        )
+
+    def test_restore_order_ticket_is_marked_as_restoration(self):
+        fixture = fixtures.ProjectFixture()
+        offering = marketplace_factories.OfferingFactory(type=SUPPORT_OFFERING)
+
+        order = marketplace_factories.OrderFactory(
+            offering=offering,
+            type=OrderTypes.RESTORE,
+            attributes={"name": "item_name", "description": "Description"},
+            state=OrderStates.EXECUTING,
+        )
+
+        marketplace_utils.process_order(order, fixture.staff)
+        issue = get_order_issue(order)
+        self.assertIn("Request to restore resource", issue.summary)
+        self.assertIn(order.resource.name, issue.summary)
+        self.assertIn(
+            "This is a restoration request for a previously terminated resource.",
+            issue.description,
         )
 
     def test_request_payload_is_validated(self):
@@ -189,6 +211,37 @@ class RequestCreateTest(BaseTest):
         self.mock_get_active_backend().create_confirmation_comment.assert_called_once_with(
             mock.ANY, "template_confirmation_comment"
         )
+
+    def test_purchase_order_is_attached_to_issue(self):
+        fixture = fixtures.ProjectFixture()
+        offering = marketplace_factories.OfferingFactory(type=SUPPORT_OFFERING)
+
+        order = marketplace_factories.OrderFactory(
+            offering=offering,
+            attributes={"name": "item_name", "description": "Description"},
+            state=OrderStates.EXECUTING,
+            attachment=ContentFile(b"%PDF-1.4 test content", name="purchase_order.pdf"),
+        )
+
+        marketplace_utils.process_order(order, fixture.staff)
+        issue = get_order_issue(order)
+        self.assertTrue(support_models.Attachment.objects.filter(issue=issue).exists())
+        self.mock_get_active_backend().create_attachment.assert_called_once()
+
+    def test_purchase_order_is_not_attached_when_order_has_no_attachment(self):
+        fixture = fixtures.ProjectFixture()
+        offering = marketplace_factories.OfferingFactory(type=SUPPORT_OFFERING)
+
+        order = marketplace_factories.OrderFactory(
+            offering=offering,
+            attributes={"name": "item_name", "description": "Description"},
+            state=OrderStates.EXECUTING,
+        )
+
+        marketplace_utils.process_order(order, fixture.staff)
+        issue = get_order_issue(order)
+        self.assertFalse(support_models.Attachment.objects.filter(issue=issue).exists())
+        self.mock_get_active_backend().create_attachment.assert_not_called()
 
     def test_set_creation_ticket_id_as_backend_id_of_resource(self):
         def mock_create_issue(issue):
@@ -650,7 +703,7 @@ class NotificationTest(BaseTest):
         self.issue.save()
 
 
-class ProcessingTest(test.APITransactionTestCase):
+class ProcessingTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.url = marketplace_factories.OrderFactory.get_list_url()

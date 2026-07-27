@@ -32,16 +32,52 @@ class TestCoreUserAttributes(TestCase):
             "personal_title",
             "birth_date",
             "place_of_birth",
+            "address",
             "country_of_residence",
             "nationality",
             "nationalities",
             "organization_country",
             "organization_type",
+            "organization_registry_code",
+            "organization_vat_code",
+            "organization_address",
             "eduperson_assurance",
             "civil_number",
             "identity_source",
+            "active_isds",
+            "uid_number",
+            "primary_gid",
         }
         self.assertEqual(ALL_PROFILE_ATTRIBUTES, expected)
+
+    def test_all_profile_attributes_are_admin_selectable(self):
+        # Every configurable profile attribute must be selectable via the
+        # Constance USER_ATTRIBUTE_CHOICES, otherwise an admin cannot enable
+        # it (e.g. for ENABLED_USER_PROFILE_ATTRIBUTES), which silently
+        # disables IdP sync / UI display for that attribute.
+        from waldur_core.server.constance_settings import USER_ATTRIBUTE_CHOICES
+
+        selectable = {key for key, _label in USER_ATTRIBUTE_CHOICES}
+        missing = ALL_PROFILE_ATTRIBUTES - selectable
+        self.assertEqual(
+            missing,
+            set(),
+            f"Profile attributes missing from USER_ATTRIBUTE_CHOICES: {missing}",
+        )
+
+    def test_writable_user_fields_are_admin_selectable(self):
+        # IdP-syncable fields must also be selectable so their sync can be
+        # enabled through configuration.
+        from waldur_auth_social.const import WRITABLE_USER_FIELDS
+        from waldur_core.server.constance_settings import USER_ATTRIBUTE_CHOICES
+
+        selectable = {key for key, _label in USER_ATTRIBUTE_CHOICES}
+        missing = set(WRITABLE_USER_FIELDS) - selectable
+        self.assertEqual(
+            missing,
+            set(),
+            f"Writable user fields missing from USER_ATTRIBUTE_CHOICES: {missing}",
+        )
 
 
 class TestGetEnabledProfileAttributes(TestCase):

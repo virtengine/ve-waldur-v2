@@ -4,12 +4,14 @@ from functools import reduce
 from rest_framework import exceptions, permissions
 
 from waldur_core.core.permissions import SAFE_METHODS, IsAdminOrReadOnly
+from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import (
     CustomerRole,
     OfferingRole,
     ProjectRole,
     ServiceProviderRole,
 )
+from waldur_core.permissions.utils import check_pat_support_scope, has_permission
 from waldur_core.structure import models
 
 logger = logging.getLogger(__name__)
@@ -21,7 +23,9 @@ class IsStaffOrSupportUser(permissions.BasePermission):
     """
 
     def has_permission(self, request, view):
-        return request.user.is_staff or request.user.is_support
+        return (
+            request.user.is_staff or request.user.is_support
+        ) and check_pat_support_scope(request)
 
 
 # TODO: this is a temporary permission filter.
@@ -150,3 +154,47 @@ def _get_project(obj, **kwargs) -> models.Project:
 
 def _get_customer(obj, **kwargs) -> models.Customer:
     return _get_parent_by_permission_path(obj, "customer_path", **kwargs)
+
+
+def can_move_project(request, view, obj=None):
+    """
+    Check if user can move a project.
+    Staff users can always move projects.
+    Regular users can move projects if they have CREATE_PROJECT permission
+    in BOTH the source and target organizations.
+    """
+    if request.user.is_staff:
+        return
+
+    if not obj:
+        # We can't use view.get_object() here because it applies permission filtering.
+        # Instead, get the object directly.
+        try:
+            uuid = view.kwargs.get("uuid")
+            if not uuid:
+                raise exceptions.PermissionDenied()
+            obj = models.Project.objects.get(uuid=uuid)
+        except models.Project.DoesNotExist:
+            raise exceptions.PermissionDenied()
+
+    source_customer = obj.customer
+
+    serializer = view.get_serializer(data=request.data)
+    if not serializer.is_valid():
+        raise exceptions.PermissionDenied()
+
+    target_customer = serializer.validated_data.get("customer")
+
+    if not target_customer:
+        raise exceptions.PermissionDenied()
+
+    # Check if user has CREATE_PROJECT permission in both organizations
+    has_source_permission = has_permission(
+        request, PermissionEnum.CREATE_PROJECT, source_customer
+    )
+    has_target_permission = has_permission(
+        request, PermissionEnum.CREATE_PROJECT, target_customer
+    )
+
+    if not (has_source_permission and has_target_permission):
+        raise exceptions.PermissionDenied()

@@ -12,7 +12,7 @@ from waldur_openstack.serializers import (
 from . import factories, fixtures
 
 
-class BasePortTest(test.APITransactionTestCase):
+class BasePortTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = fixtures.OpenStackFixture()
         self.client.force_authenticate(user=self.fixture.owner)
@@ -109,6 +109,61 @@ class PortCreateTest(BasePortTest):
                     "description": port.description,
                     "network_id": port.network.backend_id,
                     "tenant_id": port.tenant.backend_id,
+                    "port_security_enabled": True,
+                    "fixed_ips": self.fixed_ips,
+                }
+            }
+        )
+
+    @mock.patch("waldur_openstack.executors.PortCreateExecutor.execute")
+    def test_port_create_with_port_security_disabled(self, create_port_executor_mock):
+        data = self.valid_data.copy()
+        data["port_security_enabled"] = False
+        response = self.client.post(self.url, data)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        port = Port.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(port.port_security_enabled, False)
+
+    @mock.patch("neutronclient.v2_0.client.Client")
+    @mock.patch("waldur_openstack.backend.get_keystone_session")
+    def test_port_creation_with_port_security_disabled_passes_to_backend(
+        self, mock_get_keystone_session, mock_neutron_client
+    ):
+        mock_session = mock.MagicMock()
+        mock_get_keystone_session.return_value = mock_session
+
+        mock_neutron_instance = mock_neutron_client.return_value
+        mock_neutron_instance.create_port.return_value = {
+            "port": {
+                "id": "backend_id_from_mock",
+                "status": "ACTIVE",
+                "mac_address": "fa:16:3e:ab:cd:ef",
+                "fixed_ips": [
+                    {"ip_address": "192.168.42.100", "subnet_id": "subnet-backend-id"}
+                ],
+                "admin_state_up": True,
+                "port_security_enabled": False,
+                "device_owner": "",
+            }
+        }
+
+        data = self.valid_data.copy()
+        data["port_security_enabled"] = False
+        response = self.client.post(self.url, data)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        port = Port.objects.get(uuid=response.data["uuid"])
+        port.get_backend().create_port(port)
+
+        mock_neutron_instance.create_port.assert_called_once_with(
+            {
+                "port": {
+                    "name": port.name,
+                    "description": port.description,
+                    "network_id": port.network.backend_id,
+                    "tenant_id": port.tenant.backend_id,
+                    "port_security_enabled": False,
                     "fixed_ips": self.fixed_ips,
                 }
             }
@@ -170,7 +225,7 @@ class PortDeleteTest(BasePortTest):
         delete_port_executor_mock.assert_called_once()
 
 
-class PortSerializerTest(test.APITransactionTestCase):
+class PortSerializerTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.subnet = self.fixture.subnet
@@ -209,7 +264,7 @@ class PortSerializerTest(test.APITransactionTestCase):
         self.assertFalse(serializer.is_valid())
 
 
-class PortNetworkValidationTest(test.APITransactionTestCase):
+class PortNetworkValidationTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         # Create two different tenants to test cross-tenant validation
@@ -262,7 +317,7 @@ class PortNetworkValidationTest(test.APITransactionTestCase):
         self.assertIn("subnet", serializer.errors)
 
 
-class PortExecutorTest(test.APITransactionTestCase):
+class PortExecutorTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.port = self.fixture.port
@@ -358,7 +413,7 @@ class PortIPUpdateValidationTest(BasePortTest):
         self.assertIn("subnet", serializer.errors)
 
 
-class PortSharedNetworkTest(test.APITransactionTestCase):
+class PortSharedNetworkTest(test.APITestCase):
     """Tests for shared network port creation functionality."""
 
     def setUp(self):
@@ -464,7 +519,7 @@ class PortSharedNetworkTest(test.APITransactionTestCase):
         self.assertTrue(serializer.is_valid(), serializer.errors)
 
 
-class PortBackendSharedNetworkTest(test.APITransactionTestCase):
+class PortBackendSharedNetworkTest(test.APITestCase):
     """Tests for backend methods handling shared networks."""
 
     def setUp(self):
@@ -560,8 +615,40 @@ class PortBackendSharedNetworkTest(test.APITransactionTestCase):
             self.port_for_instance_port.backend_id, "instance-port-backend-id"
         )
 
+    @mock.patch("waldur_openstack.backend.get_neutron_client")
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.admin_session")
+    def test_create_instance_port_with_port_security_disabled_skips_security_groups(
+        self, mock_admin_session, mock_get_neutron_client
+    ):
+        """Test that create_instance_port skips security groups when port_security_enabled is False."""
+        self.port_for_instance_port.port_security_enabled = False
+        self.port_for_instance_port.save()
 
-class InstancePortCreationTest(test.APITransactionTestCase):
+        mock_neutron = mock_get_neutron_client.return_value
+        mock_neutron.create_port.return_value = {
+            "port": {
+                "id": "instance-port-backend-id",
+                "mac_address": "fa:16:3e:12:34:56",
+                "fixed_ips": [
+                    {"subnet_id": "subnet-id", "ip_address": "192.168.1.101"}
+                ],
+                "admin_state_up": True,
+                "port_security_enabled": False,
+                "device_owner": "",
+                "status": "ACTIVE",
+            }
+        }
+
+        backend = self.port_for_instance_port.get_backend()
+        backend.create_instance_port(self.port_for_instance_port, ["security-group-id"])
+
+        # Verify port payload does NOT include security_groups
+        call_args = mock_neutron.create_port.call_args[0][0]["port"]
+        self.assertNotIn("security_groups", call_args)
+        self.assertEqual(call_args["port_security_enabled"], False)
+
+
+class InstancePortCreationTest(test.APITestCase):
     """Tests for port creation during instance provisioning in shared networks."""
 
     def setUp(self):

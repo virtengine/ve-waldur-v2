@@ -11,6 +11,7 @@ classDiagram
     class Attribute {
         +AutoCreatedField created
         +AutoLastModifiedField modified
+        +string uuid
         +string key [PK]
         +string title
         +Section section [FK]
@@ -20,6 +21,7 @@ classDiagram
     }
     class AttributeOption {
         +int id [PK]
+        +string uuid
         +Attribute attribute [FK]
         +string key
         +string title
@@ -50,6 +52,7 @@ classDiagram
         +string integration_guide
         +Category category [FK]
         +Checklist compliance_checklist [FK]
+        +OfferingGroup offering_group [FK]
         +Customer customer [FK]
         +Project project [FK]
         +Offering parent [FK]
@@ -58,11 +61,15 @@ classDiagram
         +JSONField resource_options
         +JSONField plugin_options
         +JSONField secret_options
+        +JSONField backend_id_rules
         +string privacy_policy_link
+        +string helpdesk_url
+        +string documentation_url
         +string country
         +string type
         +FSMIntegerField state
         +string paused_reason
+        +OfferingProfile profile [FK]
         +bool shared
         +bool billable
         +bool support_per_user_consumption_limitation
@@ -96,6 +103,10 @@ classDiagram
         +OfferingComponent overage_component [FK]
         +int min_prepaid_duration
         +int max_prepaid_duration
+        +int prepaid_duration_step
+        +int min_renewal_duration
+        +int max_renewal_duration
+        +int renewal_duration_step
     }
     Attribute "*" -- "1" Section : section
     AttributeOption "*" -- "1" Attribute : attribute

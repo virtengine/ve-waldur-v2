@@ -1,13 +1,16 @@
+import datetime
 import pickle  # noqa: S403
 from unittest import TestCase, mock
 
 from cinderclient import exceptions as cinder_exceptions
-from ddt import ddt
+from ddt import data, ddt
+from django.urls import reverse
+from django.utils import timezone
 from glanceclient import exc as glance_exceptions
 from keystoneclient import exceptions as keystone_exceptions
 from neutronclient.client import exceptions as neutron_exceptions
 from novaclient import exceptions as nova_exceptions
-from rest_framework import test
+from rest_framework import status, test
 
 from waldur_core.core.enums import CoreStates
 from waldur_core.logging.enums import EventType
@@ -41,7 +44,7 @@ class TestOpenStackBackendError(TestCase):
                         self.fail("Reraised exception is not serializable: %s" % str(e))
 
 
-class BaseBackendTestCase(test.APITransactionTestCase):
+class BaseBackendTestCase(test.APITestCase):
     def setUp(self):
         self.mocked_keystone = mock.patch("keystoneclient.v3.client.Client").start()()
         self.mocked_nova = mock.patch("novaclient.v2.client.Client").start()()
@@ -57,6 +60,48 @@ class BaseBackendTestCase(test.APITransactionTestCase):
     def tearDown(self):
         super().tearDown()
         mock.patch.stopall()
+
+
+class TenantAuditLogNetworkEventsTest(BaseBackendTestCase):
+    def setUp(self):
+        super().setUp()
+        self.client.force_authenticate(user=self.fixture.owner)
+        self.events_url = reverse("event-list")
+
+    def test_network_create_and_delete_events_appear_in_tenant_audit_log(self):
+        # Arrange: create network to be sent to backend
+        network = factories.NetworkFactory(
+            tenant=self.tenant,
+            service_settings=self.fixture.settings,
+            project=self.fixture.project,
+            backend_id="",
+        )
+        network_uuid = network.uuid.hex
+        self.mocked_neutron.create_network.return_value = {
+            "network": {
+                "id": "backend-network-id",
+                "status": "ACTIVE",
+            }
+        }
+
+        # Act: create network and delete it in backend
+        self.backend.create_network(network)
+        self.mocked_neutron.delete_network.return_value = None
+        self.backend.delete_network(network)
+
+        # Assert: tenant audit log includes network events
+        response = self.client.get(
+            self.events_url,
+            {"scope": factories.TenantFactory.get_url(self.tenant)},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        event_types = {
+            event["event_type"]
+            for event in response.data
+            if event["context"]["network_uuid"] == network_uuid
+        }
+        self.assertIn(EventType.OPENSTACK_NETWORK_CREATED, event_types)
+        self.assertIn(EventType.OPENSTACK_NETWORK_DELETED, event_types)
 
 
 @ddt
@@ -668,6 +713,90 @@ class PullImagesTest(BaseBackendTestCase):
         self.backend.pull_tenant_images(self.fixture.tenant)
         self.assertEqual(models.Image.objects.count(), 0)
 
+    def test_pull_handles_image_hidden_by_latest_per_name_manager(self):
+        # Reproduces the IntegrityError on
+        # openstack_image_settings_id_..._uniq when an image with the same
+        # (settings, backend_id) exists in the database but is filtered out
+        # by ImageManager.get_queryset() because another image with the same
+        # name has a newer backend_created_at. Image.objects.get() raises
+        # DoesNotExist, the subsequent INSERT hits the unique constraint, and
+        # the recovery get() also returns DoesNotExist — so IntegrityError
+        # propagates instead of being recovered.
+        older = timezone.now() - datetime.timedelta(days=10)
+        newer = timezone.now() - datetime.timedelta(days=1)
+
+        hidden = models.Image.all_objects.create(
+            backend_id="1",
+            name="CentOS 7",
+            min_ram=512,
+            min_disk=10240,
+            backend_created_at=older,
+            settings=self.fixture.settings,
+        )
+        models.Image.all_objects.create(
+            backend_id="2",
+            name="CentOS 7",
+            min_ram=2048,
+            min_disk=20480,
+            backend_created_at=newer,
+            settings=self.fixture.settings,
+        )
+
+        self.backend.pull_tenant_images(self.fixture.tenant)
+
+        hidden.refresh_from_db()
+        self.assertEqual(hidden.min_ram, 1024)
+
+    def test_pull_global_images_handles_image_hidden_by_manager(self):
+        # Same hidden-row scenario as above but for pull_global_images,
+        # which is the admin-session path (Tenant.pull_quotas etc.).
+        # Both rows must be present in the glance response so the cleanup
+        # step at the start of pull_global_images doesn't delete the winner
+        # and inadvertently un-hide the older row before update_or_create
+        # runs.
+        self.mocked_glance.images.list.return_value = [
+            {
+                "status": "active",
+                "id": "1",
+                "name": "CentOS 7",
+                "min_ram": 1024,
+                "min_disk": 10,
+                "visibility": "public",
+            },
+            {
+                "status": "active",
+                "id": "2",
+                "name": "CentOS 7",
+                "min_ram": 4096,
+                "min_disk": 20,
+                "visibility": "public",
+            },
+        ]
+        older = timezone.now() - datetime.timedelta(days=10)
+        newer = timezone.now() - datetime.timedelta(days=1)
+
+        hidden = models.Image.all_objects.create(
+            backend_id="1",
+            name="CentOS 7",
+            min_ram=512,
+            min_disk=10240,
+            backend_created_at=older,
+            settings=self.fixture.settings,
+        )
+        models.Image.all_objects.create(
+            backend_id="2",
+            name="CentOS 7",
+            min_ram=2048,
+            min_disk=20480,
+            backend_created_at=newer,
+            settings=self.fixture.settings,
+        )
+
+        self.backend.pull_global_images()
+
+        hidden.refresh_from_db()
+        self.assertEqual(hidden.min_ram, 1024)
+
 
 class PullPortsTest(BaseBackendTestCase):
     def setUp(self):
@@ -784,9 +913,9 @@ class PullServerGroupsTest(BaseBackendTestCase):
         return self.backend.pull_tenant_server_groups(self.fixture.tenant)
 
     def test_missing_server_groups_are_created(self):
-        mock_server_group = mock.Mock()
+        mock_server_group = mock.Mock(spec=["name", "policy", "id", "project_id"])
         mock_server_group.name = "mock_server_group"
-        mock_server_group.policies = ["affinity"]
+        mock_server_group.policy = "affinity"
         mock_server_group.id = self.tenant.backend_id
         mock_server_group.project_id = self.tenant.backend_id
 
@@ -809,6 +938,28 @@ class PullServerGroupsTest(BaseBackendTestCase):
                 name=mock_server_group.name,
             ).exists()
         )
+
+    @data(
+        models.ServerGroup.AFFINITY,
+        models.ServerGroup.ANTI_AFFINITY,
+        models.ServerGroup.SOFT_AFFINITY,
+        models.ServerGroup.SOFT_ANTI_AFFINITY,
+    )
+    def test_server_group_policy_is_imported_correctly(self, policy):
+        # Regression: Nova microversion 2.64+ returns `policy` (singular string)
+        # instead of `policies` (list). Reading `policies` raises AttributeError.
+        mock_server_group = mock.Mock(spec=["name", "policy", "id", "project_id"])
+        mock_server_group.name = f"sg-{policy}"
+        mock_server_group.policy = policy
+        mock_server_group.id = "backend-sg-id"
+        mock_server_group.project_id = self.tenant.backend_id
+
+        self.mocked_nova.server_groups.list.return_value = [mock_server_group]
+
+        self.call_backend()
+
+        server_group = models.ServerGroup.objects.get(backend_id="backend-sg-id")
+        self.assertEqual(server_group.policy, policy)
 
     def test_stale_server_groups_are_deleted(self):
         server_group = self.fixture.server_group

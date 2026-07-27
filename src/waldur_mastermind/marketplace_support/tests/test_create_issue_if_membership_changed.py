@@ -13,7 +13,7 @@ from waldur_mastermind.marketplace.tests import (
 from waldur_mastermind.support import models as support_models
 
 
-class TestMembershipChangeIssues(test.APITransactionTestCase):
+class TestMembershipChangeIssues(test.APITestCase):
     def setUp(self):
         super().setUp()
         self.fixture = marketplace_fixtures.MarketplaceFixture()
@@ -28,6 +28,7 @@ class TestMembershipChangeIssues(test.APITransactionTestCase):
 
         mock_patch = mock.patch("waldur_mastermind.support.backend.get_active_backend")
         self.mock_get_active_backend = mock_patch.start()
+        self.addCleanup(mock_patch.stop)
         self.mock_get_active_backend().get_issue_details.return_value = {}
 
     def test_issue_created_when_user_added_to_project(self):

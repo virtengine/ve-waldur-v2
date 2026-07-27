@@ -9,6 +9,7 @@ from django.utils import timezone
 
 from waldur_core.core.models import User
 from waldur_core.logging import backend, models, utils
+from waldur_core.logging.circuit_breaker import stomp_circuit_breaker
 from waldur_core.logging.event_logger import get_event_groups
 from waldur_core.logging.models import BaseHook, Event, Feed, UserDataAccessLog
 from waldur_core.permissions.enums import RoleEnum
@@ -128,42 +129,30 @@ def delete_stale_event_subscriptions():
     retry_jitter=True,  # Add randomness to prevent thundering herd
 )
 def publish_messages(self, messages: list[dict[str, str]]) -> dict:
-    """Publish messages to MQTT and STOMP message queues.
+    """Publish messages to STOMP message queue.
 
     Uses Celery's built-in retry mechanism with exponential backoff.
     Returns statistics about successful and failed message delivery.
     """
     results = {
-        "mqtt": {"sent": 0, "failed": 0},
         "stomp": {"sent": 0, "failed": 0},
         "retry_count": self.request.retries,
     }
 
-    # MQTT publishing (deprecated, kept for backward compatibility)
-    try:
-        utils.publish_mqtt_messages(messages)
-        results["mqtt"]["sent"] = len(messages)
-    except Exception as e:
-        logger.error("Error publishing MQTT messages: %s", e)
-        results["mqtt"]["failed"] = len(messages)
+    # STOMP publishing. The underlying call already logs failures (rate-limited
+    # to keep sustained outages from flooding the error stream) and updates the
+    # circuit breaker. Don't re-log the same condition here — Celery's
+    # task_retry / task_failed log will capture the retry path on its own.
+    successful, failed = utils.publish_stomp_messages(messages)
+    results["stomp"]["sent"] = successful
+    results["stomp"]["failed"] = failed
 
-    # STOMP publishing (primary protocol)
-    try:
-        successful, failed = utils.publish_stomp_messages(messages)
-        results["stomp"]["sent"] = successful
-        results["stomp"]["failed"] = failed
-
-        # If all STOMP messages failed and circuit breaker is not open,
-        # raise exception to trigger retry
-        if failed > 0 and successful == 0:
-            from waldur_core.logging.circuit_breaker import stomp_circuit_breaker
-
-            if not stomp_circuit_breaker.is_open():
-                raise ConnectionError(f"All {failed} STOMP messages failed to publish")
-    except Exception as e:
-        logger.error("Error publishing STOMP messages: %s", e)
-        results["stomp"]["failed"] = len(messages)
-        raise  # Re-raise to trigger Celery retry
+    # If all STOMP messages failed and the circuit breaker hasn't already
+    # tripped, raise so Celery retries this task. Once the breaker is OPEN we
+    # accept the loss for this batch — Celery retrying would just keep hitting
+    # the same dead backend.
+    if failed > 0 and successful == 0 and not stomp_circuit_breaker.is_open():
+        raise ConnectionError(f"All {failed} STOMP messages failed to publish")
 
     return results
 
@@ -176,6 +165,8 @@ def cleanup_orphan_subscription_queues() -> None:
     - The pre_delete signal failed to clean up a queue
     - DB records were deleted manually without triggering signals
     - Data corruption left orphaned queues in RabbitMQ
+
+    Handles both subscription_ and consumer_ prefixed queues.
     """
     rmq_backend = backend.RabbitMQManagementBackend()
     all_vhost_data = rmq_backend.list_all_subscription_queues()
@@ -185,14 +176,42 @@ def cleanup_orphan_subscription_queues() -> None:
         vhost = vhost_info["vhost"]
         for queue_info in vhost_info["queues"]:
             queue_name = queue_info["name"]
-            # Check if a matching DB record exists
+
+            # Handle consumer_ queues (unified EventConsumer path)
+            if queue_name.startswith("consumer_"):
+                consumer_uuid = utils.parse_consumer_queue_name(queue_name)
+                if consumer_uuid:
+                    has_consumer = models.EventConsumer.objects.filter(
+                        uuid=consumer_uuid,
+                        queue_created=True,
+                    ).exists()
+                    if has_consumer:
+                        continue
+                # Orphan consumer queue
+                logger.info(
+                    "Deleting orphan consumer queue %s in vhost %s",
+                    queue_name,
+                    vhost,
+                )
+                try:
+                    rmq_backend.delete_queue(vhost, queue_name)
+                    deleted_count += 1
+                except Exception as e:
+                    logger.warning(
+                        "Failed to delete orphan queue %s in vhost %s: %s",
+                        queue_name,
+                        vhost,
+                        e,
+                    )
+                continue
+
+            # Handle subscription_ queues (existing logic)
             has_db_record = models.EventSubscriptionQueue.objects.filter(
                 event_subscription__user__uuid=vhost,
                 offering_uuid__isnull=False,
             ).exists()
 
             if has_db_record:
-                # More precise check: verify this exact queue_name matches a record
                 matching = any(
                     q.queue_name == queue_name
                     for q in models.EventSubscriptionQueue.objects.filter(
@@ -202,7 +221,6 @@ def cleanup_orphan_subscription_queues() -> None:
                 if matching:
                     continue
 
-            # No matching DB record - this is an orphan queue
             logger.info(
                 "Deleting orphan subscription queue %s in vhost %s",
                 queue_name,
@@ -325,3 +343,40 @@ def delete_dangling_event_subscriptions() -> None:
             logger.info("Deleting event subscription %s", event_subscription.uuid)
             event_subscription.delete()
             continue
+
+
+@shared_task(name="waldur_core.logging.cleanup_system_logs")
+def cleanup_system_logs():
+    """
+    Enforce row count limit per source (across all instances).
+
+    Keeps newest logs, deletes oldest when count exceeds the configured limit.
+    Runs periodically to maintain log volume within limits.
+    """
+    if not config.SYSTEM_LOG_ENABLED:
+        return
+
+    max_rows = config.SYSTEM_LOG_MAX_ROWS_PER_SOURCE
+
+    for source in models.SystemLog.SourceChoices.values:
+        total_count = models.SystemLog.objects.filter(source=source).count()
+        delete_count = total_count - max_rows
+
+        if delete_count > 0:
+            # Find the cutoff: the created timestamp of the Nth oldest row to keep
+            cutoff_row = (
+                models.SystemLog.objects.filter(source=source)
+                .order_by("-created")
+                .values_list("created", flat=True)[max_rows : max_rows + 1]
+            )
+            if cutoff_row:
+                deleted, _ = models.SystemLog.objects.filter(
+                    source=source, created__lte=cutoff_row[0]
+                ).delete()
+                logger.info(
+                    "Cleaned up %d system log entries for source %s (had %d rows, limit %d)",
+                    deleted,
+                    source,
+                    total_count,
+                    max_rows,
+                )

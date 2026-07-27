@@ -7,8 +7,8 @@ from waldur_mastermind.marketplace_script import models as marketplace_script_mo
 
 
 class CommonSerializer(serializers.Serializer):
-    attributes = serializers.ReadOnlyField()
-    limits = serializers.ReadOnlyField()
+    attributes = serializers.JSONField(read_only=True)
+    limits = serializers.JSONField(read_only=True)
     customer_uuid = serializers.UUIDField(
         read_only=True, source="project.customer.uuid"
     )
@@ -46,7 +46,9 @@ class OrderSerializer(CommonSerializer):
     resource_backend_metadata = serializers.ReadOnlyField(
         source="resource.backend_metadata"
     )
-    resource_attributes = serializers.ReadOnlyField(source="resource.attributes")
+    resource_attributes = serializers.JSONField(
+        read_only=True, source="resource.attributes"
+    )
 
 
 class ResourceSerializer(CommonSerializer):
@@ -87,6 +89,7 @@ class DryRunSerializer(
         write_only=True,
     )
     attributes = serializers.JSONField(required=False, write_only=True)
+    get_state_display = serializers.CharField(read_only=True)
 
     class Meta:
         model = marketplace_script_models.DryRun
@@ -128,3 +131,11 @@ class DryRunSerializer(
 
 class PullMarketplaceScriptResourceSerializer(serializers.Serializer):
     resource_uuid = serializers.UUIDField()
+
+
+class ScriptDryRunResponseSerializer(serializers.Serializer):
+    output = serializers.CharField()
+
+
+class ScriptAsyncDryRunResponseSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField()

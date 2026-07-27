@@ -1,4 +1,4 @@
-import textwrap
+import tomllib
 
 from rest_framework import status, test
 
@@ -11,20 +11,20 @@ from waldur_mastermind.marketplace.enums import (
 )
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 from waldur_mastermind.marketplace.tests import fixtures as marketplace_fixtures
+from waldur_mastermind.marketplace_site_agent.tests.fixtures import add_posix_ranges
 
 
-class RobotAccountGlauthConfigTest(test.APITransactionTestCase):
+class RobotAccountGlauthConfigTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
         self.offering.type = SITE_AGENT_OFFERING
         self.offering.plugin_options = {
             "username_generation_policy": "waldur_username",
-            "initial_uidnumber": 1000,
-            "initial_primarygroup_number": 2000,
             "service_provider_can_create_offering_user": True,
         }
         self.offering.save()
+        add_posix_ranges(self.offering)
 
         self.resource = self.fixture.resource
         self.resource.state = ResourceStates.OK
@@ -48,25 +48,24 @@ class RobotAccountGlauthConfigTest(test.APITransactionTestCase):
         self.client.force_login(self.fixture.offering_owner)
         response = self.client.get(self.url)
 
-        expected_config_file = textwrap.dedent(
-            f"""
-        [[users]]
-          name = "{self.robot_account.username}"
-          uidnumber = 1001
-          primarygroup = 2001
-          sshkeys = ["{ssh_key.public_key}"]
-          loginShell = "/bin/bash"
-          homeDir = "/home/{self.robot_account.username}"
-          passsha256 = ""
-            [[users.customattributes]]
-            preferredUsername = ["{self.robot_account.username}"]
-
-        [[groups]]
-          name = "{self.robot_account.username}"
-          gidnumber = 2001
-        """
-        )
-        self.assertEqual(expected_config_file, response.data)
+        expected_data = {
+            "users": [
+                {
+                    "name": self.robot_account.username,
+                    "uidnumber": 1001,
+                    "primarygroup": 2001,
+                    "sshkeys": [ssh_key.public_key],
+                    "loginShell": "/bin/bash",
+                    "homeDir": f"/home/{self.robot_account.username}",
+                    "passsha256": "",
+                    "customattributes": {
+                        "preferredUsername": [self.robot_account.username]
+                    },
+                }
+            ],
+            "groups": [{"name": self.robot_account.username, "gidnumber": 2001}],
+        }
+        self.assertEqual(expected_data, tomllib.loads(response.data))
 
     def test_glauth_exposes_correct_states(self):
         """Test that only OK and REQUESTED_DELETION states are exposed in glauth due to filtering by state"""

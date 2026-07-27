@@ -1,6 +1,8 @@
+import ipaddress
 import logging
 import re
 
+from constance import config
 from cryptography import x509
 from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat import backends as hazmat_backends
@@ -10,11 +12,9 @@ from django.core.exceptions import ValidationError
 from django.core.validators import URLValidator
 from django.utils.deconstruct import deconstructible
 from django.utils.translation import gettext_lazy as _
-from iptools.ipv4 import validate_cidr as is_valid_ipv4_cidr
-from iptools.ipv6 import validate_cidr as is_valid_ipv6_cidr
 
 from waldur_core.core import exceptions
-from waldur_core.core.enums import CoreStates
+from waldur_core.core.enums import GENDER_CHOICES, CoreStates
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,33 @@ def validate_name(value):
         raise ValidationError(
             _("Ensure that name has at least one non-whitespace character.")
         )
+
+
+def get_project_name_regex_error(value):
+    """Check a user-supplied project name against the configurable pattern.
+
+    Returns an error message if ``PROJECT_NAME_REGEX`` is set and the whole name
+    does not match it, otherwise ``None``. The check is intentionally applied
+    only to user-facing project create/rename paths; system-generated project
+    names (auto-provisioning, imports, proposal/Rancher composed names) are not
+    subject to it. A malformed pattern is treated as an admin misconfiguration
+    and skipped rather than blocking project creation.
+    """
+    pattern = config.PROJECT_NAME_REGEX
+    if not pattern or not value:
+        return None
+    try:
+        matches = re.fullmatch(pattern, value)
+    except re.error:
+        logger.warning(
+            "PROJECT_NAME_REGEX is not a valid regular expression: %r", pattern
+        )
+        return None
+    if matches:
+        return None
+    return config.PROJECT_NAME_REGEX_ERROR_MESSAGE or _(
+        "Project name does not match the required pattern."
+    )
 
 
 class StateValidator:
@@ -67,6 +94,27 @@ class RuntimeStateValidator(StateValidator):
 
 class BackendURLValidator(URLValidator):
     schemes = ["ldap", "ldaps", "http", "https", "ssh", "rdp"]
+
+
+def is_valid_ipv4_cidr(value: str) -> bool:
+    # Mirrors iptools.ipv4.validate_cidr: bare addresses without /prefix are rejected.
+    if not isinstance(value, str) or "/" not in value:
+        return False
+    try:
+        ipaddress.IPv4Network(value, strict=False)
+    except ValueError:
+        return False
+    return True
+
+
+def is_valid_ipv6_cidr(value: str) -> bool:
+    if not isinstance(value, str) or "/" not in value:
+        return False
+    try:
+        ipaddress.IPv6Network(value, strict=False)
+    except ValueError:
+        return False
+    return True
 
 
 def is_valid_ipv46_cidr(value):
@@ -418,6 +466,53 @@ class ISO3166Alpha2Validator:
 validate_iso_3166_alpha2 = ISO3166Alpha2Validator()
 
 
+VALID_PERSONAL_TITLES = {"Mr", "Ms", "Mrs", "Miss", "Dr", "Prof", "Sir", "Dame"}
+
+
+def validate_personal_title(value):
+    """Validate personal title against a set of allowed values."""
+    if not value:
+        return
+    if value not in VALID_PERSONAL_TITLES:
+        raise ValidationError(
+            _("Invalid personal title '%(value)s'. Allowed values are: %(allowed)s."),
+            params={
+                "value": value,
+                "allowed": ", ".join(sorted(VALID_PERSONAL_TITLES)),
+            },
+        )
+
+
+def validate_gender(value):
+    if not value:
+        return
+    valid_values = {key for key, _ in GENDER_CHOICES}
+    if value not in valid_values:
+        raise ValidationError(
+            _("Invalid gender '%(value)s'. Allowed values are: %(allowed)s."),
+            params={
+                "value": value,
+                "allowed": ", ".join(sorted(valid_values)),
+            },
+        )
+
+
+def validate_nationalities(value):
+    """Validate that nationalities is a list of valid ISO 3166-1 alpha-2 codes."""
+    if not value:
+        return
+    if not isinstance(value, list):
+        raise ValidationError(_("Nationalities must be a list."))
+    for item in value:
+        if not isinstance(item, str):
+            raise ValidationError(_("Each nationality must be a string."))
+        if item.upper() not in ISO_3166_1_ALPHA_2_CODES:
+            raise ValidationError(
+                _("'%(value)s' is not a valid ISO 3166-1 alpha-2 country code."),
+                params={"value": item},
+            )
+
+
 def validate_schac_organization_type(value):
     """
     Validate SCHAC homeOrganizationType URN format.
@@ -529,3 +624,24 @@ def validate_unix_path(path):
             raise ValidationError(
                 _("Path component is too long (maximum 255 characters).")
             )
+
+
+# Patterns that indicate potential ReDoS vulnerability
+_REDOS_PATTERNS = [
+    r"\(\?P?<[^>]*>[^)]*[+*][^)]*\)[+*]",  # Nested quantifiers: (a+)+
+    r"\([^)]*\|[^)]*\)[+*]{2,}",  # Overlapping alternations with quantifiers
+    r"[+*]\?[+*]",  # Adjacent quantifiers
+]
+_REDOS_REGEX = re.compile("|".join(_REDOS_PATTERNS))
+_MAX_REGEX_PATTERN_LENGTH = 200
+
+
+def is_potentially_dangerous_regex(pattern: str) -> bool:
+    """Check if a regex pattern might cause ReDoS.
+
+    Returns True if the pattern exceeds the maximum length or contains
+    constructs known to cause catastrophic backtracking.
+    """
+    if len(pattern) > _MAX_REGEX_PATTERN_LENGTH:
+        return True
+    return bool(_REDOS_REGEX.search(pattern))

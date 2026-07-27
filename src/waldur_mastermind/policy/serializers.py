@@ -4,6 +4,7 @@ from typing import cast
 
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
@@ -11,13 +12,19 @@ from rest_framework import serializers
 from waldur_core.core import serializers as core_serializers
 from waldur_core.permissions.fixtures import CustomerRole
 from waldur_core.structure import models as structure_models
+from waldur_core.structure.managers import filter_queryset_for_user
 from waldur_core.structure.permissions import _get_customer
-from waldur_mastermind.invoices.models import CustomerCredit, ProjectCredit
+from waldur_mastermind.invoices.models import CustomerCredit, PeriodMixin, ProjectCredit
 from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_mastermind.marketplace.enums import BillingTypes
-from waldur_mastermind.policy.policy_actions import POLICY_ACTIONS
+from waldur_mastermind.marketplace.enums import BillingTypes, ResourceStates
+from waldur_mastermind.policy.policy_actions import (
+    POLICY_ACTIONS,
+    _filter_resources_by_scope,
+)
 
 from . import models
+from .models import LIMIT_PERIOD_TO_POLICY_PERIOD
+from .utils import system_actor_event_context
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +40,41 @@ class PolicySerializer(serializers.HyperlinkedModelSerializer):
     )
     has_fired = serializers.BooleanField(read_only=True)
     fired_datetime = serializers.DateTimeField(read_only=True)
+    affected_resources_count = serializers.SerializerMethodField()
+
+    def get_affected_resources_count(self, instance) -> int:
+        if not instance.has_fired:
+            return 0
+        actions = set((instance.actions or "").split(","))
+        qs = marketplace_models.Resource.objects.exclude(
+            state__in=(ResourceStates.TERMINATED, ResourceStates.TERMINATING)
+        )
+        qs = _filter_resources_by_scope(qs, instance)
+        if qs is None:
+            return 0
+
+        # Filter by user visibility to prevent information disclosure.
+        # Non-staff users should only see counts of resources they have access to.
+        request = self.context.get("request")
+        if request and request.user and not request.user.is_staff:
+            qs = filter_queryset_for_user(qs, request.user)
+
+        q = Q()
+        if "request_pausing" in actions:
+            q |= Q(paused=True, offering__plugin_options__supports_pausing=True)
+        if "request_downscaling" in actions:
+            q |= Q(
+                downscaled=True,
+                offering__plugin_options__supports_downscaling=True,
+            )
+        if "restrict_members" in actions:
+            q |= Q(
+                restrict_member_access=True,
+                offering__plugin_options__service_provider_can_create_offering_user=True,
+            )
+        if not q:
+            return 0
+        return qs.filter(q).count()
 
     def validate_actions(self, value):
         if not value:
@@ -90,13 +132,17 @@ class PolicySerializer(serializers.HyperlinkedModelSerializer):
                 # Execute actions after the transaction is committed to ensure
                 # the policy exists in the database when Celery tasks run
                 def execute_actions():
-                    for action in policy.get_immediate_actions():
-                        action.method(policy)
-                        logger.info(
-                            "%s action of policy %s has been triggered.",
-                            action.method.__name__,
-                            policy.uuid.hex,
-                        )
+                    # Attribute the policy-driven events (and the resource saves
+                    # they trigger) to the system robot rather than the user whose
+                    # request saved the policy.
+                    with system_actor_event_context():
+                        for action in policy.get_immediate_actions():
+                            action.method(policy)
+                            logger.info(
+                                "%s action of policy %s has been triggered.",
+                                action.method.__name__,
+                                policy.uuid.hex,
+                            )
 
                 transaction.on_commit(execute_actions)
         else:
@@ -113,14 +159,15 @@ class PolicySerializer(serializers.HyperlinkedModelSerializer):
 
                 # Execute reset actions after transaction commit
                 def execute_reset_actions():
-                    for action in policy.get_all_actions():
-                        if action.reset_method:
-                            action.reset_method(policy)
-                            logger.info(
-                                "Reset method %s of policy %s has been executed.",
-                                action.reset_method.__name__,
-                                policy.uuid.hex,
-                            )
+                    with system_actor_event_context():
+                        for action in policy.get_all_actions():
+                            if action.reset_method:
+                                action.reset_method(policy)
+                                logger.info(
+                                    "Reset method %s of policy %s has been executed.",
+                                    action.reset_method.__name__,
+                                    policy.uuid.hex,
+                                )
 
                 transaction.on_commit(execute_reset_actions)
 
@@ -140,6 +187,7 @@ class PolicySerializer(serializers.HyperlinkedModelSerializer):
             "has_fired",
             "fired_datetime",
             "options",
+            "affected_resources_count",
         )
         extra_kwargs = {
             "url": {
@@ -153,7 +201,7 @@ class PolicySerializer(serializers.HyperlinkedModelSerializer):
 
 
 class EstimatedCostPolicySerializer(PolicySerializer):
-    period_name = serializers.ReadOnlyField(source="get_period_display")
+    period_name = serializers.CharField(read_only=True, source="get_period_display")
 
     class Meta(PolicySerializer.Meta):
         fields = PolicySerializer.Meta.fields + (
@@ -178,19 +226,71 @@ class ProjectEstimatedCostPolicySerializer(
         fields = EstimatedCostPolicySerializer.Meta.fields + (
             "project_credit",
             "customer_credit",
+            "resource",
+            "resource_name",
+            "use_credit",
         )
 
     project_credit = serializers.SerializerMethodField()
     customer_credit = serializers.SerializerMethodField()
+    resource = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=marketplace_models.Resource.objects.all(),
+        allow_null=True,
+        required=False,
+    )
+    resource_name = serializers.CharField(read_only=True, source="resource.name")
 
-    def get_project_credit(self, instance) -> float | None:
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        resource = (
+            attrs.get("resource")
+            if "resource" in attrs
+            else (self.instance.resource if self.instance else None)
+        )
+        if resource is None:
+            return attrs
+
+        scope = attrs.get("scope") or (self.instance.scope if self.instance else None)
+        if scope is not None and resource.project_id != scope.id:
+            raise serializers.ValidationError(
+                {"resource": _("Resource must belong to the selected project.")}
+            )
+
+        # Only reject a terminated resource when it is being (re)assigned.
+        if "resource" in attrs and resource.state in (
+            ResourceStates.TERMINATED,
+            ResourceStates.TERMINATING,
+        ):
+            raise serializers.ValidationError(
+                {"resource": _("Cannot scope a policy to a terminated resource.")}
+            )
+
+        actions = attrs.get("actions")
+        if actions is None and self.instance:
+            actions = self.instance.actions
+        action_set = set((actions or "").split(","))
+        if "block_creation_of_new_resources" in action_set:
+            raise serializers.ValidationError(
+                {
+                    "actions": _(
+                        "block_creation_of_new_resources cannot be used with a "
+                        "resource-scoped policy."
+                    )
+                }
+            )
+
+        return attrs
+
+    def get_project_credit(self, instance) -> str | None:
         project = cast(structure_models.Project, instance.scope)
         try:
             return ProjectCredit.objects.get(project=project).value
         except ProjectCredit.DoesNotExist:
             return None
 
-    def get_customer_credit(self, instance) -> float | None:
+    def get_customer_credit(self, instance) -> str | None:
         customer: structure_models.Customer = instance.scope.customer
         try:
             return CustomerCredit.objects.get(customer=customer).value
@@ -235,7 +335,7 @@ class CustomerEstimatedCostPolicySerializer(
 
     customer_credit = serializers.SerializerMethodField()
 
-    def get_customer_credit(self, instance) -> int:
+    def get_customer_credit(self, instance) -> str | None:
         customer = cast(structure_models.Customer, instance.scope)
         try:
             return CustomerCredit.objects.get(customer=customer).value
@@ -327,7 +427,7 @@ class OfferingPolicySerializerMixin(core_serializers.AugmentedSerializerMixin):
 class OfferingEstimatedCostPolicySerializer(
     OfferingPolicySerializerMixin, EstimatedCostPolicySerializer
 ):
-    period_name = serializers.ReadOnlyField(source="get_period_display")
+    period_name = serializers.CharField(read_only=True, source="get_period_display")
 
     class Meta(EstimatedCostPolicySerializer.Meta):
         fields = (
@@ -351,7 +451,7 @@ class NestedOfferingComponentLimitSerializer(serializers.ModelSerializer):
 
 class OfferingUsagePolicySerializer(OfferingPolicySerializerMixin, PolicySerializer):
     component_limits_set = NestedOfferingComponentLimitSerializer(many=True)
-    period_name = serializers.ReadOnlyField(source="get_period_display")
+    period_name = serializers.CharField(read_only=True, source="get_period_display")
 
     class Meta(PolicySerializer.Meta):
         fields = (
@@ -408,7 +508,7 @@ class OfferingUsagePolicySerializer(OfferingPolicySerializerMixin, PolicySeriali
 
 class NestedCustomerUsagePolicyComponentSerializer(serializers.ModelSerializer):
     type = serializers.CharField(source="component.type", read_only=True)
-    period_name = serializers.ReadOnlyField(source="get_period_display", read_only=True)
+    period_name = serializers.CharField(read_only=True, source="get_period_display")
     component = serializers.UUIDField(source="component.uuid")
 
     class Meta:
@@ -487,6 +587,13 @@ class CustomerComponentUsagePolicySerializer(PolicySerializer):
 
 
 class SlurmPeriodicUsagePolicySerializer(OfferingUsagePolicySerializer):
+    warnings = serializers.ListField(
+        child=serializers.CharField(),
+        read_only=True,
+        required=False,
+        help_text="Warnings about misconfiguration, e.g. missing site agent queue registration.",
+    )
+
     class Meta(OfferingUsagePolicySerializer.Meta):
         model = models.SlurmPeriodicUsagePolicy
         view_name = "marketplace-slurm-periodic-usage-policy-detail"
@@ -499,8 +606,79 @@ class SlurmPeriodicUsagePolicySerializer(OfferingUsagePolicySerializer):
             "carryover_enabled",
             "raw_usage_reset",
             "qos_strategy",
+            "warnings",
         )
         extra_kwargs = OfferingUsagePolicySerializer.Meta.extra_kwargs
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        scope = attrs.get("scope") or (self.instance.scope if self.instance else None)
+        if not scope:
+            return attrs
+
+        # Collect distinct non-empty limit_period values from limit-based components
+        limit_periods = set(
+            scope.components.filter(billing_type=BillingTypes.LIMIT)
+            .exclude(limit_period__isnull=True)
+            .exclude(limit_period="")
+            .values_list("limit_period", flat=True)
+            .distinct()
+        )
+        if not limit_periods:
+            return attrs
+        if len(limit_periods) > 1:
+            raise serializers.ValidationError(
+                {
+                    "period": _(
+                        "Offering has multiple limit-based components with "
+                        "different limit_period values: %(periods)s. "
+                        "All must use the same limit_period."
+                    )
+                    % {"periods": ", ".join(sorted(limit_periods))}
+                }
+            )
+
+        limit_period = limit_periods.pop()
+        expected_period = LIMIT_PERIOD_TO_POLICY_PERIOD.get(limit_period)
+        if expected_period is None:
+            return attrs
+
+        period = attrs.get("period")
+        if period is None and self.instance is None:
+            # Auto-set period on create when not explicitly provided
+            attrs["period"] = expected_period
+        elif period is not None and period != expected_period:
+            raise serializers.ValidationError(
+                {
+                    "period": _(
+                        "Period must match the offering component's limit_period "
+                        "(%(limit_period)s). Expected %(expected)s, got %(actual)s."
+                    )
+                    % {
+                        "limit_period": limit_period,
+                        "expected": dict(PeriodMixin.Periods.CHOICES).get(
+                            expected_period
+                        ),
+                        "actual": dict(PeriodMixin.Periods.CHOICES).get(period),
+                    }
+                }
+            )
+        return attrs
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        from waldur_core.logging.models import EventSubscriptionQueue
+
+        queue_exists = EventSubscriptionQueue.objects.filter(
+            offering_uuid=instance.scope.uuid,
+            object_type="resource_periodic_limits",
+        ).exists()
+        if not queue_exists:
+            data["warnings"] = [
+                "No site agent has registered a queue for periodic limits updates on this offering. "
+                "Ensure the site agent has periodic_limits.enabled set to true and is running."
+            ]
+        return data
 
 
 class SlurmPolicyPreviewRequestSerializer(serializers.Serializer):
@@ -679,6 +857,7 @@ class SlurmPolicyEvaluationLogSerializer(serializers.ModelSerializer):
 
     resource_name = serializers.CharField(source="resource.name", read_only=True)
     resource_uuid = serializers.UUIDField(source="resource.uuid", read_only=True)
+    actions_taken = serializers.ListField(child=serializers.CharField(), read_only=True)
 
     class Meta:
         model = models.SlurmPolicyEvaluationLog

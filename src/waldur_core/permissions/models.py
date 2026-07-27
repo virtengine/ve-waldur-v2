@@ -1,7 +1,9 @@
 from typing import cast
 
 from django.conf import settings
+from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils import timezone
 from model_utils import FieldTracker
@@ -16,17 +18,28 @@ from . import signals
 
 
 class RoleManager(models.Manager):
+    _cache: dict[str, "Role"] = {}
+
     def get_system_role(self, name: str, content_type) -> "Role":
+        cache_key = name.value if hasattr(name, "value") else name
+        if cache_key in self._cache:
+            return self._cache[cache_key]
         role, _ = self.get_or_create(
-            name=name, defaults={"is_system_role": True, "content_type": content_type}
+            name=cache_key,
+            defaults={"is_system_role": True, "content_type": content_type},
         )
+        self._cache[cache_key] = role
         return role
+
+    @classmethod
+    def clear_cache(cls):
+        cls._cache.clear()
 
 
 class Role(DescribableMixin, UuidMixin):
     permissions: models.Manager["RolePermission"]
 
-    name = models.CharField(unique=True, db_index=True, max_length=150)
+    name = models.CharField(db_index=True, max_length=150)
     is_system_role = models.BooleanField(default=False)
     is_active = models.BooleanField(default=True)
     objects: RoleManager = RoleManager()
@@ -37,9 +50,36 @@ class Role(DescribableMixin, UuidMixin):
         blank=False,
         related_name="+",
     )
+    # The role this one was cloned from (organization-scoped clones only).
+    # SET_NULL so removing a template never cascades away its clones.
+    template = models.ForeignKey(
+        to="self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="clones",
+    )
 
     class Meta:
         ordering = ["name"]
+
+    def save(self, *args, **kwargs):
+        # Enforce name+content_type uniqueness for non-resource scopes.
+        # Resource/ResourceProject roles can have duplicate names
+        # because different offerings define their own roles.
+        if self.content_type_id:
+            model_name = self.content_type.model
+            if model_name not in ("resource", "resourceproject"):
+                qs = Role.objects.filter(name=self.name, content_type=self.content_type)
+                if self.pk:
+                    qs = qs.exclude(pk=self.pk)
+                if qs.exists():
+                    raise ValidationError(
+                        {
+                            "name": "A role with this name already exists for this scope type."
+                        }
+                    )
+        super().save(*args, **kwargs)
 
     def add_permission(self, name):
         RolePermission.objects.get_or_create(role=self, permission=name)
@@ -49,6 +89,61 @@ class Role(DescribableMixin, UuidMixin):
 
     def __str__(self):
         return f"{self.name} ({self.is_active})"
+
+
+class RoleAvailability(UuidMixin):
+    """Controls where a Role can be assigned.
+
+    When no RoleAvailability records exist for a role, it is available
+    everywhere (system role behavior). When records exist, the role is
+    only usable in those scopes (typically a specific Offering, Customer
+    or similar).
+
+    Logical "kind" grouping (e.g. all offerings of a Rancher-cluster
+    profile) is expressed via :class:`marketplace.OfferingProfile` —
+    binding an offering to a profile creates one RoleAvailability per
+    catalog role on that offering, reconciled via Celery tasks.
+    """
+
+    role = models.ForeignKey(
+        Role, on_delete=models.CASCADE, related_name="availability"
+    )
+    content_type = models.ForeignKey(
+        ContentType, on_delete=models.CASCADE, related_name="+"
+    )
+    object_id = models.PositiveIntegerField()
+    scope = GenericForeignKey("content_type", "object_id")
+
+    class Meta:
+        unique_together = ("role", "content_type", "object_id")
+
+
+class CustomerRoleConcealment(UuidMixin):
+    """Hides a role within a specific scope (deny-list).
+
+    :class:`RoleAvailability` is an allow-list and cannot subtract a
+    globally-available (system) role from a single organization. A concealment
+    record does exactly that: when one exists for ``(role, scope)``, the role can
+    no longer be granted on that scope or its descendants, and it is hidden from
+    that scope's role pickers. Existing grants are left untouched
+    (block-new-only).
+
+    The scope is generic (mirroring :class:`RoleAvailability`) to keep the
+    permissions app independent of ``structure``; in practice it is always a
+    Customer.
+    """
+
+    role = models.ForeignKey(
+        Role, on_delete=models.CASCADE, related_name="concealments"
+    )
+    content_type = models.ForeignKey(
+        ContentType, on_delete=models.CASCADE, related_name="+"
+    )
+    object_id = models.PositiveIntegerField()
+    scope = GenericForeignKey("content_type", "object_id")
+
+    class Meta:
+        unique_together = ("role", "content_type", "object_id")
 
 
 class UserRoleManager(GenericKeyMixin, models.Manager):
@@ -67,6 +162,14 @@ class UserRole(TimeStampedModel, ScopeMixin, UuidMixin):
         blank=True,
         related_name="+",
     )
+    revoked_by = models.ForeignKey[User](
+        on_delete=models.SET_NULL,
+        to=settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    revoke_reason = models.CharField(max_length=255, blank=True, default="")
     expiration_time = models.DateTimeField(null=True, blank=True)
     is_active = models.BooleanField(null=True, default=True, db_index=True)
     tracker = cast(
@@ -95,8 +198,40 @@ class UserRole(TimeStampedModel, ScopeMixin, UuidMixin):
             return
         self.is_active = False
         self.expiration_time = timezone.now()
-        self.save(update_fields=["is_active", "expiration_time"])
+        self.revoked_by = current_user
+        self.revoke_reason = reason or ""
+        self.save(
+            update_fields=[
+                "is_active",
+                "expiration_time",
+                "revoked_by",
+                "revoke_reason",
+            ]
+        )
         signals.role_revoked.send(
+            sender=self.__class__,
+            instance=self,
+            current_user=current_user,
+            reason=reason,
+        )
+
+    def restore(self, current_user=None, reason=None):
+        if self.is_active:
+            # user role is already active
+            return
+        self.is_active = True
+        self.expiration_time = None
+        self.revoked_by = None
+        self.revoke_reason = ""
+        self.save(
+            update_fields=[
+                "is_active",
+                "expiration_time",
+                "revoked_by",
+                "revoke_reason",
+            ]
+        )
+        signals.role_granted.send(
             sender=self.__class__,
             instance=self,
             current_user=current_user,

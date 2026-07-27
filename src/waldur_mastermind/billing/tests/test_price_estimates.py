@@ -7,11 +7,8 @@ from rest_framework import status, test
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.billing import models
+from waldur_mastermind.billing.tests.utils import get_financial_report_url
 from waldur_mastermind.invoices.tests import factories as invoice_factories
-
-
-def get_financial_report_url(customer):
-    return f"/api/financial-reports/{customer.uuid.hex}/"
 
 
 class PriceEstimateSignalsTest(test.APITransactionTestCase):
@@ -60,7 +57,7 @@ class PriceEstimateSignalsTest(test.APITransactionTestCase):
 
 
 @ddt
-class PriceEstimateAPITest(test.APITransactionTestCase):
+class PriceEstimateAPITest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
 
@@ -74,7 +71,7 @@ class PriceEstimateAPITest(test.APITransactionTestCase):
         response = self.client.get(get_financial_report_url(self.fixture.customer))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         estimate = response.data["billing_price_estimate"]
-        self.assertEqual(estimate["total"], 100)
+        self.assertEqual(estimate["total"], "100.0000000000")
 
         response = self.client.get(
             get_financial_report_url(self.fixture.customer),
@@ -82,7 +79,7 @@ class PriceEstimateAPITest(test.APITransactionTestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         estimate = response.data["billing_price_estimate"]
-        self.assertEqual(estimate["total"], 0)
+        self.assertEqual(estimate["total"], "0.0000000000")
 
     @data("staff", "owner", "manager", "admin")
     def test_authorized_can_get_price_estimate_for_customer(self, user):
@@ -95,7 +92,7 @@ class PriceEstimateAPITest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
         estimate = response.data["billing_price_estimate"]
-        self.assertEqual(estimate["total"], 100)
+        self.assertEqual(estimate["total"], "100.0000000000")
 
     @data("staff", "owner", "manager", "admin")
     def test_authorized_can_get_price_estimate_for_project(self, user):
@@ -110,12 +107,12 @@ class PriceEstimateAPITest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
         estimate = response.data["billing_price_estimate"]
-        self.assertEqual(estimate["total"], 100)
+        self.assertEqual(estimate["total"], "100.0000000000")
 
 
 @ddt
 @freeze_time("2017-01-01")
-class PriceEstimateInvoiceItemTest(test.APITransactionTestCase):
+class PriceEstimateInvoiceItemTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
 

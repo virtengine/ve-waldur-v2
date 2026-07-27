@@ -10,7 +10,7 @@ from waldur_mastermind.marketplace.tests import factories
 from waldur_mastermind.marketplace.tests import fixtures as marketplace_fixtures
 
 
-class OfferingUserChecklistCompletionsViewSetTest(test.APITransactionTestCase):
+class OfferingUserChecklistCompletionsViewSetTest(test.APITestCase):
     """Test listing checklist completions for user's offering users."""
 
     def setUp(self):
@@ -178,8 +178,7 @@ class OfferingUserChecklistCompletionsViewSetTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
     def test_completion_percentage_calculation(self):
-        """Test that completion percentage is calculated correctly."""
-        # Add some questions to checklist1
+        """Two questions in the checklist, one answered → 50.0%."""
         question1 = checklist_factories.QuestionFactory(
             checklist=self.checklist1, description="Question 1", required=True
         )
@@ -187,12 +186,10 @@ class OfferingUserChecklistCompletionsViewSetTest(test.APITransactionTestCase):
             checklist=self.checklist1, description="Question 2", required=False
         )
 
-        # Answer one question
         checklist_factories.AnswerFactory(
             completion=self.completion1, question=question1, answer_data="Answer 1"
         )
 
-        # Update completion percentage
         self.completion1.update_completion_status()
 
         self.client.force_authenticate(self.user)
@@ -207,18 +204,88 @@ class OfferingUserChecklistCompletionsViewSetTest(test.APITransactionTestCase):
             None,
         )
         self.assertIsNotNone(result)
-        self.assertIsNotNone(result["completion_percentage"])
-        self.assertGreater(result["completion_percentage"], 0)
+        self.assertEqual(result["completion_percentage"], 50.0)
+
+    def test_completion_percentage_with_few_answers(self):
+        """Regression: 10 questions, 1 answered → 10.0%.
+
+        Previously the denominator counted Answer rows rather than checklist
+        questions, so a single answer yielded ``1/1 == 100%``.
+        """
+        questions = [
+            checklist_factories.QuestionFactory(
+                checklist=self.checklist1,
+                description=f"Question {i}",
+                required=(i == 0),
+            )
+            for i in range(10)
+        ]
+        checklist_factories.AnswerFactory(
+            completion=self.completion1,
+            question=questions[0],
+            answer_data="Answer 1",
+        )
+        self.completion1.update_completion_status()
+
+        self.client.force_authenticate(self.user)
+        response = self.client.get(self.url)
+
+        result = next(
+            (
+                r
+                for r in response.data
+                if r["offering_user_uuid"] == str(self.offering_user1.uuid)
+            ),
+            None,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["completion_percentage"], 10.0)
+
+    def test_completion_percentage_retrieve_path(self):
+        """Same scenario as above but via the single-object retrieve action.
+
+        The retrieve path doesn't get the queryset annotations, so it exercises
+        the fallback branch that delegates to ``ChecklistCompletion``'s model
+        method. Both paths must agree.
+        """
+        questions = [
+            checklist_factories.QuestionFactory(
+                checklist=self.checklist1,
+                description=f"Question {i}",
+                required=(i == 0),
+            )
+            for i in range(10)
+        ]
+        checklist_factories.AnswerFactory(
+            completion=self.completion1,
+            question=questions[0],
+            answer_data="Answer 1",
+        )
+        self.completion1.update_completion_status()
+
+        detail_url = reverse(
+            "marketplace-offering-user-checklist-completion-detail",
+            kwargs={"pk": self.completion1.pk},
+        )
+
+        self.client.force_authenticate(self.user)
+        response = self.client.get(detail_url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["completion_percentage"], 10.0)
 
     def test_unauthenticated_access_denied(self):
         """Test that unauthenticated users cannot access the endpoint."""
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
-    def test_offering_without_checklist_shows_pending_status(self):
-        """Test that offering users without configured checklists show correct status."""
-        # Create an offering user for an offering that has no compliance checklist
-        # but create a completion manually (edge case)
+    def test_offering_without_checklist_questions_shows_full_percentage(self):
+        """A checklist with zero questions is vacuously 100% — there's nothing to answer.
+
+        ``is_completed`` is decoupled from the percentage: the auto-created
+        completion remains ``is_completed=False`` until ``update_completion_status``
+        runs, but the percentage reflects the (empty) work-to-do.
+        """
         offering4 = factories.OfferingFactory(
             customer=self.fixture.customer,
             name="Test Offering 4",
@@ -232,8 +299,6 @@ class OfferingUserChecklistCompletionsViewSetTest(test.APITransactionTestCase):
             offering=offering4, user=self.user, username="test_user4"
         )
 
-        # Don't create a completion - simulating pending state
-
         self.client.force_authenticate(self.user)
         response = self.client.get(self.url)
 
@@ -245,11 +310,9 @@ class OfferingUserChecklistCompletionsViewSetTest(test.APITransactionTestCase):
             ),
             None,
         )
-        # A completion was automatically created (through signals/hooks)
-        # It should show pending status (not completed)
         self.assertIsNotNone(result)
         self.assertFalse(result["is_completed"])
-        self.assertEqual(result["completion_percentage"], 0)
+        self.assertEqual(result["completion_percentage"], 100)
 
     def test_filter_by_user_uuid(self):
         """Test filtering completions by user UUID."""
@@ -486,6 +549,84 @@ class OfferingUserChecklistCompletionsViewSetTest(test.APITransactionTestCase):
         self.assertTrue(
             issubclass(OfferingUserChecklistCompletionsViewSet, ReadOnlyActionsViewSet)
         )
+
+    def test_required_question_without_answer_counts_as_unanswered(self):
+        """A required question with NO Answer row counts toward unanswered_required_questions."""
+        checklist_factories.QuestionFactory(
+            checklist=self.checklist1, description="Required Q", required=True
+        )
+        checklist_factories.QuestionFactory(
+            checklist=self.checklist1, description="Optional Q", required=False
+        )
+
+        self.client.force_authenticate(self.user)
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        result = next(
+            r
+            for r in response.data
+            if r["offering_user_uuid"] == str(self.offering_user1.uuid)
+        )
+        self.assertEqual(result["unanswered_required_questions"], 1)
+
+    def test_required_question_with_answer_row_counts_as_answered(self):
+        """An existing Answer row marks the required question as answered."""
+        question = checklist_factories.QuestionFactory(
+            checklist=self.checklist1, description="Required Q", required=True
+        )
+        checklist_factories.AnswerFactory(
+            user=self.user,
+            question=question,
+            completion=self.completion1,
+            answer_data=["yes"],
+        )
+
+        self.client.force_authenticate(self.user)
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        result = next(
+            r
+            for r in response.data
+            if r["offering_user_uuid"] == str(self.offering_user1.uuid)
+        )
+        self.assertEqual(result["unanswered_required_questions"], 0)
+
+    def test_list_query_count_does_not_scale_per_completion(self):
+        """List endpoint must bulk-fetch OfferingUsers; query count is bounded."""
+        # Add several more completions to amplify any N+1.
+        content_type = ContentType.objects.get_for_model(models.OfferingUser)
+        for i in range(5):
+            offering = factories.OfferingFactory(
+                customer=self.fixture.customer,
+                name=f"Bulk Offering {i}",
+                plugin_options={"service_provider_can_create_offering_user": True},
+            )
+            checklist = checklist_factories.ChecklistFactory(name=f"Bulk Checklist {i}")
+            offering.compliance_checklist = checklist
+            offering.save()
+            offering_user = factories.OfferingUserFactory(
+                offering=offering, user=self.user, username=f"bulk_user_{i}"
+            )
+            checklist_models.ChecklistCompletion.objects.get_or_create(
+                checklist=checklist,
+                scope_content_type=content_type,
+                scope_object_id=offering_user.id,
+                defaults={"is_completed": False},
+            )
+
+        self.client.force_authenticate(self.user)
+        # Warm up: hit the endpoint once so any per-request caches (e.g.
+        # ContentType) are populated and don't skew the query count.
+        self.client.get(self.url)
+
+        # Pinned to lock in the bulk-fetch optimization. Should NOT grow as
+        # more completions are added — verify by re-running with 50 vs. 5.
+        with self.assertNumQueries(7):
+            response = self.client.get(self.url)
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(len(response.data), 7)
 
     def test_create_update_delete_operations_disabled(self):
         """Test that create, update, and delete operations are disabled."""

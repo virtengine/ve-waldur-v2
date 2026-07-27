@@ -1,8 +1,17 @@
+from datetime import timedelta
+
 from ddt import data, ddt
+from django.utils import timezone
 from rest_framework import status, test
 
+from waldur_core.permissions.fixtures import CustomerRole
 from waldur_core.structure.tests import factories as structure_factories
-from waldur_mastermind.marketplace.enums import ImpactLevel, MaintenanceState
+from waldur_mastermind.marketplace import models
+from waldur_mastermind.marketplace.enums import (
+    ImpactLevel,
+    MaintenanceState,
+    MaintenanceType,
+)
 from waldur_mastermind.marketplace.tests import (
     factories as marketplace_factories,
 )
@@ -10,9 +19,20 @@ from waldur_mastermind.marketplace.tests import (
     fixtures as marketplace_fixtures,
 )
 
+MANAGE_DENIED_DETAIL = (
+    "You do not have permission to manage maintenance announcements "
+    "for this service provider."
+)
+ACTION_DENIED_DETAIL = "You do not have permission to perform this action."
+
+
+def _assert_permission_denied(response, detail):
+    assert response.status_code == status.HTTP_403_FORBIDDEN, response.data
+    assert response.data.get("detail") == detail, response.data
+
 
 @ddt
-class MaintenanceAnnouncementGetTest(test.APITransactionTestCase):
+class MaintenanceAnnouncementGetTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.announcement = self.fixture.maintenance_announcement
@@ -51,7 +71,7 @@ class MaintenanceAnnouncementGetTest(test.APITransactionTestCase):
 
 
 @ddt
-class MaintenanceAnnouncementCreateTest(test.APITransactionTestCase):
+class MaintenanceAnnouncementCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.fixture.maintenance_announcement.delete()
@@ -106,7 +126,14 @@ class MaintenanceAnnouncementCreateTest(test.APITransactionTestCase):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
         response = self.client.post(self.url, self._get_payload())
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        _assert_permission_denied(response, MANAGE_DENIED_DETAIL)
+
+    def test_creation_forbidden_for_related_user_without_permission(self):
+        user = structure_factories.UserFactory()
+        self.fixture.offering_customer.add_user(user, CustomerRole.SUPPORT)
+        self.client.force_authenticate(user)
+        response = self.client.post(self.url, self._get_payload())
+        _assert_permission_denied(response, MANAGE_DENIED_DETAIL)
 
     def test_creation_forbidden_for_unauthenticated(self):
         response = self.client.post(self.url, self._get_payload())
@@ -132,7 +159,7 @@ class MaintenanceAnnouncementCreateTest(test.APITransactionTestCase):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
         response = self.client.post(self.offering_url, self._get_offering_payload())
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        _assert_permission_denied(response, MANAGE_DENIED_DETAIL)
 
     def test_offering_creation_forbidden_for_unauthenticated(self):
         response = self.client.post(self.offering_url, self._get_offering_payload())
@@ -140,7 +167,137 @@ class MaintenanceAnnouncementCreateTest(test.APITransactionTestCase):
 
 
 @ddt
-class MaintenanceAnnouncementDeleteTest(test.APITransactionTestCase):
+class MaintenanceAnnouncementPermissionTest(test.APITestCase):
+    """Cover MANAGE_MAINTENANCE_ANNOUNCEMENT paths for connected users."""
+
+    def setUp(self):
+        self.fixture = marketplace_fixtures.MarketplaceFixture()
+        self.announcement = self.fixture.maintenance_announcement
+        self.offering_link = self.fixture.maintenance_announcement_offering
+        self.list_url = (
+            marketplace_factories.MaintenanceAnnouncementFactory.get_list_url()
+        )
+        self.detail_url = marketplace_factories.MaintenanceAnnouncementFactory.get_url(
+            self.announcement
+        )
+        self.offering_list_url = (
+            marketplace_factories.MaintenanceAnnouncementOfferingFactory.get_list_url()
+        )
+        self.offering_detail_url = (
+            marketplace_factories.MaintenanceAnnouncementOfferingFactory.get_url(
+                self.offering_link
+            )
+        )
+        self.related_without_perm = structure_factories.UserFactory()
+        self.fixture.offering_customer.add_user(
+            self.related_without_perm, CustomerRole.SUPPORT
+        )
+
+    def _create_payload(self):
+        return {
+            "name": "Permission test maintenance",
+            "message": "Test message",
+            "scheduled_start": "2030-01-01T10:00:00Z",
+            "scheduled_end": "2030-01-01T12:00:00Z",
+            "service_provider": marketplace_factories.ServiceProviderFactory.get_url(
+                self.fixture.service_provider
+            ),
+        }
+
+    def _offering_payload(self):
+        return {
+            "maintenance": marketplace_factories.MaintenanceAnnouncementFactory.get_url(
+                self.announcement
+            ),
+            "offering": marketplace_factories.OfferingFactory.get_url(
+                self.fixture.offering
+            ),
+            "impact_level": ImpactLevel.FULL_OUTAGE,
+            "impact_description": "Impact",
+        }
+
+    def test_related_user_without_permission_can_list_and_retrieve(self):
+        self.client.force_authenticate(self.related_without_perm)
+        response = self.client.get(self.list_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(
+            any(a["uuid"] == str(self.announcement.uuid) for a in response.json())
+        )
+        response = self.client.get(self.detail_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_related_user_without_permission_cannot_update(self):
+        self.client.force_authenticate(self.related_without_perm)
+        response = self.client.patch(self.detail_url, {"message": "Nope"})
+        _assert_permission_denied(response, ACTION_DENIED_DETAIL)
+
+    def test_related_user_without_permission_cannot_delete(self):
+        self.client.force_authenticate(self.related_without_perm)
+        response = self.client.delete(self.detail_url)
+        _assert_permission_denied(response, ACTION_DENIED_DETAIL)
+
+    @data(
+        "schedule",
+        "unschedule",
+        "start_maintenance",
+        "complete_maintenance",
+        "cancel_maintenance",
+    )
+    def test_related_user_without_permission_cannot_change_state(self, action):
+        state_by_action = {
+            "schedule": MaintenanceState.DRAFT,
+            "unschedule": MaintenanceState.SCHEDULED,
+            "start_maintenance": MaintenanceState.SCHEDULED,
+            "complete_maintenance": MaintenanceState.IN_PROGRESS,
+            "cancel_maintenance": MaintenanceState.DRAFT,
+        }
+        self.announcement.state = state_by_action[action]
+        self.announcement.save()
+        self.client.force_authenticate(self.related_without_perm)
+        url = marketplace_factories.MaintenanceAnnouncementFactory.get_url(
+            self.announcement, action=action
+        )
+        response = self.client.post(url)
+        _assert_permission_denied(response, ACTION_DENIED_DETAIL)
+
+    def test_related_user_without_permission_cannot_manage_offering_link(self):
+        self.client.force_authenticate(self.related_without_perm)
+        response = self.client.post(self.offering_list_url, self._offering_payload())
+        _assert_permission_denied(response, MANAGE_DENIED_DETAIL)
+
+        response = self.client.patch(
+            self.offering_detail_url, {"impact_description": "Nope"}
+        )
+        _assert_permission_denied(response, ACTION_DENIED_DETAIL)
+
+        response = self.client.delete(self.offering_detail_url)
+        _assert_permission_denied(response, ACTION_DENIED_DETAIL)
+
+    @data("service_owner", "service_manager")
+    def test_permitted_roles_can_create_and_update(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        response = self.client.post(self.list_url, self._create_payload())
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        response = self.client.patch(self.detail_url, {"message": "Updated"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    @data("service_owner", "service_manager")
+    def test_permitted_roles_can_schedule(self, user):
+        user = getattr(self.fixture, user)
+        self.announcement.state = MaintenanceState.DRAFT
+        self.announcement.save()
+        self.client.force_authenticate(user)
+        url = marketplace_factories.MaintenanceAnnouncementFactory.get_url(
+            self.announcement, action="schedule"
+        )
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+
+@ddt
+class MaintenanceAnnouncementDeleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.announcement = self.fixture.maintenance_announcement
@@ -171,7 +328,7 @@ class MaintenanceAnnouncementDeleteTest(test.APITransactionTestCase):
 
 
 @ddt
-class MaintenanceAnnouncementUpdateTest(test.APITransactionTestCase):
+class MaintenanceAnnouncementUpdateTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.announcement = self.fixture.maintenance_announcement
@@ -202,7 +359,54 @@ class MaintenanceAnnouncementUpdateTest(test.APITransactionTestCase):
 
 
 @ddt
-class MaintenanceAnnouncementScheduleTest(test.APITransactionTestCase):
+class MaintenanceAnnouncementUpdateStateTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = marketplace_fixtures.MarketplaceFixture()
+        self.announcement = self.fixture.maintenance_announcement
+        self.url = marketplace_factories.MaintenanceAnnouncementFactory.get_url(
+            self.announcement
+        )
+        self.client.force_authenticate(self.fixture.staff)
+
+    def _set_state(self, state):
+        self.announcement.state = state
+        self.announcement.save()
+
+    @data(
+        MaintenanceState.DRAFT,
+        MaintenanceState.SCHEDULED,
+        MaintenanceState.IN_PROGRESS,
+    )
+    def test_update_allowed_while_active(self, state):
+        self._set_state(state)
+        response = self.client.patch(self.url, {"message": "Updated message"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.announcement.refresh_from_db()
+        self.assertEqual(self.announcement.message, "Updated message")
+
+    @data(MaintenanceState.COMPLETED, MaintenanceState.CANCELLED)
+    def test_update_forbidden_in_terminal_states(self, state):
+        self._set_state(state)
+        response = self.client.patch(self.url, {"message": "Updated message"})
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.announcement.refresh_from_db()
+        self.assertNotEqual(self.announcement.message, "Updated message")
+
+    def test_internal_notes_can_be_updated_while_in_progress(self):
+        self._set_state(MaintenanceState.IN_PROGRESS)
+        response = self.client.patch(
+            self.url, {"internal_notes": "Ended early: work finished ahead of schedule"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.announcement.refresh_from_db()
+        self.assertEqual(
+            self.announcement.internal_notes,
+            "Ended early: work finished ahead of schedule",
+        )
+
+
+@ddt
+class MaintenanceAnnouncementScheduleTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.announcement = self.fixture.maintenance_announcement
@@ -261,7 +465,7 @@ class MaintenanceAnnouncementScheduleTest(test.APITransactionTestCase):
 
 
 @ddt
-class MaintenanceAnnouncementUnscheduleTest(test.APITransactionTestCase):
+class MaintenanceAnnouncementUnscheduleTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.announcement = self.fixture.maintenance_announcement
@@ -350,7 +554,7 @@ class MaintenanceAnnouncementUnscheduleTest(test.APITransactionTestCase):
 
 
 @ddt
-class MaintenanceAnnouncementStartTest(test.APITransactionTestCase):
+class MaintenanceAnnouncementStartTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.announcement = self.fixture.maintenance_announcement
@@ -409,7 +613,7 @@ class MaintenanceAnnouncementStartTest(test.APITransactionTestCase):
 
 
 @ddt
-class MaintenanceAnnouncementCompleteTest(test.APITransactionTestCase):
+class MaintenanceAnnouncementCompleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.announcement = self.fixture.maintenance_announcement
@@ -468,7 +672,7 @@ class MaintenanceAnnouncementCompleteTest(test.APITransactionTestCase):
 
 
 @ddt
-class MaintenanceAnnouncementCancelTest(test.APITransactionTestCase):
+class MaintenanceAnnouncementCancelTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.announcement = self.fixture.maintenance_announcement
@@ -553,7 +757,7 @@ class MaintenanceAnnouncementCancelTest(test.APITransactionTestCase):
 
 
 @ddt
-class PublicMaintenanceAnnouncementViewSetTest(test.APITransactionTestCase):
+class PublicMaintenanceAnnouncementViewSetTest(test.APITestCase):
     """Test the public maintenance announcement viewset that allows anonymous access."""
 
     def setUp(self):
@@ -674,7 +878,7 @@ class PublicMaintenanceAnnouncementViewSetTest(test.APITransactionTestCase):
 
 
 @ddt
-class MaintenanceAnnouncementInternalNotesTest(test.APITransactionTestCase):
+class MaintenanceAnnouncementInternalNotesTest(test.APITestCase):
     """Test internal_notes field visibility based on user permissions."""
 
     def setUp(self):
@@ -785,17 +989,8 @@ class MaintenanceAnnouncementInternalNotesTest(test.APITransactionTestCase):
 
         list_url = marketplace_factories.MaintenanceAnnouncementFactory.get_list_url()
         response = self.client.post(list_url, payload)
-        # Support users might not have permission to create announcements for arbitrary service providers
-        # This depends on the existing permission system
-        if response.status_code == status.HTTP_400_BAD_REQUEST:
-            # Support users may not be allowed to create announcements - this is expected
-            return
-        elif response.status_code == status.HTTP_201_CREATED:
-            # If creation is allowed, verify internal_notes is present
-            self.assertIn("internal_notes", response.json())
-            self.assertEqual(response.json()["internal_notes"], "Support user notes")
-        else:
-            self.fail(f"Unexpected status code: {response.status_code}")
+        # Global support is not staff and has no manage permission on the SP.
+        _assert_permission_denied(response, MANAGE_DENIED_DETAIL)
 
     @data("staff", "service_owner")
     def test_internal_notes_can_be_updated_by_authorized_users(self, user):
@@ -817,17 +1012,13 @@ class MaintenanceAnnouncementInternalNotesTest(test.APITransactionTestCase):
         self.assertEqual(self.announcement.internal_notes, "Updated internal notes")
 
     def test_internal_notes_can_be_updated_by_support_users(self):
-        """Support users should be able to update internal_notes."""
+        """Support users without manage permission cannot update announcements."""
         self.client.force_authenticate(self.support_user)
 
         response = self.client.patch(
             self.url, {"internal_notes": "Support updated notes"}
         )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-
-        # Verify updated internal_notes
-        self.assertIn("internal_notes", response.json())
-        self.assertEqual(response.json()["internal_notes"], "Support updated notes")
+        _assert_permission_denied(response, ACTION_DENIED_DETAIL)
 
     def test_internal_notes_in_list_view_for_authorized_users(self):
         """Internal notes should be included in list view for authorized users."""
@@ -889,3 +1080,151 @@ class MaintenanceAnnouncementInternalNotesTest(test.APITransactionTestCase):
 
         self.assertIsNotNone(test_announcement)
         self.assertNotIn("internal_notes", test_announcement)
+
+
+@ddt
+class MaintenanceAnnouncementDerivedFieldsTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = marketplace_fixtures.MarketplaceFixture()
+        self.sp = self.fixture.service_provider
+        self.client.force_authenticate(self.fixture.staff)
+        self.ss = timezone.now().replace(microsecond=0)
+        self.se = self.ss + timedelta(hours=2)
+
+    @data((30, 30), (-30, -30), (0, 0))
+    def test_overrun_minutes_returned_with_announcement(self, case):
+        end_delta, expected = case
+        announcement = marketplace_factories.MaintenanceAnnouncementFactory(
+            service_provider=self.sp,
+            state=MaintenanceState.COMPLETED,
+            scheduled_start=self.ss,
+            scheduled_end=self.se,
+            actual_start=self.ss,
+            actual_end=self.se + timedelta(minutes=end_delta),
+        )
+        url = marketplace_factories.MaintenanceAnnouncementFactory.get_url(announcement)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["overrun_minutes"], expected)
+
+    def test_overrun_minutes_null_when_not_completed(self):
+        announcement = marketplace_factories.MaintenanceAnnouncementFactory(
+            service_provider=self.sp,
+            state=MaintenanceState.SCHEDULED,
+            scheduled_start=self.ss,
+            scheduled_end=self.se,
+        )
+        url = marketplace_factories.MaintenanceAnnouncementFactory.get_url(announcement)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNone(response.json()["overrun_minutes"])
+
+    def test_timing_bucket_returned_with_announcement(self):
+        announcement = marketplace_factories.MaintenanceAnnouncementFactory(
+            service_provider=self.sp,
+            state=MaintenanceState.COMPLETED,
+            scheduled_start=self.ss,
+            scheduled_end=self.se,
+            actual_start=self.ss,
+            actual_end=self.se + timedelta(minutes=30),
+        )
+        url = marketplace_factories.MaintenanceAnnouncementFactory.get_url(announcement)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["timing_bucket"], "overrun")
+
+    def _bucket(self, *, started=True, ended=True, start_delta=0, end_delta=0):
+        announcement = models.MaintenanceAnnouncement(
+            scheduled_start=self.ss,
+            scheduled_end=self.se,
+            actual_start=self.ss + timedelta(minutes=start_delta) if started else None,
+            actual_end=self.se + timedelta(minutes=end_delta) if ended else None,
+        )
+        return announcement.timing_bucket
+
+    def test_timing_bucket_classification(self):
+        self.assertEqual(self._bucket(started=False, ended=False), "pending")
+        self.assertEqual(self._bucket(start_delta=0, end_delta=0), "on_time")
+        # 15-minute boundary is inclusive of on_time (tolerance is exceeded only above 15).
+        self.assertEqual(self._bucket(start_delta=0, end_delta=15), "on_time")
+        self.assertEqual(self._bucket(start_delta=0, end_delta=30), "overrun")
+        # Start-side boundary: 15 min late is still on_time, 16 min is late_start.
+        self.assertEqual(self._bucket(start_delta=15, end_delta=0), "on_time")
+        self.assertEqual(self._bucket(start_delta=16, end_delta=0), "late_start")
+        self.assertEqual(self._bucket(start_delta=30, end_delta=0), "late_start")
+        self.assertEqual(self._bucket(start_delta=0, end_delta=-30), "early")
+
+
+class MaintenanceStatsDerivedTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = marketplace_fixtures.MarketplaceFixture()
+        self.fixture.maintenance_announcement.delete()
+        self.sp = self.fixture.service_provider
+        self.url = marketplace_factories.MaintenanceAnnouncementFactory.get_list_url(
+            "maintenance_stats"
+        )
+        self.client.force_authenticate(self.fixture.staff)
+        self.ss = timezone.now().replace(microsecond=0)
+        self.se = self.ss + timedelta(hours=2)
+
+    def _make(
+        self, *, state, end_delta=None, maintenance_type=MaintenanceType.SCHEDULED
+    ):
+        started = state in (MaintenanceState.COMPLETED, MaintenanceState.IN_PROGRESS)
+        return marketplace_factories.MaintenanceAnnouncementFactory(
+            service_provider=self.sp,
+            state=state,
+            maintenance_type=maintenance_type,
+            scheduled_start=self.ss,
+            scheduled_end=self.se,
+            actual_start=self.ss if started else None,
+            actual_end=self.se + timedelta(minutes=end_delta)
+            if end_delta is not None
+            else None,
+        )
+
+    def test_maintenance_stats_on_time_rate_15min(self):
+        self._make(state=MaintenanceState.COMPLETED, end_delta=0)  # within 15 min
+        self._make(state=MaintenanceState.COMPLETED, end_delta=60)  # overran
+        self._make(state=MaintenanceState.COMPLETED, end_delta=-30)  # early, within 15
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertAlmostEqual(
+            response.data["summary"]["on_time_rate_15min"], 2 / 3, places=4
+        )
+
+    def test_maintenance_stats_avg_overrun_hours(self):
+        self._make(state=MaintenanceState.COMPLETED, end_delta=0)  # not an overrun
+        self._make(state=MaintenanceState.COMPLETED, end_delta=60)  # 1h overrun
+        self._make(state=MaintenanceState.COMPLETED, end_delta=120)  # 2h overrun
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertAlmostEqual(
+            response.data["summary"]["avg_overrun_hours"], 1.5, places=4
+        )
+
+    def test_maintenance_stats_emergency_count(self):
+        self._make(
+            state=MaintenanceState.SCHEDULED,
+            maintenance_type=MaintenanceType.EMERGENCY,
+        )
+        self._make(
+            state=MaintenanceState.SCHEDULED,
+            maintenance_type=MaintenanceType.EMERGENCY,
+        )
+        self._make(
+            state=MaintenanceState.SCHEDULED,
+            maintenance_type=MaintenanceType.SCHEDULED,
+        )
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["summary"]["emergency_count"], 2)
+
+    def test_maintenance_stats_tolerates_timing_ordering_and_bucket_params(self):
+        # The stats endpoint must not 500 if the timing ordering/bucket params
+        # (which rely on annotations only applied by those filters) leak in.
+        self._make(state=MaintenanceState.COMPLETED, end_delta=60)
+        response = self.client.get(
+            self.url, {"o": "overrun_minutes", "timing_bucket": "overrun"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)

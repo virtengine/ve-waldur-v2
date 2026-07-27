@@ -3,24 +3,37 @@ import json
 import django_filters
 from constance import config
 from django.contrib.contenttypes.models import ContentType
-from django.db.models import Count, F, Q, QuerySet
+from django.db.models import (
+    Count,
+    DurationField,
+    Exists,
+    ExpressionWrapper,
+    F,
+    OuterRef,
+    Q,
+    QuerySet,
+)
 from django.utils.translation import gettext_lazy as _
 from django_filters import DateFromToRangeFilter
 from django_filters.widgets import BooleanWidget
+from drf_spectacular.plumbing import build_parameter_type
+from drf_spectacular.utils import OpenApiParameter
 from rest_framework import exceptions as rf_exceptions
 from rest_framework.filters import BaseFilterBackend
 
 from waldur_core.checklist import models as checklist_models
 from waldur_core.core import filters as core_filters
+from waldur_core.core.enums import CoreStates
 from waldur_core.core.filters import (
     CharInFilter,
     LooseMultipleChoiceFilter,
-    UUIDInFilter,
+    ReviewStateFilter,
     get_generic_field_filter,
 )
 from waldur_core.core.models import User
-from waldur_core.core.utils import is_uuid_like
-from waldur_core.permissions.enums import PermissionEnum, RoleEnum
+from waldur_core.core.utils import get_ip_address, is_uuid_like
+from waldur_core.permissions import models as permission_models
+from waldur_core.permissions.enums import TYPE_MAP, PermissionEnum, RoleEnum
 from waldur_core.permissions.filters import UserPermissionFilter
 from waldur_core.permissions.models import UserRole
 from waldur_core.structure import filters as structure_filters
@@ -38,6 +51,7 @@ from waldur_mastermind.marketplace.enums import (
     BillingTypes,
     CourseAccountState,
     OfferingStates,
+    OfferingUserRuntimeStates,
     OfferingUserStates,
     OrderStates,
     OrderTypes,
@@ -51,9 +65,10 @@ from waldur_mastermind.marketplace.managers import (
 )
 from waldur_mastermind.proposal import models as proposal_models
 from waldur_mastermind.proposal.enums import CallStates, RequestedOfferingStates
+from waldur_openstack import models as openstack_models
 from waldur_pid import models as pid_models
 
-from . import models
+from . import models, utils
 
 
 class ServiceProviderFilter(django_filters.FilterSet):
@@ -62,8 +77,8 @@ class ServiceProviderFilter(django_filters.FilterSet):
         field_name="customer__uuid",
         label="Customer URL",
     )
-    customer_uuid = django_filters.UUIDFilter(
-        field_name="customer__uuid", label="Customer UUID"
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail", field_name="customer__uuid", label="Customer UUID"
     )
     customer_keyword = django_filters.CharFilter(
         method="filter_customer_keyword",
@@ -85,7 +100,9 @@ class ServiceProviderFilter(django_filters.FilterSet):
 
 class TagFilter(django_filters.FilterSet):
     name = django_filters.CharFilter(lookup_expr="icontains")
-    created_by = django_filters.UUIDFilter(field_name="created_by__uuid")
+    created_by = core_filters.RelatedUUIDFilter(
+        view_name="user-detail", field_name="created_by__uuid"
+    )
 
     class Meta:
         model = models.Tag
@@ -101,25 +118,34 @@ class OfferingFilter(
         model = models.Offering
         fields = []
 
+    slug = django_filters.CharFilter(
+        field_name="slug", lookup_expr="exact", label="Slug"
+    )
     customer = core_filters.URLFilter(
         view_name="customer-detail",
         field_name="customer__uuid",
         label="Customer URL",
     )
-    customer_uuid = django_filters.UUIDFilter(
-        field_name="customer__uuid", label="Customer UUID"
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail", field_name="customer__uuid", label="Customer UUID"
     )
-    allowed_customer_uuid = django_filters.UUIDFilter(
-        method="filter_allowed_customer", label="Allowed customer UUID"
+    allowed_customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        method="filter_allowed_customer",
+        label="Allowed customer UUID",
     )
-    service_manager_uuid = django_filters.UUIDFilter(
-        method="filter_service_manager", label="Service manager UUID"
+    service_manager_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail",
+        method="filter_service_manager",
+        label="Service manager UUID",
     )
-    project_uuid = django_filters.UUIDFilter(
-        method="filter_project", label="Project UUID"
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", method="filter_project", label="Project UUID"
     )
-    parent_uuid = django_filters.UUIDFilter(
-        field_name="parent__uuid", label="Parent offering UUID"
+    parent_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="parent__uuid",
+        label="Parent offering UUID",
     )
     attributes = django_filters.CharFilter(
         method="filter_attributes", label="Offering attributes (JSON)"
@@ -127,7 +153,8 @@ class OfferingFilter(
     state = core_filters.MappedMultipleChoiceFilter(
         OfferingStates.CHOICES, label="Offering state"
     )
-    organization_group_uuid = LooseMultipleChoiceFilter(
+    organization_group_uuid = core_filters.RelatedUUIDFilter(
+        view_name="organization-group-detail",
         field_name="organization_groups__uuid",
         label="Organization group UUID",
     )
@@ -147,11 +174,20 @@ class OfferingFilter(
         method="filter_tag_names_and",
         label="Tag names with AND logic (comma-separated)",
     )
-    category_uuid = django_filters.UUIDFilter(
-        field_name="category__uuid", label="Category UUID"
+    category_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-category-detail",
+        field_name="category__uuid",
+        label="Category UUID",
     )
-    category_group_uuid = django_filters.UUIDFilter(
-        field_name="category__group__uuid", label="Category group UUID"
+    category_group_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-category-group-detail",
+        field_name="category__group__uuid",
+        label="Category group UUID",
+    )
+    offering_group_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-offering-group-detail",
+        field_name="offering_group__uuid",
+        label="Offering group UUID",
     )
     billable = django_filters.BooleanFilter(widget=BooleanWidget, label="Billable")
     shared = django_filters.BooleanFilter(widget=BooleanWidget, label="Shared")
@@ -159,7 +195,8 @@ class OfferingFilter(
         lookup_expr="icontains", label="Description contains"
     )
     keyword = django_filters.CharFilter(method="filter_keyword", label="Keyword")
-    scope_uuid = django_filters.UUIDFilter(
+    scope_uuid = core_filters.RelatedUUIDFilter(
+        view_name="servicesettings-detail",
         method=get_generic_field_filter(
             models_to_search=[structure_models.ServiceSettings]
         ),
@@ -168,11 +205,19 @@ class OfferingFilter(
     accessible_via_calls = django_filters.BooleanFilter(
         label="Accessible via calls", method="filter_accessible_via_calls"
     )
-    resource_customer_uuid = django_filters.UUIDFilter(
-        method="filter_resource_customer_uuid", label="Resource customer UUID"
+    accessible = django_filters.BooleanFilter(
+        label="Only offerings the current user can order",
+        method="filter_accessible",
     )
-    resource_project_uuid = django_filters.UUIDFilter(
-        method="filter_resource_project_uuid", label="Resource project UUID"
+    resource_customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        method="filter_resource_customer_uuid",
+        label="Resource customer UUID",
+    )
+    resource_project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail",
+        method="filter_resource_project_uuid",
+        label="Resource project UUID",
     )
     uuid_list = django_filters.CharFilter(
         method="filter_uuid_list",
@@ -291,6 +336,16 @@ class OfferingFilter(
             queryset = self.filters[name].filter(queryset, value)
         return queryset
 
+    def filter_accessible(self, queryset, name, value):
+        # When True, hide restricted offerings the current user cannot order
+        # (e.g. plugin_options.restricted_to_roles the user does not hold), even
+        # if their project already consumes a resource from one. The catalog
+        # passes this so non-orderable offerings do not clutter the marketplace,
+        # while detail/retrieve endpoints keep resolving them.
+        if not value:
+            return queryset
+        return queryset.filter_accessible_for_user(self.request.user)
+
     def filter_accessible_via_calls(self, queryset, name, value):
         if value is None:
             return queryset
@@ -344,14 +399,15 @@ class OfferingFilter(
             return queryset.none() if value else queryset
 
         user = request.user
+        active_consent = models.UserOfferingConsent.objects.filter(
+            offering=OuterRef("pk"),
+            user=user,
+            revocation_date__isnull=True,
+        )
         if value:
-            return queryset.filter(
-                user_consents__user=user, user_consents__revocation_date__isnull=True
-            ).distinct()
+            return queryset.filter(Exists(active_consent)).distinct()
         else:
-            return queryset.exclude(
-                user_consents__user=user, user_consents__revocation_date__isnull=True
-            ).distinct()
+            return queryset.exclude(Exists(active_consent)).distinct()
 
     def filter_user_has_offering_user(self, queryset, name, value):
         if value is None:
@@ -423,6 +479,61 @@ class OfferingCustomersFilterBackend(BaseFilterBackend):
         return queryset.filter_for_user(request.user)
 
 
+class ResourceAccessSubnetConcealmentFilterBackend(BaseFilterBackend):
+    """Hide resources whose offering opted into subnet-based concealment when the
+    caller's IP is not covered by the resource's access subnets.
+
+    Mirrors the organization-level ``filter_queryset_by_user_ip`` semantics:
+    staff/support and requests without a resolvable IP bypass the check. A
+    resource is hidden only when its offering enabled
+    ``conceal_subnet_restricted_resources`` AND it is restricted (it has at least
+    one own subnet, or its offering has at least one provider-default subnet) AND
+    the caller's IP is in none of the resource's own subnets nor the offering's
+    default subnets. The provider defaults widen the allow-list.
+    """
+
+    FLAG = "conceal_subnet_restricted_resources"
+
+    def filter_queryset(self, request, queryset, view):
+        user = request.user
+        if user is None or not user.is_authenticated:
+            return queryset
+        user_ip = get_ip_address(request)
+        if user.is_staff or user.is_support or not user_ip:
+            return queryset
+
+        concealing = {
+            "offering__plugin_options__has_key": self.FLAG,
+            f"offering__plugin_options__{self.FLAG}": True,
+        }
+        # Resources restricted because they have their own subnet(s).
+        restricted_own = models.ResourceAccessSubnet.objects.filter(
+            **{f"resource__{k}": v for k, v in concealing.items()},
+            inet__isnull=False,
+        ).values_list("resource_id", flat=True)
+        # Concealing offerings that carry provider-default subnets: every resource
+        # of such an offering is restricted (checked against the defaults).
+        offerings_with_defaults = models.OfferingAccessSubnet.objects.filter(
+            **concealing,
+            inet__isnull=False,
+        ).values_list("offering_id", flat=True)
+
+        # Resources allowed because one of their own subnets covers the IP.
+        allowed_own = models.ResourceAccessSubnet.objects.filter(
+            inet__net_contains_or_equals=user_ip,
+        ).values_list("resource_id", flat=True)
+        # Offerings whose provider-default subnets cover the IP.
+        offerings_allowing_ip = models.OfferingAccessSubnet.objects.filter(
+            inet__net_contains_or_equals=user_ip,
+        ).values_list("offering_id", flat=True)
+
+        restricted = Q(pk__in=restricted_own) | Q(
+            offering_id__in=offerings_with_defaults
+        )
+        allowed = Q(pk__in=allowed_own) | Q(offering_id__in=offerings_allowing_ip)
+        return queryset.exclude(restricted & ~allowed)
+
+
 class OfferingImportableFilterBackend(BaseFilterBackend):
     def filter_queryset(self, request, queryset: QuerySet[models.Offering], view):
         if "importable" in request.query_params:
@@ -448,6 +559,17 @@ class OfferingImportableFilterBackend(BaseFilterBackend):
             )
         return queryset
 
+    def get_schema_operation_parameters(self, view):
+        return [
+            build_parameter_type(
+                name="importable",
+                schema={"type": "string"},
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Filter by importable offerings.",
+            )
+        ]
+
 
 class OfferingFilterMixin(django_filters.FilterSet):
     """Mixin to provide common offering-related filters."""
@@ -456,10 +578,13 @@ class OfferingFilterMixin(django_filters.FilterSet):
         view_name="marketplace-provider-offering-detail",
         field_name="offering__uuid",
     )
-    offering_uuid = UUIDInFilter(field_name="offering__uuid")
+    offering_uuid = core_filters.RelatedUUIDInFilter(
+        view_name="marketplace-provider-offering-detail", field_name="offering__uuid"
+    )
     offering_slug = CharInFilter(field_name="offering__slug")
-    parent_offering_uuid = django_filters.UUIDFilter(
-        field_name="offering__parent__uuid"
+    parent_offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="offering__parent__uuid",
     )
 
     def filter_service_manager(self, queryset, name, value):
@@ -477,13 +602,52 @@ class OfferingFilterMixin(django_filters.FilterSet):
         )
 
 
+class OfferingRoleFilter(django_filters.FilterSet):
+    offering_uuid = django_filters.CharFilter(method="filter_by_offering")
+    content_type = django_filters.CharFilter(method="filter_by_content_type")
+    name = django_filters.CharFilter(lookup_expr="icontains")
+
+    class Meta:
+        model = permission_models.Role
+        fields = []
+
+    def filter_by_offering(self, queryset, name, value):
+        try:
+            offering = models.Offering.objects.get(uuid=value)
+        except models.Offering.DoesNotExist:
+            return queryset.none()
+        if offering.profile_id:
+            # Profile-bound offerings own their catalog through the profile;
+            # any direct RoleAvailability rows are ignored to avoid stale
+            # bindings from leaking into the per-offering Roles tab.
+            return queryset.filter(
+                id__in=offering.profile.roles.values_list("id", flat=True)
+            )
+        offering_ct = ContentType.objects.get_for_model(models.Offering)
+        return queryset.filter(
+            availability__content_type=offering_ct,
+            availability__object_id=offering.id,
+        )
+
+    def filter_by_content_type(self, queryset, name, value):
+        if value in TYPE_MAP:
+            app_label, model_name = TYPE_MAP[value]
+            ct = ContentType.objects.get_by_natural_key(app_label, model_name)
+            return queryset.filter(content_type=ct)
+        return queryset.none()
+
+
 class OfferingPermissionFilter(UserPermissionFilter):
     class Meta:
         fields = []
         model = UserRole
 
-    offering = django_filters.UUIDFilter(method="filter_by_offering")
-    customer = django_filters.UUIDFilter(method="filter_by_customer")
+    offering = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail", method="filter_by_offering"
+    )
+    customer = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail", method="filter_by_customer"
+    )
 
     def filter_by_offering(self, queryset, name, value):
         try:
@@ -506,17 +670,34 @@ class SoftwareCatalogFilter(django_filters.FilterSet):
 
     name = django_filters.CharFilter(lookup_expr="icontains")
     version = django_filters.CharFilter(lookup_expr="icontains")
+    catalog_type = django_filters.ChoiceFilter(
+        choices=models.SoftwareCatalog.CATALOG_TYPE_CHOICES,
+        label="Catalog type",
+        help_text="Filter by catalog type (binary_runtime, source_package, package_manager)",
+    )
+    description = django_filters.CharFilter(
+        lookup_expr="icontains",
+        label="Description",
+        help_text="Filter catalogs by description (case-insensitive partial match)",
+    )
+    auto_update_enabled = django_filters.BooleanFilter(
+        widget=BooleanWidget,
+        label="Auto-update enabled",
+        help_text="Filter catalogs by auto-update status",
+    )
 
     o = django_filters.OrderingFilter(
         fields=(
             ("name", "name"),
             ("version", "version"),
+            ("catalog_type", "catalog_type"),
             ("created", "created"),
             ("modified", "modified"),
         ),
         field_labels={
             "name": "Catalog name",
             "version": "Version",
+            "catalog_type": "Catalog type",
             "created": "Created date",
             "modified": "Modified date",
         },
@@ -524,7 +705,7 @@ class SoftwareCatalogFilter(django_filters.FilterSet):
 
     class Meta:
         model = models.SoftwareCatalog
-        fields = ["name", "version"]
+        fields = ["name", "version", "catalog_type"]
 
 
 class SoftwarePackageFilter(django_filters.FilterSet):
@@ -535,12 +716,14 @@ class SoftwarePackageFilter(django_filters.FilterSet):
         label="query",
         help_text="Query packages by name, description, or version (case-insensitive partial match)",
     )
-    offering_uuid = django_filters.UUIDFilter(
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
         method="filter_offering_uuid",
         label="Offering UUID",
         help_text="Filter packages available for a specific offering",
     )
-    catalog_uuid = django_filters.UUIDFilter(
+    catalog_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-category-group-detail",
         field_name="catalog__uuid",
         label="Catalog UUID",
         help_text="Filter packages from a specific software catalog",
@@ -561,6 +744,12 @@ class SoftwarePackageFilter(django_filters.FilterSet):
         lookup_expr="icontains",
         label="Package name",
         help_text="Filter packages by name (case-insensitive partial match)",
+    )
+    name_exact = django_filters.CharFilter(
+        field_name="name",
+        lookup_expr="iexact",
+        label="Package name (exact)",
+        help_text="Filter packages by exact name (case-insensitive)",
     )
     description = django_filters.CharFilter(
         lookup_expr="icontains",
@@ -592,6 +781,54 @@ class SoftwarePackageFilter(django_filters.FilterSet):
         label="Extension name",
         help_text="Filter packages having extensions with a specific name",
     )
+    is_extension = django_filters.BooleanFilter(
+        widget=BooleanWidget,
+        label="Is extension",
+        help_text="Filter packages that are extensions of other packages",
+    )
+    parent_software_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-software-package-detail",
+        field_name="parent_softwares__uuid",
+        label="Parent software UUID",
+        help_text="Filter extension packages belonging to a specific parent package",
+    )
+    category = django_filters.CharFilter(
+        method="filter_category",
+        label="Category",
+        help_text="Filter packages by category (e.g., bio, hpc, chemistry)",
+    )
+    license = django_filters.CharFilter(
+        method="filter_license",
+        label="License",
+        help_text="Filter packages by license (e.g., GPL-3.0, MIT)",
+    )
+    catalog_type = django_filters.ChoiceFilter(
+        choices=models.SoftwareCatalog.CATALOG_TYPE_CHOICES,
+        field_name="catalog__catalog_type",
+        label="Catalog type",
+        help_text="Filter packages by catalog type (binary_runtime, source_package, package_manager)",
+    )
+    toolchain_families_compatibility = django_filters.CharFilter(
+        method="filter_toolchain_families_compatibility",
+        label="Toolchain families compatibility",
+        help_text="Filter packages compatible with a specific toolchain family (e.g., foss_2022b)",
+    )
+    toolchain_name = django_filters.CharFilter(
+        method="filter_toolchain_name",
+        label="Toolchain name",
+        help_text="Filter packages by toolchain name (e.g., foss, gfbf)",
+    )
+    has_gpu = django_filters.BooleanFilter(
+        method="filter_has_gpu",
+        widget=BooleanWidget,
+        label="Has GPU support",
+        help_text="Filter packages that have GPU-enabled builds",
+    )
+    gpu_arch = django_filters.CharFilter(
+        method="filter_gpu_arch",
+        label="GPU architecture",
+        help_text="Filter packages by GPU architecture (e.g., nvidia/cc90)",
+    )
 
     o = django_filters.OrderingFilter(
         fields=(
@@ -620,12 +857,16 @@ class SoftwarePackageFilter(django_filters.FilterSet):
 
     def filter_cpu_family(self, queryset, name, value):
         """Filter packages with versions available for CPU family."""
-        return queryset.filter(versions__targets__cpu_family=value).distinct()
+        return queryset.filter(
+            versions__targets__target_type="cpu_architecture",
+            versions__targets__target_name=value,
+        ).distinct()
 
     def filter_cpu_microarchitecture(self, queryset, name, value):
         """Filter packages with versions available for CPU microarchitecture."""
         return queryset.filter(
-            versions__targets__cpu_microarchitecture=value
+            versions__targets__target_type="cpu_architecture",
+            versions__targets__target_subtype=value,
         ).distinct()
 
     def filter_has_version(self, queryset, name, value):
@@ -655,20 +896,103 @@ class SoftwarePackageFilter(django_filters.FilterSet):
             versions__metadata__extensions__contains=[{"name": value}]
         ).distinct()
 
+    def filter_toolchain_families_compatibility(self, queryset, name, value):
+        """Filter packages with versions compatible with a specific toolchain family."""
+        return queryset.filter(
+            versions__metadata__toolchain_families_compatibility__contains=[value]
+        ).distinct()
+
+    def filter_category(self, queryset, name, value):
+        """Filter packages by category."""
+        return queryset.filter(categories__contains=[value]).distinct()
+
+    def filter_license(self, queryset, name, value):
+        """Filter packages by license."""
+        return queryset.filter(licenses__contains=[value]).distinct()
+
+    def filter_toolchain_name(self, queryset, name, value):
+        """Filter packages by toolchain name (via version metadata)."""
+        return queryset.filter(versions__metadata__toolchain__name=value).distinct()
+
+    def filter_has_gpu(self, queryset, name, value):
+        """Filter packages that have at least one GPU-enabled target."""
+        # Exists: at least one non-empty gpu_architectures target (not "all targets").
+        has_gpu_target = models.SoftwareTarget.objects.filter(
+            version__package_id=OuterRef("pk"),
+        ).exclude(gpu_architectures=[])
+        if value:
+            return queryset.filter(Exists(has_gpu_target)).distinct()
+        return queryset.exclude(Exists(has_gpu_target)).distinct()
+
+    def filter_gpu_arch(self, queryset, name, value):
+        """Filter packages by specific GPU architecture (e.g., nvidia/cc90)."""
+        return queryset.filter(
+            versions__targets__gpu_architectures__contains=[value]
+        ).distinct()
+
 
 class SoftwareVersionFilter(django_filters.FilterSet):
     """Filter for SoftwareVersion model."""
 
-    package_uuid = django_filters.UUIDFilter(field_name="package__uuid")
-    catalog_uuid = django_filters.UUIDFilter(field_name="package__catalog__uuid")
-    offering_uuid = django_filters.UUIDFilter(method="filter_offering_uuid")
+    package_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-software-package-detail", field_name="package__uuid"
+    )
+    catalog_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-category-group-detail",
+        field_name="package__catalog__uuid",
+    )
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail", method="filter_offering_uuid"
+    )
     package_name = django_filters.CharFilter(
         field_name="package__name", lookup_expr="icontains"
     )
     version = django_filters.CharFilter(lookup_expr="icontains")
-    cpu_family = django_filters.CharFilter(field_name="targets__cpu_family")
+    version_exact = django_filters.CharFilter(
+        field_name="version",
+        lookup_expr="exact",
+        label="Version (exact)",
+        help_text="Filter versions by exact version string",
+    )
+    cpu_family = django_filters.CharFilter(method="filter_cpu_family")
     cpu_microarchitecture = django_filters.CharFilter(
-        field_name="targets__cpu_microarchitecture"
+        method="filter_cpu_microarchitecture"
+    )
+    toolchain_families_compatibility = django_filters.CharFilter(
+        method="filter_toolchain_families_compatibility",
+        label="Toolchain families compatibility",
+        help_text="Filter versions compatible with a specific toolchain family (e.g., foss_2022b)",
+    )
+    toolchain_name = django_filters.CharFilter(
+        method="filter_toolchain_name",
+        label="Toolchain name",
+        help_text="Filter versions by toolchain name (e.g., foss, gfbf)",
+    )
+    toolchain_version = django_filters.CharFilter(
+        method="filter_toolchain_version",
+        label="Toolchain version",
+        help_text="Filter versions by toolchain version (e.g., 2023b)",
+    )
+    release_date = DateFromToRangeFilter(
+        label="Release date range",
+        help_text="Filter versions by release date range (release_date_after, release_date_before)",
+    )
+    catalog_type = django_filters.ChoiceFilter(
+        choices=models.SoftwareCatalog.CATALOG_TYPE_CHOICES,
+        field_name="package__catalog__catalog_type",
+        label="Catalog type",
+        help_text="Filter versions by catalog type (binary_runtime, source_package, package_manager)",
+    )
+    has_gpu = django_filters.BooleanFilter(
+        method="filter_has_gpu",
+        widget=BooleanWidget,
+        label="Has GPU support",
+        help_text="Filter versions that have GPU-enabled builds",
+    )
+    gpu_arch = django_filters.CharFilter(
+        method="filter_gpu_arch",
+        label="GPU architecture",
+        help_text="Filter versions by GPU architecture (e.g., nvidia/cc90)",
     )
 
     o = django_filters.OrderingFilter(
@@ -695,57 +1019,169 @@ class SoftwareVersionFilter(django_filters.FilterSet):
             package__catalog__offerings__offering__uuid=value
         ).distinct()
 
+    def filter_cpu_family(self, queryset, name, value):
+        return queryset.filter(
+            targets__target_type="cpu_architecture",
+            targets__target_name=value,
+        ).distinct()
+
+    def filter_cpu_microarchitecture(self, queryset, name, value):
+        return queryset.filter(
+            targets__target_type="cpu_architecture",
+            targets__target_subtype=value,
+        ).distinct()
+
+    def filter_toolchain_families_compatibility(self, queryset, name, value):
+        """Filter versions compatible with a specific toolchain family."""
+        return queryset.filter(
+            metadata__toolchain_families_compatibility__contains=[value]
+        )
+
+    def filter_toolchain_name(self, queryset, name, value):
+        """Filter versions by toolchain name."""
+        return queryset.filter(metadata__toolchain__name=value)
+
+    def filter_toolchain_version(self, queryset, name, value):
+        """Filter versions by toolchain version."""
+        return queryset.filter(metadata__toolchain__version=value)
+
+    def filter_has_gpu(self, queryset, name, value):
+        """Filter versions that have at least one GPU-enabled target."""
+        has_gpu_target = models.SoftwareTarget.objects.filter(
+            version_id=OuterRef("pk"),
+        ).exclude(gpu_architectures=[])
+        if value:
+            return queryset.filter(Exists(has_gpu_target)).distinct()
+        return queryset.exclude(Exists(has_gpu_target)).distinct()
+
+    def filter_gpu_arch(self, queryset, name, value):
+        """Filter versions by specific GPU architecture (e.g., nvidia/cc90)."""
+        return queryset.filter(targets__gpu_architectures__contains=[value]).distinct()
+
 
 class SoftwareTargetFilter(django_filters.FilterSet):
     """Filter for SoftwareTarget model."""
 
-    version_uuid = django_filters.UUIDFilter(field_name="version__uuid")
-    package_uuid = django_filters.UUIDFilter(field_name="version__package__uuid")
-    catalog_uuid = django_filters.UUIDFilter(
-        field_name="version__package__catalog__uuid"
+    version_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-software-version-detail", field_name="version__uuid"
     )
-    offering_uuid = django_filters.UUIDFilter(method="filter_offering_uuid")
-    cpu_family = django_filters.CharFilter(lookup_expr="icontains")
-    cpu_microarchitecture = django_filters.CharFilter(lookup_expr="icontains")
-    path = django_filters.CharFilter(lookup_expr="icontains")
+    package_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-software-package-detail",
+        field_name="version__package__uuid",
+    )
+    catalog_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-category-group-detail",
+        field_name="version__package__catalog__uuid",
+    )
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail", method="filter_offering_uuid"
+    )
+    cpu_family = django_filters.CharFilter(method="filter_cpu_family")
+    cpu_microarchitecture = django_filters.CharFilter(
+        method="filter_cpu_microarchitecture"
+    )
+    path = django_filters.CharFilter(
+        field_name="location",
+        lookup_expr="icontains",
+        label="Path",
+        help_text="Filter targets by location/path (case-insensitive partial match)",
+    )
+    target_type = django_filters.CharFilter(
+        lookup_expr="iexact",
+        label="Target type",
+        help_text="Filter targets by type (e.g., architecture, platform, variant)",
+    )
+    target_name = django_filters.CharFilter(
+        lookup_expr="icontains",
+        label="Target name",
+        help_text="Filter targets by name (e.g., x86_64, aarch64)",
+    )
+    target_subtype = django_filters.CharFilter(
+        lookup_expr="icontains",
+        label="Target subtype",
+        help_text="Filter targets by subtype (e.g., microarchitecture, distribution)",
+    )
+    has_gpu = django_filters.BooleanFilter(
+        method="filter_has_gpu",
+        widget=BooleanWidget,
+        label="Has GPU support",
+        help_text="Filter targets that have GPU architectures",
+    )
+    gpu_arch = django_filters.CharFilter(
+        method="filter_gpu_arch",
+        label="GPU architecture",
+        help_text="Filter targets by GPU architecture (e.g., nvidia/cc90)",
+    )
 
     o = django_filters.OrderingFilter(
         fields=(
-            ("cpu_family", "cpu_family"),
-            ("cpu_microarchitecture", "cpu_microarchitecture"),
+            ("target_name", "cpu_family"),
+            ("target_subtype", "cpu_microarchitecture"),
             ("version__package__name", "package_name"),
+            ("target_type", "target_type"),
+            ("target_name", "target_name"),
             ("created", "created"),
         ),
         field_labels={
             "cpu_family": "CPU Family",
             "cpu_microarchitecture": "CPU Microarchitecture",
             "package_name": "Package name",
+            "target_type": "Target type",
+            "target_name": "Target name",
             "created": "Created date",
         },
     )
 
     class Meta:
         model = models.SoftwareTarget
-        fields = ["cpu_family", "cpu_microarchitecture"]
+        fields = ["cpu_family", "cpu_microarchitecture", "target_type", "target_name"]
 
     def filter_offering_uuid(self, queryset, name, value):
         return queryset.filter(
             version__package__catalog__offerings__offering__uuid=value
         ).distinct()
 
+    def filter_cpu_family(self, queryset, name, value):
+        return queryset.filter(
+            target_type="cpu_architecture",
+            target_name__iexact=value,
+        )
+
+    def filter_cpu_microarchitecture(self, queryset, name, value):
+        return queryset.filter(
+            target_type="cpu_architecture",
+            target_subtype__iexact=value,
+        )
+
+    def filter_has_gpu(self, queryset, name, value):
+        """Filter targets that have GPU architectures."""
+        if value:
+            return queryset.exclude(gpu_architectures=[])
+        return queryset.filter(gpu_architectures=[])
+
+    def filter_gpu_arch(self, queryset, name, value):
+        """Filter targets by specific GPU architecture (e.g., nvidia/cc90)."""
+        return queryset.filter(gpu_architectures__contains=[value])
+
 
 class OfferingSoftwareCatalogFilter(django_filters.FilterSet):
     """Filter for OfferingSoftwareCatalog model."""
 
-    offering_uuid = django_filters.UUIDFilter(field_name="offering__uuid")
-    catalog_uuid = django_filters.UUIDFilter(field_name="catalog__uuid")
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail", field_name="offering__uuid"
+    )
+    catalog_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-category-group-detail", field_name="catalog__uuid"
+    )
     catalog_name = django_filters.CharFilter(
         field_name="catalog__name", lookup_expr="icontains"
     )
     offering_name = django_filters.CharFilter(
         field_name="offering__name", lookup_expr="icontains"
     )
-    partition_uuid = django_filters.UUIDFilter(field_name="partition__uuid")
+    partition_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-software-partition-detail", field_name="partition__uuid"
+    )
     partition_name = django_filters.CharFilter(
         field_name="partition__partition_name", lookup_expr="icontains"
     )
@@ -806,30 +1242,43 @@ class ScreenshotFilter(OfferingFilterMixin, django_filters.FilterSet):
 class OrderFilter(
     core_filters.CreatedModifiedFilter, OfferingFilterMixin, django_filters.FilterSet
 ):
+    slug = django_filters.CharFilter(
+        field_name="slug", lookup_expr="exact", label="Slug"
+    )
     query = django_filters.CharFilter(
         method="filter_query",
         label="Search by order UUID, slug, project name or resource name",
     )
-    project_uuid = django_filters.UUIDFilter(
-        field_name="project__uuid", label="Project UUID"
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", field_name="project__uuid", label="Project UUID"
     )
-    offering_uuid = django_filters.UUIDFilter(
-        field_name="offering__uuid", label="Offering UUID"
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="offering__uuid",
+        label="Offering UUID",
     )
     offering_type = core_filters.LooseMultipleChoiceFilter(
         field_name="offering__type", lookup_expr="exact", label="Offering type"
     )
-    category_uuid = django_filters.UUIDFilter(
-        field_name="offering__category__uuid", label="Category UUID"
+    category_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-category-detail",
+        field_name="offering__category__uuid",
+        label="Category UUID",
     )
-    provider_uuid = django_filters.UUIDFilter(
-        field_name="offering__customer__uuid", label="Provider UUID"
+    provider_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-service-provider-detail",
+        field_name="offering__customer__uuid",
+        label="Provider UUID",
     )
-    customer_uuid = django_filters.UUIDFilter(
-        field_name="project__customer__uuid", label="Customer UUID"
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        field_name="project__customer__uuid",
+        label="Customer UUID",
     )
-    service_manager_uuid = django_filters.UUIDFilter(
-        method="filter_service_manager", label="Service manager UUID"
+    service_manager_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail",
+        method="filter_service_manager",
+        label="Service manager UUID",
     )
     state = core_filters.MappedMultipleChoiceFilter(
         OrderStates.CHOICES, label="Order state"
@@ -842,8 +1291,10 @@ class OrderFilter(
         field_name="resource__uuid",
         label="Resource URL",
     )
-    resource_uuid = django_filters.UUIDFilter(
-        field_name="resource__uuid", label="Resource UUID"
+    resource_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-resource-detail",
+        field_name="resource__uuid",
+        label="Resource UUID",
     )
     resource_name = django_filters.CharFilter(
         field_name="resource__name", lookup_expr="exact", label="Resource name"
@@ -855,6 +1306,10 @@ class OrderFilter(
     can_approve_as_provider = django_filters.BooleanFilter(
         method="filter_can_approve_as_provider",
         label="Can approve as provider",
+    )
+    was_auto_approved = django_filters.BooleanFilter(
+        method="filter_was_auto_approved",
+        label="Auto-approved",
     )
 
     o = django_filters.OrderingFilter(
@@ -909,12 +1364,38 @@ class OrderFilter(
 
         return queryset
 
+    def filter_was_auto_approved(self, queryset, name, value):
+        if value:
+            return queryset.filter(auto_approved_by_rule__isnull=False)
+        return queryset.filter(auto_approved_by_rule__isnull=True)
+
+
+class ProjectOrderAutoApprovalFilter(django_filters.FilterSet):
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail",
+        field_name="project__uuid",
+        label="Project UUID",
+    )
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        field_name="project__customer__uuid",
+        label="Customer UUID",
+    )
+    enabled = django_filters.BooleanFilter()
+
+    class Meta:
+        model = models.ProjectOrderAutoApproval
+        fields = []
+
 
 class ResourceFilter(
     OfferingFilterMixin,
     structure_filters.NameFilterSet,
     core_filters.CreatedModifiedFilter,
 ):
+    slug = django_filters.CharFilter(
+        field_name="slug", lookup_expr="exact", label="Slug"
+    )
     query = django_filters.CharFilter(
         method="filter_query",
         label="Search by resource UUID, name, slug, backend ID, effective ID, IPs or hypervisor",
@@ -926,29 +1407,39 @@ class ResourceFilter(
     offering_billable = django_filters.BooleanFilter(
         field_name="offering__billable", label="Offering billable"
     )
-    plan_uuid = django_filters.UUIDFilter(field_name="plan__uuid", label="Plan UUID")
-    project_uuid = django_filters.UUIDFilter(
-        field_name="project__uuid", label="Project UUID"
+    plan_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-plan-detail", field_name="plan__uuid", label="Plan UUID"
+    )
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", field_name="project__uuid", label="Project UUID"
     )
     project_name = django_filters.CharFilter(
         field_name="project__name", label="Project name"
     )
-    customer_uuid = django_filters.UUIDFilter(
-        field_name="project__customer__uuid", label="Customer UUID"
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        field_name="project__customer__uuid",
+        label="Customer UUID",
     )
     customer = core_filters.URLFilter(
         view_name="customer-detail",
         field_name="project__customer__uuid",
         label="Customer URL",
     )
-    service_manager_uuid = django_filters.UUIDFilter(
-        method="filter_service_manager", label="Service manager UUID"
+    service_manager_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail",
+        method="filter_service_manager",
+        label="Service manager UUID",
     )
-    category_uuid = django_filters.UUIDFilter(
-        field_name="offering__category__uuid", label="Category UUID"
+    category_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-category-detail",
+        field_name="offering__category__uuid",
+        label="Category UUID",
     )
-    provider_uuid = django_filters.UUIDFilter(
-        field_name="offering__customer__uuid", label="Provider UUID"
+    provider_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-service-provider-detail",
+        field_name="offering__customer__uuid",
+        label="Provider UUID",
     )
     backend_id = django_filters.CharFilter(label="Backend ID")
     state = core_filters.MappedMultipleChoiceFilter(
@@ -956,6 +1447,16 @@ class ResourceFilter(
     )
     runtime_state = django_filters.CharFilter(
         field_name="backend_metadata__runtime_state", label="Runtime state"
+    )
+    flavor_name = django_filters.CharFilter(
+        field_name="backend_metadata__flavor_name",
+        lookup_expr="icontains",
+        label="Flavor name",
+    )
+    image_name = django_filters.CharFilter(
+        field_name="backend_metadata__image_name",
+        lookup_expr="icontains",
+        label="Image name",
     )
     downscaled = django_filters.BooleanFilter(
         field_name="downscaled", label="Downscaled"
@@ -1011,6 +1512,10 @@ class ResourceFilter(
         method="filter_is_attached",
         label="Filter by attached state",
     )
+    resource_attributes = django_filters.CharFilter(
+        method="filter_resource_attributes",
+        label="Resource attributes (JSON)",
+    )
 
     o = django_filters.OrderingFilter(
         fields=(
@@ -1028,6 +1533,26 @@ class ResourceFilter(
 
     def filter_has_termination_date(self, queryset: ResourceQuerySet, name, value):
         return queryset.exclude(end_date__isnull=value)
+
+    def filter_resource_attributes(self, queryset, name, value):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            raise rf_exceptions.ValidationError(
+                _("Filter attribute is not valid json.")
+            )
+
+        if not isinstance(value, dict):
+            raise rf_exceptions.ValidationError(
+                _("Filter attribute should be an dict.")
+            )
+
+        for k, v in value.items():
+            if isinstance(v, list):
+                queryset = queryset.filter(**{f"attributes__{k}__in": v})
+            else:
+                queryset = queryset.filter(attributes__contains={k: v})
+        return queryset
 
     def filter_query(self, queryset: ResourceQuerySet, name, value):
         if is_uuid_like(value):
@@ -1212,6 +1737,64 @@ class ResourceFilter(
         return queryset
 
 
+class ResourceAccessSubnetFilter(django_filters.FilterSet):
+    resource = core_filters.URLFilter(
+        view_name="marketplace-resource-detail",
+        field_name="resource__uuid",
+        label="Resource URL",
+    )
+    resource_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-resource-detail",
+        field_name="resource__uuid",
+        label="Resource UUID",
+    )
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="resource__offering__uuid",
+        label="Offering UUID",
+    )
+    inet = django_filters.CharFilter(lookup_expr="icontains", label="Inet")
+    description = django_filters.CharFilter(
+        lookup_expr="icontains", label="Description"
+    )
+
+    class Meta:
+        model = models.ResourceAccessSubnet
+        fields = [
+            "resource",
+            "resource_uuid",
+            "offering_uuid",
+            "inet",
+            "description",
+        ]
+
+
+class OfferingAccessSubnetFilter(django_filters.FilterSet):
+    offering = core_filters.URLFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="offering__uuid",
+        label="Offering URL",
+    )
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="offering__uuid",
+        label="Offering UUID",
+    )
+    inet = django_filters.CharFilter(lookup_expr="icontains", label="Inet")
+    description = django_filters.CharFilter(
+        lookup_expr="icontains", label="Description"
+    )
+
+    class Meta:
+        model = models.OfferingAccessSubnet
+        fields = [
+            "offering",
+            "offering_uuid",
+            "inet",
+            "description",
+        ]
+
+
 class ResourceScopeFilterBackend(core_filters.GenericKeyFilterBackend):
     def get_related_models(self):
         return []
@@ -1238,8 +1821,8 @@ class CustomerServiceAccountFilter(BaseScopedServiceAccountFilter):
         field_name="customer__uuid",
         label="Customer URL",
     )
-    customer_uuid = django_filters.UUIDFilter(
-        field_name="customer__uuid", label="Customer UUID"
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail", field_name="customer__uuid", label="Customer UUID"
     )
 
     class Meta(BaseScopedServiceAccountFilter.Meta):
@@ -1253,13 +1836,25 @@ class ProjectServiceAccountFilter(BaseScopedServiceAccountFilter):
         field_name="project__uuid",
         label="Project URL",
     )
-    project_uuid = django_filters.UUIDFilter(
-        field_name="project__uuid", label="Project UUID"
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", field_name="project__uuid", label="Project UUID"
     )
 
     class Meta(BaseScopedServiceAccountFilter.Meta):
         model = models.ProjectServiceAccount
         fields = BaseScopedServiceAccountFilter.Meta.fields
+
+
+class ResourceApiKeyFilter(django_filters.FilterSet):
+    resource_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-resource-detail",
+        field_name="resource__uuid",
+        label="Resource UUID",
+    )
+
+    class Meta:
+        model = models.ResourceApiKey
+        fields = ("resource_uuid",)
 
 
 class RobotAccountFilter(core_filters.CreatedModifiedFilter, django_filters.FilterSet):
@@ -1268,54 +1863,108 @@ class RobotAccountFilter(core_filters.CreatedModifiedFilter, django_filters.Filt
         field_name="resource__uuid",
         label="Resource URL",
     )
-    resource_uuid = django_filters.UUIDFilter(
-        field_name="resource__uuid", label="Resource UUID"
+    resource_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-resource-detail",
+        field_name="resource__uuid",
+        label="Resource UUID",
     )
-    project_uuid = django_filters.UUIDFilter(
-        field_name="resource__project__uuid", label="Project UUID"
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail",
+        field_name="resource__project__uuid",
+        label="Project UUID",
     )
-    customer_uuid = django_filters.UUIDFilter(
-        field_name="resource__project__customer__uuid", label="Customer UUID"
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        field_name="resource__project__customer__uuid",
+        label="Customer UUID",
     )
-    provider_uuid = django_filters.UUIDFilter(
-        field_name="resource__offering__customer__uuid", label="Provider UUID"
+    provider_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-service-provider-detail",
+        field_name="resource__offering__customer__uuid",
+        label="Provider UUID",
     )
     state = django_filters.ChoiceFilter(
         choices=RobotAccountStates.CHOICES, label="Robot account state"
     )
+    username = django_filters.CharFilter(
+        lookup_expr="icontains", label="Username contains"
+    )
+    user_email = django_filters.CharFilter(
+        field_name="users__email",
+        lookup_expr="icontains",
+        label="Connected user email contains",
+        distinct=True,
+    )
+    responsible_user_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail",
+        field_name="responsible_user__uuid",
+        label="Responsible user UUID",
+    )
 
     class Meta:
         model = models.RobotAccount
-        fields = ["type", "state"]
+        fields = ["type", "state", "username"]
 
 
-class ResourceUserFilter(django_filters.FilterSet):
+class ResourceProjectFilter(django_filters.FilterSet):
     resource = core_filters.URLFilter(
         view_name="marketplace-resource-detail",
         field_name="resource__uuid",
         label="Resource URL",
     )
-    resource_uuid = django_filters.UUIDFilter(
-        field_name="resource__uuid", label="Resource UUID"
+    resource_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-resource-detail",
+        field_name="resource__uuid",
+        label="Resource UUID",
     )
-    role_uuid = django_filters.UUIDFilter(field_name="role__uuid", label="Role UUID")
-    role_name = django_filters.CharFilter(field_name="role__name", label="Role name")
-    user_uuid = django_filters.UUIDFilter(field_name="user__uuid", label="User UUID")
+    name = django_filters.CharFilter(lookup_expr="icontains")
 
     class Meta:
-        model = models.ResourceUser
+        model = models.ResourceProject
         fields = []
 
 
-# TODO: Remove after migration of clients to a new endpoint
 class PlanFilter(OfferingFilterMixin, django_filters.FilterSet):
     class Meta:
         model = models.Plan
         fields = []
 
-    offering_uuid = django_filters.UUIDFilter(
-        field_name="offering__uuid", label="Offering UUID"
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="offering__uuid",
+        label="Offering UUID",
     )
+
+
+class ComponentUsageMonthlyFilter(django_filters.FilterSet):
+    billing_period = django_filters.DateFilter(
+        field_name="billing_period", input_formats=["%Y-%m"]
+    )
+    start = django_filters.DateFilter(
+        field_name="billing_period", lookup_expr="gte", input_formats=["%Y-%m"]
+    )
+    end = django_filters.DateFilter(
+        field_name="billing_period", lookup_expr="lte", input_formats=["%Y-%m"]
+    )
+    component_type = django_filters.CharFilter(field_name="component__type")
+    billing_type = django_filters.CharFilter(field_name="component__billing_type")
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="component__offering__uuid",
+    )
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        field_name="component__offering__customer__uuid",
+    )
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail",
+        field_name="component__offering__project__uuid",
+    )
+    offering_type = django_filters.CharFilter(field_name="component__offering__type")
+
+    class Meta:
+        model = models.ComponentUsageMonthly
+        fields = []
 
 
 class CategoryComponentUsageScopeFilterBackend(core_filters.GenericKeyFilterBackend):
@@ -1345,17 +1994,25 @@ class ComponentUsageFilter(django_filters.FilterSet):
         field_name="resource__uuid",
         label="Resource URL",
     )
-    resource_uuid = django_filters.UUIDFilter(
-        field_name="resource__uuid", label="Resource UUID"
+    resource_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-resource-detail",
+        field_name="resource__uuid",
+        label="Resource UUID",
     )
-    offering_uuid = django_filters.UUIDFilter(
-        field_name="resource__offering__uuid", label="Offering UUID"
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="resource__offering__uuid",
+        label="Offering UUID",
     )
-    project_uuid = django_filters.UUIDFilter(
-        field_name="resource__project__uuid", label="Project UUID"
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail",
+        field_name="resource__project__uuid",
+        label="Project UUID",
     )
-    customer_uuid = django_filters.UUIDFilter(
-        field_name="resource__project__customer__uuid", label="Customer UUID"
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        field_name="resource__project__customer__uuid",
+        label="Customer UUID",
     )
     date_before = django_filters.DateFilter(
         field_name="date__date", lookup_expr="lte", label="Date before or equal to"
@@ -1391,16 +2048,23 @@ class ComponentUserUsageFilter(django_filters.FilterSet):
         field_name="component_usage__resource__uuid",
         label="Resource URL",
     )
-    resource_uuid = django_filters.UUIDFilter(
-        field_name="component_usage__resource__uuid", label="Resource UUID"
+    resource_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-resource-detail",
+        field_name="component_usage__resource__uuid",
+        label="Resource UUID",
     )
-    offering_uuid = django_filters.UUIDFilter(
-        field_name="component_usage__resource__offering__uuid", label="Offering UUID"
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="component_usage__resource__offering__uuid",
+        label="Offering UUID",
     )
-    project_uuid = django_filters.UUIDFilter(
-        field_name="component_usage__resource__project__uuid", label="Project UUID"
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail",
+        field_name="component_usage__resource__project__uuid",
+        label="Project UUID",
     )
-    customer_uuid = django_filters.UUIDFilter(
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
         field_name="component_usage__resource__project__customer__uuid",
         label="Customer UUID",
     )
@@ -1443,11 +2107,15 @@ class ComponentUserUsageLimitFilter(django_filters.FilterSet):
         field_name="resource__uuid",
         label="Resource URL",
     )
-    resource_uuid = django_filters.UUIDFilter(
-        field_name="resource__uuid", label="Resource UUID"
+    resource_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-resource-detail",
+        field_name="resource__uuid",
+        label="Resource UUID",
     )
-    offering_uuid = django_filters.UUIDFilter(
-        field_name="resource__offering__uuid", label="Offering UUID"
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="resource__offering__uuid",
+        label="Offering UUID",
     )
     component_type = django_filters.CharFilter(
         field_name="component__type", label="Component type"
@@ -1505,6 +2173,17 @@ class CustomerResourceFilter(BaseFilterBackend):
             queryset = queryset.filter(pk__in=customers)
         return queryset
 
+    def get_schema_operation_parameters(self, view):
+        return [
+            build_parameter_type(
+                name="has_resources",
+                schema={"type": "string"},
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Filter by customers with resources.",
+            )
+        ]
+
 
 class ServiceProviderOfferingFilter(BaseFilterBackend):
     def filter_queryset(self, request, queryset, view):
@@ -1517,6 +2196,19 @@ class ServiceProviderOfferingFilter(BaseFilterBackend):
             queryset = queryset.filter(pk__in=customers)
         return queryset
 
+    def get_schema_operation_parameters(self, view):
+        return [
+            build_parameter_type(
+                name="service_provider_uuid",
+                schema={"type": "string", "format": "uuid"},
+                location=OpenApiParameter.QUERY,
+                description="Filter by service provider UUID.",
+                extensions={
+                    "x-waldur-operation-id": "marketplace_service_providers_list"
+                },
+            )
+        ]
+
 
 class CustomerServiceProviderFilter(core_filters.BaseFilterBackend):
     def filter_queryset(self, request, queryset, view):
@@ -1527,6 +2219,17 @@ class CustomerServiceProviderFilter(core_filters.BaseFilterBackend):
             )
             return queryset.filter(pk__in=customers)
         return queryset
+
+    def get_schema_operation_parameters(self, view):
+        return [
+            build_parameter_type(
+                name="is_service_provider",
+                schema={"type": "boolean"},
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Filter by customers that are service providers.",
+            )
+        ]
 
 
 class CustomerCallManagingOrganisationFilter(core_filters.BaseFilterBackend):
@@ -1541,20 +2244,29 @@ class CustomerCallManagingOrganisationFilter(core_filters.BaseFilterBackend):
             return queryset.filter(pk__in=customers)
         return queryset
 
-
-class OfferingUserRoleFilter(OfferingFilterMixin):
-    class Meta:
-        model = models.OfferingUserRole
-        fields = []
+    def get_schema_operation_parameters(self, view):
+        return [
+            build_parameter_type(
+                name="is_call_managing_organization",
+                schema={"type": "boolean"},
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Filter by customers that are call managing organizations.",
+            )
+        ]
 
 
 class OfferingUserFilter(OfferingFilterMixin, core_filters.CreatedModifiedFilter):
-    user_uuid = django_filters.UUIDFilter(field_name="user__uuid", label="User UUID")
+    user_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail", field_name="user__uuid", label="User UUID"
+    )
     user_username = django_filters.CharFilter(
         field_name="user__username", lookup_expr="iexact", label="User username"
     )
-    provider_uuid = django_filters.UUIDFilter(
-        field_name="offering__customer__uuid", label="Provider UUID"
+    provider_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-service-provider-detail",
+        field_name="offering__customer__uuid",
+        label="Provider UUID",
     )
     is_restricted = django_filters.BooleanFilter(
         field_name="is_restricted", label="Is restricted"
@@ -1562,15 +2274,37 @@ class OfferingUserFilter(OfferingFilterMixin, core_filters.CreatedModifiedFilter
     state = core_filters.MappedMultipleChoiceFilter(
         OfferingUserStates.CHOICES, label="Offering user state"
     )
+    runtime_state = core_filters.MappedMultipleChoiceFilter(
+        OfferingUserRuntimeStates.CHOICES, label="Offering user runtime state"
+    )
     has_consent = django_filters.BooleanFilter(
         method="filter_has_consent",
         label="User Has Consent",
         widget=BooleanWidget,
     )
+    has_complete_profile = django_filters.BooleanFilter(
+        method="filter_has_complete_profile",
+        label="User has complete profile for the offering",
+        widget=BooleanWidget,
+    )
+    offering_has_active_tos = django_filters.BooleanFilter(
+        method="filter_offering_has_active_tos",
+        label="Offering has active Terms of Service",
+        widget=BooleanWidget,
+    )
 
-    o = django_filters.OrderingFilter(fields=("created", "modified", "username"))
+    o = django_filters.OrderingFilter(
+        fields=(
+            "created",
+            "modified",
+            "username",
+            ("user__first_name", "user_first_name"),
+            ("user__last_name", "user_last_name"),
+        )
+    )
     query = django_filters.CharFilter(
-        method="filter_query", label="Search by offering name, username or user name"
+        method="filter_query",
+        label="Search by offering name, username, user name, UID or primary GID",
     )
 
     class Meta:
@@ -1583,6 +2317,9 @@ class OfferingUserFilter(OfferingFilterMixin, core_filters.CreatedModifiedFilter
             | Q(username__icontains=value)
             | Q(user__first_name__icontains=value)
             | Q(user__last_name__icontains=value)
+            | Q(user__username__icontains=value)
+            | Q(backend_metadata__uidnumber__icontains=value)
+            | Q(backend_metadata__primarygroup__icontains=value)
         )
 
     def filter_has_consent(self, queryset, name, value):
@@ -1599,17 +2336,42 @@ class OfferingUserFilter(OfferingFilterMixin, core_filters.CreatedModifiedFilter
                 user__offering_consents__revocation_date__isnull=True,
             ).distinct()
 
+    def filter_has_complete_profile(self, queryset, name, value):
+        if value is None:
+            return queryset
+        incomplete_q = utils.build_incomplete_profile_q()
+        if value:
+            return queryset.exclude(incomplete_q).distinct()
+        else:
+            return queryset.filter(incomplete_q).distinct()
+
+    def filter_offering_has_active_tos(self, queryset, name, value):
+        if value is None:
+            return queryset
+
+        if value:
+            return queryset.filter(
+                offering__terms_of_service_configs__is_active=True
+            ).distinct()
+        else:
+            return queryset.exclude(
+                offering__terms_of_service_configs__is_active=True
+            ).distinct()
+
 
 class OfferingUserChecklistCompletionsFilter(core_filters.CreatedModifiedFilter):
     """Filter for checklist completions related to offering users."""
 
-    user_uuid = django_filters.UUIDFilter(
+    user_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail",
         field_name="scope_object_id",
         method="filter_user_uuid",
         label="Filter by user UUID",
     )
-    offering_uuid = django_filters.UUIDFilter(
-        method="filter_offering_uuid", label="Filter by offering UUID"
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        method="filter_offering_uuid",
+        label="Filter by offering UUID",
     )
     is_completed = django_filters.BooleanFilter(field_name="is_completed")
     o = django_filters.OrderingFilter(fields=("modified", "is_completed"))
@@ -1665,17 +2427,82 @@ class CategoryGroupFilter(django_filters.FilterSet):
     title = django_filters.CharFilter(lookup_expr="icontains")
 
 
+class OfferingGroupFilter(django_filters.FilterSet):
+    class Meta:
+        model = models.OfferingGroup
+        fields = []
+
+    title = django_filters.CharFilter(lookup_expr="icontains")
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        field_name="customer__uuid",
+        label="Customer UUID",
+    )
+
+
+class PosixIdPoolFilter(django_filters.FilterSet):
+    class Meta:
+        model = models.PosixIdPool
+        fields = []
+
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        method="filter_customer_uuid",
+        label="Customer UUID",
+    )
+    service_provider_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-service-provider-detail",
+        field_name="service_provider__uuid",
+        label="Service provider UUID",
+    )
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="offering__uuid",
+        label="Offering UUID",
+    )
+
+    def filter_customer_uuid(self, queryset, name, value):
+        return queryset.filter(
+            Q(service_provider__customer__uuid=value)
+            | Q(offering__customer__uuid=value)
+        )
+
+
+class PosixIdentityFilter(django_filters.FilterSet):
+    class Meta:
+        model = models.PosixIdentity
+        fields = []
+
+    pool_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-posix-id-pool-detail",
+        field_name="pool__uuid",
+        label="POSIX ID pool UUID",
+    )
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="offering__uuid",
+        label="Offering UUID",
+    )
+    is_released = django_filters.BooleanFilter(
+        field_name="released_at", lookup_expr="isnull", exclude=True
+    )
+
+
 class CategoryFilter(django_filters.FilterSet):
     class Meta:
         model = models.Category
         fields = []
 
-    customer_uuid = django_filters.UUIDFilter(
-        method="filter_customer_uuid", label="Customer UUID"
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        method="filter_customer_uuid",
+        label="Customer UUID",
     )
 
-    group_uuid = django_filters.UUIDFilter(
-        field_name="group__uuid", label="Category group UUID"
+    group_uuid = core_filters.RelatedUUIDFilter(
+        view_name="organization-group-detail",
+        field_name="group__uuid",
+        label="Category group UUID",
     )
 
     title = django_filters.CharFilter(lookup_expr="icontains", label="Title contains")
@@ -1696,11 +2523,19 @@ class CategoryFilter(django_filters.FilterSet):
         label="Offering name contains",
     )
 
-    resource_customer_uuid = django_filters.UUIDFilter(
-        method="filter_resource_customer_uuid", label="Resource customer UUID"
+    resource_customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        method="filter_resource_customer_uuid",
+        label="Resource customer UUID",
     )
-    resource_project_uuid = django_filters.UUIDFilter(
-        method="filter_resource_project_uuid", label="Resource project UUID"
+    resource_project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail",
+        method="filter_resource_project_uuid",
+        label="Resource project UUID",
+    )
+    accessible = django_filters.BooleanFilter(
+        method="filter_accessible",
+        label="Only categories with offerings the current user can order",
     )
 
     def filter_customer_uuid(self, queryset, name, value):
@@ -1741,14 +2576,55 @@ class CategoryFilter(django_filters.FilterSet):
         )
         return queryset.filter(id__in=valid_ids)
 
+    def filter_accessible(self, queryset, name, value):
+        # When True, drop categories that have no offering the current user can
+        # order (e.g. only restricted offerings whose roles the user does not
+        # hold, even if their project already consumes one). Mirrors the
+        # `accessible` filter on offerings so the "Add resource" quick-add and
+        # catalog agree. The per-category offering_count is filtered to match in
+        # MarketplaceCategorySerializer.get_offering_count.
+        if not value:
+            return queryset
+        accessible_offerings = models.Offering.objects.all().filter_accessible_for_user(
+            self.request.user
+        )
+        return queryset.filter(offerings__in=accessible_offerings).distinct()
+
+
+class AttributeFilter(django_filters.FilterSet):
+    class Meta:
+        model = models.Attribute
+        fields = []
+
+    section = core_filters.URLFilter(
+        view_name="marketplace-section-detail",
+        field_name="section__key",
+        label="Section URL",
+        lookup_field="key",
+    )
+
+
+class AttributeOptionFilter(django_filters.FilterSet):
+    class Meta:
+        model = models.AttributeOption
+        fields = []
+
+    attribute = core_filters.URLFilter(
+        view_name="marketplace-attribute-detail",
+        field_name="attribute__uuid",
+        label="Attribute URL",
+    )
+
 
 class CategoryColumnFilter(django_filters.FilterSet):
     class Meta:
         model = models.CategoryColumn
         fields = []
 
-    category_uuid = django_filters.UUIDFilter(
-        field_name="category__uuid", label="Category UUID"
+    category_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-category-detail",
+        field_name="category__uuid",
+        label="Category UUID",
     )
     title = django_filters.CharFilter(lookup_expr="icontains", label="Title contains")
 
@@ -1758,11 +2634,15 @@ class PlanComponentFilter(django_filters.FilterSet):
         model = models.PlanComponent
         fields = []
 
-    offering_uuid = django_filters.UUIDFilter(
-        field_name="plan__offering__uuid", label="Offering UUID"
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="plan__offering__uuid",
+        label="Offering UUID",
     )
 
-    plan_uuid = django_filters.UUIDFilter(field_name="plan__uuid", label="Plan UUID")
+    plan_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-plan-detail", field_name="plan__uuid", label="Plan UUID"
+    )
 
     shared = django_filters.BooleanFilter(
         widget=BooleanWidget, field_name="plan__offering__shared", label="Shared"
@@ -1797,14 +2677,18 @@ class MarketplaceInvoiceItemsFilter(django_filters.FilterSet):
         )
     )
 
-    customer_uuid = django_filters.UUIDFilter(
-        field_name="invoice__customer__uuid", label="Customer UUID"
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        field_name="invoice__customer__uuid",
+        label="Customer UUID",
     )
-    project_uuid = django_filters.UUIDFilter(
-        field_name="project__uuid", label="Project UUID"
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", field_name="project__uuid", label="Project UUID"
     )
-    offering_uuid = django_filters.UUIDFilter(
-        field_name="resource__offering__uuid", label="Offering UUID"
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="resource__offering__uuid",
+        label="Offering UUID",
     )
     invoice_month = django_filters.NumberFilter(
         field_name="invoice__month", label="Invoice month"
@@ -1856,11 +2740,13 @@ class BackendResourceFilter(
     django_filters.FilterSet,
 ):
     o = django_filters.OrderingFilter(fields=("created",))
-    offering_uuid = django_filters.UUIDFilter(
-        field_name="offering__uuid", label="Offering UUID"
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="offering__uuid",
+        label="Offering UUID",
     )
-    project_uuid = django_filters.UUIDFilter(
-        field_name="project__uuid", label="Project UUID"
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", field_name="project__uuid", label="Project UUID"
     )
     backend_id = django_filters.CharFilter(
         field_name="backend_id", lookup_expr="exact", label="Backend ID"
@@ -1876,8 +2762,10 @@ class BackendResourceRequestFilter(
     django_filters.FilterSet,
 ):
     o = django_filters.OrderingFilter(fields=("created",))
-    offering_uuid = django_filters.UUIDFilter(
-        field_name="offering__uuid", label="Offering UUID"
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="offering__uuid",
+        label="Offering UUID",
     )
     started = django_filters.DateTimeFilter(lookup_expr="gte", label="Created after")
     finished = django_filters.DateTimeFilter(lookup_expr="gte", label="Modified after")
@@ -1892,8 +2780,10 @@ class BackendResourceRequestFilter(
 
 
 class MaintenanceAnnouncementTemplateFilter(django_filters.FilterSet):
-    service_provider_uuid = django_filters.UUIDFilter(
-        field_name="service_provider__uuid", label="Service provider UUID"
+    service_provider_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-service-provider-detail",
+        field_name="service_provider__uuid",
+        label="Service provider UUID",
     )
     maintenance_type = django_filters.NumberFilter(
         field_name="maintenance_type", label="Maintenance type"
@@ -1905,9 +2795,52 @@ class MaintenanceAnnouncementTemplateFilter(django_filters.FilterSet):
         fields = []
 
 
+def annotate_timing_deltas(queryset):
+    """Annotate the derived overrun/start deltas used by timing ordering and the
+    timing_bucket filter. Applied on demand (only when those params are used) so
+    the aggregation queries in maintenance_stats keep their intended GROUP BY."""
+    return queryset.annotate(
+        overrun_delta=ExpressionWrapper(
+            F("actual_end") - F("scheduled_end"), output_field=DurationField()
+        ),
+        start_delta=ExpressionWrapper(
+            F("actual_start") - F("scheduled_start"), output_field=DurationField()
+        ),
+    )
+
+
+class MaintenanceOrderingFilter(django_filters.OrderingFilter):
+    """Ordering filter that sorts derived timing fields by their queryset
+    annotations and always sinks NULL rows (not-yet-completed maintenances)."""
+
+    # ?o param name -> queryset annotation.
+    NULLS_LAST_ANNOTATIONS = {
+        "overrun_minutes": "overrun_delta",
+        "start_delta_minutes": "start_delta",
+    }
+
+    def filter(self, qs, value):
+        if value and {v.lstrip("-") for v in value} & set(self.NULLS_LAST_ANNOTATIONS):
+            qs = annotate_timing_deltas(qs)
+        return super().filter(qs, value)
+
+    def get_ordering_value(self, param):
+        descending = param.startswith("-")
+        name = param[1:] if descending else param
+        annotation = self.NULLS_LAST_ANNOTATIONS.get(name)
+        if annotation:
+            expr = F(annotation)
+            return (
+                expr.desc(nulls_last=True) if descending else expr.asc(nulls_last=True)
+            )
+        return super().get_ordering_value(param)
+
+
 class MaintenanceAnnouncementFilter(django_filters.FilterSet):
-    service_provider_uuid = django_filters.UUIDFilter(
-        field_name="service_provider__uuid", label="Service provider UUID"
+    service_provider_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-service-provider-detail",
+        field_name="service_provider__uuid",
+        label="Service provider UUID",
     )
     maintenance_type = django_filters.NumberFilter(
         field_name="maintenance_type", label="Maintenance type"
@@ -1927,25 +2860,73 @@ class MaintenanceAnnouncementFilter(django_filters.FilterSet):
     scheduled_end_before = django_filters.DateTimeFilter(
         field_name="scheduled_end", lookup_expr="lte", label="Scheduled end before"
     )
-    o = django_filters.OrderingFilter(
-        fields=("created", "name", "scheduled_start", "scheduled_end")
+    o = MaintenanceOrderingFilter(
+        fields=(
+            "created",
+            "name",
+            "scheduled_start",
+            "scheduled_end",
+            "overrun_minutes",
+            "start_delta_minutes",
+        )
+    )
+    timing_bucket = django_filters.CharFilter(
+        method="filter_timing_bucket",
+        label="Timing bucket (comma-separated: on_time, late_start, overrun, early, pending)",
     )
 
     class Meta:
         model = models.MaintenanceAnnouncement
         fields = []
 
+    def filter_timing_bucket(self, queryset, name, value):
+        buckets = [b.strip() for b in value.split(",") if b.strip()]
+        if not buckets:
+            return queryset
+        queryset = annotate_timing_deltas(queryset)
+        # Q-expressions mirror MaintenanceAnnouncement.timing_bucket precedence
+        # (pending > overrun > late_start > early > on_time), operating on the
+        # overrun_delta / start_delta annotations added by the viewset.
+        tol = models.MaintenanceAnnouncement.TIMING_TOLERANCE
+        started = Q(actual_start__isnull=False)
+        ended = Q(actual_end__isnull=False)
+        q_overrun = ended & Q(overrun_delta__gt=tol)
+        q_late = started & Q(start_delta__gt=tol) & ~q_overrun
+        q_early = ended & Q(overrun_delta__lt=-tol) & ~q_overrun & ~q_late
+        q_on_time = started & ~q_overrun & ~q_late & ~q_early
+        bucket_q = {
+            models.MaintenanceTimingBucket.OVERRUN: q_overrun,
+            models.MaintenanceTimingBucket.LATE_START: q_late,
+            models.MaintenanceTimingBucket.EARLY: q_early,
+            models.MaintenanceTimingBucket.ON_TIME: q_on_time,
+            models.MaintenanceTimingBucket.PENDING: Q(actual_start__isnull=True),
+        }
+        combined = Q()
+        matched = False
+        for bucket in buckets:
+            if bucket in bucket_q:
+                combined |= bucket_q[bucket]
+                matched = True
+        if not matched:
+            return queryset.none()
+        return queryset.filter(combined)
+
 
 class MaintenanceAnnouncementOfferingTemplateFilter(django_filters.FilterSet):
-    maintenance_template_uuid = django_filters.UUIDFilter(
-        field_name="maintenance_template__uuid", label="Maintenance template UUID"
+    maintenance_template_uuid = core_filters.RelatedUUIDFilter(
+        view_name="maintenance-announcement-template-detail",
+        field_name="maintenance_template__uuid",
+        label="Maintenance template UUID",
     )
-    service_provider_uuid = django_filters.UUIDFilter(
+    service_provider_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-service-provider-detail",
         field_name="maintenance_template__service_provider__uuid",
         label="Service provider UUID",
     )
-    offering_uuid = django_filters.UUIDFilter(
-        field_name="offering__uuid", label="Offering UUID"
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="offering__uuid",
+        label="Offering UUID",
     )
     impact_level = django_filters.NumberFilter(
         field_name="impact_level", label="Impact level"
@@ -1993,14 +2974,18 @@ class UserOfferingConsentFilter(django_filters.FilterSet):
     user = core_filters.URLFilter(
         view_name="user-detail", field_name="user__uuid", label="User URL"
     )
-    user_uuid = django_filters.UUIDFilter(field_name="user__uuid", label="User UUID")
+    user_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail", field_name="user__uuid", label="User UUID"
+    )
     offering = core_filters.URLFilter(
         view_name="marketplace-provider-offering-detail",
         field_name="offering__uuid",
         label="Offering URL",
     )
-    offering_uuid = django_filters.UUIDFilter(
-        field_name="offering__uuid", label="Offering UUID"
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="offering__uuid",
+        label="Offering UUID",
     )
     version = django_filters.CharFilter(field_name="version", label="Version")
     has_consent = django_filters.BooleanFilter(
@@ -2050,8 +3035,10 @@ class OfferingTermsOfServiceFilter(django_filters.FilterSet):
         field_name="offering__uuid",
         label="Offering URL",
     )
-    offering_uuid = django_filters.UUIDFilter(
-        field_name="offering__uuid", label="Offering UUID"
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="offering__uuid",
+        label="Offering UUID",
     )
     is_active = django_filters.BooleanFilter(field_name="is_active", label="Is active")
     version = django_filters.CharFilter(field_name="version", label="Version")
@@ -2084,8 +3071,8 @@ class CourseAccountFilter(django_filters.FilterSet):
     state = core_filters.MappedMultipleChoiceFilter(
         CourseAccountState.choices, label="Course account state"
     )
-    project_uuid = django_filters.UUIDFilter(
-        field_name="project__uuid", label="Project UUID"
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", field_name="project__uuid", label="Project UUID"
     )
     project_start_date = DateFromToRangeFilter(
         field_name="project__start_date", label="Project start date range"
@@ -2122,8 +3109,10 @@ class CourseAccountFilter(django_filters.FilterSet):
 class OfferingPartitionFilter(django_filters.FilterSet):
     """Filter for OfferingPartition model."""
 
-    offering_uuid = django_filters.UUIDFilter(
-        field_name="offering__uuid", label="Offering UUID"
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="offering__uuid",
+        label="Offering UUID",
     )
     offering_name = django_filters.CharFilter(
         field_name="offering__name",
@@ -2138,6 +3127,20 @@ class OfferingPartitionFilter(django_filters.FilterSet):
     exclusive_user = django_filters.BooleanFilter(label="Exclusive user")
     exclusive_topo = django_filters.BooleanFilter(label="Exclusive topology")
     req_resv = django_filters.BooleanFilter(label="Requires reservation")
+
+    # Architecture filters
+    cpu_arch = django_filters.CharFilter(
+        lookup_expr="icontains", label="CPU architecture"
+    )
+    gpu_arch = django_filters.CharFilter(
+        lookup_expr="icontains", label="GPU architecture"
+    )
+    has_gpu = django_filters.BooleanFilter(
+        method="filter_has_gpu",
+        widget=BooleanWidget,
+        label="Has GPU",
+        help_text="Filter partitions that have GPU architecture",
+    )
 
     # Resource limit filters
     max_cpus_per_node = django_filters.NumberFilter(label="Max CPUs per node")
@@ -2173,9 +3176,102 @@ class OfferingPartitionFilter(django_filters.FilterSet):
             "offering_uuid",
             "offering_name",
             "partition_name",
+            "cpu_arch",
+            "gpu_arch",
             "qos",
             "priority_tier",
             "exclusive_user",
             "exclusive_topo",
             "req_resv",
         ]
+
+    def filter_has_gpu(self, queryset, name, value):
+        """Filter partitions that have GPU architecture."""
+        if value:
+            return queryset.exclude(gpu_arch="")
+        return queryset.filter(gpu_arch="")
+
+
+class OpenStackInstanceReportFilter(django_filters.FilterSet):
+    name = django_filters.CharFilter(lookup_expr="icontains")
+    flavor_name = django_filters.CharFilter(lookup_expr="icontains")
+    image_name = django_filters.CharFilter(lookup_expr="icontains")
+    hypervisor_hostname = django_filters.CharFilter(lookup_expr="icontains")
+
+    runtime_state = django_filters.CharFilter()
+    availability_zone_name = django_filters.CharFilter(
+        field_name="availability_zone__name",
+    )
+
+    cores_min = django_filters.NumberFilter(field_name="cores", lookup_expr="gte")
+    cores_max = django_filters.NumberFilter(field_name="cores", lookup_expr="lte")
+    ram_min = django_filters.NumberFilter(field_name="ram", lookup_expr="gte")
+    ram_max = django_filters.NumberFilter(field_name="ram", lookup_expr="lte")
+    disk_min = django_filters.NumberFilter(field_name="disk", lookup_expr="gte")
+    disk_max = django_filters.NumberFilter(field_name="disk", lookup_expr="lte")
+
+    service_settings_uuid = django_filters.UUIDFilter(
+        field_name="service_settings__uuid",
+    )
+    customer_uuid = django_filters.UUIDFilter(
+        field_name="project__customer__uuid",
+    )
+    project_uuid = django_filters.UUIDFilter(
+        field_name="project__uuid",
+    )
+    tenant_uuid = django_filters.UUIDFilter(
+        field_name="tenant__uuid",
+    )
+
+    state = core_filters.MappedMultipleChoiceFilter(
+        choices=CoreStates.choices,
+    )
+
+    o = django_filters.OrderingFilter(
+        fields=(
+            ("name", "name"),
+            ("cores", "cores"),
+            ("ram", "ram"),
+            ("disk", "disk"),
+            ("created", "created"),
+            ("runtime_state", "runtime_state"),
+            ("flavor_name", "flavor_name"),
+            ("hypervisor_hostname", "hypervisor_hostname"),
+            ("project__customer__name", "customer_name"),
+            ("project__name", "project_name"),
+            ("service_settings__name", "cluster_name"),
+            ("start_time", "start_time"),
+        ),
+    )
+
+    class Meta:
+        model = openstack_models.Instance
+        fields = []
+
+
+class ResourceLimitChangeRequestFilter(django_filters.FilterSet):
+    resource_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-resource-detail",
+        field_name="resource__uuid",
+        label="Resource UUID",
+    )
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        field_name="resource__project__customer__uuid",
+        label="Customer UUID",
+    )
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail",
+        field_name="resource__project__uuid",
+        label="Project UUID",
+    )
+    created_by_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail",
+        field_name="created_by__uuid",
+        label="Created by UUID",
+    )
+    state = ReviewStateFilter()
+
+    class Meta:
+        model = models.ResourceLimitChangeRequest
+        fields = []

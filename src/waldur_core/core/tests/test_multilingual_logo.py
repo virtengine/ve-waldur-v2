@@ -4,7 +4,7 @@ import tempfile
 from io import StringIO
 from unittest import mock
 
-from constance.backends.database.models import Constance
+from constance.models import Constance
 from django.core.management import call_command
 from django.test import TestCase
 from rest_framework import status, test
@@ -13,7 +13,7 @@ from waldur_core.media.utils import dummy_image
 from waldur_core.structure.tests.factories import UserFactory
 
 
-class MultilingualLoginLogoViewTest(test.APITransactionTestCase):
+class MultilingualLoginLogoViewTest(test.APITestCase):
     def setUp(self):
         self.url = "/api/icons/login_logo/"
 
@@ -211,7 +211,7 @@ class SetLoginLogoLanguageCommandTest(TestCase):
         self.assertIn("et", setting.value)
 
 
-class MultilingualLogoRestApiTest(test.APITransactionTestCase):
+class MultilingualLogoRestApiTest(test.APITestCase):
     """Test setting LOGIN_LOGO_MULTILINGUAL via REST API."""
 
     def setUp(self):
@@ -282,7 +282,7 @@ class MultilingualLogoRestApiTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
-class MultilingualLogoBinaryUploadTest(test.APITransactionTestCase):
+class MultilingualLogoBinaryUploadTest(test.APITestCase):
     """Test binary image upload for LOGIN_LOGO_MULTILINGUAL via REST API."""
 
     def setUp(self):
@@ -362,7 +362,7 @@ class MultilingualLogoBinaryUploadTest(test.APITransactionTestCase):
         # The previous 'fr' value would be replaced since we're posting new data.
 
 
-class SingleLogoFileUploadTest(test.APITransactionTestCase):
+class SingleLogoFileUploadTest(test.APITestCase):
     """
     Test uploading single logo files (non-multilingual) via REST API.
 
@@ -479,3 +479,26 @@ class SingleLogoFileUploadTest(test.APITransactionTestCase):
         response = self.client.get(self.url)
         self.assertIsInstance(response.data["SIDEBAR_LOGO_DARK"], str)
         self.assertIn("de", response.data["LOGIN_LOGO_MULTILINGUAL"])
+
+    def test_staff_can_clear_image_setting_with_empty_string(self):
+        """
+        Staff can clear an image setting by sending {"POWERED_BY_LOGO": ""} (JSON).
+        """
+        self.client.force_login(self.staff)
+        response = self.client.post(
+            self.url,
+            {"POWERED_BY_LOGO": ""},
+            format="json",
+        )
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+            msg=response.data if response.status_code != 200 else None,
+        )
+        response = self.client.get(self.url)
+        self.assertIn("POWERED_BY_LOGO", response.data)
+        self.assertIn(
+            response.data["POWERED_BY_LOGO"],
+            ("", None),
+            msg="Cleared logo should be empty string or null",
+        )

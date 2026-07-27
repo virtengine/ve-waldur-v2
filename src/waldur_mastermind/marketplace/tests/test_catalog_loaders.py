@@ -494,7 +494,7 @@ class EESSINewAPIFormatTest(BaseLoaderTestCase):
         # Check that NewFormatPackage is loaded
         self.assertIn("NewFormatPackage", catalog_data.packages)
         package = catalog_data.packages["NewFormatPackage"]
-        version = package.versions["3.0.0"]
+        version = package.versions["3.0.0-foss-2023b"]
 
         # Verify module is a dict with correct structure
         module = version.version_data.metadata.get("module", {})
@@ -524,7 +524,7 @@ class EESSINewAPIFormatTest(BaseLoaderTestCase):
         catalog_data = loader.fetch_catalog_data()
 
         package = catalog_data.packages["NewFormatPackage"]
-        version = package.versions["3.0.0"]
+        version = package.versions["3.0.0-foss-2023b"]
 
         # Verify required_modules is a list of dicts
         required_modules = version.version_data.metadata.get("required_modules", [])
@@ -558,7 +558,7 @@ class EESSINewAPIFormatTest(BaseLoaderTestCase):
 
         # Check package with extensions
         package = catalog_data.packages["PackageWithExtensions"]
-        version = package.versions["2.0.0"]
+        version = package.versions["2.0.0-gfbf-2023b"]
 
         extensions = version.version_data.metadata.get("extensions", [])
         self.assertIsInstance(extensions, list)
@@ -574,7 +574,7 @@ class EESSINewAPIFormatTest(BaseLoaderTestCase):
 
         # Check package without extensions
         package_no_ext = catalog_data.packages["PackageNoExtensions"]
-        version_no_ext = package_no_ext.versions["1.5.0"]
+        version_no_ext = package_no_ext.versions["1.5.0-foss-2023a"]
         extensions_no_ext = version_no_ext.version_data.metadata.get("extensions", [])
         self.assertEqual(extensions_no_ext, [])
 
@@ -607,7 +607,11 @@ class EESSINewAPIFormatTest(BaseLoaderTestCase):
         package = SoftwarePackage.objects.get(
             catalog=catalog, name="PackageWithExtensions"
         )
-        version = SoftwareVersion.objects.get(package=package, version="2.0.0")
+        version = SoftwareVersion.objects.get(
+            package=package,
+            version="2.0.0",
+            module_version="2.0.0-gfbf-2023b",
+        )
 
         # Verify metadata contains new fields
         self.assertIn("module", version.metadata)
@@ -621,6 +625,121 @@ class EESSINewAPIFormatTest(BaseLoaderTestCase):
         # Verify module structure
         module = version.metadata["module"]
         self.assertEqual(module["module_name"], "PackageWithExtensions")
+
+
+class EESSIExtensionMultipleParentsTest(BaseLoaderTestCase):
+    """Test that extensions with multiple parent software packages are loaded correctly.
+
+    Reproduces the bug where adwaita-icon-theme should have both GTK3 and GTK4
+    as parents but only gets one (or zero) due to prefixed dict keys in
+    _process_extension_batch not matching actual DB package names.
+    """
+
+    def setUp(self):
+        self.eessi_software_data = self.load_test_fixture("eessi_software_test.json")
+        self.eessi_component_data = self.load_test_fixture(
+            "eessi_extensions_component_test.json"
+        )
+
+    def _make_mock_get(self):
+        """Create mock that returns software + component extension data."""
+
+        def mock_requests_side_effect(url, **kwargs):
+            mock_response = Mock()
+            if "software.json" in url:
+                mock_response.json.return_value = self.eessi_software_data
+            elif "ext-component.json" in url:
+                mock_response.json.return_value = self.eessi_component_data
+            else:
+                mock_response.json.return_value = {}
+            mock_response.raise_for_status.return_value = None
+            return mock_response
+
+        return mock_requests_side_effect
+
+    @patch("requests.get")
+    def test_extension_with_two_parents_loaded_into_database(self, mock_get):
+        """adwaita-icon-theme should have both GTK3 and GTK4 as parent_softwares."""
+        mock_get.side_effect = self._make_mock_get()
+
+        loader = EESSICatalogLoader(catalog_version="2023.06")
+        loader.load_catalog(update_existing=True, dry_run=False)
+
+        catalog = SoftwareCatalog.objects.get(name="EESSI", version="2023.06")
+
+        # Both parent packages must exist as main packages
+        gtk3 = SoftwarePackage.objects.get(catalog=catalog, name="GTK3")
+        gtk4 = SoftwarePackage.objects.get(catalog=catalog, name="GTK4")
+        self.assertFalse(gtk3.is_extension)
+        self.assertFalse(gtk4.is_extension)
+
+        # adwaita-icon-theme must exist as an extension
+        adwaita = SoftwarePackage.objects.get(
+            catalog=catalog, name="adwaita-icon-theme"
+        )
+        self.assertTrue(adwaita.is_extension)
+
+        # Must have BOTH parents
+        parent_names = set(adwaita.parent_softwares.values_list("name", flat=True))
+        self.assertEqual(parent_names, {"GTK3", "GTK4"})
+
+    @patch("requests.get")
+    def test_extension_versions_are_created(self, mock_get):
+        """Extension packages must have their versions created in the DB."""
+        mock_get.side_effect = self._make_mock_get()
+
+        loader = EESSICatalogLoader(catalog_version="2023.06")
+        loader.load_catalog(update_existing=True, dry_run=False)
+
+        catalog = SoftwareCatalog.objects.get(name="EESSI", version="2023.06")
+        adwaita = SoftwarePackage.objects.get(
+            catalog=catalog, name="adwaita-icon-theme"
+        )
+
+        # Must have versions from the fixture (42.0 from GTK3, 45.0 from GTK4)
+        version_names = set(
+            SoftwareVersion.objects.filter(package=adwaita).values_list(
+                "version", flat=True
+            )
+        )
+        self.assertIn("42.0", version_names)
+        self.assertIn("45.0", version_names)
+
+    @patch("requests.get")
+    def test_single_parent_extension_works(self, mock_get):
+        """hicolor-icon-theme has only GTK3 as parent — should still work."""
+        mock_get.side_effect = self._make_mock_get()
+
+        loader = EESSICatalogLoader(catalog_version="2023.06")
+        loader.load_catalog(update_existing=True, dry_run=False)
+
+        catalog = SoftwareCatalog.objects.get(name="EESSI", version="2023.06")
+        hicolor = SoftwarePackage.objects.get(
+            catalog=catalog, name="hicolor-icon-theme"
+        )
+        self.assertTrue(hicolor.is_extension)
+
+        parent_names = set(hicolor.parent_softwares.values_list("name", flat=True))
+        self.assertEqual(parent_names, {"GTK3"})
+
+    @patch("requests.get")
+    def test_reload_preserves_multiple_parents(self, mock_get):
+        """Loading twice should preserve (not lose) parent relationships."""
+        mock_get.side_effect = self._make_mock_get()
+
+        loader = EESSICatalogLoader(catalog_version="2023.06")
+        loader.load_catalog(update_existing=True, dry_run=False)
+
+        # Second load
+        loader2 = EESSICatalogLoader(catalog_version="2023.06")
+        loader2.load_catalog(update_existing=True, dry_run=False)
+
+        catalog = SoftwareCatalog.objects.get(name="EESSI", version="2023.06")
+        adwaita = SoftwarePackage.objects.get(
+            catalog=catalog, name="adwaita-icon-theme"
+        )
+        parent_names = set(adwaita.parent_softwares.values_list("name", flat=True))
+        self.assertEqual(parent_names, {"GTK3", "GTK4"})
 
 
 class CatalogLoaderErrorHandlingTest(TestCase):
@@ -673,11 +792,297 @@ class CatalogLoaderErrorHandlingTest(TestCase):
 
             loader = EESSICatalogLoader(catalog_version="2023.06")
 
-            # Simulate database error during loading
+            # Simulate database error during loading (management command path
+            # uses filter().first() + create(); patch create to fail)
             with patch.object(
                 SoftwareCatalog.objects,
-                "get_or_create",
+                "create",
                 side_effect=Exception("DB Error"),
             ):
                 with self.assertRaises(CatalogLoadError):
                     loader.load_catalog(dry_run=False)
+
+
+class EESSIVersionFilteringTest(BaseLoaderTestCase):
+    """Test that EESSI loader correctly filters versions by EESSI version."""
+
+    def setUp(self):
+        self.eessi_software_data = self.load_test_fixture("eessi_software_test.json")
+
+    def _make_mock_get(self):
+        """Create a mock requests.get that returns the test fixture data."""
+
+        def mock_requests_side_effect(url, **kwargs):
+            mock_response = Mock()
+            if "software.json" in url:
+                mock_response.json.return_value = self.eessi_software_data
+            else:
+                mock_response.json.return_value = {}
+            mock_response.raise_for_status.return_value = None
+            return mock_response
+
+        return mock_requests_side_effect
+
+    @patch("requests.get")
+    def test_loader_2023_06_only_includes_2023_06_versions(self, mock_get):
+        """Test that loader with catalog_version=2023.06 only includes EESSI 2023.06 versions."""
+        mock_get.side_effect = self._make_mock_get()
+
+        loader = EESSICatalogLoader(catalog_version="2023.06", include_extensions=False)
+        catalog_data = loader.fetch_catalog_data()
+
+        # ALL, AOFlagger, ASE are 2023.06 only — should be present
+        self.assertIn("ALL", catalog_data.packages)
+        self.assertIn("AOFlagger", catalog_data.packages)
+        self.assertIn("ASE", catalog_data.packages)
+
+        # JupyterLab has versions in both — only 4.0.5 is 2023.06
+        self.assertIn("JupyterLab", catalog_data.packages)
+        jupyterlab = catalog_data.packages["JupyterLab"]
+        self.assertIn("4.0.5", jupyterlab.versions)
+        self.assertNotIn("4.2.5", jupyterlab.versions)
+
+        # NewTool2025 is 2025.06 only — should NOT be present
+        self.assertNotIn("NewTool2025", catalog_data.packages)
+
+    @patch("requests.get")
+    def test_loader_2025_06_only_includes_2025_06_versions(self, mock_get):
+        """Test that loader with catalog_version=2025.06 only includes EESSI 2025.06 versions."""
+        mock_get.side_effect = self._make_mock_get()
+
+        loader = EESSICatalogLoader(catalog_version="2025.06", include_extensions=False)
+        catalog_data = loader.fetch_catalog_data()
+
+        # ALL, AOFlagger, ASE are 2023.06 only — should NOT be present
+        self.assertNotIn("ALL", catalog_data.packages)
+        self.assertNotIn("AOFlagger", catalog_data.packages)
+        self.assertNotIn("ASE", catalog_data.packages)
+
+        # JupyterLab has versions in both — only 4.2.5 is 2025.06
+        self.assertIn("JupyterLab", catalog_data.packages)
+        jupyterlab = catalog_data.packages["JupyterLab"]
+        self.assertNotIn("4.0.5", jupyterlab.versions)
+        self.assertIn("4.2.5", jupyterlab.versions)
+
+        # NewTool2025 is 2025.06 only — should be present
+        self.assertIn("NewTool2025", catalog_data.packages)
+
+    @patch("requests.get")
+    def test_packages_with_zero_matching_versions_excluded(self, mock_get):
+        """Test that packages with no matching versions are excluded entirely."""
+        mock_get.side_effect = self._make_mock_get()
+
+        loader = EESSICatalogLoader(catalog_version="2025.06", include_extensions=False)
+        catalog_data = loader.fetch_catalog_data()
+
+        # ALL only has a 2023.06 version, so should be excluded from 2025.06 catalog
+        self.assertNotIn("ALL", catalog_data.packages)
+
+    @patch("requests.get")
+    def test_new_format_version_filtering(self, mock_get):
+        """Test version filtering with new dict-based required_modules format."""
+        new_format_data = self.load_test_fixture("eessi_new_format_test.json")
+
+        def mock_requests_side_effect(url, **kwargs):
+            mock_response = Mock()
+            if "software.json" in url:
+                mock_response.json.return_value = new_format_data
+            else:
+                mock_response.json.return_value = {}
+            mock_response.raise_for_status.return_value = None
+            return mock_response
+
+        mock_get.side_effect = mock_requests_side_effect
+
+        # All packages in new_format_test.json are 2023.06
+        loader = EESSICatalogLoader(catalog_version="2023.06", include_extensions=False)
+        catalog_data = loader.fetch_catalog_data()
+        self.assertIn("NewFormatPackage", catalog_data.packages)
+        self.assertIn("PackageWithExtensions", catalog_data.packages)
+
+        # None should appear under 2025.06
+        loader_2025 = EESSICatalogLoader(
+            catalog_version="2025.06", include_extensions=False
+        )
+        catalog_data_2025 = loader_2025.fetch_catalog_data()
+        self.assertEqual(len(catalog_data_2025.packages), 0)
+
+    @patch("requests.get")
+    def test_sync_removes_stale_versions_from_database(self, mock_get):
+        """Test that sync=True removes stale versions wrongly in the DB."""
+        mock_get.side_effect = self._make_mock_get()
+
+        # First load with no filtering (simulate the old buggy behavior)
+        # by loading all data as 2023.06
+        loader = EESSICatalogLoader(catalog_version="2023.06", include_extensions=False)
+        stats = loader.load_catalog(update_existing=True, dry_run=False)
+        self.assertGreater(stats["packages_created"], 0)
+
+        catalog = SoftwareCatalog.objects.get(name="EESSI")
+
+        # JupyterLab should have only version 4.0.5 (2023.06)
+        jupyterlab_pkg = SoftwarePackage.objects.get(catalog=catalog, name="JupyterLab")
+        self.assertEqual(
+            SoftwareVersion.objects.filter(package=jupyterlab_pkg).count(), 1
+        )
+        self.assertTrue(
+            SoftwareVersion.objects.filter(
+                package=jupyterlab_pkg, version="4.0.5"
+            ).exists()
+        )
+
+        # Manually create a stale version (simulating old buggy load)
+        SoftwareVersion.objects.create(
+            package=jupyterlab_pkg,
+            version="4.2.5",
+            dependencies=[],
+            metadata={},
+        )
+        self.assertEqual(
+            SoftwareVersion.objects.filter(package=jupyterlab_pkg).count(), 2
+        )
+
+        # Re-load with sync=True to clean up
+        loader2 = EESSICatalogLoader(
+            catalog_version="2023.06", include_extensions=False
+        )
+        stats2 = loader2.load_catalog(
+            update_existing=True, dry_run=False, catalog=catalog, sync=True
+        )
+
+        # Stale version should be deleted
+        self.assertGreater(stats2["versions_deleted"], 0)
+        self.assertEqual(
+            SoftwareVersion.objects.filter(package=jupyterlab_pkg).count(), 1
+        )
+        self.assertTrue(
+            SoftwareVersion.objects.filter(
+                package=jupyterlab_pkg, version="4.0.5"
+            ).exists()
+        )
+        self.assertFalse(
+            SoftwareVersion.objects.filter(
+                package=jupyterlab_pkg, version="4.2.5"
+            ).exists()
+        )
+
+    @patch("requests.get")
+    def test_sync_removes_stale_packages_from_database(self, mock_get):
+        """Test that sync=True removes packages not in incoming data."""
+        mock_get.side_effect = self._make_mock_get()
+
+        # Load with 2023.06 version
+        loader = EESSICatalogLoader(catalog_version="2023.06", include_extensions=False)
+        loader.load_catalog(update_existing=True, dry_run=False)
+
+        catalog = SoftwareCatalog.objects.get(name="EESSI")
+
+        # Manually create a stale package (simulating old buggy load)
+        SoftwarePackage.objects.create(
+            catalog=catalog,
+            name="StalePackage",
+            description="Should not be here",
+        )
+
+        # Re-load with sync=True to clean up
+        loader2 = EESSICatalogLoader(
+            catalog_version="2023.06", include_extensions=False
+        )
+        stats2 = loader2.load_catalog(
+            update_existing=True, dry_run=False, catalog=catalog, sync=True
+        )
+
+        self.assertGreater(stats2["packages_deleted"], 0)
+        self.assertFalse(
+            SoftwarePackage.objects.filter(
+                catalog=catalog, name="StalePackage"
+            ).exists()
+        )
+
+
+class EESSIGromacsDuplicateVersionsTest(BaseLoaderTestCase):
+    """Test that EESSI builds with the same upstream version are all loaded.
+
+    Example: GROMACS 2024.4 is published twice in EESSI - with and without CUDA.
+    Both share version='2024.4' but have different module_version values.
+    """
+
+    def setUp(self):
+        self.gromacs_data = self.load_test_fixture(
+            "eessi_gromacs_duplicate_versions_test.json"
+        )
+
+    @patch("requests.get")
+    def test_gromacs_duplicate_upstream_versions_parsed(self, mock_get):
+        """Both GROMACS 2024.4 builds are kept when parsing catalog data."""
+
+        def mock_requests_side_effect(url, **kwargs):
+            mock_response = Mock()
+            if "software.json" in url:
+                mock_response.json.return_value = self.gromacs_data
+            else:
+                mock_response.json.return_value = {}
+            mock_response.raise_for_status.return_value = None
+            return mock_response
+
+        mock_get.side_effect = mock_requests_side_effect
+
+        loader = EESSICatalogLoader(catalog_version="2023.06", include_extensions=False)
+        catalog_data = loader.fetch_catalog_data()
+
+        package = catalog_data.packages["GROMACS"]
+        self.assertEqual(len(package.versions), 2)
+        self.assertIn("2024.4-foss-2023b", package.versions)
+        self.assertIn("2024.4-foss-2023b-CUDA-12.4.0", package.versions)
+
+        cpu_build = package.versions["2024.4-foss-2023b"]
+        cuda_build = package.versions["2024.4-foss-2023b-CUDA-12.4.0"]
+        self.assertEqual(cpu_build.version_data.version, "2024.4")
+        self.assertEqual(cuda_build.version_data.version, "2024.4")
+        self.assertEqual(cpu_build.version_data.module_version, "2024.4-foss-2023b")
+        self.assertEqual(
+            cuda_build.version_data.module_version,
+            "2024.4-foss-2023b-CUDA-12.4.0",
+        )
+
+    @patch("requests.get")
+    def test_gromacs_duplicate_upstream_versions_loaded_to_database(self, mock_get):
+        """Both GROMACS 2024.4 builds are persisted as separate SoftwareVersion rows."""
+
+        def mock_requests_side_effect(url, **kwargs):
+            mock_response = Mock()
+            if "software.json" in url:
+                mock_response.json.return_value = self.gromacs_data
+            else:
+                mock_response.json.return_value = {}
+            mock_response.raise_for_status.return_value = None
+            return mock_response
+
+        mock_get.side_effect = mock_requests_side_effect
+
+        loader = EESSICatalogLoader(catalog_version="2023.06", include_extensions=False)
+        stats = loader.load_catalog(update_existing=True, dry_run=False)
+
+        self.assertEqual(stats["packages_created"], 1)
+        self.assertEqual(stats["versions_created"], 2)
+
+        catalog = SoftwareCatalog.objects.get(name="EESSI", version="2023.06")
+        package = SoftwarePackage.objects.get(catalog=catalog, name="GROMACS")
+        versions = SoftwareVersion.objects.filter(package=package).order_by(
+            "module_version"
+        )
+        self.assertEqual(versions.count(), 2)
+
+        module_versions = list(versions.values_list("version", "module_version"))
+        self.assertEqual(
+            module_versions,
+            [
+                ("2024.4", "2024.4-foss-2023b"),
+                ("2024.4", "2024.4-foss-2023b-CUDA-12.4.0"),
+            ],
+        )
+
+        cuda_version = versions.get(module_version="2024.4-foss-2023b-CUDA-12.4.0")
+        self.assertTrue(cuda_version.targets.exclude(gpu_architectures=[]).exists())
+        cpu_version = versions.get(module_version="2024.4-foss-2023b")
+        self.assertFalse(cpu_version.targets.exclude(gpu_architectures=[]).exists())

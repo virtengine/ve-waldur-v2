@@ -113,6 +113,72 @@ def resource_creation_canceled(resource: models.Resource, validate=False):
     return order
 
 
+def resource_restore_succeeded(resource: models.Resource, validate=False):
+    order = set_order_state(
+        resource,
+        OrderTypes.RESTORE,
+        OrderStates.DONE,
+        validate,
+    )
+
+    if resource.state != ResourceStates.OK:
+        resource.set_state_ok()
+        resource.save(update_fields=["state"])
+
+    signals.resource_creation_succeeded.send(sender=models.Resource, instance=resource)
+    event_logger.emit(
+        "Resource {resource_name} has been restored.",
+        event_type=EventType.MARKETPLACE_RESOURCE_CREATE_SUCCEEDED,
+        event_context={"resource": resource},
+        scopes=log.get_resource_scopes(resource),
+    )
+    return order
+
+
+def resource_restore_failed(resource: models.Resource, validate=False):
+    order = set_order_state(
+        resource,
+        OrderTypes.RESTORE,
+        OrderStates.ERRED,
+        validate,
+    )
+    resource.set_state_erred()
+    resource.save(update_fields=["state"])
+
+    if order:
+        copy_error_from_resource_to_order(resource, order)
+
+    event_logger.emit(
+        "Resource {resource_name} restoration has failed.",
+        event_type=EventType.MARKETPLACE_RESOURCE_CREATE_FAILED,
+        event_context={"resource": resource},
+        scopes=log.get_resource_scopes(resource),
+        level="error",
+    )
+    return order
+
+
+def resource_restore_canceled(resource: models.Resource, validate=False):
+    order = set_order_state(
+        resource,
+        OrderTypes.RESTORE,
+        OrderStates.CANCELED,
+        validate,
+    )
+
+    if resource.state != ResourceStates.TERMINATED:
+        resource.set_state_terminated()
+        resource.save(update_fields=["state"])
+
+    event_logger.emit(
+        "Resource {resource_name} restoration has been canceled.",
+        event_type=EventType.MARKETPLACE_RESOURCE_CREATE_CANCELED,
+        event_context={"resource": resource},
+        scopes=log.get_resource_scopes(resource),
+    )
+    return order
+
+
 def resource_update_succeeded(resource: models.Resource, validate=False):
     """
     Handle successful resource update completion.
@@ -216,7 +282,34 @@ def resource_update_succeeded(resource: models.Resource, validate=False):
         if limits_changed:
             log.log_resource_limit_update_succeeded(locked_resource)
 
+        if limits_changed and (locked_resource.downscaled or locked_resource.paused):
+            resource_uuid = str(locked_resource.uuid)
+            offering_id = locked_resource.offering_id
+            transaction.on_commit(
+                lambda: _trigger_slurm_policy_reevaluation(resource_uuid, offering_id)
+            )
+
         return order
+
+
+def _trigger_slurm_policy_reevaluation(resource_uuid, offering_id):
+    """Trigger immediate SLURM policy re-evaluation after limit changes.
+
+    When resource limits increase on a downscaled/paused resource,
+    the policy system needs to re-evaluate usage percentages so that
+    QoS restrictions are lifted promptly instead of waiting for the
+    next periodic evaluation cycle.
+    """
+    from waldur_mastermind.policy import models as policy_models
+    from waldur_mastermind.policy import tasks as policy_tasks
+
+    policies = policy_models.SlurmPeriodicUsagePolicy.objects.filter(
+        scope_id=offering_id,
+    )
+    for policy in policies:
+        policy_tasks.evaluate_resource_against_policy.delay(
+            resource_uuid, str(policy.uuid)
+        )
 
 
 def resource_update_failed(resource: models.Resource, validate=False):
@@ -294,6 +387,15 @@ def resource_deletion_succeeded(resource: models.Resource, validate=False):
     else:
         logger.info(
             "Resource %s is already in terminated state, skip transition", resource
+        )
+
+    # Terminated resources keep their row, so the ResourceApiKey FK cascade never
+    # fires. Delete the key rows explicitly (the agent's delete_resource already
+    # removed the gateway Secret entries) so no orphan OK keys remain revealable.
+    deleted, _ = resource.api_keys.all().delete()
+    if deleted:
+        logger.info(
+            "Deleted %s API key row(s) of terminated resource %s", deleted, resource
         )
 
     signals.resource_deletion_succeeded.send(models.Resource, instance=resource)
@@ -460,6 +562,18 @@ OrderHandlers = {
         OrderTypes.TERMINATE,
         OrderStates.CANCELED,
     ): resource_deletion_canceled,
+    (
+        OrderTypes.RESTORE,
+        OrderStates.DONE,
+    ): resource_restore_succeeded,
+    (
+        OrderTypes.RESTORE,
+        OrderStates.ERRED,
+    ): resource_restore_failed,
+    (
+        OrderTypes.RESTORE,
+        OrderStates.CANCELED,
+    ): resource_restore_canceled,
 }
 
 

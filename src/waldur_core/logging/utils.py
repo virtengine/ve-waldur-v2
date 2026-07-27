@@ -4,15 +4,17 @@ import logging
 import re
 import threading
 import time
+import uuid as uuid_mod
 
 import stomp
 from django.apps import apps
 from django.conf import settings
 from django.core.cache import cache
 from django.db.models import QuerySet
-from paho.mqtt import publish as mqtt_publish
+from rest_framework.exceptions import ValidationError
 
 from waldur_core.logging import backend, models
+from waldur_core.logging.circuit_breaker import stomp_circuit_breaker
 from waldur_core.logging.mixins import LoggableMixin
 
 logger = logging.getLogger(__name__)
@@ -291,6 +293,123 @@ def parse_subscription_queue_name(queue_name: str) -> dict | None:
     return None
 
 
+def parse_consumer_queue_name(queue_name: str) -> str | None:
+    """Parse a consumer queue name and return the EventConsumer UUID.
+
+    Queue names follow the pattern: consumer_{event_consumer_uuid}
+
+    Args:
+        queue_name: The queue name to parse
+
+    Returns:
+        The event_consumer_uuid string or None if not a valid consumer queue.
+    """
+    pattern = r"^consumer_([a-f0-9]{32})$"
+    match = re.match(pattern, queue_name)
+    if match:
+        return match.group(1)
+    return None
+
+
+def resolve_consumer_rmq_password(request) -> str:
+    """RabbitMQ password for a consumer queue.
+
+    Uses the presented Personal Access Token when the caller authenticated with
+    one (the client presents the same PAT string as its STOMP passcode, and a
+    long-lived PAT survives a session-token logout/rotation); otherwise falls
+    back to the get-or-created DRF token (avoiding the Token.DoesNotExist a bare
+    ``request.user.auth_token`` would raise). No hard gate. cleanup_stale is
+    PAT-aware to match.
+    """
+    # Kept lazy deliberately: importing waldur_core.core.authentication /
+    # core.models at this module's top raises AppRegistryNotReady, because
+    # logging.utils is imported early during app loading (before the core app's
+    # models are ready). Not the optional-backend-SDK carve-out, but the same
+    # app-initialization-order hazard the CLAUDE.md rule exists to avoid.
+    from waldur_core.core.authentication import (
+        parse_token_from_request,
+        refresh_token,
+    )
+    from waldur_core.core.models import PersonalAccessToken
+
+    if isinstance(request.auth, PersonalAccessToken):
+        raw_pat = parse_token_from_request(request, b"bearer")
+        if raw_pat:
+            return raw_pat
+    return refresh_token(request.user).key
+
+
+def provision_consumer_queue(consumer, password: str) -> dict:
+    """Create the RMQ vhost/user/queue for an EventConsumer and mark it created.
+
+    These are external, non-transactional side effects and must run OUTSIDE any
+    DB transaction. Raises rest_framework ValidationError on failure, tearing
+    down a just-created user first. Idempotency / ownership / stale-recreate
+    stay with the caller; this is only the fresh-provision step.
+    """
+    vhost = consumer.user.uuid.hex
+    queue_name = consumer.queue_name
+    rmq_backend = backend.RabbitMQManagementBackend()
+    new_rmq_username = uuid_mod.uuid4().hex
+
+    if not rmq_backend.create_rabbitmq_virtual_host(vhost):
+        logger.error("Failed to create RabbitMQ virtual host: %s", vhost)
+        raise ValidationError("Failed to create RabbitMQ virtual host")
+    if not rmq_backend.create_rabbitmq_user(new_rmq_username, password):
+        logger.error("Failed to create RabbitMQ user: %s", new_rmq_username)
+        raise ValidationError("Failed to create RabbitMQ user")
+    permissions = {"configure": ".*", "write": ".*", "read": ".*"}
+    if not rmq_backend.assign_rabbitmq_vhost_permissions(
+        new_rmq_username, vhost, permissions
+    ):
+        logger.error(
+            "Failed to assign RabbitMQ permissions for user: %s", new_rmq_username
+        )
+        rmq_backend.delete_rabbitmq_user(new_rmq_username)
+        raise ValidationError("Failed to assign RabbitMQ permissions")
+    # arguments= must be a keyword — see the site-agent register_queue note.
+    if not rmq_backend.create_queue(
+        vhost, queue_name, arguments=backend.SUBSCRIPTION_QUEUE_ARGUMENTS
+    ):
+        logger.error("Failed to create RabbitMQ queue: %s", queue_name)
+        rmq_backend.delete_rabbitmq_user(new_rmq_username)
+        raise ValidationError("Failed to create RabbitMQ queue")
+
+    consumer.rmq_username = new_rmq_username
+    consumer.queue_created = True
+    consumer.save(update_fields=["rmq_username", "queue_created"])
+    return {
+        "rmq_username": new_rmq_username,
+        "queue_name": queue_name,
+        "vhost": vhost,
+    }
+
+
+# Advisory-lock namespace for consumer registration (arbitrary constant, "EVNT").
+_REGISTRATION_LOCK_NAMESPACE = 0x45564E54
+
+
+def lock_user_registration(user_id: int) -> None:
+    """Serialize a user's concurrent consumer registrations within the current
+    transaction (must be called inside ``transaction.atomic()``).
+
+    ``select_for_update`` cannot lock rows that do not exist yet, so two
+    concurrent FIRST-time registrations both see an empty candidate set and both
+    insert — creating duplicate consumers + RMQ queues. A per-user Postgres
+    transaction-level advisory lock covers first-time AND re-registration; it is
+    released automatically at transaction end. No-op on non-PostgreSQL backends.
+    """
+    from django.db import connection
+
+    if connection.vendor != "postgresql":
+        return
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT pg_advisory_xact_lock(%s, %s)",
+            [_REGISTRATION_LOCK_NAMESPACE, user_id],
+        )
+
+
 def get_loggable_models():
     return [model for model in apps.get_models() if issubclass(model, LoggableMixin)]
 
@@ -322,39 +441,42 @@ def delete_stale_subscriptions(
     return models.EventSubscription.objects.filter(id__in=removed_subscription_ids)
 
 
-def publish_mqtt_messages(messages_to_send: list[dict[str, str]]) -> None:
-    """Helper function to publish prepared MQTT messages"""
-    mqtt_settings: dict = settings.RABBITMQ
-    if not mqtt_settings.get("MQTT_PORT"):
-        logger.warning("MQTT_PORT is not defined in settings")
-        return
+# Throttle for STOMP publish-failure ERROR logs. During a sustained RabbitMQ
+# outage the same connection error fires for every message and every Celery
+# retry, burying actionable signal under thousands of duplicate tracebacks.
+# Emit at most one full traceback per minute per process; downgrade the rest
+# to a one-line WARNING.
+_STOMP_FAILURE_ERROR_LOG_INTERVAL_S = 60.0
+_stomp_failure_log_lock = threading.Lock()
+_stomp_failure_last_error_log_time: float = 0.0
 
-    for message_info in messages_to_send:
-        try:
-            logger.info(
-                "Sending MQTT message to mqtt://%s:%s, topic: %s",
-                mqtt_settings["HOST"],
-                mqtt_settings["MQTT_PORT"],
-                message_info["topic"],
-            )
-            mqtt_auth = {
-                "username": f"{message_info['vhost']}:{mqtt_settings['USER']}",
-                "password": mqtt_settings["PASSWORD"],
-            }
-            mqtt_publish.single(
-                message_info["topic"],
-                message_info["payload"],
-                hostname=mqtt_settings["HOST"],
-                port=mqtt_settings["MQTT_PORT"],
-                auth=mqtt_auth,
-            )
-        except Exception as exc:
-            logger.exception(
-                "Unable to send order info to mqtt://%s:%s, reason: %s",
-                mqtt_settings["HOST"],
-                mqtt_settings["MQTT_PORT"],
-                exc,
-            )
+
+def _log_stomp_publish_failure(exc: BaseException) -> None:
+    """Log a STOMP publish failure with bounded frequency.
+
+    First failure (or one per ``_STOMP_FAILURE_ERROR_LOG_INTERVAL_S``) is
+    logged at ERROR with a traceback so on-call sees the root cause.
+    Subsequent failures within the window are logged at WARNING without a
+    traceback so a long outage doesn't drown the error stream.
+    """
+    global _stomp_failure_last_error_log_time
+    now = time.monotonic()
+    with _stomp_failure_log_lock:
+        emit_error = (
+            now - _stomp_failure_last_error_log_time
+            >= _STOMP_FAILURE_ERROR_LOG_INTERVAL_S
+        )
+        if emit_error:
+            _stomp_failure_last_error_log_time = now
+
+    if emit_error:
+        logger.exception("Failed to publish message to RabbitMQ STOMP queue: %s", exc)
+    else:
+        logger.warning(
+            "STOMP publish failed (traceback suppressed; one ERROR per %ss): %s",
+            int(_STOMP_FAILURE_ERROR_LOG_INTERVAL_S),
+            exc,
+        )
 
 
 def publish_stomp_messages(
@@ -370,16 +492,13 @@ def publish_stomp_messages(
     Returns:
         Tuple of (successful_count, failed_count)
     """
-    # Import here to avoid circular imports
-    from waldur_core.logging.circuit_breaker import stomp_circuit_breaker
-
     rabbitmq_settings: dict = settings.RABBITMQ
     if not rabbitmq_settings.get("STOMP_PORT"):
         logger.warning("STOMP_PORT is not defined in settings")
         return (0, len(messages_to_send))
 
-    # Check circuit breaker
-    if stomp_circuit_breaker.is_open():
+    # Check circuit breaker (use can_execute() so recovery timeout is respected)
+    if not stomp_circuit_breaker.can_execute():
         logger.warning(
             "STOMP circuit breaker is OPEN, skipping %d messages",
             len(messages_to_send),
@@ -447,17 +566,17 @@ def publish_stomp_messages(
             duration_ms = (time.time() - start_time) * 1000
             PublishingMetrics.record_publish(success=True, duration_ms=duration_ms)
         except Exception as e:
-            logger.exception(
-                "Failed to publish message to RabbitMQ STOMP queue: %s",
-                e,
-            )
+            _log_stomp_publish_failure(e)
+            was_open = stomp_circuit_breaker.is_open()
             stomp_circuit_breaker.record_failure()
             failed += 1
             duration_ms = (time.time() - start_time) * 1000
             PublishingMetrics.record_publish(success=False, duration_ms=duration_ms)
 
-            # Check if circuit breaker tripped
-            if stomp_circuit_breaker.is_open():
+            # Check if this failure tripped the circuit breaker. The state
+            # transition itself is already logged at INFO by CircuitBreaker;
+            # only record the metric here.
+            if not was_open and stomp_circuit_breaker.is_open():
                 PublishingMetrics.record_circuit_breaker_trip()
                 logger.warning(
                     "Circuit breaker tripped after failure, remaining messages will be skipped"

@@ -1,16 +1,21 @@
 import decimal
 import json
 import logging
-from datetime import date
+from datetime import date, timedelta
+
+import openportal
+from django.utils import timezone
 
 from waldur_core.core.enums import ReviewStates
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.invoices import models as invoice_models
 
-from . import models, utils
-from . import op as openportal
+from . import config, exceptions, models, utils
 
 logger = logging.getLogger(__name__)
+
+
+PROJECT_GRACE_PERIOD_DAYS = 30
 
 
 class OpenPortalBoard:
@@ -23,8 +28,8 @@ class OpenPortalBoard:
 
     def __init__(self, destination: openportal.Destination = None):
         # make sure that the OpenPortal config is loaded
-        if not openportal.ensure_config_loaded():
-            raise openportal.OpenPortalError(
+        if not config.ensure_config_loaded():
+            raise exceptions.OpenPortalError(
                 "OpenPortal is not enabled or configuration is not available"
             )
 
@@ -69,7 +74,7 @@ class OpenPortalBoard:
             logger.error(
                 f"Failed to get portal name from destination {self._destination}: {e}"
             )
-            raise openportal.OpenPortalError(
+            raise exceptions.OpenPortalError(
                 f"Failed to get portal name from destination {self._destination}: {e}"
             )
 
@@ -79,7 +84,7 @@ class OpenPortalBoard:
         This is the destination that the OpenPortal Bridge is connected to.
         """
         if self._destination is None:
-            raise openportal.OpenPortalError("Board is not connected to a destination")
+            raise exceptions.OpenPortalError("Board is not connected to a destination")
 
         return self._destination
 
@@ -89,7 +94,7 @@ class OpenPortalBoard:
         name in the destination
         """
         if self._destination is None:
-            raise openportal.OpenPortalError("Board is not connected to a destination")
+            raise exceptions.OpenPortalError("Board is not connected to a destination")
 
         return str(self._destination.agents[-1])
 
@@ -100,43 +105,43 @@ class OpenPortalBoard:
         OpenPortalException if the environment variable is not set
         or if the config file cannot be loaded
         """
-        openportal.ensure_config_loaded()
+        config.ensure_config_loaded()
 
     def health(self):
-        if not openportal.is_config_available():
-            raise openportal.OpenPortalError(
+        if not config.is_config_available():
+            raise exceptions.OpenPortalError(
                 "OpenPortal is not enabled or configuration is not available"
             )
 
         try:
             health = openportal.health()
         except Exception as e:
-            raise openportal.OpenPortalError(f"Failed to get OpenPortal health: {e}")
+            raise exceptions.OpenPortalError(f"Failed to get OpenPortal health: {e}")
 
         if not health.is_healthy():
             logger.error(f"OpenPortal is not healthy: {health}")
-            raise openportal.OpenPortalError(f"OpenPortal is not healthy: {health}")
+            raise exceptions.OpenPortalError(f"OpenPortal is not healthy: {health}")
 
     def fetch_job(self, job_id: str) -> openportal.Job:
         """
         Fetch the OpenPortal job with the specified job_id
         """
-        if not openportal.is_config_available():
-            raise openportal.OpenPortalError(
+        if not config.is_config_available():
+            raise exceptions.OpenPortalError(
                 f"OpenPortal is not enabled or configuration is not available - cannot fetch job with ID '{job_id}'"
             )
 
         try:
             job = openportal.fetch_job(str(job_id))
         except Exception as e:
-            raise openportal.OpenPortalError(
+            raise exceptions.OpenPortalError(
                 f"Failed to fetch job with ID '{job_id}': {e}"
             )
 
         return job
 
     def _get_project_template(
-        self, managed_project: models.ManagedProject, details: openportal.ProjectDetails
+        self, managed_project: models.ManagedProject, details: openportal.AwardDetails
     ) -> models.ProjectTemplate:
         """
         Get the project class for the managed project.
@@ -153,7 +158,7 @@ class OpenPortalBoard:
         if not managed_project.has_remote_identifier():
             managed_project.delete()
 
-            raise openportal.ManagedProjectRejectedError(
+            raise exceptions.ManagedProjectRejectedError(
                 f"ManagedProject {managed_project} does not have an identifier set"
             )
 
@@ -163,14 +168,14 @@ class OpenPortalBoard:
         if details.project_template is None:
             managed_project.delete()
 
-            raise openportal.ManagedProjectRejectedError(
+            raise exceptions.ManagedProjectRejectedError(
                 f"Project template is not set for project {details}"
             )
 
         if not isinstance(details.project_template, openportal.ProjectTemplate):
             managed_project.delete()
 
-            raise openportal.ManagedProjectRejectedError(
+            raise exceptions.ManagedProjectRejectedError(
                 f"Invalid project class: {details.project_template}"
             )
 
@@ -179,8 +184,8 @@ class OpenPortalBoard:
         if len(project_template) == 0:
             managed_project.delete()
 
-            raise openportal.ManagedProjectRejectedError(
-                f"Project class is empty for project {identifier}"
+            raise exceptions.ManagedProjectRejectedError(
+                f"Project class is empty for project {managed_project}"
             )
 
         # Make sure that we are the right board to manage this project
@@ -193,7 +198,7 @@ class OpenPortalBoard:
             )
             managed_project.delete()
 
-            raise openportal.ManagedProjectRejectedError(
+            raise exceptions.ManagedProjectRejectedError(
                 f"ManagedProject {managed_project} is not managed by this board. "
                 f"Expected destination {self.destination()}, got {project_destination}."
             )
@@ -212,7 +217,7 @@ class OpenPortalBoard:
                 f"Failed to get the project template for portal {remote_portal} for {project_template}@{self.offering()}. "
                 "This suggests that the portal is not allowed to create projects in this template for this offering."
             )
-            raise openportal.ManagedProjectRejectedError(
+            raise exceptions.ManagedProjectRejectedError(
                 f"{project_template}@{self.offering()} is not allowed for portal '{remote_portal}'"
             )
 
@@ -223,7 +228,7 @@ class OpenPortalBoard:
                 f"Failed to get the project template for portal {remote_portal} for {details.project_template}@{self.offering()}. "
                 "This suggests that the portal is not allowed to create projects in this template for this offering."
             )
-            raise openportal.ManagedProjectRejectedError(
+            raise exceptions.ManagedProjectRejectedError(
                 f"{details.project_template}@{self.offering()} is not allowed for portal '{remote_portal}'"
             )
 
@@ -237,7 +242,7 @@ class OpenPortalBoard:
                 f"Failed to validate key for portal {remote_portal} for {details.project_template}@{self.offering()}. "
                 "This suggests that the portal was not allowed to create projects in this template for this offering."
             )
-            raise openportal.ManagedProjectRejectedError(
+            raise exceptions.ManagedProjectRejectedError(
                 f"{details.project_template}@{self.offering()} is not allowed for portal '{remote_portal}'"
             )
 
@@ -262,7 +267,7 @@ class OpenPortalBoard:
             logger.error(
                 f"ManagedProject {managed_project} already has a project {managed_project.project}, but we are trying to attach {existing_project}"
             )
-            raise openportal.OpenPortalError(
+            raise exceptions.OpenPortalError(
                 f"ManagedProject {managed_project} already has a project {managed_project.project}, but we are trying to attach {existing_project}"
             )
 
@@ -275,7 +280,7 @@ class OpenPortalBoard:
                 utils.get_openportal_robot(),
                 f"{managed_project} does not have an identifier set.",
             )
-            raise openportal.ManagedProjectRejectedError()
+            raise exceptions.ManagedProjectRejectedError()
 
         if managed_project.project.is_expired or managed_project.project.is_removed:
             # any changes to this project are now not allowed - this is rejected
@@ -286,7 +291,7 @@ class OpenPortalBoard:
                 utils.get_openportal_robot(),
                 f"{identifier} is expired or removed, cannot create project.",
             )
-            raise openportal.ManagedProjectRejectedError()
+            raise exceptions.ManagedProjectRejectedError()
 
         # we have already created this project, so we can just return the mapping - check
         # there the project details are in agreement with the existing project
@@ -299,7 +304,7 @@ class OpenPortalBoard:
                 utils.get_openportal_robot(),
                 f"{identifier} details are None, but the project already exists.",
             )
-            raise openportal.ManagedProjectRejectedError()
+            raise exceptions.ManagedProjectRejectedError()
 
         if managed_project.local_identifier is None:
             self._get_local_identifier(managed_project)
@@ -310,7 +315,7 @@ class OpenPortalBoard:
         # Now create a unique shortname for this project using
         # the generator from the project class
         if managed_project is None:
-            raise openportal.ManagedProjectRejectedError(
+            raise exceptions.ManagedProjectRejectedError(
                 f"ManagedProject {managed_project} is None - cannot generate local identifier"
             )
 
@@ -325,7 +330,7 @@ class OpenPortalBoard:
                 utils.get_openportal_robot(),
                 f"ManagedProject {managed_project} does not have a project set.",
             )
-            raise openportal.ManagedProjectRejectedError()
+            raise exceptions.ManagedProjectRejectedError()
 
         project_info, created = models.ProjectInfo.objects.get_or_create(
             project=waldur_project,
@@ -344,7 +349,7 @@ class OpenPortalBoard:
                     utils.get_openportal_robot(),
                     f"Project class is not set for project {managed_project.project}",
                 )
-                raise openportal.ManagedProjectRejectedError()
+                raise exceptions.ManagedProjectRejectedError()
 
             generator = project_template.get_generator()
 
@@ -356,7 +361,7 @@ class OpenPortalBoard:
                     utils.get_openportal_robot(),
                     f"Project class {project_template} does not have a generator set.",
                 )
-                raise openportal.ManagedProjectRejectedError()
+                raise exceptions.ManagedProjectRejectedError()
 
             shortname = project_info.generate_shortname(generator)
 
@@ -370,7 +375,7 @@ class OpenPortalBoard:
 
         identifier = managed_project.get_remote_identifier()
         project_template: models.ProjectTemplate = managed_project.project_template
-        details: openportal.ProjectDetails = managed_project.get_details()
+        details: openportal.AwardDetails = managed_project.get_details()
 
         if identifier is None or project_template is None or details is None:
             # This is a bug - we should not have a ManagedProject without a project class
@@ -379,7 +384,7 @@ class OpenPortalBoard:
                 utils.get_openportal_robot(),
                 f"{managed_project} is in an invalid state - project class or customer is not set.",
             )
-            raise openportal.ManagedProjectRejectedError(
+            raise exceptions.ManagedProjectRejectedError(
                 f"{managed_project} is in an invalid state - project class or customer is not set."
             )
 
@@ -391,7 +396,7 @@ class OpenPortalBoard:
             logger.warning(
                 f"Project class {project_template} does not have a customer set."
             )
-            raise openportal.ManagedProjectRejectedError(
+            raise exceptions.ManagedProjectRejectedError(
                 f"Project class {project_template} does not have a customer set."
             )
 
@@ -439,23 +444,31 @@ class OpenPortalBoard:
             self._attach_existing_project(managed_project, orphaned_existing_project)
 
             if managed_project.is_rejected():
-                raise openportal.ManagedProjectRejectedError()
+                raise exceptions.ManagedProjectRejectedError()
             else:
                 # We need to ask the site admin to approve this connection
                 managed_project.set_needs_approval(
                     True,
                     comment=f"Project '{orphaned_existing_project}' already exists in customer '{customer}' and is being attached to '{managed_project}'.",
                 )
-                raise openportal.ManagedProjectPendingError()
+                raise exceptions.ManagedProjectPendingError()
 
     def _create_local_project(self, managed_project: models.ManagedProject):
         if managed_project.project is not None:
             # This project already exists - nothing to do?
             return
 
+        today = date.today()
+        end_date = managed_project.get_details().end_date
+
+        if end_date is not None and end_date <= today:
+            raise exceptions.ManagedProjectRejectedError(
+                f"End date {end_date} is today or in the past - cannot create a new project!"
+            )
+
         identifier = managed_project.get_remote_identifier()
         project_template: models.ProjectTemplate = managed_project.project_template
-        details: openportal.ProjectDetails = managed_project.get_details()
+        details: openportal.AwardDetails = managed_project.get_details()
 
         if identifier is None or project_template is None or details is None:
             # This is a bug - we should not have a ManagedProject without a project class
@@ -464,7 +477,7 @@ class OpenPortalBoard:
                 utils.get_openportal_robot(),
                 f"{managed_project} is in an invalid state - project class or customer is not set.",
             )
-            raise openportal.ManagedProjectRejectedError()
+            raise exceptions.ManagedProjectRejectedError()
 
         # get the customer (organisation) in which the project should be created
         if project_template.customer is None:
@@ -475,7 +488,7 @@ class OpenPortalBoard:
             logger.warning(
                 f"Project class {project_template} does not have a customer set."
             )
-            raise openportal.ManagedProjectRejectedError()
+            raise exceptions.ManagedProjectRejectedError()
 
         customer = project_template.customer
 
@@ -493,7 +506,7 @@ class OpenPortalBoard:
             logger.warning(
                 f"Project class {project_template} does not have a generator."
             )
-            raise openportal.ManagedProjectRejectedError()
+            raise exceptions.ManagedProjectRejectedError()
 
         # at a minimum, we need to know the name of the project
         if details.name is None:
@@ -502,7 +515,7 @@ class OpenPortalBoard:
                 f"Project name is not set for project {details}",
             )
             logger.warning(f"Project name is not set for project {details}")
-            raise openportal.ManagedProjectRejectedError()
+            raise exceptions.ManagedProjectRejectedError()
 
         project_name = str(details.name).strip()
 
@@ -512,7 +525,7 @@ class OpenPortalBoard:
                 f"Project name is empty for project {identifier}",
             )
             logger.warning(f"Project name is empty for project {identifier}")
-            raise openportal.ManagedProjectRejectedError()
+            raise exceptions.ManagedProjectRejectedError()
 
         # create the project in the customer
         waldur_project = structure_models.Project.objects.create(
@@ -528,7 +541,7 @@ class OpenPortalBoard:
     def create_project(
         self,
         identifier: openportal.ProjectIdentifier,
-        details: openportal.ProjectDetails,
+        details: openportal.AwardDetails,
         force_request_approval: bool = False,
     ) -> openportal.ProjectMapping:
         """
@@ -539,18 +552,28 @@ class OpenPortalBoard:
         logger.info(f"Creating project {identifier} with details {details}")
 
         if not isinstance(identifier, openportal.ProjectIdentifier):
-            raise openportal.ManagedProjectRejectedError(
+            raise exceptions.ManagedProjectRejectedError(
                 f"Invalid project identifier: {identifier}"
             )
 
-        if not isinstance(details, openportal.ProjectDetails):
-            raise openportal.ManagedProjectRejectedError(
+        if not isinstance(details, openportal.AwardDetails):
+            raise exceptions.ManagedProjectRejectedError(
                 f"Invalid project details: {details}"
             )
 
         if self.destination() is None:
-            raise openportal.ManagedProjectRejectedError(
+            raise exceptions.ManagedProjectRejectedError(
                 "Board is not connected to a destination"
+            )
+
+        today = date.today()
+
+        if (
+            details.end_date is not None
+            and details.end_date + timedelta(days=PROJECT_GRACE_PERIOD_DAYS) < today
+        ):
+            raise exceptions.ManagedProjectRejectedError(
+                f"End date {details.end_date} is in the past"
             )
 
         # Get (or create) the ManagedProject for the given project identifier
@@ -586,7 +609,7 @@ class OpenPortalBoard:
             logger.error(f"{identifier} does not have a project class set")
             managed_project.delete()
 
-            raise openportal.ManagedProjectRejectedError(
+            raise exceptions.ManagedProjectRejectedError(
                 f"{identifier} does not have a project class set"
             )
 
@@ -608,7 +631,7 @@ class OpenPortalBoard:
                     utils.get_openportal_robot(),
                     f"{identifier} is rejected as allocation exceeds the limit.",
                 )
-                raise openportal.ManagedProjectRejectedError()
+                raise exceptions.ManagedProjectRejectedError()
 
         # Try to link an existing project first
         self._link_existing_project(managed_project)
@@ -624,13 +647,13 @@ class OpenPortalBoard:
         # We can't do anything if the project is pending approval or canceled
         if managed_project.is_pending():
             logger.warning(f"{identifier} is pending approval!")
-            raise openportal.ManagedProjectPendingError()
+            raise exceptions.ManagedProjectPendingError()
         elif managed_project.is_canceled():
             logger.warning(f"{identifier} is canceled!")
-            raise openportal.ManagedProjectRejectedError("The project is canceled.")
+            raise exceptions.ManagedProjectRejectedError("The project is canceled.")
         elif managed_project.is_rejected():
             logger.warning(f"{identifier} is rejected!")
-            raise openportal.ManagedProjectRejectedError()
+            raise exceptions.ManagedProjectRejectedError()
 
         if (
             project_template.action_needs_approval()
@@ -645,7 +668,7 @@ class OpenPortalBoard:
             # Here you would typically send a notification to the admin or
             # the person responsible for approving project creation requests.
             # For now, we will just raise an error to indicate that approval is needed.
-            raise openportal.ManagedProjectPendingError()
+            raise exceptions.ManagedProjectPendingError()
         elif not managed_project.is_approved():
             # If the project class does not require approval, we can proceed
             logger.info(
@@ -669,7 +692,7 @@ class OpenPortalBoard:
     def update_project(
         self,
         identifier: openportal.ProjectIdentifier,
-        new_details: openportal.ProjectDetails,
+        new_details: openportal.AwardDetails,
         force_approve: bool = False,
     ) -> openportal.ProjectMapping:
         """
@@ -679,13 +702,23 @@ class OpenPortalBoard:
         """
         logger.info(f"Updating project {identifier} with details {new_details}")
 
+        today = date.today()
+
+        if (
+            new_details.end_date is not None
+            and new_details.end_date + timedelta(days=PROJECT_GRACE_PERIOD_DAYS) < today
+        ):
+            raise exceptions.ManagedProjectRejectedError(
+                f"End date {new_details.end_date} is in the past"
+            )
+
         if not isinstance(identifier, openportal.ProjectIdentifier):
-            raise openportal.ManagedProjectRejectedError(
+            raise exceptions.ManagedProjectRejectedError(
                 f"Invalid project identifier: {identifier}"
             )
 
-        if not isinstance(new_details, openportal.ProjectDetails):
-            raise openportal.ManagedProjectRejectedError(
+        if not isinstance(new_details, openportal.AwardDetails):
+            raise exceptions.ManagedProjectRejectedError(
                 f"Invalid project details: {new_details}"
             )
 
@@ -714,7 +747,7 @@ class OpenPortalBoard:
                 f"{identifier} does not have a project class set. Cannot update project."
             )
             managed_project.delete()
-            raise openportal.ManagedProjectRejectedError(
+            raise exceptions.ManagedProjectRejectedError(
                 f"{identifier} does not have a project class set"
             )
 
@@ -736,7 +769,7 @@ class OpenPortalBoard:
                     utils.get_openportal_robot(),
                     f"{identifier} is rejected as allocation exceeds the limit.",
                 )
-                raise openportal.ManagedProjectRejectedError()
+                raise exceptions.ManagedProjectRejectedError()
 
         if (
             project_template.action_needs_approval()
@@ -753,7 +786,7 @@ class OpenPortalBoard:
 
             managed_project.set_needs_approval()
 
-            raise openportal.ManagedProjectPendingError()
+            raise exceptions.ManagedProjectPendingError()
 
         # We can't do anything if the project is pending approval or canceled
         if managed_project.is_pending():
@@ -764,13 +797,13 @@ class OpenPortalBoard:
                 managed_project.get_details().merge(new_details)
             )
 
-            raise openportal.ManagedProjectPendingError()
+            raise exceptions.ManagedProjectPendingError()
         elif managed_project.is_canceled():
             logger.warning(f"{identifier} is canceled!")
-            raise openportal.ManagedProjectRejectedError("The project is canceled.")
+            raise exceptions.ManagedProjectRejectedError("The project is canceled.")
         elif managed_project.is_rejected():
             logger.warning(f"{identifier} is rejected!")
-            raise openportal.ManagedProjectRejectedError()
+            raise exceptions.ManagedProjectRejectedError()
 
         if managed_project.project is None:
             # we actually need to create the project
@@ -779,16 +812,33 @@ class OpenPortalBoard:
             )
             self._create_local_project(managed_project)
 
-        if managed_project.project.is_expired or managed_project.project.is_removed:
-            # we can't make any changes to this project - return an error
+        # Always reject updates to removed projects
+        if managed_project.project.is_removed:
             managed_project.reject(
                 utils.get_openportal_robot(),
-                f"{identifier} is expired or removed, cannot update project.",
+                f"{identifier} is removed, cannot update project.",
             )
-            logger.warning(
-                f"{identifier} is expired or removed, cannot update project."
+            logger.warning(f"{identifier} is removed, cannot update project.")
+            raise exceptions.ManagedProjectRejectedError()
+
+        # Check if trying to reactivate with a future end_date
+        is_reactivating = (
+            new_details.end_date is not None
+            and new_details.end_date >= timezone.now().date()
+        )
+
+        # Reject updates for expired projects unless still in grace period or reactivating
+        if (
+            managed_project.project.is_expired
+            and not managed_project.project.is_in_grace_period
+            and not is_reactivating
+        ):
+            managed_project.reject(
+                utils.get_openportal_robot(),
+                f"{identifier} is expired, cannot update project.",
             )
-            raise openportal.ManagedProjectRejectedError()
+            logger.warning(f"{identifier} is expired, cannot update project.")
+            raise exceptions.ManagedProjectRejectedError()
 
         if managed_project.local_identifier is None:
             logger.warning(
@@ -851,7 +901,9 @@ class OpenPortalBoard:
             )
             project.save(update_fields=update_fields)
 
-        if project.is_expired or project.is_removed:
+        if (
+            project.is_expired and not project.is_in_grace_period
+        ) or project.is_removed:
             # we can't make any further changes to this project - return an error
             managed_project.reject(
                 utils.get_openportal_robot(),
@@ -860,7 +912,7 @@ class OpenPortalBoard:
             logger.warning(
                 f"{identifier} is expired or removed, cannot update project."
             )
-            raise openportal.ManagedProjectRejectedError()
+            raise exceptions.ManagedProjectRejectedError()
 
         if details.allocation is not None:
             new_credits = decimal.Decimal(
@@ -885,7 +937,7 @@ class OpenPortalBoard:
                         utils.get_openportal_robot(),
                         f"{identifier} is rejected as allocation exceeds the limit.",
                     )
-                    raise openportal.ManagedProjectRejectedError()
+                    raise exceptions.ManagedProjectRejectedError()
 
                 # Only check credits if we are increasing the allocation
                 elif (
@@ -899,7 +951,7 @@ class OpenPortalBoard:
                         f"{identifier} with class {project_template} requires approval for allocation changes."
                     )
                     managed_project.set_needs_approval()
-                    raise openportal.ManagedProjectPendingError()
+                    raise exceptions.ManagedProjectPendingError()
 
                 logger.info(
                     f"Setting allocation {details.allocation} for project {identifier}"
@@ -983,7 +1035,7 @@ class OpenPortalBoard:
 
     def get_project(
         self, identifier: openportal.ProjectIdentifier
-    ) -> openportal.ProjectDetails:
+    ) -> openportal.AwardDetails:
         """
         Get a project from OpenPortal with the given identifier.
         This returns the details of the project, e.g. its name,
@@ -1023,7 +1075,7 @@ class OpenPortalBoard:
                 f"ManagedProject '{managed_project}' is expired or removed"
             )
 
-        details = openportal.ProjectDetails("{}")
+        details = openportal.AwardDetails("{}")
 
         if project.name is not None:
             details.name = str(project.name).strip()
@@ -1041,7 +1093,7 @@ class OpenPortalBoard:
         return details
 
     def get_projects(
-        self, identifier: openportal.PortalIdentifier
+        self, portal: openportal.PortalIdentifier
     ) -> list[openportal.ProjectMapping]:
         """
         Get all projects in OpenPortal for the given portal identifier.
@@ -1049,8 +1101,8 @@ class OpenPortalBoard:
         identifier in the requesting portal and the OpenPortal project
         identifier used internally.
         """
-        if not isinstance(identifier, openportal.PortalIdentifier):
-            raise openportal.OpenPortalError(f"Invalid portal identifier: {identifier}")
+        if not isinstance(portal, openportal.PortalIdentifier):
+            raise openportal.OpenPortalError(f"Invalid portal identifier: {portal}")
 
         mappings = []
 
@@ -1062,7 +1114,7 @@ class OpenPortalBoard:
 
             remote_identifier = project.get_remote_identifier()
 
-            if remote_identifier.portal_identifier != identifier:
+            if remote_identifier.portal_identifier != portal:
                 # This project is not in the requested portal
                 continue
 
@@ -1071,7 +1123,7 @@ class OpenPortalBoard:
             else:
                 mappings.append(openportal.ProjectMapping(f"{remote_identifier}:None"))
 
-        logger.info(f"Mappings for portal {identifier}: {mappings}")
+        logger.info(f"Mappings for portal {portal}: {mappings}")
 
         return mappings
 
@@ -1118,6 +1170,38 @@ class OpenPortalBoard:
             )
 
         return managed_project.get_mapping()
+
+    def _get_cached_report_for_month(self, project, month: int, year: int):
+        """
+        Return a CachedProjectUsageReport-derived ProjectUsageReport for the given
+        project, month, and year, or None if no cached data exists.
+
+        Uses _identifiers_for_project_uuid to find all project identifiers,
+        including cases where the Allocation has been deleted (slug-based fallback).
+        Falls back to InvoiceItem if no cached reports are found.
+        """
+        from .filters import _identifiers_for_project_uuid
+
+        project_identifiers = _identifiers_for_project_uuid(project.uuid)
+
+        if not project_identifiers:
+            return None
+
+        cached_records = models.CachedProjectUsageReport.objects.filter(
+            project_identifier__in=project_identifiers,
+            year=year,
+            month=month,
+        )
+
+        if not cached_records.exists():
+            return None
+
+        reports = [cr.get_report() for cr in cached_records]
+
+        if len(reports) == 1:
+            return reports[0]
+
+        return openportal.ProjectUsageReport.combine(reports)
 
     def get_usage_report(
         self,
@@ -1181,95 +1265,139 @@ class OpenPortalBoard:
                     scale_factor = template.get_allocation_mapping_for(allocation_units)
                 except Exception as e:
                     logger.warning(
-                        f"Failed to get the allocation mapping for {allocation_units}: {e}"
+                        f"Failed to get the allocation mapping for {allocation_units} from template {template}: {e}"
                     )
 
         report = openportal.ProjectUsageReport(managed_project.get_remote_identifier())
-
         this_month = date.today().month
         this_year = date.today().year
 
         # Get the usage month by month
         for month_range in date_range.months:
-            # get all of the invoice items for this project for this month
-            # These are the consumption details, and are not deleted when the
-            # project is deleted
             month = month_range.start_date.month
             year = month_range.start_date.year
 
-            logger.debug(
-                f"Fetching invoice items for project {project} for {month}/{year}"
-            )
+            # Try to use CachedProjectUsageReport first, if all allocations
+            # for this project are OpenPortal-managed with project identifiers
+            cached = self._get_cached_report_for_month(project, month, year)
 
-            try:
-                invoice_items = invoice_models.InvoiceItem.objects.filter(
-                    project=project, invoice__month=month, invoice__year=year
+            if cached is not None:
+                logger.info(
+                    f"Using cached usage report for project {project} for {month}/{year}"
                 )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to retrieve invoice items for project {project}: {e}"
-                )
-                invoice_items = []
 
-            for invoice_item in invoice_items:
-                usage = float(invoice_item.price)
+                # Build {UserIdentifier: email} map for remap_users.
+                # resolve_useridentifiers works on strings; we keep the
+                # original UserIdentifier objects to pass to remap_users.
+                user_identifiers = cached.users
+                uid_strings = [str(uid) for uid in user_identifiers]
+                user_info_map = utils.resolve_useridentifiers(uid_strings)
 
-                logger.info(f"Invoice {invoice_item} : Usage {usage}")
+                user_email_map = {}
+                for uid in user_identifiers:
+                    user_info = user_info_map.get(str(uid))
+                    if user_info and user_info.get("email"):
+                        user_email_map[uid] = user_info["email"]
 
-                if usage == 0:
-                    continue
-                elif usage < 0:
-                    # this is a credit, so can be safely ignored here
-                    continue
+                if user_email_map:
+                    cached.remap_users(user_email_map)
 
-                # get the month and year of the usage
-                try:
-                    invoice_month = invoice_item.invoice.month
-                    invoice_year = invoice_item.invoice.year
-                except Exception:
-                    logger.warning(
-                        f"Invoice item {invoice_item} has no invoice month/year - skipping"
-                    )
-                    continue
+                # remap_project updates the project identifier and rebuilds
+                # all UserIdentifier keys so that report += cached succeeds.
+                remote_id = managed_project.get_remote_identifier()
+                cached.remap_project(remote_id)
 
-                if invoice_month is None or invoice_year is None:
-                    logger.warning(
-                        f"Invoice item {invoice_item} has no invoice month/year - skipping"
-                    )
-                    continue
-
-                if invoice_month < 1 or invoice_month > 12:
-                    logger.warning(
-                        f"Invoice item {invoice_item} has invalid month {invoice_month} - skipping"
-                    )
-                    continue
-
-                if invoice_month != month or invoice_year != year:
-                    logger.warning(
-                        f"Invoice item {invoice_item} has mismatched month/year - skipping"
-                    )
-                    continue
-
-                consumption_date = date(year=year, month=month, day=1)
-
-                # change the day to the first of the month
-                consumption_date = utils.get_first_day_of_month(consumption_date)
-
-                d = openportal.DailyProjectUsageReport()
-                d.add_unattributed_usage(openportal.Usage.from_hours(usage))
-
-                if year <= this_year and month < this_month:
+                if year <= this_year and month < this_month and not cached.is_complete:
                     # this is a month in the past - we don't expect the usage to change
-                    d.set_complete()
+                    logger.warning(
+                        f"Cached usage report for project {project} for {month}/{year} is not marked complete, but this month is in the past. Will need to refetch in the future to get the completed report."
+                    )
 
-                report.add_report(consumption_date, d)
+                report += cached
+            else:
+                # Fall back to building usage from InvoiceItem objects
+                logger.info(
+                    f"Fetching invoice items for project {project} for {month}/{year}"
+                )
+
+                try:
+                    invoice_items = invoice_models.InvoiceItem.objects.filter(
+                        project=project, invoice__month=month, invoice__year=year
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to retrieve invoice items for project {project}: {e}"
+                    )
+                    invoice_items = []
+
+                for invoice_item in invoice_items:
+                    usage = float(invoice_item.price)
+
+                    logger.info(f"Invoice {invoice_item} : Usage {usage}")
+
+                    if usage == 0:
+                        continue
+                    elif usage < 0:
+                        # this is a credit, so can be safely ignored here
+                        continue
+
+                    # get the month and year of the usage
+                    try:
+                        invoice_month = invoice_item.invoice.month
+                        invoice_year = invoice_item.invoice.year
+                    except Exception:
+                        logger.warning(
+                            f"Invoice item {invoice_item} has no invoice month/year - skipping"
+                        )
+                        continue
+
+                    if invoice_month is None or invoice_year is None:
+                        logger.warning(
+                            f"Invoice item {invoice_item} has no invoice month/year - skipping"
+                        )
+                        continue
+
+                    if invoice_month < 1 or invoice_month > 12:
+                        logger.warning(
+                            f"Invoice item {invoice_item} has invalid month {invoice_month} - skipping"
+                        )
+                        continue
+
+                    if invoice_month != month or invoice_year != year:
+                        logger.warning(
+                            f"Invoice item {invoice_item} has mismatched month/year - skipping"
+                        )
+                        continue
+
+                    consumption_date = date(year=year, month=month, day=1)
+
+                    # change the day to the first of the month
+                    consumption_date = utils.get_first_day_of_month(consumption_date)
+
+                    # But make sure that the consumption date fits within
+                    # the date range - this is messy as we don't have day-based
+                    # consumption from the invoice
+                    if consumption_date < date_range.start_date:
+                        consumption_date = date_range.start_date
+                    elif consumption_date > date_range.end_date:
+                        consumption_date = date_range.end_date
+
+                    d = openportal.DailyProjectUsageReport()
+                    d.add_unattributed_usage(openportal.Usage.from_hours(usage))
+
+                    if year <= this_year and month < this_month:
+                        # this is a month in the past - we don't expect the usage to change
+                        d.set_complete()
+
+                    report.add_report(consumption_date, d)
 
         if scale_factor is None or scale_factor <= 0:
             logger.warning(f"Invalid scale factor: {scale_factor}")
         elif scale_factor != 1.0:
-            report *= scale_factor
+            report.scale_total(scale_factor)
 
-        return report
+        # now filter the report to the requested date range
+        return report.filter(date_range)
 
     def get_usage_reports(
         self, portal: openportal.PortalIdentifier, date_range: openportal.DateRange
@@ -1304,6 +1432,150 @@ class OpenPortalBoard:
                 )
 
         return openportal.UsageReport.combine(reports)
+
+    def get_storage_report(
+        self,
+        identifier: openportal.ProjectIdentifier,
+        date_range: openportal.DateRange,
+    ) -> openportal.ProjectStorageReport:
+        """
+        Return the accumulated storage report for a managed project over the given
+        date range.  Only CachedProjectStorageReport records are used — there is no
+        InvoiceItem fallback, and no unit scaling.
+        """
+        if not isinstance(identifier, openportal.ProjectIdentifier):
+            raise openportal.OpenPortalError(
+                f"Invalid project identifier: {identifier}"
+            )
+
+        if not isinstance(date_range, openportal.DateRange):
+            raise openportal.OpenPortalError(f"Invalid date range: {date_range}")
+
+        logger.info(
+            f"Getting storage report for project {identifier} and date range {date_range}"
+        )
+
+        try:
+            managed_project = models.ManagedProject.objects.get(
+                identifier=str(identifier),
+                destination=str(self.destination()),
+            )
+        except models.ManagedProject.DoesNotExist:
+            raise openportal.OpenPortalError(
+                f"ManagedProject for identifier '{identifier}' does not exist"
+            )
+
+        if managed_project.project is None:
+            raise openportal.OpenPortalError(
+                f"ManagedProject '{managed_project}' does not have an associated project"
+            )
+
+        project = managed_project.project
+
+        if project.is_removed:
+            raise openportal.OpenPortalError(
+                f"ManagedProject '{managed_project}' is removed"
+            )
+
+        from .filters import _identifiers_for_project_uuid
+
+        project_identifiers = _identifiers_for_project_uuid(project.uuid)
+
+        if not project_identifiers:
+            raise openportal.OpenPortalError(
+                f"No project identifiers found for project {project}"
+            )
+
+        report = openportal.ProjectStorageReport(
+            managed_project.get_remote_identifier()
+        )
+
+        logger.info(f"Date range: {date_range}")
+        logger.info(f"report = {report}")
+
+        # Get the storage month by month
+        for month_range in date_range.months:
+            month = month_range.start_date.month
+            year = month_range.start_date.year
+
+            cached_records = models.CachedProjectStorageReport.objects.filter(
+                project_identifier__in=project_identifiers,
+                year=year,
+                month=month,
+            )
+
+            if not cached_records.exists():
+                logger.info(
+                    f"No cached storage report for project {project}"
+                    f" for {month}/{year} - skipping"
+                )
+                continue
+
+            logger.info(
+                f"Using cached storage report for project {project} for {month}/{year}"
+            )
+
+            records = [cr.get_report() for cr in cached_records]
+            monthly = (
+                records[0]
+                if len(records) == 1
+                else openportal.ProjectStorageReport.combine(records)
+            )
+
+            # Remap unix usernames to email addresses
+            user_identifiers = monthly.users
+            uid_strings = [str(uid) for uid in user_identifiers]
+            user_info_map = utils.resolve_useridentifiers(uid_strings)
+            user_email_map = {}
+            for uid in user_identifiers:
+                user_info = user_info_map.get(str(uid))
+                if user_info and user_info.get("email"):
+                    user_email_map[uid] = user_info["email"]
+            if user_email_map:
+                monthly.remap_users(user_email_map)
+
+            # remap_project updates the project identifier and rebuilds
+            # all UserIdentifier keys so that report += monthly succeeds.
+            monthly.remap_project(managed_project.get_remote_identifier())
+            report += monthly
+
+        # Filter to the exact requested date range (trims partial months
+        # at either end of the requested range).
+        return report.filter(date_range)
+
+    def get_storage_reports(
+        self, portal: openportal.PortalIdentifier, date_range: openportal.DateRange
+    ) -> openportal.StorageReport:
+        """
+        Return a storage report that covers all of the projects managed by the
+        specified portal.
+        """
+        if not isinstance(portal, openportal.PortalIdentifier):
+            raise openportal.OpenPortalError(f"Invalid portal identifier: {portal}")
+
+        reports = []
+
+        for project in models.ManagedProject.objects.filter(
+            destination=str(self.destination())
+        ):
+            if not project.has_remote_identifier():
+                continue
+
+            remote_identifier = project.get_remote_identifier()
+
+            if remote_identifier.portal_identifier != portal:
+                # This project is not in the requested portal
+                continue
+
+            if project.has_local_identifier():
+                reports.append(
+                    self.get_storage_report(
+                        identifier=remote_identifier,
+                        date_range=date_range,
+                    ).to_storage_report()
+                )
+
+        return openportal.StorageReport.combine(reports)
 
     def send_result(self, job: openportal.Job) -> None:
         """

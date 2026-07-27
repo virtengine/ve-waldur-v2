@@ -9,11 +9,53 @@ from drf_spectacular.plumbing import (
     build_basic_type,
     get_doc,
 )
-from drf_spectacular.utils import OpenApiParameter
-from rest_framework.serializers import ListSerializer
+from drf_spectacular.utils import OpenApiParameter, OpenApiResponse
+from rest_framework.serializers import BaseSerializer, ListSerializer
 
 from waldur_core.core.serializers import RestrictedSerializerMixin
 from waldur_core.core.signals import pre_serializer_fields
+
+
+def _resolve_response_serializer(response):
+    """Coerce a drf-spectacular response declaration into a serializer instance.
+
+    ``@extend_schema(responses=...)`` accepts several shapes and stores the
+    value verbatim — ``get_response_serializers()`` then returns it as-is.
+    Without normalisation we must instance-check against every variant, which
+    is fragile (and was missed for the dict case, silently dropping the
+    ``?field=`` projection from the schema for every endpoint that uses
+    ``responses={status: SerializerClass}``).
+    """
+    if response is None:
+        return None
+    if isinstance(response, OpenApiResponse):
+        return _resolve_response_serializer(response.response)
+    if isinstance(response, dict):
+        # Prefer a 2xx entry; fall back to whatever resolves first.
+        def _is_success(code):
+            try:
+                return 200 <= int(code) < 300
+            except (TypeError, ValueError):
+                return False
+
+        ordered = sorted(
+            response.items(), key=lambda item: 0 if _is_success(item[0]) else 1
+        )
+        for _code, value in ordered:
+            resolved = _resolve_response_serializer(value)
+            if resolved is not None:
+                return resolved
+        return None
+    if isinstance(response, ListSerializer):
+        return response.child
+    if isinstance(response, BaseSerializer):
+        return response
+    if isinstance(response, type) and issubclass(response, BaseSerializer):
+        try:
+            return response()
+        except Exception:
+            return None
+    return None
 
 
 class WaldurOpenApiInspector(AutoSchema):
@@ -33,15 +75,32 @@ class WaldurOpenApiInspector(AutoSchema):
         operation = super().get_operation(
             path, path_regex, path_prefix, method, registry
         )
-        # Exclude HEAD operations for detail views
+        # Emit HEAD (`_count`) operations for collection endpoints only.
+        # Detail views (a single-object retrieve, or a detail-scoped custom
+        # action) do not get one by default, since a count is usually
+        # meaningless there. A detail action that returns a list can opt in
+        # with @count_action (e.g. `/projects/{uuid}/list_users/`).
         if method == "HEAD":
-            if getattr(self.view, "detail", False):
+            if getattr(self.view, "detail", False) and not self._count_action_enabled():
                 return None
             else:
                 operation["responses"] = {"200": {"description": "No response body"}}
                 operation["description"] = (
                     "Get number of items in the collection matching the request parameters."
                 )
+                # An explicit @extend_schema(operation_id=...) on the GET action
+                # leaks onto this auto-added HEAD companion (unless it is scoped
+                # to methods=["GET"]) and would collide with the GET. Give the
+                # HEAD a distinct `_count` id: swap a trailing `_list`, otherwise
+                # append `_count`. Ids that are *explicitly* HEAD-specific — a
+                # `@extend_schema(methods=["HEAD"], operation_id="..._head")`
+                # existence check, e.g. openportal's `retrieve_head` — are
+                # intentional and left untouched.
+                op_id = operation.get("operationId", "")
+                if op_id.endswith("_list"):
+                    operation["operationId"] = op_id[: -len("_list")] + "_count"
+                elif not op_id.endswith(("_count", "_head")):
+                    operation["operationId"] = op_id + "_count"
 
         if not hasattr(self.view, "action"):
             return operation
@@ -63,6 +122,14 @@ class WaldurOpenApiInspector(AutoSchema):
             operation["x-permissions"] = permissions_data
 
         return operation
+
+    def _count_action_enabled(self) -> bool:
+        """Whether the current detail action opted into a HEAD `count` variant."""
+        action_name = getattr(self.view, "action", None)
+        if not action_name:
+            return False
+        action = getattr(self.view, action_name, None)
+        return bool(getattr(action, "count_enabled", False))
 
     def get_description(self) -> str:
         action_or_method = getattr(
@@ -90,10 +157,7 @@ class WaldurOpenApiInspector(AutoSchema):
         if self.method != "GET":
             return []
 
-        serializer = self.get_response_serializers()
-
-        if isinstance(serializer, ListSerializer):
-            serializer = serializer.child
+        serializer = _resolve_response_serializer(self.get_response_serializers())
 
         if not isinstance(serializer, RestrictedSerializerMixin):
             return []

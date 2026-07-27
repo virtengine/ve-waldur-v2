@@ -1,6 +1,7 @@
 from unittest import mock
 
 from ddt import data, ddt
+from django.test import override_settings
 from freezegun import freeze_time
 from rest_framework import status, test
 
@@ -15,8 +16,9 @@ from waldur_mastermind.policy.models import CustomerEstimatedCostPolicy
 from waldur_mastermind.policy.tests import factories
 
 
+@override_settings(task_always_eager=True)
 @freeze_time("2024-09-01")
-class ActionsFunctionsTest(test.APITransactionTestCase):
+class ActionsFunctionsTest(test.APITestCase):
     def setUp(self):
         self.notify_organization_owners_mock = mock.MagicMock()
         self.notify_organization_owners_mock.__name__ = "notify_organization_owners"
@@ -94,6 +96,12 @@ class ActionsFunctionsTest(test.APITransactionTestCase):
             self.block_creation_of_new_resources_mock.reset_mock()
 
     def test_calling_of_threshold_actions(self):
+        # The pre-flight handler reads policy.actions (CharField) directly and
+        # would block creation before the post-save threshold runs. Drop the
+        # blocking action from the stored string; the mock-patched
+        # get_all_actions still injects it for the post-save check.
+        self.policy.actions = "notify_organization_owners"
+        self.policy.save()
         with mock.patch.object(
             CustomerEstimatedCostPolicy,
             "get_all_actions",
@@ -178,7 +186,7 @@ class ActionsFunctionsTest(test.APITransactionTestCase):
 
 
 @ddt
-class GetPolicyTest(test.APITransactionTestCase):
+class GetPolicyTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.customer = self.fixture.customer
@@ -289,7 +297,7 @@ class CreatePolicyTest(test.APITransactionTestCase):
 
 
 @ddt
-class DeletePolicyTest(test.APITransactionTestCase):
+class DeletePolicyTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.customer = self.fixture.customer
@@ -312,7 +320,7 @@ class DeletePolicyTest(test.APITransactionTestCase):
 
 
 @ddt
-class UpdatePolicyTest(test.APITransactionTestCase):
+class UpdatePolicyTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.customer = self.fixture.customer

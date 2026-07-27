@@ -6,11 +6,60 @@ This guide covers SLURM partition configuration and their integration with softw
 
 SLURM partitions represent compute partitions in a cluster that can be associated with marketplace offerings. They define resource limits, scheduling policies, access controls, and optionally link to software catalogs for partition-specific software availability.
 
+`OfferingPartition` records are exposed via the marketplace API for tools like Open OnDemand and are **informational by default**. The Waldur Site Agent can optionally enforce them as access restrictions on the SLURM cluster (`sacctmgr add user … Partitions=…`), enabling per-partition pricing — one offering per partition, each with its own price components — while reusing the same underlying SLURM account hierarchy. Enforcement is opt-in; existing deployments that populated partitions for documentation purposes only continue to behave exactly as before.
+
+## SLURM partition assignment by the Site Agent
+
+Enforcement is enabled per-cluster via the `enforce_offering_partitions` setting in the agent's `backend_settings`. The default is `false` — partition records are not threaded into SLURM. When set to `true`, and when an offering has `OfferingPartition` records, the agent constructs an association command that includes the offering's partition list:
+
+```bash
+sacctmgr add user <username> account=<account> DefaultAccount=<default> \
+    Partitions=p1,p2 Share=parent
+```
+
+Behavior summary (when enforcement is enabled):
+
+- The offering's partition list is read at user-association time. Partition names are sorted alphabetically and joined with commas into a single `Partitions=` argument.
+- The agent **does not** reconcile partition associations after creation. Changes to an offering's partition list affect only newly-added users; users who already have associations keep their existing partition restrictions until they are explicitly removed and re-added.
+- The agent does **not** emit a per-user `DefaultPartition=`. Real `sacctmgr` does not accept that attribute on `add user` (no parser in `user_functions.c` or `sacctmgr_set_assoc_rec`) and rejects the call with `Unknown option`. The default partition for unparameterized jobs comes from the cluster-wide `Default=YES` line in `slurm.conf`.
+
+### Precedence
+
+The agent resolves partitions in this order:
+
+1. **Offering partitions** — when `enforce_offering_partitions` is `true` and the offering has `OfferingPartition` records, those names become the `Partitions=` value.
+2. **Global `default_partition`** — when the offering has no partitions (or enforcement is disabled), the agent's `default_partition` setting (single partition string) is used as a fallback. This preserves the pre-existing single-partition behavior for sites that haven't migrated to per-offering partitions.
+3. **Unrestricted** — neither configured, no `Partitions=` flag is emitted. The user falls back to SLURM's cluster-wide default partition behavior.
+
+### Site-agent configuration
+
+Two relevant settings under `backend_settings`:
+
+```yaml
+backend_settings:
+  enforce_offering_partitions: true    # Opt-in; default false (informational only)
+  default_partition: "cn"              # Fallback when offering has no partitions
+```
+
+- `enforce_offering_partitions` switches on the partition-aware path. Leave unset (or set to `false`) to keep `OfferingPartition` records purely informational, the historical behavior.
+- `default_partition` is the legacy single-partition fallback used when the offering has no partitions or when enforcement is disabled.
+
+### Scope and non-goals
+
+- Partition restrictions are applied at **user-level** SLURM associations. SLURM's accounting model does not support partition restrictions at account scope.
+- The agent does **not** modify existing user associations when an offering's partition list changes. To rebalance, an operator must remove and re-add the user, or terminate the resource and re-provision it on the desired offering.
+- Other partition attributes (`max_cpus_per_node`, `max_time`, QoS, etc.) remain informational — they are exposed via the API but are not pushed into SLURM by the agent.
+
 ## SLURM Partition Model
 
 The OfferingPartition model maps closely to SLURM's partition_info_t struct and includes comprehensive configuration options for HPC environments.
 
 ### Partition Parameters
+
+#### Architecture
+
+- `cpu_arch`: CPU architecture of the partition (e.g., `x86_64/amd/zen3`)
+- `gpu_arch`: GPU architecture of the partition (e.g., `nvidia/cc90`, `amd/gfx90a`)
 
 #### CPU Configuration
 
@@ -65,6 +114,8 @@ curl -X POST "https://your-waldur.example.com/api/marketplace-provider-offerings
   -H "Content-Type: application/json" \
   -d '{
     "partition_name": "gpu-partition",
+    "cpu_arch": "x86_64/amd/zen3",
+    "gpu_arch": "nvidia/cc90",
     "max_cpus_per_node": 64,
     "max_mem_per_node": 512000,
     "max_time": 2880,
@@ -137,6 +188,8 @@ curl -X POST "https://your-waldur.example.com/api/marketplace-provider-offerings
   -H "Content-Type: application/json" \
   -d '{
     "partition_name": "gpu-v100",
+    "cpu_arch": "x86_64/intel/skylake_avx512",
+    "gpu_arch": "nvidia/cc70",
     "max_cpus_per_node": 40,
     "def_cpu_per_gpu": 4,
     "max_mem_per_node": 384000,
@@ -157,6 +210,46 @@ curl -X POST "https://your-waldur.example.com/api/marketplace-provider-offerings
     "enabled_cpu_microarchitectures": ["skylake_avx512"],
     "partition": "gpu-partition-uuid"
   }'
+```
+
+## Partition Architecture Filtering
+
+Partitions can be filtered by their CPU and GPU architecture fields, enabling users to find partitions matching specific hardware requirements.
+
+### Available Filters
+
+| Filter | Type | Description |
+|--------|------|-------------|
+| `cpu_arch` | string (icontains) | Filter by CPU architecture substring (e.g., `zen3`, `x86_64`) |
+| `gpu_arch` | string (icontains) | Filter by GPU architecture substring (e.g., `nvidia`, `cc90`) |
+| `has_gpu` | boolean | Filter partitions with (`true`) or without (`false`) GPU architecture |
+
+### Examples
+
+```bash
+# Find partitions with AMD Zen3 CPUs
+curl "https://your-waldur.example.com/api/marketplace-offering-partitions/?cpu_arch=zen3"
+
+# Find partitions with NVIDIA GPUs
+curl "https://your-waldur.example.com/api/marketplace-offering-partitions/?gpu_arch=nvidia"
+
+# Find all GPU-equipped partitions
+curl "https://your-waldur.example.com/api/marketplace-offering-partitions/?has_gpu=true"
+
+# Find CPU-only partitions
+curl "https://your-waldur.example.com/api/marketplace-offering-partitions/?has_gpu=false"
+```
+
+### Connecting Software to Partitions
+
+The `gpu_arch` field on partitions and the `gpu_architectures` field on software targets enable matching software to compatible hardware. For example, to find which partitions can run software requiring `nvidia/cc90`:
+
+```bash
+# 1. Find software targets requiring nvidia/cc90
+curl "https://your-waldur.example.com/api/marketplace-software-targets/?gpu_arch=nvidia/cc90"
+
+# 2. Find partitions providing nvidia/cc90
+curl "https://your-waldur.example.com/api/marketplace-offering-partitions/?gpu_arch=nvidia/cc90"
 ```
 
 ## Integration Considerations

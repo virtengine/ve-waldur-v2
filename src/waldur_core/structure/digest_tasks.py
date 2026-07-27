@@ -3,10 +3,13 @@ from collections import defaultdict
 from datetime import timedelta
 
 from celery import shared_task
+from constance import config as constance_config
 from django.conf import settings
 from django.template.loader import render_to_string
 from django.utils import timezone, translation
 from django.utils.translation import gettext as _
+
+from waldur_core.core.utils import chunked_queryset
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +149,10 @@ def send_project_digest_notifications():
     """
     from waldur_core.structure.models import ProjectDigestConfiguration
 
+    if not constance_config.ENABLE_PROJECT_DIGEST:
+        logger.info("Project digest notifications are disabled.")
+        return 0
+
     configs = ProjectDigestConfiguration.objects.filter(
         is_enabled=True,
         customer__archived=False,
@@ -153,7 +160,7 @@ def send_project_digest_notifications():
     ).select_related("customer")
 
     count = 0
-    for config in configs.iterator(chunk_size=50):
+    for config in chunked_queryset(configs, chunk_size=50, max_records=10_000):
         if _is_due_to_send(config):
             send_digest_for_customer.delay(config.pk)
             count += 1
@@ -181,7 +188,7 @@ def send_digest_for_customer(config_pk):
     # Phase 1: Gather structured data (language-independent)
     projects = customer.projects.filter(is_removed=False)
     project_data = []
-    for project in projects.iterator(chunk_size=50):
+    for project in chunked_queryset(projects, chunk_size=50, max_records=10_000):
         sections = _gather_project_sections(
             project, providers, period_start, period_end
         )

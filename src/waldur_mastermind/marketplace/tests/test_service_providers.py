@@ -21,7 +21,7 @@ from . import factories
 
 
 @ddt
-class ServiceProviderGetTest(test.APITransactionTestCase):
+class ServiceProviderGetTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.service_provider = self.fixture.service_provider
@@ -89,7 +89,7 @@ class ServiceProviderGetTest(test.APITransactionTestCase):
 
 
 @ddt
-class ServiceProviderRegisterTest(test.APITransactionTestCase):
+class ServiceProviderRegisterTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
         self.customer = self.fixture.customer
@@ -137,7 +137,7 @@ class ServiceProviderRegisterTest(test.APITransactionTestCase):
 
 
 @ddt
-class ServiceProviderUpdateTest(test.APITransactionTestCase):
+class ServiceProviderUpdateTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
         self.customer = self.fixture.customer
@@ -216,7 +216,7 @@ class ServiceProviderUpdateTest(test.APITransactionTestCase):
 
 
 @ddt
-class ServiceProviderDeleteTest(test.APITransactionTestCase):
+class ServiceProviderDeleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
         self.customer = self.fixture.customer
@@ -250,6 +250,21 @@ class ServiceProviderDeleteTest(test.APITransactionTestCase):
             models.ServiceProvider.objects.filter(customer=self.customer).exists()
         )
 
+    def test_service_provider_is_deleted_if_it_has_only_child_offerings(self):
+        parent = factories.OfferingFactory(state=OfferingStates.ACTIVE)
+        factories.OfferingFactory(
+            customer=self.customer,
+            state=OfferingStates.ACTIVE,
+            parent=parent,
+        )
+        response = self.delete_service_provider("staff")
+        self.assertEqual(
+            response.status_code, status.HTTP_204_NO_CONTENT, response.data
+        )
+        self.assertFalse(
+            models.ServiceProvider.objects.filter(customer=self.customer).exists()
+        )
+
     @data("user", "customer_support", "admin", "manager")
     def test_unauthorized_user_can_not_delete_service_provider(self, user):
         response = self.delete_service_provider(user)
@@ -266,7 +281,7 @@ class ServiceProviderDeleteTest(test.APITransactionTestCase):
         return response
 
 
-class CustomerSerializerTest(test.APITransactionTestCase):
+class CustomerSerializerTest(test.APITestCase):
     def test_service_provider_is_not_defined(self):
         customer = structure_factories.CustomerFactory()
         self.assertFalse(self.get_value(customer))
@@ -284,7 +299,7 @@ class CustomerSerializerTest(test.APITransactionTestCase):
         return response.data["is_service_provider"]
 
 
-class ServiceProviderNotificationTest(test.APITransactionTestCase):
+class ServiceProviderNotificationTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.CustomerFixture()
         self.fixture.owner
@@ -318,7 +333,7 @@ class ServiceProviderNotificationTest(test.APITransactionTestCase):
         self.assertEqual(len(utils.get_info_about_missing_usage_reports()), 0)
 
 
-class ConsumerProjectListTest(test.APITransactionTestCase):
+class ConsumerProjectListTest(test.APITestCase):
     def setUp(self) -> None:
         self.mp_fixture = fixtures.MarketplaceFixture()
 
@@ -339,7 +354,7 @@ class ConsumerProjectListTest(test.APITransactionTestCase):
         )
 
 
-class ConsumerSshKeyListTest(test.APITransactionTestCase):
+class ConsumerSshKeyListTest(test.APITestCase):
     def setUp(self) -> None:
         self.mp_fixture = fixtures.MarketplaceFixture()
 
@@ -365,7 +380,7 @@ class ConsumerSshKeyListTest(test.APITransactionTestCase):
         self.assertIn(self.ssh_key.uuid.hex, [item["uuid"] for item in response.data])
 
 
-class ConsumerProjectPermissionListTest(test.APITransactionTestCase):
+class ConsumerProjectPermissionListTest(test.APITestCase):
     def setUp(self) -> None:
         self.mp_fixture = fixtures.MarketplaceFixture()
 
@@ -390,7 +405,7 @@ class ConsumerProjectPermissionListTest(test.APITransactionTestCase):
         self.assertEqual(len(response.data), 1)
 
 
-class ConsumerUserListTest(test.APITransactionTestCase):
+class ConsumerUserListTest(test.APITestCase):
     def setUp(self) -> None:
         self.mp_fixture = fixtures.MarketplaceFixture()
 
@@ -425,7 +440,7 @@ class ConsumerUserListTest(test.APITransactionTestCase):
         self.assertNotIn(self.admin.uuid.hex, [item["uuid"] for item in response.data])
 
 
-class SetOfferingUsersTest(test.APITransactionTestCase):
+class SetOfferingUsersTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = fixtures.MarketplaceFixture()
 
@@ -497,7 +512,7 @@ class SetOfferingUsersTest(test.APITransactionTestCase):
         self.assertEqual("ADMIN_NEW", offering_user.username)
 
 
-class ServiceProviderUserCustomersTest(test.APITransactionTestCase):
+class ServiceProviderUserCustomersTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.CustomerFixture()
         self.service_provider = factories.ServiceProviderFactory(
@@ -532,7 +547,7 @@ class ServiceProviderUserCustomersTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
 
-class ServiceProviderProjectServiceAccountsTest(test.APITransactionTestCase):
+class ServiceProviderProjectServiceAccountsTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.service_provider = self.fixture.service_provider
@@ -587,7 +602,7 @@ class ServiceProviderProjectServiceAccountsTest(test.APITransactionTestCase):
         self.assertEqual(service_account["project_uuid"], new_project.uuid.hex)
 
 
-class ServiceProviderCourseAccountsTest(test.APITransactionTestCase):
+class ServiceProviderCourseAccountsTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.service_provider = self.fixture.service_provider
@@ -637,7 +652,7 @@ class ServiceProviderCourseAccountsTest(test.APITransactionTestCase):
         self.assertEqual(course_account["project_uuid"], new_project.uuid.hex)
 
 
-class ServiceProviderUsersGDPRFilteringTest(test.APITransactionTestCase):
+class ServiceProviderUsersGDPRFilteringTest(test.APITestCase):
     """Test GDPR-aware attribute filtering on service provider users endpoint."""
 
     def setUp(self):
@@ -755,8 +770,8 @@ class ServiceProviderUsersGDPRFilteringTest(test.APITransactionTestCase):
         self.assertIn("phone_number", user_data)
         self.assertIn("organization", user_data)
 
-    def test_intersection_of_multiple_offerings(self):
-        """When multiple offerings exist, uses intersection (most restrictive)."""
+    def test_union_of_multiple_offerings(self):
+        """When multiple offerings exist, uses union (least restrictive)."""
         # Create first offering config - exposes phone_number but not organization
         models.OfferingUserAttributeConfig.objects.create(
             offering=self.offering,
@@ -791,14 +806,14 @@ class ServiceProviderUsersGDPRFilteringTest(test.APITransactionTestCase):
         )
         self.assertIsNotNone(user_data)
 
-        # Only common attributes should be exposed (intersection)
+        # Common attributes should be exposed
         self.assertIn("username", user_data)
         self.assertIn("full_name", user_data)
         self.assertIn("email", user_data)
 
-        # phone_number and organization are NOT in intersection
-        self.assertNotIn("phone_number", user_data)
-        self.assertNotIn("organization", user_data)
+        # Both phone_number and organization are in the union
+        self.assertIn("phone_number", user_data)
+        self.assertIn("organization", user_data)
 
     def test_uuid_and_projects_count_always_present(self):
         """Non-GDPR fields like uuid and projects_count are always present."""
@@ -823,9 +838,9 @@ class ServiceProviderUsersGDPRFilteringTest(test.APITransactionTestCase):
         self.assertIn("uuid", user_data)
         self.assertIn("projects_count", user_data)
 
-    def test_mixed_config_and_no_config_uses_intersection(self):
-        """When one offering has config and another uses defaults, intersection is applied."""
-        # First offering has restrictive config (no phone)
+    def test_mixed_config_and_no_config_uses_union(self):
+        """When one offering has config and another uses defaults, union is applied."""
+        # First offering has config with organization enabled
         models.OfferingUserAttributeConfig.objects.create(
             offering=self.offering,
             expose_username=True,
@@ -852,22 +867,20 @@ class ServiceProviderUsersGDPRFilteringTest(test.APITransactionTestCase):
         )
         self.assertIsNotNone(user_data)
 
-        # Intersection of config1 and defaults: username, full_name, email
+        # Union of config1 and defaults: username, full_name, email, organization
         self.assertIn("username", user_data)
         self.assertIn("full_name", user_data)
         self.assertIn("email", user_data)
 
-        # organization is in config1 but not in defaults - NOT exposed
-        self.assertNotIn("organization", user_data)
+        # organization is in config1 - exposed via union
+        self.assertIn("organization", user_data)
 
-    def test_first_name_last_name_not_in_attribute_map(self):
-        """first_name and last_name are not filtered by GDPR config (not in USER_ATTRIBUTE_FIELD_MAP)."""
-        # Note: first_name and last_name are included in the serializer but
-        # the USER_ATTRIBUTE_FIELD_MAP only has full_name, not first/last separately
+    def test_first_last_name_filtered_with_full_name(self):
+        """first_name and last_name are filtered together with full_name via USER_ATTRIBUTE_EXTRA_FIELDS."""
         models.OfferingUserAttributeConfig.objects.create(
             offering=self.offering,
             expose_username=True,
-            expose_full_name=False,  # Disable full_name
+            expose_full_name=False,  # Disable full_name → also hides first/last name
             expose_email=False,
         )
 
@@ -880,11 +893,10 @@ class ServiceProviderUsersGDPRFilteringTest(test.APITransactionTestCase):
         )
         self.assertIsNotNone(user_data)
 
-        # first_name and last_name are in Meta.fields but NOT in USER_ATTRIBUTE_FIELD_MAP
-        # So they should still be present (not filtered)
-        self.assertIn("first_name", user_data)
-        self.assertIn("last_name", user_data)
-        # But full_name should be filtered out
+        # first_name and last_name are linked to full_name via USER_ATTRIBUTE_EXTRA_FIELDS
+        # When expose_full_name=False, all three should be filtered out
+        self.assertNotIn("first_name", user_data)
+        self.assertNotIn("last_name", user_data)
         self.assertNotIn("full_name", user_data)
 
     def test_affiliations_field_filtering(self):
@@ -1083,3 +1095,292 @@ class ServiceProviderUsersGDPRFilteringTest(test.APITransactionTestCase):
             self.assertIn("username", user_data)
             self.assertIn("email", user_data)
             self.assertNotIn("phone_number", user_data)
+
+    def test_active_isds_exposed_when_enabled(self):
+        """active_isds field is exposed when expose_active_isds=True in config."""
+        self.user.active_isds = ["isd:puhuri", "isd:fenix"]
+        self.user.save()
+
+        models.OfferingUserAttributeConfig.objects.create(
+            offering=self.offering,
+            expose_username=True,
+            expose_full_name=True,
+            expose_email=True,
+            expose_active_isds=True,
+        )
+
+        self.client.force_authenticate(self.fixture.offering_owner)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        user_data = next(
+            (u for u in response.data if u["uuid"] == str(self.user.uuid)), None
+        )
+        self.assertIsNotNone(user_data)
+        self.assertIn("active_isds", user_data)
+        self.assertEqual(user_data["active_isds"], ["isd:puhuri", "isd:fenix"])
+
+    def test_active_isds_hidden_when_not_enabled(self):
+        """active_isds field is hidden when expose_active_isds=False."""
+        self.user.active_isds = ["isd:puhuri"]
+        self.user.save()
+
+        models.OfferingUserAttributeConfig.objects.create(
+            offering=self.offering,
+            expose_username=True,
+            expose_full_name=True,
+            expose_email=True,
+            expose_active_isds=False,
+        )
+
+        self.client.force_authenticate(self.fixture.offering_owner)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        user_data = next(
+            (u for u in response.data if u["uuid"] == str(self.user.uuid)), None
+        )
+        self.assertIsNotNone(user_data)
+        self.assertNotIn("active_isds", user_data)
+
+    def test_organization_registry_code_exposed_when_enabled(self):
+        """organization_registry_code is exposed when enabled in config."""
+        self.user.organization_registry_code = "12345678"
+        self.user.save()
+
+        models.OfferingUserAttributeConfig.objects.create(
+            offering=self.offering,
+            expose_username=True,
+            expose_full_name=True,
+            expose_email=True,
+            expose_organization_registry_code=True,
+        )
+
+        self.client.force_authenticate(self.fixture.offering_owner)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        user_data = next(
+            (u for u in response.data if u["uuid"] == str(self.user.uuid)), None
+        )
+        self.assertIsNotNone(user_data)
+        self.assertIn("organization_registry_code", user_data)
+        self.assertEqual(user_data["organization_registry_code"], "12345678")
+
+    def test_organization_registry_code_hidden_when_not_enabled(self):
+        """organization_registry_code is hidden when not enabled in config."""
+        self.user.organization_registry_code = "12345678"
+        self.user.save()
+
+        models.OfferingUserAttributeConfig.objects.create(
+            offering=self.offering,
+            expose_username=True,
+            expose_full_name=True,
+            expose_email=True,
+            expose_organization_registry_code=False,
+        )
+
+        self.client.force_authenticate(self.fixture.offering_owner)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        user_data = next(
+            (u for u in response.data if u["uuid"] == str(self.user.uuid)), None
+        )
+        self.assertIsNotNone(user_data)
+        self.assertNotIn("organization_registry_code", user_data)
+
+
+@ddt
+class ServiceProviderEndpointAllowedDomainsFieldTest(test.APITestCase):
+    """Tests that allowed_domains is staff-only writable."""
+
+    def setUp(self):
+        self.fixture = structure_fixtures.ProjectFixture()
+        self.customer = self.fixture.customer
+        self.service_provider = factories.ServiceProviderFactory(customer=self.customer)
+
+    def _update(self, user, payload):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        url = factories.ServiceProviderFactory.get_url(self.service_provider)
+        response = self.client.patch(url, payload, format="json")
+        self.service_provider.refresh_from_db()
+        return response
+
+    @data("staff")
+    def test_authorized_user_can_set_allowed_domains(self, user):
+        response = self._update(
+            user, {"allowed_domains": ["example.com", "provider.org"]}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(
+            self.service_provider.allowed_domains,
+            ["example.com", "provider.org"],
+        )
+
+    @data("staff")
+    def test_authorized_user_can_clear_allowed_domains(self, user):
+        self.service_provider.allowed_domains = ["example.com"]
+        self.service_provider.save()
+
+        response = self._update(user, {"allowed_domains": []})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(self.service_provider.allowed_domains, [])
+
+    @data("owner")
+    def test_non_staff_cannot_change_allowed_domains(self, user):
+        """Non-staff users can see the field but cant change (read_only)."""
+        self.service_provider.allowed_domains = ["original.com"]
+        self.service_provider.save()
+
+        response = self._update(user, {"allowed_domains": ["attacker.com"]})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(
+            self.service_provider.allowed_domains,
+            ["original.com"],
+        )
+
+    def test_allowed_domains_visible_in_response_for_owner(self):
+        self.service_provider.allowed_domains = ["example.com"]
+        self.service_provider.save()
+
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.ServiceProviderFactory.get_url(self.service_provider)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("allowed_domains", response.data)
+        self.assertEqual(response.data["allowed_domains"], ["example.com"])
+
+    @data(["api.example.com", "api.provider.org", "example.com", "provider.org"])
+    def test_staff_can_set_valid_subdomain(self, domain_list):
+        for domain in domain_list:
+            response = self._update("staff", {"allowed_domains": [domain]})
+            self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+            self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+            self.assertEqual(self.service_provider.allowed_domains, [domain])
+
+    @data(
+        [
+            "localhost",
+            "127.0.0.1",
+            "localhost:8000",
+            "127.0.0.1",
+            "https://example.com/scim",
+        ]
+    )
+    def test_invalid_domain_is_rejected(self, domain_list):
+        for domain in domain_list:
+            response = self._update("staff", {"allowed_domains": [domain]})
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class OfferingEndpointDomainValidationTest(test.APITestCase):
+    """Tests that OfferingAccessEndpoints can only be created under allowed domains."""
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.offering = self.fixture.offering
+        # Grant ADD_OFFERING_ENDPOINT permission to the offering owner role
+        CustomerRole.OWNER.add_permission(PermissionEnum.ADD_OFFERING_ENDPOINT)
+        self.url = factories.OfferingFactory.get_url(self.offering, "add_endpoint")
+
+    def _add_endpoint(self, user, endpoint_url):
+        self.client.force_authenticate(user)
+        return self.client.post(
+            self.url,
+            {"name": "Test Endpoint", "url": endpoint_url},
+            format="json",
+        )
+
+    def test_endpoint_can_be_added_when_no_domain_restriction_set(self):
+        """When allowed_domains is empty, any domain is allowed."""
+        self.fixture.service_provider.allowed_domains = []
+        self.fixture.service_provider.save()
+
+        response = self._add_endpoint(
+            self.fixture.service_owner,
+            "https://any-domain.example.com/api",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_endpoint_with_allowed_domain_is_accepted(self):
+        self.fixture.service_provider.allowed_domains = ["provider.org"]
+        self.fixture.service_provider.save()
+
+        response = self._add_endpoint(
+            self.fixture.service_owner,
+            "https://provider.org/scim",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_endpoint_with_allowed_subdomain_is_accepted(self):
+        """Subdomains of allowed domains should be permitted."""
+        self.fixture.service_provider.allowed_domains = ["provider.org"]
+        self.fixture.service_provider.save()
+
+        response = self._add_endpoint(
+            self.fixture.service_owner,
+            "https://api.provider.org/scim",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_endpoint_with_disallowed_domain_is_rejected(self):
+        self.fixture.service_provider.allowed_domains = ["provider.org"]
+        self.fixture.service_provider.save()
+
+        response = self._add_endpoint(
+            self.fixture.service_owner,
+            "https://attacker.com/steal-tokens",
+        )
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
+
+    def test_endpoint_domain_rejection_includes_useful_message(self):
+        self.fixture.service_provider.allowed_domains = ["provider.org"]
+        self.fixture.service_provider.save()
+
+        response = self._add_endpoint(
+            self.fixture.service_owner,
+            "https://attacker.com/endpoint",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("attacker.com", str(response.data))
+        self.assertIn("provider.org", str(response.data))
+
+    def test_endpoint_with_multiple_allowed_domains(self):
+        self.fixture.service_provider.allowed_domains = [
+            "provider.org",
+            "secondary.net",
+        ]
+        self.fixture.service_provider.save()
+
+        response = self._add_endpoint(
+            self.fixture.service_owner,
+            "https://secondary.net/api",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_endpoint_with_nested_subdomain_is_accepted(self):
+        """Nested subdomains of allowed domains should be permitted."""
+        self.fixture.service_provider.allowed_domains = ["somedomain.test.com"]
+        self.fixture.service_provider.save()
+
+        response = self._add_endpoint(
+            self.fixture.service_owner,
+            "https://opentest.somedomain.test.com/api",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_partial_domain_match_is_rejected(self):
+        """'fakeprovider.org' must not match allowed domain 'provider.org'."""
+        self.fixture.service_provider.allowed_domains = ["provider.org"]
+        self.fixture.service_provider.save()
+
+        response = self._add_endpoint(
+            self.fixture.service_owner,
+            "https://fakeprovider.org",
+        )
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )

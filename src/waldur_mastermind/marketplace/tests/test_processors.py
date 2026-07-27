@@ -18,7 +18,7 @@ from waldur_mastermind.marketplace.tests import factories
 from waldur_mastermind.marketplace.tests.fixtures import MarketplaceFixture
 
 
-class ProcessorsTest(test.APITransactionTestCase):
+class ProcessorsTest(test.APITestCase):
     def test_creating_of_resource(self):
         user = structure_factories.UserFactory(is_staff=True)
         success = []
@@ -119,7 +119,7 @@ class ProcessorsTest(test.APITransactionTestCase):
         self.assertEqual(order.resource.options["cpu"], 1)
 
 
-class UpdateResourceProcessorTest(test.APITransactionTestCase):
+class UpdateResourceProcessorTest(test.APITestCase):
     def setUp(self):
         # Use a fixture that provides all necessary objects
         self.fixture = MarketplaceFixture()
@@ -153,7 +153,6 @@ class UpdateResourceProcessorTest(test.APITransactionTestCase):
             "old_limits": resource.limits,
             "new_end_date": new_end_date.isoformat(),
             "old_end_date": initial_end_date.isoformat(),
-            "renewal_cost": 24000.0,
         }
 
         order = factories.OrderFactory(
@@ -164,6 +163,7 @@ class UpdateResourceProcessorTest(test.APITransactionTestCase):
             type=OrderTypes.UPDATE,
             limits={"storage": 200},
             attributes=order_attributes,
+            cost=24000.0,
         )
 
         # Act
@@ -229,7 +229,7 @@ class UpdateResourceProcessorTest(test.APITransactionTestCase):
         self.assertNotIn("renewal_history", resource.attributes)
 
 
-class ScopeModelsHasIsAvailableFieldTest(test.APITransactionTestCase):
+class ScopeModelsHasIsAvailableFieldTest(test.APITestCase):
     def test_can_be_managed_field_exists(self):
         all_types = list(manager.backends.keys())
         has_not_field = []

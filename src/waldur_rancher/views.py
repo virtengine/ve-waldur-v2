@@ -11,9 +11,10 @@ from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.types import OpenApiTypes
-from drf_spectacular.utils import OpenApiParameter, extend_schema
+from drf_spectacular.utils import OpenApiParameter, extend_schema, inline_serializer
 from keycloak import exceptions as keycloak_exceptions
 from rest_framework import decorators, generics, mixins, response, status, viewsets
+from rest_framework import serializers as rf_serializers
 from rest_framework.exceptions import MethodNotAllowed, ValidationError
 from rest_framework.permissions import SAFE_METHODS
 
@@ -21,6 +22,7 @@ from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
 from waldur_core.core.enums import CoreStates
 from waldur_core.core.models import User
+from waldur_core.core.serializers import DetailSerializer
 from waldur_core.structure import exceptions as structure_exceptions
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import permissions as structure_permissions
@@ -73,6 +75,7 @@ class ClusterViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
     ]
     pull_executor = executors.ClusterPullExecutor
 
+    @extend_schema(responses={status.HTTP_200_OK: None})
     @decorators.action(detail=True, methods=["post"])
     def import_yaml(self, request, uuid=None):
         cluster: models.Cluster = self.get_object()
@@ -100,6 +103,14 @@ class ClusterViewSet(OptionalReadonlyViewset, structure_views.ResourceViewSet):
     import_yaml_serializer_class = serializers.RancherImportYamlSerializer
     import_yaml_permissions = [structure_permissions.is_staff]
 
+    @extend_schema(
+        responses={
+            status.HTTP_201_CREATED: inline_serializer(
+                "RancherCreateManagementSecurityGroupResponse",
+                fields={"security_group_uuid": rf_serializers.CharField()},
+            )
+        }
+    )
     @decorators.action(detail=True, methods=["post"])
     def create_management_security_group(self, request, uuid=None):
         serializer = serializers.RancherCreateManagementSecurityGroupSerializer(
@@ -369,6 +380,7 @@ class CatalogViewSet(OptionalReadonlyViewset, core_views.ActionsViewSet):
             [Q(content_type=content_type, object_id=object_id) for object_id in ids],
         )
 
+    @extend_schema(request=None, responses={status.HTTP_200_OK: None})
     @decorators.action(detail=True, methods=["post"])
     def refresh(self, request, uuid=None):
         catalog: models.Catalog = self.get_object()
@@ -428,7 +440,11 @@ class ProjectViewSet(structure_views.BaseServicePropertyViewSet):
     filterset_class = filters.ProjectFilter
     lookup_field = "uuid"
 
-    @extend_schema(filters=False, description="Returns project's secrets.")
+    @extend_schema(
+        filters=False,
+        description="Returns project's secrets.",
+        responses=serializers.SecretSerializer(many=True),
+    )
     @decorators.action(detail=True, methods=["get"])
     def secrets(self, request, uuid=None):
         project: models.Project = self.get_object()
@@ -505,6 +521,7 @@ class YamlMixin:
     get_yaml_method = NotImplemented
     put_yaml_method = NotImplemented
 
+    @extend_schema(responses={status.HTTP_200_OK: DetailSerializer})
     @decorators.action(detail=True, methods=["get", "put"])
     def yaml(self, request, *args, **kwargs):
         workload = self.get_object()

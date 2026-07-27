@@ -3,6 +3,7 @@ import re
 from datetime import datetime
 
 from constance import config
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Q
 from django.db.models.query import QuerySet
 from django.utils import timezone
@@ -17,10 +18,12 @@ from waldur_core.checklist import enums as checklist_enums
 from waldur_core.checklist import models as checklist_models
 from waldur_core.checklist import serializers as checklist_serializers
 from waldur_core.core import serializers as core_serializers
+from waldur_core.core.validators import get_project_name_regex_error
 from waldur_core.permissions import enums as permissions_enums
 from waldur_core.permissions import utils as permissions_utils
 from waldur_core.permissions.fixtures import CallRole
 from waldur_core.permissions.models import Role
+from waldur_core.structure import models as structure_models
 from waldur_core.structure.models import Customer
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import permissions as marketplace_permissions
@@ -28,19 +31,107 @@ from waldur_mastermind.marketplace.serializers import (
     BasePublicPlanSerializer,
     OfferingComponentSerializer,
     OfferingOptionsField,
+    UserAttributeConfigBaseSerializer,
 )
 from waldur_mastermind.proposal.enums import (
+    MANDATORY_STEPS,
+    WORKFLOW_STEPS_MAP,
+    AllocationTimes,
+    BulkRoundCadence,
     CallStates,
     COISeverityLevels,
     COITypes,
     ProposalStates,
     RequestedOfferingStates,
+    ReviewerPoolInvitationStatuses,
     RoundStatuses,
+    WorkflowStepInstanceStatuses,
+    WorkflowStepOutcomes,
 )
 
-from . import models
+from . import models, workflow_service
+from .managers import get_connected_calls
 
 logger = logging.getLogger(__name__)
+
+
+# Maps applicant attribute name (from CallApplicantVisibilityConfig.expose_*)
+# to ProposalSerializer field names that should be filtered when a reviewer
+# views a proposal and the attribute is not exposed.
+APPLICANT_FIELD_MAP: dict[str, list[str]] = {
+    "full_name": [
+        "created_by_name",
+        "applicant_full_name",
+        "applicant_first_name",
+        "applicant_last_name",
+    ],
+    "username": [
+        "created_by",
+        "created_by_uuid",
+        "applicant_username",
+    ],
+    "email": ["applicant_email"],
+    "registration_method": ["applicant_registration_method"],
+    "phone_number": ["applicant_phone_number"],
+    "organization": ["applicant_organization"],
+    "organization_country": ["applicant_organization_country"],
+    "organization_type": ["applicant_organization_type"],
+    "organization_registry_code": ["applicant_organization_registry_code"],
+    "organization_vat_code": ["applicant_organization_vat_code"],
+    "organization_address": ["applicant_organization_address"],
+    "job_title": ["applicant_job_title"],
+    "affiliations": ["applicant_affiliations"],
+    "gender": ["applicant_gender"],
+    "personal_title": ["applicant_personal_title"],
+    "place_of_birth": ["applicant_place_of_birth"],
+    "address": ["applicant_address"],
+    "country_of_residence": ["applicant_country_of_residence"],
+    "nationality": ["applicant_nationality"],
+    "nationalities": ["applicant_nationalities"],
+    "eduperson_assurance": ["applicant_eduperson_assurance"],
+    "identity_source": ["applicant_identity_source"],
+    "civil_number": ["applicant_civil_number"],
+    "birth_date": ["applicant_birth_date"],
+    "active_isds": ["applicant_active_isds"],
+}
+
+
+def _is_reviewer_only_view(user, proposal) -> bool:
+    """True if the user views this proposal solely as a reviewer.
+
+    Returns False for the applicant, call managers, staff, support, and
+    anonymous users — all of whom should see unfiltered data.
+    """
+    if not user or user.is_anonymous:
+        return False
+    if user.is_staff or user.is_support:
+        return False
+    if proposal.created_by_id == user.id:
+        return False
+    call_id = proposal.round.call_id
+    if call_id in get_connected_calls(user, CallRole.MANAGER):
+        return False
+    return call_id in get_connected_calls(user, CallRole.REVIEWER)
+
+
+def filter_applicant_fields_for_reviewer(data: dict, proposal, user) -> dict:
+    """Mutate the serialized representation to drop applicant fields that
+    are not exposed by the call's visibility config when the user is a
+    reviewer-only viewer."""
+    if not _is_reviewer_only_view(user, proposal):
+        return data
+    exposed = models.CallApplicantVisibilityConfig.get_exposed_fields_for_call(
+        proposal.round.call
+    )
+    kept_serializer_fields: set[str] = set()
+    for attr in exposed:
+        kept_serializer_fields.update(APPLICANT_FIELD_MAP.get(attr, []))
+    all_filterable: set[str] = set()
+    for serializer_fields in APPLICANT_FIELD_MAP.values():
+        all_filterable.update(serializer_fields)
+    for field_name in all_filterable - kept_serializer_fields:
+        data.pop(field_name, None)
+    return data
 
 
 class EligibilityCheckSerializer(serializers.Serializer):
@@ -253,11 +344,13 @@ class ProposalReviewSerializer(
     )
     reviewer_full_name = serializers.ReadOnlyField(source="reviewer.full_name")
     reviewer_uuid = serializers.UUIDField(read_only=True, source="reviewer.uuid")
+    reviewer_image = serializers.ImageField(source="reviewer.image", read_only=True)
     anonymous_reviewer_name = serializers.SerializerMethodField()
 
     proposal_name = serializers.ReadOnlyField(source="proposal.name")
     proposal_uuid = serializers.UUIDField(read_only=True, source="proposal.uuid")
     proposal_slug = serializers.ReadOnlyField(source="proposal.slug")
+    coi_confirmation_required = serializers.SerializerMethodField()
 
     class Meta:
         model = models.Review
@@ -271,6 +364,7 @@ class ProposalReviewSerializer(
             "reviewer",
             "reviewer_full_name",
             "reviewer_uuid",
+            "reviewer_image",
             "anonymous_reviewer_name",
             "state",
             "review_end_date",
@@ -295,9 +389,13 @@ class ProposalReviewSerializer(
             "comment_project_supporting_documentation",
             "comment_resource_requests",
             "comment_team",
+            "coi_confirmed",
+            "coi_confirmed_at",
+            "coi_confirmation_required",
             "created",
             "modified",
         )
+        read_only_fields = ("coi_confirmed", "coi_confirmed_at")
         protected_fields = ("proposal", "reviewer")
         extra_kwargs = {
             "url": {
@@ -324,6 +422,17 @@ class ProposalReviewSerializer(
                 )
 
         return attrs
+
+    @extend_schema_field(serializers.BooleanField())
+    def get_coi_confirmation_required(self, obj) -> bool:
+        # True when the call has an enabled workflow step that requires the
+        # reviewer to attest absence of conflict of interest. Drives the
+        # confirmation checkbox in the review-submission UI.
+        return models.CallWorkflowStep.objects.filter(
+            call=obj.proposal.round.call_id,
+            is_enabled=True,
+            requires_coi_confirmation=True,
+        ).exists()
 
     def get_anonymous_reviewer_name(self, obj) -> str | None:
         """
@@ -378,6 +487,7 @@ class ProposalReviewSerializer(
             fields.pop("reviewer", None)
             fields.pop("reviewer_full_name", None)
             fields.pop("reviewer_uuid", None)
+            fields.pop("reviewer_image", None)
         else:
             # Show real reviewer info, hide anonymous identifier
             fields.pop("anonymous_reviewer_name", None)
@@ -431,7 +541,43 @@ class ReviewSubmitSerializer(serializers.ModelSerializer):
             "summary_score",
             "summary_public_comment",
             "summary_private_comment",
+            "coi_confirmed",
         )
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        review = self.instance
+        # A conflict-of-interest attestation is required only when the call has
+        # an enabled workflow step configured with requires_coi_confirmation.
+        # The flag is per-step, but the attestation is per-review, so any such
+        # enabled step on the call triggers the requirement.
+        requires_coi = models.CallWorkflowStep.objects.filter(
+            call=review.proposal.round.call_id,
+            is_enabled=True,
+            requires_coi_confirmation=True,
+        ).exists()
+        coi_confirmed = attrs.get("coi_confirmed", review.coi_confirmed)
+        if requires_coi and not coi_confirmed:
+            raise serializers.ValidationError(
+                {
+                    "coi_confirmed": _(
+                        "You must confirm absence of conflict of interest "
+                        "before submitting this review."
+                    )
+                }
+            )
+        return attrs
+
+    def update(self, instance, validated_data):
+        if "coi_confirmed" in validated_data:
+            if validated_data["coi_confirmed"]:
+                if not instance.coi_confirmed_at:
+                    validated_data["coi_confirmed_at"] = timezone.now()
+            else:
+                # Keep the timestamp consistent with the flag: an unconfirmed
+                # review must not carry a stale confirmation time.
+                validated_data["coi_confirmed_at"] = None
+        return super().update(instance, validated_data)
 
 
 class ProtectedProposalListSerializer(serializers.HyperlinkedModelSerializer):
@@ -507,13 +653,8 @@ class NestedRoundSerializer(serializers.HyperlinkedModelSerializer):
             "start_time",
             "cutoff_time",
             "status",
-            "review_strategy",
-            "deciding_entity",
-            "allocation_time",
             "allocation_date",
-            "minimal_average_scoring",
             "review_duration_in_days",
-            "minimum_number_of_reviewers",
         ]
         extra_kwargs = {
             "slug": {"required": False},
@@ -529,7 +670,22 @@ class CallDocumentSerializer(serializers.ModelSerializer):
         fields = ["uuid", "file", "file_name", "file_size", "description", "created"]
 
 
+class CallNotArchivedCreateMixin:
+    """Provide the ``validate_call_not_archived`` hook used by
+    ``ActionMethodMixin.action_list_method``'s ``additional_validators``.
+
+    The hook is looked up by name on the serializer and called with the parent
+    Call. It keeps archived calls read-only across their nested-create surface
+    (offerings / resource templates / workflow steps).
+    """
+
+    def validate_call_not_archived(self, call):
+        if call.state == CallStates.ARCHIVED:
+            raise serializers.ValidationError(_("Cannot modify an archived call."))
+
+
 class CallResourceTemplateSerializer(
+    CallNotArchivedCreateMixin,
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
 ):
@@ -549,6 +705,7 @@ class CallResourceTemplateSerializer(
         view_name="proposal-call-offering-detail",
         lookup_field="uuid",
     )
+    limits = serializers.DictField(child=serializers.IntegerField(), required=False)
 
     class Meta:
         model = models.CallResourceTemplate
@@ -745,7 +902,9 @@ class PublicCallSerializer(
 
 
 class RequestedOfferingSerializer(
-    core_serializers.AugmentedSerializerMixin, NestedRequestedOfferingSerializer
+    CallNotArchivedCreateMixin,
+    core_serializers.AugmentedSerializerMixin,
+    NestedRequestedOfferingSerializer,
 ):
     url = serializers.SerializerMethodField()
     created_by_name = serializers.ReadOnlyField(source="created_by.full_name")
@@ -991,6 +1150,11 @@ class ProviderRequestedOfferingSerializer(NestedRequestedOfferingSerializer):
         }
 
 
+class CallApplicantVisibilityConfigSerializer(UserAttributeConfigBaseSerializer):
+    class Meta(UserAttributeConfigBaseSerializer.Meta):
+        model = models.CallApplicantVisibilityConfig
+
+
 class ProtectedCallSerializer(PublicCallSerializer):
     reference_code = serializers.CharField(source="backend_id", required=False)
     fixed_duration_in_days = serializers.IntegerField(required=False, allow_null=True)
@@ -1026,36 +1190,50 @@ class ProtectedCallSerializer(PublicCallSerializer):
     )
 
     # Eligibility restriction fields (from UserDetailsMatchMixin)
-    user_email_patterns = serializers.JSONField(
+    user_email_patterns = serializers.ListField(
+        child=serializers.CharField(),
         required=False,
-        default=list,
         help_text="List of email regex patterns. User must match one.",
     )
-    user_affiliations = serializers.JSONField(
+    user_affiliations = serializers.ListField(
+        child=serializers.CharField(),
         required=False,
-        default=list,
         help_text="List of allowed affiliations. User must have one.",
     )
-    user_identity_sources = serializers.JSONField(
+    user_identity_sources = serializers.ListField(
+        child=serializers.CharField(),
         required=False,
-        default=list,
         help_text="List of allowed identity sources (identity providers).",
     )
-    user_nationalities = serializers.JSONField(
+    user_nationalities = serializers.ListField(
+        child=serializers.CharField(),
         required=False,
-        default=list,
         help_text="List of allowed nationality codes (ISO 3166-1 alpha-2). User must have one.",
     )
-    user_organization_types = serializers.JSONField(
+    user_organization_types = serializers.ListField(
+        child=serializers.CharField(),
         required=False,
-        default=list,
         help_text="List of allowed organization type URNs (SCHAC). User must match one.",
     )
-    user_assurance_levels = serializers.JSONField(
+    user_assurance_levels = serializers.ListField(
+        child=serializers.CharField(),
         required=False,
-        default=list,
         help_text="List of required assurance URIs (REFEDS). User must have ALL of these.",
     )
+
+    applicant_visibility_config = CallApplicantVisibilityConfigSerializer(
+        required=False,
+        allow_null=True,
+    )
+
+    has_proposals = serializers.SerializerMethodField(
+        help_text="Whether any proposal has been submitted to this call. "
+        "Used by the frontend to gate slug-template and checklist fields."
+    )
+
+    @extend_schema_field(serializers.BooleanField())
+    def get_has_proposals(self, obj) -> bool:
+        return models.Proposal.objects.filter(round__call=obj).exists()
 
     class Meta(PublicCallSerializer.Meta):
         fields = PublicCallSerializer.Meta.fields + (
@@ -1070,6 +1248,8 @@ class ProtectedCallSerializer(PublicCallSerializer):
             "user_nationalities",
             "user_organization_types",
             "user_assurance_levels",
+            "applicant_visibility_config",
+            "has_proposals",
         )
         view_name = "proposal-protected-call-detail"
         protected_fields = ("manager",)
@@ -1152,6 +1332,19 @@ class ProtectedCallSerializer(PublicCallSerializer):
 
         return value
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if getattr(self.context.get("view"), "swagger_fake_view", False):
+            return data
+        if data.get("applicant_visibility_config") is None:
+            synthetic = models.CallApplicantVisibilityConfig(call=instance)
+            data["applicant_visibility_config"] = (
+                CallApplicantVisibilityConfigSerializer(
+                    synthetic, context=self.context
+                ).data
+            )
+        return data
+
     def create(self, validated_data):
         request = self.context["request"]
         customer = validated_data.get("manager", None).customer
@@ -1163,7 +1356,15 @@ class ProtectedCallSerializer(PublicCallSerializer):
             raise PermissionDenied()
 
         validated_data["created_by"] = request.user
-        return super().create(validated_data)
+        has_visibility = "applicant_visibility_config" in validated_data
+        visibility_data = validated_data.pop("applicant_visibility_config", None)
+        call = super().create(validated_data)
+        if has_visibility and visibility_data is not None:
+            seed = models.CallApplicantVisibilityConfig.get_default_exposure_flags()
+            models.CallApplicantVisibilityConfig.objects.create(
+                call=call, **{**seed, **visibility_data}
+            )
+        return call
 
     def update(self, instance, validated_data):
         if "fixed_duration_in_days" in validated_data:
@@ -1176,54 +1377,29 @@ class ProtectedCallSerializer(PublicCallSerializer):
                 proposal.duration_in_days = fixed_duration_in_days
                 proposal.save()
 
-        return super().update(instance, validated_data)
-
-
-class CallApplicantAttributeConfigSerializer(serializers.ModelSerializer):
-    """Serializer for configuring what applicant attributes are exposed in proposals."""
-
-    call = serializers.SlugRelatedField(
-        queryset=models.Call.objects.all(),
-        slug_field="uuid",
-        write_only=True,
-        required=False,
-    )
-    call_uuid = serializers.UUIDField(source="call.uuid", read_only=True)
-    call_name = serializers.CharField(source="call.name", read_only=True)
-    exposed_fields = serializers.SerializerMethodField()
-    is_default = serializers.SerializerMethodField()
-
-    class Meta:
-        model = models.CallApplicantAttributeConfig
-        fields = (
-            "uuid",
-            "call",
-            "call_uuid",
-            "call_name",
-            "expose_full_name",
-            "expose_email",
-            "expose_organization",
-            "expose_affiliations",
-            "expose_organization_type",
-            "expose_organization_country",
-            "expose_nationality",
-            "expose_nationalities",
-            "expose_country_of_residence",
-            "expose_eduperson_assurance",
-            "expose_identity_source",
-            "reviewers_see_applicant_details",
-            "exposed_fields",
-            "is_default",
-        )
-        read_only_fields = ("uuid", "exposed_fields", "is_default")
-
-    def get_exposed_fields(self, obj) -> list[str]:
-        """Return list of currently exposed field names."""
-        return obj.get_exposed_fields()
-
-    def get_is_default(self, obj) -> bool:
-        """Return True if this is a default (unsaved) config."""
-        return obj.pk is None
+        has_visibility = "applicant_visibility_config" in validated_data
+        visibility_data = validated_data.pop("applicant_visibility_config", None)
+        call = super().update(instance, validated_data)
+        if has_visibility:
+            if visibility_data is None:
+                models.CallApplicantVisibilityConfig.objects.filter(call=call).delete()
+            elif (
+                existing := models.CallApplicantVisibilityConfig.objects.filter(
+                    call=call
+                ).first()
+            ) is not None:
+                # Row exists — partial PATCH only touches supplied keys.
+                for key, value in visibility_data.items():
+                    setattr(existing, key, value)
+                existing.save()
+            else:
+                # First create — seed Constance defaults so unspecified fields
+                # don't silently fall back to model defaults.
+                seed = models.CallApplicantVisibilityConfig.get_default_exposure_flags()
+                models.CallApplicantVisibilityConfig.objects.create(
+                    call=call, **{**seed, **visibility_data}
+                )
+        return call
 
 
 class ProtectedRoundSerializer(
@@ -1320,6 +1496,23 @@ class ProposalUpdateProjectDetailsSerializer(serializers.ModelSerializer):
         ]
 
 
+class ProposalComplianceStatusSerializer(serializers.Serializer):
+    error = serializers.CharField(required=False)
+    has_checklist = serializers.BooleanField()
+    is_completed = serializers.BooleanField()
+    requires_review = serializers.BooleanField()
+    completion_percentage = serializers.IntegerField()
+    reviewed_by = serializers.CharField(allow_null=True)
+    reviewed_at = serializers.DateTimeField(allow_null=True)
+    checklist_name = serializers.CharField(required=False)
+    unanswered_required_count = serializers.IntegerField(required=False)
+
+
+class ProposalCanSubmitResponseSerializer(serializers.Serializer):
+    can_submit = serializers.BooleanField()
+    error = serializers.CharField(allow_null=True)
+
+
 class ProposalSerializer(
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
@@ -1335,17 +1528,95 @@ class ProposalSerializer(
     supporting_documentation = ProposalDocumentationSerializer(
         many=True, read_only=True, source="proposaldocumentation_set"
     )
-    oecd_fos_2007_label = serializers.ReadOnlyField(
-        source="get_oecd_fos_2007_code_display"
+    oecd_fos_2007_label = serializers.CharField(
+        read_only=True, source="get_oecd_fos_2007_code_display"
+    )
+    science_sub_domain = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=structure_models.ScienceSubDomain.objects.all(),
+        allow_null=True,
+        required=False,
+    )
+    science_sub_domain_name = serializers.ReadOnlyField(
+        source="science_sub_domain.name",
+    )
+    science_domain_uuid = serializers.ReadOnlyField(
+        source="science_sub_domain.domain.uuid",
+    )
+    science_domain_name = serializers.ReadOnlyField(
+        source="science_sub_domain.domain.name",
     )
     created_by_name = serializers.ReadOnlyField(source="created_by.full_name")
     created_by_uuid = serializers.UUIDField(source="created_by.uuid", read_only=True)
     project_name = serializers.ReadOnlyField(source="project.name")
     description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
 
+    # Applicant attributes — gated by CallApplicantVisibilityConfig for reviewers.
+    applicant_username = serializers.ReadOnlyField(source="created_by.username")
+    applicant_full_name = serializers.ReadOnlyField(source="created_by.full_name")
+    applicant_first_name = serializers.ReadOnlyField(source="created_by.first_name")
+    applicant_last_name = serializers.ReadOnlyField(source="created_by.last_name")
+    applicant_email = serializers.ReadOnlyField(source="created_by.email")
+    applicant_registration_method = serializers.ReadOnlyField(
+        source="created_by.registration_method"
+    )
+    applicant_phone_number = serializers.ReadOnlyField(source="created_by.phone_number")
+    applicant_organization = serializers.ReadOnlyField(source="created_by.organization")
+    applicant_organization_country = serializers.ReadOnlyField(
+        source="created_by.organization_country"
+    )
+    applicant_organization_type = serializers.ReadOnlyField(
+        source="created_by.organization_type"
+    )
+    applicant_organization_registry_code = serializers.ReadOnlyField(
+        source="created_by.organization_registry_code"
+    )
+    applicant_organization_vat_code = serializers.ReadOnlyField(
+        source="created_by.organization_vat_code"
+    )
+    applicant_organization_address = serializers.ReadOnlyField(
+        source="created_by.organization_address",
+        allow_null=True,
+    )
+    applicant_job_title = serializers.ReadOnlyField(source="created_by.job_title")
+    applicant_affiliations = serializers.ListField(
+        child=serializers.CharField(),
+        source="created_by.affiliations",
+        read_only=True,
+    )
+    applicant_gender = serializers.ReadOnlyField(source="created_by.gender")
+    applicant_personal_title = serializers.ReadOnlyField(
+        source="created_by.personal_title"
+    )
+    applicant_place_of_birth = serializers.ReadOnlyField(
+        source="created_by.place_of_birth"
+    )
+    applicant_address = serializers.ReadOnlyField(source="created_by.address")
+    applicant_country_of_residence = serializers.ReadOnlyField(
+        source="created_by.country_of_residence"
+    )
+    applicant_nationality = serializers.ReadOnlyField(source="created_by.nationality")
+    applicant_nationalities = serializers.ListField(
+        child=serializers.CharField(), source="created_by.nationalities", read_only=True
+    )
+    applicant_eduperson_assurance = serializers.ListField(
+        child=serializers.CharField(),
+        source="created_by.eduperson_assurance",
+        read_only=True,
+    )
+    applicant_identity_source = serializers.ReadOnlyField(
+        source="created_by.identity_source"
+    )
+    applicant_civil_number = serializers.ReadOnlyField(source="created_by.civil_number")
+    applicant_birth_date = serializers.ReadOnlyField(source="created_by.birth_date")
+    applicant_active_isds = serializers.ListField(
+        child=serializers.CharField(), source="created_by.active_isds", read_only=True
+    )
+
     # Compliance fields
     compliance_status = serializers.SerializerMethodField()
     can_submit = serializers.SerializerMethodField()
+    awaiting_manual_advance = serializers.SerializerMethodField()
 
     class Meta:
         model = models.Proposal
@@ -1365,6 +1636,34 @@ class ProposalSerializer(
             "created_by",
             "created_by_name",
             "created_by_uuid",
+            # Applicant attributes (gated by CallApplicantVisibilityConfig)
+            "applicant_username",
+            "applicant_full_name",
+            "applicant_first_name",
+            "applicant_last_name",
+            "applicant_email",
+            "applicant_registration_method",
+            "applicant_phone_number",
+            "applicant_organization",
+            "applicant_organization_country",
+            "applicant_organization_type",
+            "applicant_organization_registry_code",
+            "applicant_organization_vat_code",
+            "applicant_organization_address",
+            "applicant_job_title",
+            "applicant_affiliations",
+            "applicant_gender",
+            "applicant_personal_title",
+            "applicant_place_of_birth",
+            "applicant_address",
+            "applicant_country_of_residence",
+            "applicant_nationality",
+            "applicant_nationalities",
+            "applicant_eduperson_assurance",
+            "applicant_identity_source",
+            "applicant_civil_number",
+            "applicant_birth_date",
+            "applicant_active_isds",
             "duration_in_days",
             "project",
             "round",
@@ -1374,10 +1673,15 @@ class ProposalSerializer(
             "call_managing_organisation_uuid",
             "oecd_fos_2007_code",
             "oecd_fos_2007_label",
+            "science_sub_domain",
+            "science_sub_domain_name",
+            "science_domain_uuid",
+            "science_domain_name",
             "allocation_comment",
             "created",
             "compliance_status",
             "can_submit",
+            "awaiting_manual_advance",
         ]
         read_only_fields = (
             "created_by",
@@ -1393,6 +1697,16 @@ class ProposalSerializer(
             "approved_by": {"lookup_field": "uuid", "view_name": "user-detail"},
             "project": {"lookup_field": "uuid", "view_name": "project-detail"},
         }
+
+    def validate_name(self, value):
+        # The proposal name is the applicant-controlled part of the project name
+        # created on approval (call_prefix - date - name), so hold it to the same
+        # configurable pattern as the main project API. Validated on both create
+        # and rename since the field-level check runs regardless of ``validate``.
+        error = get_project_name_regex_error(value)
+        if error:
+            raise serializers.ValidationError(error)
+        return value
 
     def validate(self, attrs):
         if self.instance:
@@ -1427,6 +1741,26 @@ class ProposalSerializer(
             proposal.save()
 
         return proposal
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if getattr(self.context.get("view"), "swagger_fake_view", False):
+            return data
+        request = self.context.get("request")
+        user = request.user if request else None
+        # ``approved_by`` names the decision-maker (the call manager / staff who
+        # accepted the proposal). Honour the call's blind-review setting: hide
+        # it from the proposal's own submitter unless the call reveals reviewer
+        # identity to submitters. Call team and staff (not the submitter) keep
+        # seeing it.
+        if (
+            user is not None
+            and not getattr(user, "is_staff", False)
+            and instance.created_by_id == getattr(user, "id", None)
+            and not instance.round.call.reviewer_identity_visible_to_submitters
+        ):
+            data["approved_by"] = None
+        return filter_applicant_fields_for_reviewer(data, instance, user)
 
     def get_fields(self):
         fields = super().get_fields()
@@ -1467,7 +1801,7 @@ class ProposalSerializer(
 
         return fields
 
-    @extend_schema_field(serializers.DictField(allow_null=True))
+    @extend_schema_field(ProposalComplianceStatusSerializer(allow_null=True))
     def get_compliance_status(self, obj):
         """Get compliance checklist status."""
         if not obj.round.call.compliance_checklist:
@@ -1496,11 +1830,28 @@ class ProposalSerializer(
             "unanswered_required_count": completion.get_unanswered_required_questions().count(),
         }
 
-    @extend_schema_field(serializers.DictField())
+    @extend_schema_field(ProposalCanSubmitResponseSerializer)
     def get_can_submit(self, obj):
         """Get whether proposal can be submitted."""
         can_submit, error = obj.can_submit()
         return {"can_submit": can_submit, "error": error}
+
+    @extend_schema_field(serializers.BooleanField())
+    def get_awaiting_manual_advance(self, obj) -> bool:
+        """True iff the current step is completed and awaiting a manual advance.
+
+        Prefers the queryset annotations (set by ProposalViewSet.get_queryset)
+        to avoid a per-row query on list. Falls back to the DB-fresh service
+        helper for objects serialized outside that viewset (e.g. after a
+        mutation).
+        """
+        if hasattr(obj, "_awaiting_manual_step"):
+            return bool(
+                obj.workflow_step
+                and obj._awaiting_manual_step
+                and obj._latest_step_status == WorkflowStepInstanceStatuses.COMPLETED
+            )
+        return workflow_service.is_awaiting_manual_advance(obj)
 
 
 class RoundReviewerSerializer(serializers.Serializer):
@@ -1512,10 +1863,6 @@ class RoundReviewerSerializer(serializers.Serializer):
 
     def get_full_name(self, obj) -> str:
         return f"{obj.first_name} {obj.last_name}"
-
-
-class ProposalApproveSerializer(serializers.Serializer):
-    allocation_comment = serializers.CharField(required=False)
 
 
 class CallRoundSerializer(serializers.HyperlinkedModelSerializer):
@@ -1556,6 +1903,57 @@ class CallManagingOrganisationStatSerializer(serializers.Serializer):
     rounds_closing_in_one_week = serializers.IntegerField(read_only=True)
     calls_closing_in_one_week = serializers.IntegerField(read_only=True)
     offering_requests_pending = serializers.IntegerField(read_only=True)
+
+
+class CallPerformanceStatSerializer(serializers.Serializer):
+    call_uuid = serializers.UUIDField(read_only=True)
+    call_name = serializers.CharField(read_only=True)
+    managing_organization_name = serializers.CharField(read_only=True)
+    state = serializers.CharField(read_only=True)
+    total_proposals = serializers.IntegerField(read_only=True)
+    proposals_draft = serializers.IntegerField(read_only=True)
+    proposals_submitted = serializers.IntegerField(read_only=True)
+    proposals_in_review = serializers.IntegerField(read_only=True)
+    proposals_accepted = serializers.IntegerField(read_only=True)
+    proposals_rejected = serializers.IntegerField(read_only=True)
+    proposals_canceled = serializers.IntegerField(read_only=True)
+    acceptance_rate = serializers.FloatField(read_only=True)
+    total_reviews = serializers.IntegerField(read_only=True)
+    reviews_completed = serializers.IntegerField(read_only=True)
+    average_score = serializers.FloatField(read_only=True, allow_null=True)
+    active_rounds = serializers.IntegerField(read_only=True)
+    last_submission_date = serializers.DateField(read_only=True, allow_null=True)
+
+
+class ReviewProgressStatSerializer(serializers.Serializer):
+    reviewer_uuid = serializers.UUIDField(read_only=True)
+    reviewer_name = serializers.CharField(read_only=True)
+    reviewer_email = serializers.EmailField(read_only=True)
+    total_assigned = serializers.IntegerField(read_only=True)
+    pending = serializers.IntegerField(read_only=True)
+    in_progress = serializers.IntegerField(read_only=True)
+    completed = serializers.IntegerField(read_only=True)
+    declined = serializers.IntegerField(read_only=True)
+    average_score = serializers.FloatField(read_only=True, allow_null=True)
+    average_review_time_days = serializers.FloatField(read_only=True, allow_null=True)
+    completion_rate = serializers.FloatField(read_only=True)
+
+
+class ResourceDemandStatSerializer(serializers.Serializer):
+    offering_uuid = serializers.UUIDField(read_only=True)
+    offering_name = serializers.CharField(read_only=True)
+    offering_type = serializers.CharField(read_only=True)
+    provider_name = serializers.CharField(read_only=True)
+    proposal_count = serializers.IntegerField(read_only=True)
+    request_count = serializers.IntegerField(read_only=True)
+    approved_count = serializers.IntegerField(read_only=True)
+    pending_count = serializers.IntegerField(read_only=True)
+    total_requested_limits = serializers.DictField(
+        child=serializers.FloatField(), read_only=True
+    )
+    total_approved_limits = serializers.DictField(
+        child=serializers.FloatField(), read_only=True
+    )
 
 
 class CallAttachDocumentsSerializer(serializers.Serializer):
@@ -1618,6 +2016,9 @@ class ProposalProjectRoleMappingSerializer(serializers.HyperlinkedModelSerialize
         ):
             raise PermissionDenied()
 
+        if call.state == CallStates.ARCHIVED:
+            raise serializers.ValidationError(_("Cannot modify an archived call."))
+
         return attrs
 
     def get_fields(self):
@@ -1644,11 +2045,123 @@ class ProposalChecklistAnswerSubmitResponseSerializer(serializers.Serializer):
     completion = checklist_serializers.ChecklistCompletionReviewerSerializer()
 
 
+class TechnicalAssessmentAnswerSerializer(serializers.Serializer):
+    """One reviewer's answer to a technical-assessment question, with a
+    human-readable ``answer_display`` (option labels for select questions)."""
+
+    question_uuid = serializers.UUIDField(source="question.uuid")
+    question_description = serializers.CharField(source="question.description")
+    question_type = serializers.CharField(source="question.question_type")
+    answer_data = serializers.JSONField()
+    answer_display = serializers.SerializerMethodField()
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_answer_display(self, obj):
+        question = obj.question
+        value = obj.answer_data
+        if question.question_type in ("single_select", "multi_select"):
+            option_uuids = value if isinstance(value, list) else [value]
+            labels = list(
+                checklist_models.QuestionOption.objects.filter(
+                    question=question, uuid__in=[str(u) for u in option_uuids]
+                )
+                .order_by("order")
+                .values_list("label", flat=True)
+            )
+            return ", ".join(labels) if labels else None
+        if isinstance(value, bool):
+            return _("Yes") if value else _("No")
+        if value in (None, ""):
+            return None
+        return str(value)
+
+
+class StepChecklistResponseGroupSerializer(serializers.Serializer):
+    """All answers a single reviewer gave to a step's checklist (grouped),
+    for the threaded technical-assessment display (WAL-9337).
+
+    Reviewer identity (uuid, name, image) is anonymized when the **applicant**
+    is viewing and the call's ``reviewer_identity_visible_to_submitters`` is
+    off — the decision + comment stay visible, but who said it is hidden.
+    Managers, staff and offering managers always see identities.
+    """
+
+    user_uuid = serializers.SerializerMethodField()
+    user_full_name = serializers.SerializerMethodField()
+    user_image = serializers.SerializerMethodField()
+    submitted_at = serializers.DateTimeField(allow_null=True)
+    answers = TechnicalAssessmentAnswerSerializer(many=True)
+
+    def _anonymize(self):
+        request = self.context.get("request")
+        proposal = self.context.get("proposal")
+        if not request or proposal is None:
+            return False
+        user = request.user
+        if user.is_staff or proposal.created_by_id != user.id:
+            return False
+        return not proposal.round.call.reviewer_identity_visible_to_submitters
+
+    @extend_schema_field(serializers.UUIDField(allow_null=True))
+    def get_user_uuid(self, obj):
+        return None if self._anonymize() else obj["user"].uuid
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_user_full_name(self, obj):
+        if self._anonymize():
+            return str(_("Technical reviewer"))
+        return obj["user"].full_name
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_user_image(self, obj):
+        if self._anonymize():
+            return None
+        image = getattr(obj["user"], "image", None)
+        if not image:
+            return None
+        request = self.context.get("request")
+        return request.build_absolute_uri(image.url) if request else image.url
+
+
 # Response serializer is now handled generically by ChecklistResponseSerializer
 # Keep this for backward compatibility in call manager views
 ProposalComplianceChecklistResponseSerializer = (
     checklist_serializers.ChecklistResponseSerializer
 )
+
+
+class CallComplianceChecklistInfoSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField()
+    name = serializers.CharField()
+    description = serializers.CharField()
+    total_questions = serializers.IntegerField()
+    required_questions = serializers.IntegerField()
+
+
+class CallComplianceOverviewProposalReviewTriggerSerializer(serializers.Serializer):
+    question = serializers.CharField()
+    answer = serializers.JSONField()
+    trigger_value = serializers.JSONField()
+    operator = serializers.CharField()
+
+
+class CallComplianceOverviewProposalComplianceSerializer(serializers.Serializer):
+    is_completed = serializers.BooleanField()
+    requires_review = serializers.BooleanField()
+    completion_percentage = serializers.IntegerField()
+    reviewed_by = serializers.CharField(allow_null=True)
+    reviewed_at = serializers.DateTimeField(allow_null=True)
+    review_triggers = CallComplianceOverviewProposalReviewTriggerSerializer(many=True)
+    unanswered_required_count = serializers.IntegerField()
+
+
+class CallComplianceOverviewProposalSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField()
+    name = serializers.CharField()
+    state = serializers.CharField()
+    created_by = serializers.CharField(allow_null=True)
+    created_by_uuid = serializers.UUIDField(allow_null=True)
+    compliance = CallComplianceOverviewProposalComplianceSerializer(allow_null=True)
 
 
 class CallComplianceOverviewSerializer(serializers.Serializer):
@@ -1657,7 +2170,7 @@ class CallComplianceOverviewSerializer(serializers.Serializer):
     checklist = serializers.SerializerMethodField()
     proposals = serializers.SerializerMethodField()
 
-    @extend_schema_field(serializers.DictField(allow_null=True))
+    @extend_schema_field(CallComplianceChecklistInfoSerializer(allow_null=True))
     def get_checklist(self, call):
         """Get checklist information."""
         if not call.compliance_checklist:
@@ -1673,7 +2186,7 @@ class CallComplianceOverviewSerializer(serializers.Serializer):
             ).count(),
         }
 
-    @extend_schema_field(serializers.ListField())
+    @extend_schema_field(CallComplianceOverviewProposalSerializer(many=True))
     def get_proposals(self, call):
         """Get proposal compliance status."""
         proposals_data = []
@@ -2202,6 +2715,18 @@ class COIStatusUpdateSerializer(serializers.Serializer):
         return attrs
 
 
+class ForceUnblockSerializer(serializers.Serializer):
+    """Serializer for force-unblocking a COI-blocked assignment item."""
+
+    override_reason = serializers.CharField(required=True)
+
+
+class ForceAcceptPoolSerializer(serializers.Serializer):
+    """Serializer for force-accepting a reviewer pool invitation."""
+
+    override_reason = serializers.CharField(required=True)
+
+
 class COIDisclosureFinancialInterestSerializer(
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
@@ -2279,6 +2804,13 @@ class COIDisclosureFormSerializer(
         }
 
 
+class COIPersonalRelationshipSerializer(serializers.Serializer):
+    name = serializers.CharField()
+    relationship_type = serializers.CharField()
+    organization = serializers.CharField(required=False, allow_blank=True)
+    description = serializers.CharField(required=False, allow_blank=True)
+
+
 class COIDisclosureSubmitSerializer(serializers.Serializer):
     """Serializer for submitting a COI disclosure."""
 
@@ -2288,8 +2820,8 @@ class COIDisclosureSubmitSerializer(serializers.Serializer):
         many=True, required=False, default=list
     )
     has_personal_relationships = serializers.BooleanField(default=False)
-    personal_relationships = serializers.ListField(
-        child=serializers.DictField(), required=False, default=list
+    personal_relationships = COIPersonalRelationshipSerializer(
+        many=True, required=False, default=list
     )
     has_other_conflicts = serializers.BooleanField(default=False)
     other_conflicts_description = serializers.CharField(
@@ -2393,6 +2925,25 @@ class CallReviewerPoolSerializer(
     reviews_pending = serializers.SerializerMethodField()
     reviews_in_progress = serializers.SerializerMethodField()
     reviews_completed = serializers.SerializerMethodField()
+    overridden_by_name = serializers.ReadOnlyField(
+        source="overridden_by.full_name", default=""
+    )
+    invitation_link = serializers.SerializerMethodField()
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_invitation_link(self, obj) -> str | None:
+        """Return the frontend invitation link path for pending invitations.
+
+        This is a frontend SPA route (not a backend API URL), so we cannot
+        use Django's reverse(). The frontend route is defined in
+        waldur-homeport/src/proposals/routes.ts as /reviewer-invitation/:token/.
+        """
+        if (
+            obj.invitation_status != ReviewerPoolInvitationStatuses.PENDING
+            or not obj.invitation_token
+        ):
+            return None
+        return f"/reviewer-invitation/{obj.invitation_token}/"
 
     def get_reviewer_name(self, obj) -> str | None:
         """Get reviewer name from profile or invited_user."""
@@ -2540,18 +3091,6 @@ class CallReviewerPoolSerializer(
             state=models.Review.States.SUBMITTED,
         ).count()
 
-    def to_representation(self, instance):
-        """Hide invitation_token from authenticated responses.
-
-        The token is only needed for public unauthenticated endpoints.
-        Authenticated users should use UUID-based endpoints instead.
-        """
-        data = super().to_representation(instance)
-        request = self.context.get("request")
-        if request and request.user.is_authenticated:
-            data.pop("invitation_token", None)
-        return data
-
     class Meta:
         model = models.CallReviewerPool
         fields = [
@@ -2577,7 +3116,7 @@ class CallReviewerPoolSerializer(
             "current_assignments",
             "expertise_match_score",
             "invited_by_name",
-            "invitation_token",
+            "invitation_link",
             "invitation_expires_at",
             "created",
             "coi_count",
@@ -2585,6 +3124,9 @@ class CallReviewerPoolSerializer(
             "reviews_pending",
             "reviews_in_progress",
             "reviews_completed",
+            "override_reason",
+            "overridden_by_name",
+            "overridden_at",
         ]
         read_only_fields = [
             "call",
@@ -2596,8 +3138,9 @@ class CallReviewerPoolSerializer(
             "response_date",
             "decline_reason",
             "current_assignments",
-            "invitation_token",
             "invitation_expires_at",
+            "override_reason",
+            "overridden_at",
         ]
         extra_kwargs = {
             "url": {"lookup_field": "uuid"},
@@ -2679,6 +3222,18 @@ class EmailInvitationSerializer(serializers.Serializer):
     max_assignments = serializers.IntegerField(default=5, min_value=1)
 
 
+class ReviewerSuggestionTopMatchingProposalSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField()
+    name = serializers.CharField(required=False)
+    slug = serializers.CharField(required=False)
+    affinity = serializers.FloatField()
+    keyword_score = serializers.FloatField(required=False, allow_null=True)
+    text_score = serializers.FloatField(required=False, allow_null=True)
+    has_coi = serializers.BooleanField(required=False, allow_null=True)
+    coi_type = serializers.CharField(required=False, allow_null=True)
+    coi_severity = serializers.CharField(required=False, allow_null=True)
+
+
 class ReviewerSuggestionSerializer(
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
@@ -2696,6 +3251,12 @@ class ReviewerSuggestionSerializer(
 
     source_type_display = serializers.CharField(
         source="get_source_type_display", read_only=True
+    )
+    matched_keywords = serializers.ListField(
+        child=serializers.CharField(), read_only=True
+    )
+    top_matching_proposals = ReviewerSuggestionTopMatchingProposalSerializer(
+        many=True, read_only=True
     )
 
     class Meta:
@@ -2906,6 +3467,73 @@ class MessageResponseSerializer(serializers.Serializer):
     """Generic message response serializer."""
 
     message = serializers.CharField()
+
+
+class DuplicateCallRequestSerializer(serializers.Serializer):
+    """Request body for the protected-calls duplicate action."""
+
+    name = serializers.CharField(
+        max_length=models.Call._meta.get_field("name").max_length,
+        required=True,
+        allow_blank=False,
+        trim_whitespace=True,
+    )
+    # Section flags mirror marketplace offering import (`include_*`). Each
+    # defaults to True; uncheck to skip that part of the source's configuration.
+    copy_documents = serializers.BooleanField(required=False, default=True)
+    copy_offerings = serializers.BooleanField(required=False, default=True)
+    copy_rounds = serializers.BooleanField(required=False, default=True)
+    copy_workflow_steps = serializers.BooleanField(required=False, default=True)
+    copy_resource_templates = serializers.BooleanField(required=False, default=True)
+    copy_role_mappings = serializers.BooleanField(required=False, default=True)
+    copy_applicant_visibility_config = serializers.BooleanField(
+        required=False, default=True
+    )
+    copy_coi_configuration = serializers.BooleanField(required=False, default=True)
+    copy_matching_configuration = serializers.BooleanField(required=False, default=True)
+    copy_assignment_configuration = serializers.BooleanField(
+        required=False, default=True
+    )
+
+
+class BulkRoundCreateRequestSerializer(serializers.ModelSerializer):
+    """Request body for the rounds_bulk_set action.
+
+    Combines a single round's configuration with cadence parameters so the
+    server can spawn N evenly-spaced rounds in one shot. ``cutoff_time`` and
+    ``allocation_date`` are intentionally excluded: cutoffs are derived from
+    ``submission_window_days``; per-round fixed allocation dates don't make
+    sense across a series and are explicitly disallowed in bulk mode.
+    """
+
+    cadence = serializers.ChoiceField(choices=BulkRoundCadence.CHOICES, required=True)
+    custom_interval_months = serializers.IntegerField(
+        min_value=1, required=False, allow_null=True
+    )
+    submission_window_days = serializers.IntegerField(min_value=1, required=True)
+    number_of_rounds = serializers.IntegerField(
+        min_value=1, max_value=60, required=True
+    )
+
+    class Meta:
+        model = models.Round
+        fields = [
+            "start_time",
+            "review_duration_in_days",
+            "cadence",
+            "custom_interval_months",
+            "submission_window_days",
+            "number_of_rounds",
+        ]
+
+    def validate(self, attrs):
+        if attrs["cadence"] == BulkRoundCadence.CUSTOM and not attrs.get(
+            "custom_interval_months"
+        ):
+            raise serializers.ValidationError(
+                {"custom_interval_months": _("Required when cadence is set to custom.")}
+            )
+        return attrs
 
 
 class ComputeAffinitiesResponseSerializer(serializers.Serializer):
@@ -3411,6 +4039,9 @@ class AssignmentItemSerializer(
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     review_uuid = serializers.UUIDField(source="review.uuid", read_only=True)
     coi_count = serializers.SerializerMethodField()
+    overridden_by_name = serializers.ReadOnlyField(
+        source="overridden_by.full_name", default=""
+    )
 
     class Meta:
         model = models.AssignmentItem
@@ -3432,6 +4063,9 @@ class AssignmentItemSerializer(
             "review",
             "review_uuid",
             "reassign_count",
+            "override_reason",
+            "overridden_by_name",
+            "overridden_at",
             "created",
         ]
         read_only_fields = [
@@ -3443,6 +4077,8 @@ class AssignmentItemSerializer(
             "responded_at",
             "review",
             "reassign_count",
+            "override_reason",
+            "overridden_at",
         ]
         extra_kwargs = {
             "url": {"lookup_field": "uuid"},
@@ -3631,14 +4267,20 @@ class GenerateAssignmentsSerializer(serializers.Serializer):
     )
 
 
+class SkippedProposalSerializer(serializers.Serializer):
+    proposal_uuid = serializers.UUIDField()
+    proposal_name = serializers.CharField()
+    reason = serializers.CharField()
+
+
 class GenerateAssignmentsResponseSerializer(serializers.Serializer):
     """Response for generate_assignments action."""
 
     batches_created = serializers.IntegerField()
     items_created = serializers.IntegerField()
     proposals_processed = serializers.IntegerField()
-    skipped_proposals = serializers.ListField(
-        child=serializers.DictField(),
+    skipped_proposals = SkippedProposalSerializer(
+        many=True,
         help_text="Proposals that were skipped with reasons",
     )
 
@@ -3726,11 +4368,19 @@ class ReassignItemResponseSerializer(serializers.Serializer):
     new_batch_uuid = serializers.UUIDField()
 
 
+class ReviewerSuggestionItemSerializer(serializers.Serializer):
+    pool_entry_uuid = serializers.UUIDField()
+    reviewer_name = serializers.CharField()
+    affinity_score = serializers.FloatField(allow_null=True)
+    current_assignments = serializers.IntegerField()
+    max_assignments = serializers.IntegerField()
+
+
 class SuggestAlternativeReviewersSerializer(serializers.Serializer):
     """Response for suggesting alternative reviewers for a declined item."""
 
-    suggestions = serializers.ListField(
-        child=serializers.DictField(),
+    suggestions = ReviewerSuggestionItemSerializer(
+        many=True,
         help_text="List of alternative reviewers with affinity scores",
     )
 
@@ -3795,7 +4445,485 @@ class CreateManualAssignmentResponseSerializer(serializers.Serializer):
 
     batch_uuid = serializers.UUIDField()
     items_created = serializers.IntegerField()
-    skipped_proposals = serializers.ListField(
-        child=serializers.DictField(),
+    skipped_proposals = SkippedProposalSerializer(
+        many=True,
         help_text="Proposals that were skipped with reasons",
     )
+
+
+# =============================================================================
+# Workflow Step Serializers
+# =============================================================================
+
+
+class WorkflowCriterionSerializer(serializers.ModelSerializer):
+    uuid = serializers.UUIDField(read_only=True)
+
+    class Meta:
+        model = models.WorkflowCriterion
+        fields = ["uuid", "name", "order"]
+
+
+CRITERIA_ALLOWED_STEPS = {"expert_review"}
+AWARD_RESPONSE_ALLOWED_STEPS = {"allocation_decision"}
+ALLOCATION_TIMING_ALLOWED_STEPS = {"allocation_decision"}
+
+
+class CallWorkflowStepSerializer(
+    CallNotArchivedCreateMixin,
+    core_serializers.AugmentedSerializerMixin,
+    serializers.HyperlinkedModelSerializer,
+):
+    call_uuid = serializers.ReadOnlyField(source="call.uuid")
+    call_name = serializers.ReadOnlyField(source="call.name")
+
+    checklist = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=checklist_models.Checklist.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    checklist_name = serializers.SerializerMethodField()
+    is_mandatory = serializers.SerializerMethodField()
+    criteria = WorkflowCriterionSerializer(many=True, required=False)
+
+    class Meta:
+        model = models.CallWorkflowStep
+        fields = [
+            "uuid",
+            "created",
+            "modified",
+            "step",
+            "call_uuid",
+            "call_name",
+            "is_enabled",
+            "is_mandatory",
+            "duration_in_days",
+            "checklist",
+            "checklist_name",
+            "checklist_required",
+            "blind_review",
+            "requires_coi_confirmation",
+            "min_reviewers",
+            "min_score_threshold",
+            "applicant_visible",
+            "responsible_role",
+            "transition_mode",
+            "include_award_response",
+            "allocation_time",
+            "display_order",
+            "criteria",
+        ]
+        read_only_fields = ("uuid", "created", "modified")
+        protected_fields = ("call", "step")
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_checklist_name(self, obj):
+        return obj.checklist.name if obj.checklist else None
+
+    @extend_schema_field(serializers.BooleanField())
+    def get_is_mandatory(self, obj):
+        # Mandatory steps can't be disabled and are required for call
+        # activation; the UI mirrors this to gate the Activate button.
+        return obj.step in MANDATORY_STEPS
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        step = attrs.get("step") or (self.instance.step if self.instance else None)
+
+        if self.instance is None and step == "award_response":
+            raise serializers.ValidationError(
+                {
+                    "step": (
+                        "award_response is provisioned automatically via the "
+                        "allocation_decision step's include_award_response flag "
+                        "and cannot be added directly."
+                    )
+                }
+            )
+
+        if (
+            attrs.get("include_award_response")
+            and step not in AWARD_RESPONSE_ALLOWED_STEPS
+        ):
+            raise serializers.ValidationError(
+                {
+                    "include_award_response": (
+                        "include_award_response can only be set on the "
+                        "allocation_decision step."
+                    )
+                }
+            )
+
+        if (
+            attrs.get("allocation_time") == AllocationTimes.FIXED_DATE
+            and step not in ALLOCATION_TIMING_ALLOWED_STEPS
+        ):
+            raise serializers.ValidationError(
+                {
+                    "allocation_time": (
+                        "allocation_time can only be configured on the "
+                        "allocation_decision step."
+                    )
+                }
+            )
+
+        criteria = attrs.get("criteria")
+        if criteria and step not in CRITERIA_ALLOWED_STEPS:
+            raise serializers.ValidationError(
+                {
+                    "criteria": (
+                        "Criteria can only be configured on the expert_review step."
+                    )
+                }
+            )
+
+        candidate = models.CallWorkflowStep()
+        candidate.pk = getattr(self.instance, "pk", None)
+        candidate.call = attrs.get("call", getattr(self.instance, "call", None))
+        candidate.step = step
+        candidate.is_enabled = attrs.get(
+            "is_enabled", getattr(self.instance, "is_enabled", True)
+        )
+        try:
+            candidate.clean()
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(exc.messages)
+
+        return attrs
+
+    def create(self, validated_data):
+        criteria = validated_data.pop("criteria", None)
+        instance = super().create(validated_data)
+        if criteria is not None:
+            self._sync_criteria(instance, criteria)
+        self._sync_award_response_step(instance)
+        return instance
+
+    def update(self, instance, validated_data):
+        criteria = validated_data.pop("criteria", None)
+        instance = super().update(instance, validated_data)
+        if criteria is not None:
+            self._sync_criteria(instance, criteria)
+        self._sync_award_response_step(instance)
+        return instance
+
+    def _sync_criteria(self, instance, criteria):
+        names = [c["name"] for c in criteria]
+        instance.criteria.exclude(name__in=names).delete()
+        for entry in criteria:
+            models.WorkflowCriterion.objects.update_or_create(
+                workflow_step=instance,
+                name=entry["name"],
+                defaults={"order": entry.get("order", 0)},
+            )
+
+    def _sync_award_response_step(self, instance):
+        """Provision/disable the award_response step based on include_award_response."""
+        if instance.step != "allocation_decision":
+            return
+        if instance.include_award_response:
+            models.CallWorkflowStep.objects.update_or_create(
+                call=instance.call,
+                step="award_response",
+                defaults={"is_enabled": True},
+            )
+        else:
+            models.CallWorkflowStep.objects.filter(
+                call=instance.call, step="award_response"
+            ).update(is_enabled=False)
+
+
+class StepChecklistStatusSerializer(serializers.Serializer):
+    """Compact per-step checklist status surfaced on workflow_states so the UI
+    can show a badge and gate the Complete button."""
+
+    has_checklist = serializers.BooleanField()
+    checklist_required = serializers.BooleanField()
+    checklist_name = serializers.CharField(allow_null=True)
+    checklist_completed = serializers.BooleanField()
+    unanswered_required_count = serializers.IntegerField()
+
+
+class ProposalWorkflowStepInstanceSerializer(serializers.ModelSerializer):
+    step_name = serializers.SerializerMethodField()
+    step_description = serializers.SerializerMethodField()
+    responsible_role = serializers.SerializerMethodField()
+    completed_by = serializers.SlugRelatedField(
+        slug_field="uuid", read_only=True, allow_null=True
+    )
+    applicant_visible = serializers.SerializerMethodField()
+    duration_in_days = serializers.SerializerMethodField()
+    is_required = serializers.SerializerMethodField()
+    rejection_reason = serializers.SerializerMethodField()
+    # Declared as a SerializerMethodField (rather than letting ModelSerializer
+    # auto-generate it from the model field) so the schema can mark it as
+    # nullable: the response is asymmetric — call-management team gets the
+    # text, everyone else gets null. Without allow_null=True the generated
+    # SDK types it as a required string and frontends crash on the applicant
+    # view (CLAUDE.md "Nullable FKs MUST use allow_null=True").
+    internal_notes = serializers.SerializerMethodField()
+    checklist_status = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.ProposalWorkflowStepInstance
+        fields = [
+            "uuid",
+            "step",
+            "step_name",
+            "step_description",
+            "responsible_role",
+            "status",
+            "outcome",
+            "outcome_reason",
+            "rejection_reason",
+            "internal_notes",
+            "started_at",
+            "completed_at",
+            "completed_by",
+            "deadline",
+            "applicant_visible",
+            "duration_in_days",
+            "is_required",
+            "checklist_status",
+        ]
+        read_only_fields = fields
+
+    # Steps whose outcome/commentary is peer-review content, gated by the
+    # call's reviews_visible_to_submitters setting (separate from the reviewer
+    # *identity* gate that governs completed_by).
+    REVIEW_STEPS = frozenset({"expert_review", "panel_review"})
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # ``completed_by`` reveals the identity of whoever completed the step —
+        # including the reviewer on expert_review and the panel member on
+        # panel_review. Honour the call's blind-review setting: null it for
+        # proposal submitters (and any other non-call-team viewer) unless the
+        # call reveals reviewer identity to submitters. ``can_view_step_actors``
+        # is set by the view; defaulting to hidden fails closed if a future
+        # caller forgets to set it. Mirrors the Review serializer's
+        # reviewer_identity_visible_to_submitters gate.
+        if not self.context.get("can_view_step_actors"):
+            data["completed_by"] = None
+        # Hide the reviewer/panel verdict and free-text commentary on the peer
+        # review steps from submitters when the call keeps reviews private. This
+        # must strip *every* field that surfaces the reviewer's words:
+        # ``outcome`` (the verdict), ``outcome_reason`` (the raw commentary) and
+        # ``rejection_reason`` — which is just ``outcome_reason`` re-exposed via a
+        # SerializerMethodField and would otherwise leak the exact rejection text
+        # the mask exists to hide. The applicant still learns the *decision* from
+        # the proposal's own state and the call manager's allocation comment;
+        # what stays private here is the reviewer's step-level reasoning.
+        if instance.step in self.REVIEW_STEPS and not self.context.get(
+            "can_view_review_content"
+        ):
+            data["outcome"] = None
+            data["outcome_reason"] = ""
+            data["rejection_reason"] = None
+        return data
+
+    def _get_call_step(self, obj):
+        """Resolve the per-call ``CallWorkflowStep`` for this instance.
+
+        When the view pre-loads configs into ``context['step_configs_by_key']``
+        (recommended for list endpoints, max 6 rows per proposal), use that
+        cache. Otherwise fall back to a per-instance query memoised on the
+        serializer so the four SerializerMethodFields that consult it don't
+        each issue their own SELECT — and re-issue it on every render of the
+        same instance.
+        """
+        configs = self.context.get("step_configs_by_key")
+        if configs is not None:
+            return configs.get(obj.step)
+        # Local cache keyed by (proposal_id, step). One query per (instance,
+        # step) pair rather than per SerializerMethodField call.
+        cache = self.context.setdefault("_call_step_fallback_cache", {})
+        key = (obj.proposal_id, obj.step)
+        if key in cache:
+            return cache[key]
+        config = (
+            models.CallWorkflowStep.objects.filter(
+                call_id=obj.proposal.round.call_id, step=obj.step
+            )
+            .only(
+                "step",
+                "applicant_visible",
+                "duration_in_days",
+                "responsible_role",
+                "checklist",
+                "checklist_required",
+            )
+            .first()
+        )
+        cache[key] = config
+        return config
+
+    @extend_schema_field(serializers.CharField())
+    def get_step_name(self, obj):
+        step_def = WORKFLOW_STEPS_MAP.get(obj.step)
+        return step_def.name if step_def else obj.step
+
+    @extend_schema_field(serializers.CharField())
+    def get_step_description(self, obj):
+        step_def = WORKFLOW_STEPS_MAP.get(obj.step)
+        return step_def.description if step_def else ""
+
+    @extend_schema_field(StepChecklistStatusSerializer(allow_null=True))
+    def get_checklist_status(self, obj):
+        call_step = self._get_call_step(obj)
+        if call_step is None or not call_step.checklist_id:
+            return None
+        completion = obj.proposal.get_checklist_completion_for(call_step.checklist)
+        if completion is not None:
+            unanswered = completion.get_unanswered_required_questions().count()
+        else:
+            unanswered = call_step.checklist.questions.filter(required=True).count()
+        return {
+            "has_checklist": True,
+            "checklist_required": call_step.checklist_required,
+            "checklist_name": call_step.checklist.name,
+            "checklist_completed": unanswered == 0,
+            "unanswered_required_count": unanswered,
+        }
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_responsible_role(self, obj):
+        # Per-call configuration takes precedence over the catalog default.
+        config = self._get_call_step(obj)
+        if config and config.responsible_role:
+            return config.responsible_role
+        step_def = WORKFLOW_STEPS_MAP.get(obj.step)
+        return step_def.default_responsible_role if step_def else None
+
+    @extend_schema_field(serializers.BooleanField())
+    def get_applicant_visible(self, obj):
+        # The applicant-visible flag is sourced from the per-call config; when
+        # no config exists the conservative default is False so applicants
+        # never see steps that were not explicitly opted into.
+        config = self._get_call_step(obj)
+        return bool(config and config.applicant_visible)
+
+    @extend_schema_field(serializers.IntegerField(allow_null=True))
+    def get_duration_in_days(self, obj):
+        config = self._get_call_step(obj)
+        return config.duration_in_days if config else None
+
+    @extend_schema_field(serializers.BooleanField())
+    def get_is_required(self, obj):
+        # Sourced from the catalog, not per-call config: mandatory steps are
+        # an invariant of the workflow definition, not configurable per call.
+        step_def = WORKFLOW_STEPS_MAP.get(obj.step)
+        return bool(step_def and step_def.is_mandatory)
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_rejection_reason(self, obj):
+        # Sugar: ``outcome_reason`` is the underlying field, but only carries
+        # rejection text when ``outcome`` is ``rejected``. The frontend
+        # otherwise has to know that convention; this surfaces it cleanly.
+        #
+        # Return the raw value (which is ``""`` when blank, not None) so a
+        # rejected step with an empty reason is still distinguishable from a
+        # non-rejected step. Frontends should branch on ``=== null`` to detect
+        # "not rejected" rather than truthiness on the string.
+        if obj.outcome == WorkflowStepOutcomes.REJECTED:
+            return obj.outcome_reason
+        return None
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_internal_notes(self, obj):
+        # ``can_view_internal_notes`` is set by the view after the same
+        # permission check used to gate write access. Returning None (not
+        # absent) keeps the response shape stable so SDK consumers can type
+        # the field as Optional[str] instead of "sometimes present".
+        if not self.context.get("can_view_internal_notes"):
+            return None
+        return obj.internal_notes or None
+
+
+class CompleteWorkflowStepSerializer(serializers.Serializer):
+    step_uuid = serializers.UUIDField(
+        required=True,
+        help_text=(
+            "UUID of the workflow step instance the client believes is active. "
+            "Used to detect concurrent step transitions."
+        ),
+    )
+    outcome = serializers.ChoiceField(
+        choices=WorkflowStepOutcomes.CHOICES,
+        required=True,
+        help_text=(
+            "Step outcome. Must be in the active step's allow-list. "
+            "'rejected' and 'expired' are reserved for system transitions."
+        ),
+    )
+    outcome_reason = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        help_text="Explanation for the outcome.",
+    )
+    internal_notes = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        help_text=(
+            "Internal notes captured by the call-management team. Stored on "
+            "the step instance and never returned to applicants."
+        ),
+    )
+
+    def validate_outcome(self, value):
+        if value in WorkflowStepOutcomes.SYSTEM_RESERVED:
+            raise serializers.ValidationError(
+                f"'{value}' is system-reserved and cannot be supplied here."
+            )
+        active_step = self.context.get("active_step")
+        if active_step:
+            allowed = WorkflowStepOutcomes.STEP_ALLOW_LIST.get(active_step, frozenset())
+            if value not in allowed:
+                raise serializers.ValidationError(
+                    f"'{value}' is not a valid outcome for step '{active_step}'. "
+                    f"Allowed: {sorted(allowed)}."
+                )
+        return value
+
+
+class RejectWorkflowStepSerializer(serializers.Serializer):
+    step_uuid = serializers.UUIDField(
+        required=True,
+        help_text=(
+            "UUID of the workflow step instance the client believes is active. "
+            "Used to detect concurrent step transitions."
+        ),
+    )
+    reason = serializers.CharField(
+        required=True,
+        help_text="Reason for rejecting the proposal at this step.",
+    )
+    internal_notes = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        help_text=(
+            "Internal notes captured by the call-management team alongside "
+            "the rejection. Never returned to applicants."
+        ),
+    )
+
+
+class CompleteWorkflowStepResponseSerializer(serializers.Serializer):
+    detail = serializers.CharField()
+    proposal_state = serializers.CharField(
+        required=False,
+        help_text="New proposal state when the workflow terminates.",
+    )
+    next_step = serializers.CharField(
+        required=False,
+        help_text="Identifier of the step that just became active.",
+    )
+
+
+class RejectWorkflowStepResponseSerializer(serializers.Serializer):
+    detail = serializers.CharField()
+    proposal_state = serializers.CharField()

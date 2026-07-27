@@ -10,7 +10,7 @@ from .. import enums
 
 
 @ddt
-class QuestionAdminGetTest(test.APITransactionTestCase):
+class QuestionAdminGetTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.CheckListFixture()
         self.url = factories.QuestionFactory.get_admin_list_url()
@@ -32,7 +32,7 @@ class QuestionAdminGetTest(test.APITransactionTestCase):
 
 
 @ddt
-class QuestionAdminCreateTest(test.APITransactionTestCase):
+class QuestionAdminCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.CustomerFixture()
         self.url = factories.QuestionFactory.get_admin_list_url()
@@ -99,7 +99,7 @@ class QuestionAdminCreateTest(test.APITransactionTestCase):
 
 
 @ddt
-class QuestionAdminUpdateTest(test.APITransactionTestCase):
+class QuestionAdminUpdateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.CheckListFixture()
         self.question = factories.QuestionFactory()
@@ -132,7 +132,7 @@ class QuestionAdminUpdateTest(test.APITransactionTestCase):
 
 
 @ddt
-class QuestionAdminDeleteTest(test.APITransactionTestCase):
+class QuestionAdminDeleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.CheckListFixture()
         self.question = factories.QuestionFactory()
@@ -155,7 +155,7 @@ class QuestionAdminDeleteTest(test.APITransactionTestCase):
         self.assertTrue(models.Question.objects.filter(pk=self.question.pk).exists())
 
 
-class QuestionAdminSerializerFieldTest(test.APITransactionTestCase):
+class QuestionAdminSerializerFieldTest(test.APITestCase):
     """Test that QuestionAdminSerializer can access all required fields."""
 
     def setUp(self):
@@ -268,7 +268,7 @@ class QuestionAdminSerializerFieldTest(test.APITransactionTestCase):
 
 
 @ddt
-class ChecklistQuestionsEndpointTest(test.APITransactionTestCase):
+class ChecklistQuestionsEndpointTest(test.APITestCase):
     """Test the checklist questions endpoint that was failing with the original error."""
 
     def setUp(self):
@@ -423,3 +423,63 @@ class ChecklistQuestionsEndpointTest(test.APITransactionTestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         # Should not fail with the original field error
+
+
+class QuestionAdminPatchWhitelistTest(test.APITestCase):
+    """Regression tests: PATCH must apply the per-type whitelists using the
+    persisted question_type when the payload doesn't include question_type."""
+
+    def setUp(self):
+        self.fixture = structure_fixtures.CustomerFixture()
+        self.client.force_authenticate(self.fixture.staff)
+        self.checklist = factories.ChecklistFactory()
+        self.text_question = factories.QuestionFactory(
+            checklist=self.checklist,
+            question_type=enums.QuestionTypes.TEXT_INPUT,
+        )
+        self.file_question = factories.QuestionFactory(
+            checklist=self.checklist,
+            question_type=enums.QuestionTypes.FILE,
+        )
+        self.url = factories.QuestionFactory.get_admin_url(self.text_question)
+
+    def test_patch_min_value_on_non_numeric_question_rejected(self):
+        response = self.client.patch(self.url, {"min_value": 10}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Min and max values", str(response.data))
+
+    def test_patch_max_value_on_non_numeric_question_rejected(self):
+        response = self.client.patch(self.url, {"max_value": 100}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Min and max values", str(response.data))
+
+    def test_patch_allowed_file_types_on_non_file_question_rejected(self):
+        response = self.client.patch(
+            self.url, {"allowed_file_types": [".pdf"]}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("File validation fields", str(response.data))
+
+    def test_patch_max_file_size_mb_on_non_file_question_rejected(self):
+        response = self.client.patch(self.url, {"max_file_size_mb": 10}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("File validation fields", str(response.data))
+
+    def test_patch_max_files_count_on_file_question_rejected(self):
+        # max_files_count is only valid for MULTIPLE_FILES, not FILE.
+        # PATCH on an existing FILE question must still reject it.
+        url = factories.QuestionFactory.get_admin_url(self.file_question)
+        response = self.client.patch(url, {"max_files_count": 5}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("MULTIPLE_FILES", str(response.data))
+
+    def test_patch_min_value_on_number_question_still_works(self):
+        number_question = factories.QuestionFactory(
+            checklist=self.checklist,
+            question_type=enums.QuestionTypes.NUMBER,
+        )
+        url = factories.QuestionFactory.get_admin_url(number_question)
+        response = self.client.patch(url, {"min_value": 10}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        number_question.refresh_from_db()
+        self.assertEqual(number_question.min_value, 10)

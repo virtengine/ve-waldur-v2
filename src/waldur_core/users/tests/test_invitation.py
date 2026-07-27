@@ -1,10 +1,12 @@
 import datetime
 from datetime import timedelta
 from unittest import mock
+from uuid import uuid4
 
 from constance.test.unittest import override_config
 from ddt import data, ddt
 from django.conf import settings
+from django.contrib.contenttypes.models import ContentType
 from django.core import mail
 from django.test import override_settings
 from django.utils import timezone
@@ -16,8 +18,13 @@ from waldur_core.core.tests.helpers import override_waldur_core_settings
 from waldur_core.logging import models as logging_models
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CustomerRole, ProjectRole, ProposalRole
-from waldur_core.permissions.models import Role
+from waldur_core.permissions.models import (
+    CustomerRoleConcealment,
+    Role,
+    RoleAvailability,
+)
 from waldur_core.permissions.utils import get_permissions
+from waldur_core.structure.models import Customer, Project
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.users import models, tasks
 from waldur_core.users.enums import InvitationState
@@ -26,7 +33,7 @@ from waldur_core.users.utils import get_invitation_link, get_invitation_token
 from waldur_mastermind.proposal.tests.factories import ProposalFactory
 
 
-class InvitationFieldValidationTest(test.APITransactionTestCase):
+class InvitationFieldValidationTest(test.APITestCase):
     def setUp(self):
         self.staff = structure_factories.UserFactory(is_staff=True)
         self.customer = structure_factories.CustomerFactory()
@@ -37,10 +44,10 @@ class InvitationFieldValidationTest(test.APITransactionTestCase):
         CustomerRole.OWNER.add_permission(PermissionEnum.LIST_INVITATIONS)
 
     def test_extra_invitation_text_within_limit(self):
-        """Test that extra_invitation_text with 250 characters or less is valid"""
+        """Test that extra_invitation_text with 2000 characters or less is valid"""
         self.client.force_authenticate(user=self.staff)
 
-        valid_text = "a" * 250  # Exactly 250 characters
+        valid_text = "a" * 2000  # Exactly 2000 characters
         payload = {
             "email": "test@example.com",
             "scope": structure_factories.CustomerFactory.get_url(self.customer),
@@ -58,10 +65,10 @@ class InvitationFieldValidationTest(test.APITransactionTestCase):
         self.assertEqual(invitation.extra_invitation_text, valid_text)
 
     def test_extra_invitation_text_exceeds_limit(self):
-        """Test that extra_invitation_text with more than 250 characters is invalid"""
+        """Test that extra_invitation_text with more than 2000 characters is invalid"""
         self.client.force_authenticate(user=self.staff)
 
-        invalid_text = "a" * 251  # 251 characters - exceeds limit
+        invalid_text = "a" * 2001  # 2001 characters - exceeds limit
         payload = {
             "email": "test@example.com",
             "scope": structure_factories.CustomerFactory.get_url(self.customer),
@@ -152,6 +159,98 @@ class BaseInvitationTest(test.APITransactionTestCase):
         self.project_invitation = factories.ProjectInvitationFactory(
             scope=self.project,
             role=ProjectRole.ADMIN,
+        )
+
+
+class InvitationDuplicateCheckTest(BaseInvitationTest):
+    def setUp(self):
+        super().setUp()
+        self.client.force_authenticate(user=self.staff)
+        self.check_duplicates_url = factories.InvitationBaseFactory.get_list_url(
+            action="check-duplicates"
+        )
+
+    def test_returns_duplicates_for_pending_invitations(self):
+        invitation = factories.CustomerInvitationFactory(
+            scope=self.customer,
+            role=CustomerRole.OWNER,
+            email="dup@example.com",
+            state=InvitationState.PENDING,
+        )
+        payload = {
+            "scope": structure_factories.CustomerFactory.get_url(self.customer),
+            "invitations": [
+                {"email": "Dup@example.com", "role": CustomerRole.OWNER.uuid.hex},
+                {"email": "unique@example.com", "role": CustomerRole.OWNER.uuid.hex},
+                {"email": "dup@example.com", "role": CustomerRole.OWNER.uuid.hex},
+            ],
+        }
+
+        response = self.client.post(self.check_duplicates_url, data=payload)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data,
+            {
+                "duplicates": [
+                    {
+                        "email": "Dup@example.com",
+                        "role": CustomerRole.OWNER.uuid.hex,
+                        "existing_invitation_uuid": str(invitation.uuid),
+                    }
+                ]
+            },
+        )
+
+    def test_does_not_return_duplicates_for_other_scope_or_role(self):
+        factories.CustomerInvitationFactory(
+            scope=self.second_customer,
+            role=CustomerRole.OWNER,
+            email="dup@example.com",
+            state=InvitationState.PENDING,
+        )
+        factories.CustomerInvitationFactory(
+            scope=self.customer,
+            role=CustomerRole.OWNER,
+            email="roledup@example.com",
+            state=InvitationState.PENDING,
+        )
+        payload = {
+            "scope": structure_factories.CustomerFactory.get_url(self.customer),
+            "invitations": [
+                {"email": "dup@example.com", "role": CustomerRole.OWNER.uuid.hex},
+                {"email": "roledup@example.com", "role": CustomerRole.SUPPORT.uuid.hex},
+            ],
+        }
+
+        response = self.client.post(self.check_duplicates_url, data=payload)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {"duplicates": []})
+
+    def test_returns_duplicates_within_request(self):
+        payload = {
+            "scope": structure_factories.CustomerFactory.get_url(self.customer),
+            "invitations": [
+                {"email": "dup@example.com", "role": CustomerRole.OWNER.uuid.hex},
+                {"email": "dup@example.com", "role": CustomerRole.OWNER.uuid.hex},
+            ],
+        }
+
+        response = self.client.post(self.check_duplicates_url, data=payload)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data,
+            {
+                "duplicates": [
+                    {
+                        "email": "dup@example.com",
+                        "role": CustomerRole.OWNER.uuid.hex,
+                        "existing_invitation_uuid": None,
+                    }
+                ]
+            },
         )
 
 
@@ -319,6 +418,49 @@ class RetrievePendingInvitationDetailsTest(BaseInvitationTest):
         response = self.get_details(self.user, invitation)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
+    def test_user_can_fetch_expired_invitation_details_with_matching_email(self):
+        invitation = factories.CustomerInvitationFactory(
+            customer=self.customer,
+            role=CustomerRole.OWNER,
+            email=self.user.email,
+            state=InvitationState.EXPIRED,
+        )
+        response = self.get_details(self.user, invitation)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["state"], InvitationState.EXPIRED)
+
+    def test_user_can_fetch_canceled_invitation_details_with_matching_email(self):
+        invitation = factories.CustomerInvitationFactory(
+            customer=self.customer,
+            role=CustomerRole.OWNER,
+            email=self.user.email,
+            state=InvitationState.CANCELED,
+        )
+        response = self.get_details(self.user, invitation)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["state"], InvitationState.CANCELED)
+
+    def test_user_cannot_fetch_accepted_invitation_details(self):
+        invitation = factories.CustomerInvitationFactory(
+            customer=self.customer,
+            role=CustomerRole.OWNER,
+            email=self.user.email,
+            state=InvitationState.ACCEPTED,
+        )
+        response = self.get_details(self.user, invitation)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    @override_waldur_core_settings(VALIDATE_INVITATION_EMAIL=True)
+    def test_user_cannot_fetch_expired_invitation_with_non_matching_email(self):
+        invitation = factories.CustomerInvitationFactory(
+            customer=self.customer,
+            role=CustomerRole.OWNER,
+            email="different@example.com",
+            state=InvitationState.EXPIRED,
+        )
+        response = self.get_details(self.user, invitation)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
 
 class InvitationRetrieveByEmailTest(BaseInvitationTest):
     def get_list(self, user):
@@ -476,6 +618,54 @@ class InvitationCreateTest(BaseInvitationTest):
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_cannot_create_project_manager_invitation_when_limit_reached(self):
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_PROJECT_PERMISSION)
+        self.client.force_authenticate(user=self.customer_owner)
+        payload = self._get_valid_project_invitation_payload(
+            self.project_invitation, role=ProjectRole.MANAGER
+        )
+
+        response = self.client.post(
+            factories.InvitationBaseFactory.get_list_url(), data=payload
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.data["non_field_errors"][0],
+            "Project already has an active project manager.",
+        )
+
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_can_create_project_admin_invitation_when_limit_reached(self):
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_PROJECT_PERMISSION)
+        self.client.force_authenticate(user=self.customer_owner)
+        payload = self._get_valid_project_invitation_payload(
+            self.project_invitation, role=ProjectRole.ADMIN
+        )
+
+        response = self.client.post(
+            factories.InvitationBaseFactory.get_list_url(), data=payload
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_can_create_project_manager_invitation_when_project_has_no_manager(self):
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_PROJECT_PERMISSION)
+        project = structure_factories.ProjectFactory(customer=self.customer)
+        self.client.force_authenticate(user=self.customer_owner)
+        payload = self._get_valid_project_invitation_payload(
+            factories.ProjectInvitationFactory.build(scope=project),
+            role=ProjectRole.MANAGER,
+        )
+
+        response = self.client.post(
+            factories.InvitationBaseFactory.get_list_url(), data=payload
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
     def test_project_admin_cannot_create_project_invitation(self):
         self.client.force_authenticate(user=self.project_admin)
         payload = self._get_valid_project_invitation_payload(self.project_invitation)
@@ -599,6 +789,28 @@ class InvitationCreateTest(BaseInvitationTest):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(response.data, {"role": ["This field is required."]})
 
+    def test_user_cannot_create_duplicate_invitation(self):
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_CUSTOMER_PERMISSION)
+        self.client.force_authenticate(user=self.customer_owner)
+        existing = factories.CustomerInvitationFactory(
+            scope=self.customer,
+            role=CustomerRole.OWNER,
+            email="dup@example.com",
+            state=InvitationState.PENDING,
+        )
+        payload = {
+            "email": existing.email,
+            "scope": structure_factories.CustomerFactory.get_url(self.customer),
+            "role": CustomerRole.OWNER.uuid.hex,
+        }
+
+        response = self.client.post(
+            factories.InvitationBaseFactory.get_list_url(), data=payload
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("email", response.data)
+
     def test_user_cannot_create_customer_invitation_without_role(self):
         self.client.force_authenticate(user=self.staff)
         payload = self._get_valid_customer_invitation_payload(self.customer_invitation)
@@ -697,9 +909,10 @@ class InvitationCreateTest(BaseInvitationTest):
         self, invitation: models.Invitation | None = None, role: Role | None = None
     ):
         invitation = invitation or factories.ProjectInvitationFactory.build()
+        email = f"invite-{uuid4().hex}@example.com"
         role = role or ProjectRole.ADMIN
         return {
-            "email": invitation.email,
+            "email": email,
             "scope": structure_factories.ProjectFactory.get_url(invitation.scope),
             "role": role.uuid.hex,
         }
@@ -708,9 +921,10 @@ class InvitationCreateTest(BaseInvitationTest):
         self, invitation: models.Invitation | None = None, role: Role | None = None
     ):
         invitation = invitation or factories.CustomerInvitationFactory.build()
+        email = f"invite-{uuid4().hex}@example.com"
         role = role or CustomerRole.OWNER
         return {
-            "email": invitation.email,
+            "email": email,
             "scope": structure_factories.CustomerFactory.get_url(invitation.scope),
             "role": role.uuid.hex,
         }
@@ -723,6 +937,179 @@ class InvitationCreateTest(BaseInvitationTest):
             "scope": scope,
             "role": role.uuid.hex,
         }
+
+
+class InvitationReminderTest(BaseInvitationTest):
+    @override_config(HOMEPORT_URL="TEST")
+    def test_send_reminder_for_pending_invitations(self):
+        waldur_section = settings.WALDUR_CORE.copy()
+        waldur_section["INVITATION_LIFETIME"] = timedelta(weeks=1)
+        waldur_section["TRANSLATION_DOMAIN"] = "TEST"
+        event_type = "invitation_created"
+        structure_factories.NotificationFactory(key=f"users.{event_type}")
+
+        with self.settings(WALDUR_CORE=waldur_section):
+            factories.ProjectInvitationFactory(
+                created=timezone.now()
+                - waldur_section["INVITATION_LIFETIME"]
+                + timedelta(days=1),
+                created_by=self.project_admin,
+            )
+            tasks.send_reminder_for_pending_invitations()
+
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertTrue("REMINDER" in mail.outbox[0].subject)
+        expected_sender = self.project_admin.full_name
+        self.assertIn(expected_sender, mail.outbox[0].body)
+        self.assertNotIn(self.project_admin.email, mail.outbox[0].body)
+
+    @override_config(HOMEPORT_URL="TEST")
+    def test_send_reminder_uses_username_when_inviter_has_no_full_name(self):
+        waldur_section = settings.WALDUR_CORE.copy()
+        waldur_section["INVITATION_LIFETIME"] = timedelta(weeks=1)
+        waldur_section["TRANSLATION_DOMAIN"] = "TEST"
+        event_type = "invitation_created"
+        structure_factories.NotificationFactory(key=f"users.{event_type}")
+
+        inviter = structure_factories.UserFactory(
+            first_name="",
+            last_name="",
+            username="svc_inviter_01",
+            email="",
+        )
+
+        with self.settings(WALDUR_CORE=waldur_section):
+            factories.ProjectInvitationFactory(
+                created=timezone.now()
+                - waldur_section["INVITATION_LIFETIME"]
+                + timedelta(days=1),
+                created_by=inviter,
+            )
+            tasks.send_reminder_for_pending_invitations()
+
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("svc_inviter_01", mail.outbox[0].body)
+        self.assertNotIn("inviter-not-in-body@example.com", mail.outbox[0].body)
+
+    @override_config(HOMEPORT_URL="TEST")
+    def test_send_reminder_uses_email_when_inviter_has_no_full_name(self):
+        waldur_section = settings.WALDUR_CORE.copy()
+        waldur_section["INVITATION_LIFETIME"] = timedelta(weeks=1)
+        waldur_section["TRANSLATION_DOMAIN"] = "TEST"
+        event_type = "invitation_created"
+        structure_factories.NotificationFactory(key=f"users.{event_type}")
+
+        inviter = structure_factories.UserFactory(
+            first_name="",
+            last_name="",
+            username="svc_inviter_01",
+            email="inviter-in-body@example.com",
+        )
+
+        with self.settings(WALDUR_CORE=waldur_section):
+            factories.ProjectInvitationFactory(
+                created=timezone.now()
+                - waldur_section["INVITATION_LIFETIME"]
+                + timedelta(days=1),
+                created_by=inviter,
+            )
+            tasks.send_reminder_for_pending_invitations()
+
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertNotIn("svc_inviter_01", mail.outbox[0].body)
+        self.assertIn("inviter-in-body@example.com", mail.outbox[0].body)
+
+    @freeze_time("2025-02-07")
+    @override_config(HOMEPORT_URL="TEST")
+    def test_send_reminder_uses_project_start_date(self):
+        waldur_section = settings.WALDUR_CORE.copy()
+        waldur_section["INVITATION_LIFETIME"] = timedelta(days=7)
+        waldur_section["TRANSLATION_DOMAIN"] = "TEST"
+        event_type = "invitation_created"
+        structure_factories.NotificationFactory(key=f"users.{event_type}")
+
+        self.project.start_date = datetime.date(2025, 2, 1)
+        self.project.save()
+
+        with self.settings(WALDUR_CORE=waldur_section):
+            factories.ProjectInvitationFactory(
+                scope=self.project,
+                state=InvitationState.PENDING,
+                created=timezone.now() - timedelta(days=40),
+                created_by=self.project_admin,
+            )
+            tasks.send_reminder_for_pending_invitations()
+
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertTrue("REMINDER" in mail.outbox[0].subject)
+
+
+class InvitationEmailRestrictionTest(test.APITestCase):
+    def setUp(self):
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_CUSTOMER_PERMISSION)
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_PROJECT_PERMISSION)
+        self.staff = structure_factories.UserFactory(is_staff=True)
+        self.customer = structure_factories.CustomerFactory()
+        self.project = structure_factories.ProjectFactory(customer=self.customer)
+
+    def test_invitation_blocked_when_email_does_not_match_customer_pattern(self):
+        self.customer.user_email_patterns = [r".*@example\.com$"]
+        self.customer.save()
+
+        self.client.force_authenticate(user=self.staff)
+        payload = {
+            "email": "user@gmail.com",
+            "scope": structure_factories.CustomerFactory.get_url(self.customer),
+            "role": CustomerRole.OWNER.uuid.hex,
+        }
+        response = self.client.post(
+            factories.InvitationBaseFactory.get_list_url(), data=payload
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("email", response.data)
+
+    def test_invitation_allowed_when_email_matches_customer_pattern(self):
+        self.customer.user_email_patterns = [r".*@example\.com$"]
+        self.customer.save()
+
+        self.client.force_authenticate(user=self.staff)
+        payload = {
+            "email": "user@example.com",
+            "scope": structure_factories.CustomerFactory.get_url(self.customer),
+            "role": CustomerRole.OWNER.uuid.hex,
+        }
+        response = self.client.post(
+            factories.InvitationBaseFactory.get_list_url(), data=payload
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_invitation_blocked_by_parent_customer_pattern_for_project_scope(self):
+        self.customer.user_email_patterns = [r".*@example\.com$"]
+        self.customer.save()
+
+        self.client.force_authenticate(user=self.staff)
+        payload = {
+            "email": "user@gmail.com",
+            "scope": structure_factories.ProjectFactory.get_url(self.project),
+            "role": ProjectRole.ADMIN.uuid.hex,
+        }
+        response = self.client.post(
+            factories.InvitationBaseFactory.get_list_url(), data=payload
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("email", response.data)
+
+    def test_invitation_allowed_when_no_patterns_configured(self):
+        self.client.force_authenticate(user=self.staff)
+        payload = {
+            "email": "anyone@anywhere.com",
+            "scope": structure_factories.CustomerFactory.get_url(self.customer),
+            "role": CustomerRole.OWNER.uuid.hex,
+        }
+        response = self.client.post(
+            factories.InvitationBaseFactory.get_list_url(), data=payload
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
 
 @ddt
@@ -796,6 +1183,29 @@ class InvitationCancelTest(BaseInvitationTest):
         self.assertEqual(len(mail.outbox), 1)
         self.assertTrue("expired" in mail.outbox[0].subject)
 
+    @data("system_robot", "openportal_robot")
+    def test_expiration_mail_is_not_sent_when_invitation_created_by_robot(
+        self, username
+    ):
+        # Robot accounts use SITE_EMAIL, so notifying them about expired
+        # invitations floods the helpdesk with a ticket per expiration.
+        event_type = "invitation_expired"
+        structure_factories.NotificationFactory(key=f"users.{event_type}")
+        waldur_section = settings.WALDUR_CORE.copy()
+        waldur_section["INVITATION_LIFETIME"] = timedelta(weeks=1)
+        robot = structure_factories.UserFactory(username=username, is_staff=True)
+
+        with self.settings(WALDUR_CORE=waldur_section):
+            invitation = factories.ProjectInvitationFactory(
+                created=timezone.now() - timedelta(weeks=1),
+                created_by=robot,
+            )
+            tasks.cancel_expired_invitations(models.Invitation.objects.all())
+
+        invitation.refresh_from_db()
+        self.assertEqual(invitation.state, InvitationState.EXPIRED)
+        self.assertEqual(len(mail.outbox), 0)
+
     @freeze_time("2025-01-10")
     def test_invitation_with_future_project_start_does_not_expire_early(self):
         event_type = "invitation_expired"
@@ -839,57 +1249,6 @@ class InvitationCancelTest(BaseInvitationTest):
 
         invitation.refresh_from_db()
         self.assertEqual(invitation.state, InvitationState.EXPIRED)
-
-    @override_settings(
-        WALDUR_CORE={
-            "INVITATION_LIFETIME": timedelta(weeks=1),
-            "TRANSLATION_DOMAIN": "TEST",
-        }
-    )
-    @override_config(HOMEPORT_URL="TEST")
-    def test_send_reminder_for_pending_invitations(self):
-        waldur_section = settings.WALDUR_CORE.copy()
-        waldur_section["INVITATION_LIFETIME"] = timedelta(weeks=1)
-        event_type = "invitation_created"
-        structure_factories.NotificationFactory(key=f"users.{event_type}")
-
-        with self.settings(WALDUR_CORE=waldur_section):
-            factories.ProjectInvitationFactory(
-                created=timezone.now()
-                - settings.WALDUR_CORE["INVITATION_LIFETIME"]
-                + timedelta(days=1),
-                created_by=self.project_admin,
-            )
-            tasks.send_reminder_for_pending_invitations()
-
-        self.assertEqual(len(mail.outbox), 1)
-        self.assertTrue("REMINDER" in mail.outbox[0].subject)
-
-    @freeze_time("2025-02-07")
-    @override_settings(
-        WALDUR_CORE={
-            "INVITATION_LIFETIME": timedelta(days=7),
-            "TRANSLATION_DOMAIN": "TEST",
-        }
-    )
-    @override_config(HOMEPORT_URL="TEST")
-    def test_send_reminder_uses_project_start_date(self):
-        event_type = "invitation_created"
-        structure_factories.NotificationFactory(key=f"users.{event_type}")
-
-        self.project.start_date = datetime.date(2025, 2, 1)
-        self.project.save()
-
-        factories.ProjectInvitationFactory(
-            scope=self.project,
-            state=InvitationState.PENDING,
-            created=timezone.now() - timedelta(days=40),
-            created_by=self.project_admin,
-        )
-        tasks.send_reminder_for_pending_invitations()
-
-        self.assertEqual(len(mail.outbox), 1)
-        self.assertTrue("REMINDER" in mail.outbox[0].subject)
 
 
 @ddt
@@ -1315,7 +1674,7 @@ class InvitationRejectTest(BaseInvitationTest):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
-class InvitationScopeDescriptionTest(test.APITransactionTestCase):
+class InvitationScopeDescriptionTest(test.APITestCase):
     """Test cases for the scope_description field in invitation serializer."""
 
     def setUp(self):
@@ -1541,7 +1900,7 @@ class InvitationScopeDescriptionTest(test.APITransactionTestCase):
         )
 
 
-class InvitationScopeFilterTest(test.APITransactionTestCase):
+class InvitationScopeFilterTest(test.APITestCase):
     """Test cases for scope name and scope description filters in invitation list."""
 
     def setUp(self):
@@ -1761,7 +2120,7 @@ class InvitationScopeFilterTest(test.APITransactionTestCase):
         self.assertEqual(invitation_uuids, expected_uuids)
 
 
-class GroupInvitationSubmitRequestTest(test.APITransactionTestCase):
+class GroupInvitationSubmitRequestTest(test.APITestCase):
     """Test cases for the submit_request method response format."""
 
     def setUp(self):
@@ -1853,7 +2212,14 @@ class GroupInvitationSubmitRequestTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
         # Verify response has exactly the expected fields from SubmitRequestResponseSerializer
-        expected_fields = {"uuid", "scope_name", "scope_uuid", "auto_approved"}
+        expected_fields = {
+            "uuid",
+            "scope_name",
+            "scope_uuid",
+            "auto_approved",
+            "project_uuid",
+            "project_created",
+        }
         actual_fields = set(response.data.keys())
         self.assertEqual(actual_fields, expected_fields)
 
@@ -1862,9 +2228,12 @@ class GroupInvitationSubmitRequestTest(test.APITransactionTestCase):
         self.assertIsInstance(response.data["scope_name"], str)
         self.assertIsInstance(response.data["scope_uuid"], str)
         self.assertIsInstance(response.data["auto_approved"], bool)
+        # project_uuid and project_created are null when no project workflow runs
+        self.assertIsNone(response.data["project_uuid"])
+        self.assertIsNone(response.data["project_created"])
 
 
-class PermissionRequestCancelTest(test.APITransactionTestCase):
+class PermissionRequestCancelTest(test.APITestCase):
     """Test cases for the cancel_request action."""
 
     def setUp(self):
@@ -2131,6 +2500,19 @@ class InvitationUpdateTest(BaseInvitationTest):
             "Role and scope should belong to the same content type", str(response.data)
         )
 
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_cannot_update_invitation_role_to_manager_when_limit_reached(self):
+        self.client.force_authenticate(user=self.customer_owner)
+
+        url = factories.ProjectInvitationFactory.get_url(self.project_invitation)
+        response = self.client.patch(url, {"role": ProjectRole.MANAGER.uuid.hex})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.data["non_field_errors"][0],
+            "Project already has an active project manager.",
+        )
+
     def test_cannot_update_accepted_invitation(self):
         """Test that accepted invitations cannot be updated"""
         self.invitation.state = InvitationState.ACCEPTED
@@ -2233,7 +2615,7 @@ class InvitationUpdateTest(BaseInvitationTest):
         self.assertEqual(self.invitation.role, CustomerRole.SUPPORT)
 
 
-class IsPermanentWebhookErrorTest(test.APITransactionTestCase):
+class IsPermanentWebhookErrorTest(test.APITestCase):
     def test_returns_true_for_4xx_errors(self):
         """4xx HTTP errors are permanent and should not be retried."""
         test_cases = [
@@ -2279,7 +2661,7 @@ class IsPermanentWebhookErrorTest(test.APITransactionTestCase):
                 self.assertFalse(tasks.is_permanent_webhook_error(error_message))
 
 
-class InvitationResendStuckTaskTest(test.APITransactionTestCase):
+class InvitationResendStuckTaskTest(test.APITestCase):
     def setUp(self):
         self.sender = structure_factories.UserFactory()
 
@@ -2367,7 +2749,7 @@ class InvitationResendStuckTaskTest(test.APITransactionTestCase):
             )
 
 
-class InvitationWebhookScopeTest(test.APITransactionTestCase):
+class InvitationWebhookScopeTest(test.APITestCase):
     """Tests for webhook scope filtering - webhooks only support project invitations."""
 
     def setUp(self):
@@ -2423,3 +2805,64 @@ class InvitationWebhookScopeTest(test.APITransactionTestCase):
             tasks.send_invitation_created(invitation.uuid.hex, self.sender.full_name)
             mock_webhook.assert_not_called()
             mock_email.assert_called_once()
+
+
+class InvitationOrgScopedRoleTest(test.APITestCase):
+    """Invitation creation respects per-organization role availability/concealment.
+
+    Plain APITestCase (not the APITransactionTestCase-based BaseInvitationTest):
+    these are ordinary request/response assertions with no transaction-boundary
+    semantics, so they don't need table truncation between tests.
+    """
+
+    def setUp(self):
+        self.staff = structure_factories.UserFactory(is_staff=True)
+        self.customer = structure_factories.CustomerFactory()
+        self.second_customer = structure_factories.CustomerFactory()
+        self.project = structure_factories.ProjectFactory(customer=self.customer)
+
+    def _project_clone_for(self, customer):
+        customer_ct = ContentType.objects.get_for_model(Customer)
+        role = Role.objects.create(
+            name=f"PROJECT.{customer.uuid.hex}.CLONE",
+            content_type=ContentType.objects.get_for_model(Project),
+            is_system_role=False,
+        )
+        RoleAvailability.objects.create(
+            role=role, content_type=customer_ct, object_id=customer.id
+        )
+        return role
+
+    def _post_invitation(self, role):
+        self.client.force_authenticate(user=self.staff)
+        payload = {
+            "email": f"invite-{uuid4().hex}@example.com",
+            "scope": structure_factories.ProjectFactory.get_url(self.project),
+            "role": role.uuid.hex,
+        }
+        return self.client.post(
+            factories.InvitationBaseFactory.get_list_url(), data=payload
+        )
+
+    def test_cannot_invite_with_another_orgs_clone(self):
+        clone = self._project_clone_for(self.second_customer)
+        response = self._post_invitation(clone)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_can_invite_with_own_orgs_clone(self):
+        clone = self._project_clone_for(self.customer)
+        response = self._post_invitation(clone)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_cannot_invite_with_concealed_role(self):
+        CustomerRoleConcealment.objects.create(
+            role=ProjectRole.ADMIN,
+            content_type=ContentType.objects.get_for_model(Customer),
+            object_id=self.customer.id,
+        )
+        response = self._post_invitation(ProjectRole.ADMIN)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_system_role_invitation_still_works(self):
+        response = self._post_invitation(ProjectRole.MANAGER)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)

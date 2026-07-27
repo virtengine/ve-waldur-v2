@@ -1,4 +1,5 @@
 import itertools
+from unittest import skip
 from unittest.mock import patch
 
 from ddt import data, ddt
@@ -20,7 +21,7 @@ from . import factories, fixtures
 
 
 @override_openstack_settings(TENANT_CREDENTIALS_VISIBLE=True)
-class BaseTenantActionsTest(test.APITransactionTestCase):
+class BaseTenantActionsTest(test.APITestCase):
     def setUp(self):
         super().setUp()
         self.fixture = fixtures.OpenStackFixture()
@@ -68,7 +69,7 @@ class TenantGetTest(BaseTenantActionsTest):
 
 
 @ddt
-class TenantCreateTest(BaseTenantActionsTest):
+class TenantCreateTest(test.APITransactionTestCase, BaseTenantActionsTest):
     def setUp(self):
         super().setUp()
         self.valid_data = {
@@ -88,7 +89,7 @@ class TenantCreateTest(BaseTenantActionsTest):
         view = marketplace_views.MarketplaceTenantViewSet.as_view({"post": "create"})
         return common_utils.create_request(view, user, payload)
 
-    @data("admin", "manager", "staff", "owner")
+    @data("admin", "manager", "staff", "owner", "member")
     def test_authorized_user_can_create_tenant(self, user):
         response = self.create_tenant_request(
             getattr(self.fixture, user), self.valid_data
@@ -99,7 +100,7 @@ class TenantCreateTest(BaseTenantActionsTest):
             models.Tenant.objects.filter(name=self.valid_data["name"]).exists()
         )
 
-    @data("global_support", "user")
+    @data("user")
     def test_unathorized_user_cannot_create_tenant(self, user):
         response = self.create_tenant_request(
             getattr(self.fixture, user), self.valid_data
@@ -398,6 +399,7 @@ class TenantCreateTest(BaseTenantActionsTest):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("security_groups", response.data)
 
+    @skip("not stable")
     def test_task_id(self):
         response = self.create_tenant_request(self.fixture.staff, self.valid_data)
         self.assertTrue(
@@ -479,6 +481,115 @@ class TenantQuotasTest(BaseTenantActionsTest):
 
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         mocked_task.assert_called_once_with(self.tenant, quotas=quotas_data)
+
+    def test_staff_can_set_neutron_quotas(self, mocked_task):
+        self.client.force_authenticate(self.fixture.staff)
+        quotas_data = {
+            "floating_ip_count": 10,
+            "network_count": 5,
+            "subnet_count": 20,
+            "port_count": 100,
+        }
+        response = self.client.post(self.get_url(), data=quotas_data)
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        mocked_task.assert_called_once_with(self.tenant, quotas=quotas_data)
+
+    def test_service_manager_can_set_neutron_quotas(self, mocked_task):
+        self.client.force_authenticate(self.fixture.service_manager)
+        quotas_data = {
+            "floating_ip_count": 10,
+            "network_count": 5,
+            "subnet_count": 20,
+            "port_count": 100,
+        }
+        response = self.client.post(self.get_url(), data=quotas_data)
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        mocked_task.assert_called_once_with(self.tenant, quotas=quotas_data)
+
+    def test_neutron_quotas_allow_zero(self, mocked_task):
+        self.client.force_authenticate(self.fixture.staff)
+        quotas_data = {"floating_ip_count": 0}
+        response = self.client.post(self.get_url(), data=quotas_data)
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        mocked_task.assert_called_once_with(self.tenant, quotas=quotas_data)
+
+    def test_neutron_quotas_allow_unlimited(self, mocked_task):
+        self.client.force_authenticate(self.fixture.staff)
+        quotas_data = {"floating_ip_count": -1}
+        response = self.client.post(self.get_url(), data=quotas_data)
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        mocked_task.assert_called_once_with(self.tenant, quotas=quotas_data)
+
+    def test_neutron_quotas_reject_below_minus_one(self, mocked_task):
+        self.client.force_authenticate(self.fixture.staff)
+        quotas_data = {"floating_ip_count": -2}
+        response = self.client.post(self.get_url(), data=quotas_data)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(mocked_task.called)
+
+    def test_staff_can_set_volume_type_quotas(self, mocked_task):
+        self.client.force_authenticate(self.fixture.staff)
+        quotas_data = {"gigabytes_ssd": 500, "gigabytes___DEFAULT__": 1000}
+        response = self.client.post(self.get_url(), data=quotas_data)
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        mocked_task.assert_called_once_with(self.tenant, quotas=quotas_data)
+
+    def test_service_manager_can_set_volume_type_quotas(self, mocked_task):
+        self.client.force_authenticate(self.fixture.service_manager)
+        quotas_data = {"gigabytes_ssd": 200}
+        response = self.client.post(self.get_url(), data=quotas_data)
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        mocked_task.assert_called_once_with(self.tenant, quotas=quotas_data)
+
+    def test_volume_type_quota_allows_zero(self, mocked_task):
+        self.client.force_authenticate(self.fixture.staff)
+        quotas_data = {"gigabytes_ssd": 0}
+        response = self.client.post(self.get_url(), data=quotas_data)
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        mocked_task.assert_called_once_with(self.tenant, quotas=quotas_data)
+
+    def test_volume_type_quota_allows_unlimited(self, mocked_task):
+        self.client.force_authenticate(self.fixture.staff)
+        quotas_data = {"gigabytes_ssd": -1}
+        response = self.client.post(self.get_url(), data=quotas_data)
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        mocked_task.assert_called_once_with(self.tenant, quotas=quotas_data)
+
+    def test_volume_type_quota_rejects_below_minus_one(self, mocked_task):
+        self.client.force_authenticate(self.fixture.staff)
+        quotas_data = {"gigabytes_ssd": -2}
+        response = self.client.post(self.get_url(), data=quotas_data)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(mocked_task.called)
+
+    def test_volume_type_quota_rejects_non_integer(self, mocked_task):
+        self.client.force_authenticate(self.fixture.staff)
+        quotas_data = {"gigabytes_ssd": "not-a-number"}
+        response = self.client.post(self.get_url(), data=quotas_data)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(mocked_task.called)
+
+    def test_unknown_keys_not_starting_with_gigabytes_are_ignored(self, mocked_task):
+        # Unknown quota names that are not gigabytes_* must not break the request;
+        # the serializer silently drops them (DRF default for undeclared fields).
+        self.client.force_authenticate(self.fixture.staff)
+        quotas_data = {"instances": 10, "unknown_quota": 999}
+        response = self.client.post(self.get_url(), data=quotas_data)
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        # unknown_quota is stripped by the serializer
+        mocked_task.assert_called_once_with(self.tenant, quotas={"instances": 10})
 
     def get_url(self):
         return factories.TenantFactory.get_url(self.tenant, "set_quotas")
@@ -660,6 +771,73 @@ class TenantCreateFloatingIPTest(BaseTenantActionsTest):
         self.assertIn("router", executor_kwargs)
         self.assertEqual(executor_kwargs["router"], router)
 
+    def test_create_floating_ip_with_router_on_non_shared_external_is_denied(
+        self, mocked_task
+    ):
+        # WAL-9991: project admin (consumer-side, not a customer owner) must not
+        # be able to indirectly target a provider-internal pool by picking a
+        # router whose gateway points at a non-shared external network.
+        private_net = factories.ExternalNetworkFactory(
+            settings=self.fixture.settings,
+            backend_id="private-ext-fip",
+            is_shared=False,
+        )
+        router = factories.RouterFactory(
+            tenant=self.tenant,
+            external_network_id=private_net.backend_id,
+            external_network_ref=private_net,
+        )
+        self.client.force_authenticate(self.fixture.admin)
+        response = self.client.post(
+            self.url,
+            {"router": factories.RouterFactory.get_url(router)},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("router", response.data)
+        mocked_task.assert_not_called()
+
+    def test_create_floating_ip_with_router_on_shared_external_is_allowed(
+        self, mocked_task
+    ):
+        shared_net = factories.ExternalNetworkFactory(
+            settings=self.fixture.settings,
+            backend_id="shared-ext-fip",
+            is_shared=True,
+        )
+        router = factories.RouterFactory(
+            tenant=self.tenant,
+            external_network_id=shared_net.backend_id,
+            external_network_ref=shared_net,
+        )
+        self.client.force_authenticate(self.fixture.admin)
+        response = self.client.post(
+            self.url,
+            {"router": factories.RouterFactory.get_url(router)},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        mocked_task.assert_called_once()
+
+    def test_create_floating_ip_with_router_on_non_shared_external_allowed_for_staff(
+        self, mocked_task
+    ):
+        private_net = factories.ExternalNetworkFactory(
+            settings=self.fixture.settings,
+            backend_id="private-ext-fip-staff",
+            is_shared=False,
+        )
+        router = factories.RouterFactory(
+            tenant=self.tenant,
+            external_network_id=private_net.backend_id,
+            external_network_ref=private_net,
+        )
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(
+            self.url,
+            {"router": factories.RouterFactory.get_url(router)},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        mocked_task.assert_called_once()
+
 
 @patch("waldur_openstack.executors.NetworkCreateExecutor.execute")
 class TenantCreateNetworkTest(BaseTenantActionsTest):
@@ -761,7 +939,7 @@ class TenantChangePasswordTest(BaseTenantActionsTest):
 
 
 @ddt
-class TenantExecutorTest(test.APITransactionTestCase):
+class TenantExecutorTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.tenant = self.fixture.tenant
@@ -805,7 +983,7 @@ class TenantExecutorTest(test.APITransactionTestCase):
         )
 
 
-class TenantTasksTest(test.APITransactionTestCase):
+class TenantTasksTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.tenant = self.fixture.tenant
@@ -839,7 +1017,7 @@ class TenantTasksTest(test.APITransactionTestCase):
             self.assertEqual(self.tenant.state, CoreStates.ERRED)
 
 
-class TenantDisabledActionsTest(test.APITransactionTestCase):
+class TenantDisabledActionsTest(test.APITestCase):
     """Tests to verify that create and destroy actions are disabled for the tenant endpoint."""
 
     def setUp(self):

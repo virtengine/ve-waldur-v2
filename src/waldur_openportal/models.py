@@ -1,6 +1,7 @@
 import json
 import logging
 
+import openportal
 from django.conf import settings
 from django.core import validators
 from django.core.validators import MaxValueValidator, MinValueValidator
@@ -17,8 +18,6 @@ from waldur_core.structure import models as structure_models
 from waldur_core.structure.managers import get_project_users
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_openportal import utils
-
-from . import op as openportal
 
 logger = logging.getLogger(__name__)
 
@@ -371,13 +370,13 @@ class RemoteAllocation(
 
         return (allocation, allocation_unit)
 
-    def get_project_details(self) -> openportal.ProjectDetails:
+    def get_project_details(self) -> openportal.AwardDetails:
         if self.project is None:
             raise ValueError("Project is not set!")
 
         project = self.project
 
-        details = openportal.ProjectDetails("{}")
+        details = openportal.AwardDetails("{}")
 
         if project.name is not None:
             details.name = str(project.name)
@@ -391,12 +390,6 @@ class RemoteAllocation(
         if project.end_date is not None:
             details.end_date = project.end_date
 
-        # The project key is the UUID of the organisation that owns
-        # the project. This way, only projects within the approved
-        # organisation can create remote projects using this
-        # allocation, thereby preventing an admin of another
-        # organisation from guessing the project template name
-        # and using that
         details.key = str(project.customer.uuid)
 
         # now get the allocation for this project (if requested)
@@ -857,6 +850,75 @@ class HistoricalRemoteAllocation(UsageMixin):
         return self.__str__()
 
 
+class CachedProjectUsageReport(models.Model):
+    """
+    Caches the full ProjectUsageReport JSON from OpenPortal for a given
+    project, month, and resource (destination). This allows rich report
+    data to be served to the frontend without re-fetching from OpenPortal.
+
+    The report field stores the JSON-serialised OpenPortal ProjectUsageReport
+    object. Use openportal.ProjectUsageReport.from_json(json.dumps(self.report))
+    to deserialise.
+    """
+
+    year = models.PositiveSmallIntegerField()
+    month = models.PositiveSmallIntegerField(
+        validators=[MinValueValidator(1), MaxValueValidator(12)]
+    )
+    project_identifier = models.CharField(max_length=MAX_PROJECTIDENTIFIER_LENGTH)
+    resource = models.CharField(max_length=MAX_DESTINATION_LENGTH)
+    is_complete = models.BooleanField(default=False)
+    report = models.JSONField()
+
+    class Meta:
+        unique_together = [("year", "month", "project_identifier", "resource")]
+        indexes = [models.Index(fields=["project_identifier"])]
+
+    def get_report(self) -> "openportal.ProjectUsageReport":
+        return openportal.ProjectUsageReport.from_json(json.dumps(self.report))
+
+    def __str__(self):
+        status = "complete" if self.is_complete else "incomplete"
+        return f"{self.project_identifier} [{self.year}-{self.month:02d}] ({self.resource}): {status}"
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
+class CachedProjectStorageReport(models.Model):
+    """
+    Caches an accumulated ProjectStorageReport JSON from OpenPortal for a given
+    project, month, and resource (destination). Each time a new storage snapshot
+    is fetched it is merged into the cached report via +=, so the stored object
+    accumulates daily snapshots over the course of the month.
+
+    The report field stores the JSON-serialised OpenPortal ProjectStorageReport
+    object. Use openportal.ProjectStorageReport.from_json(json.dumps(self.report))
+    to deserialise.
+    """
+
+    year = models.PositiveSmallIntegerField()
+    month = models.PositiveSmallIntegerField(
+        validators=[MinValueValidator(1), MaxValueValidator(12)]
+    )
+    project_identifier = models.CharField(max_length=MAX_PROJECTIDENTIFIER_LENGTH)
+    resource = models.CharField(max_length=MAX_DESTINATION_LENGTH)
+    report = models.JSONField()
+
+    class Meta:
+        unique_together = [("year", "month", "project_identifier", "resource")]
+        indexes = [models.Index(fields=["project_identifier"])]
+
+    def get_report(self) -> "openportal.ProjectStorageReport":
+        return openportal.ProjectStorageReport.from_json(json.dumps(self.report))
+
+    def __str__(self):
+        return f"{self.project_identifier} [{self.year}-{self.month:02d}] ({self.resource})"
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
 class UserInfo(models.Model):
     """
     This model is responsible for storing additional user information
@@ -928,10 +990,24 @@ class UserInfo(models.Model):
                 shortname != self.user.unix_username
                 and self.user.unix_username is not None
             ):
-                self.user.unix_username = self.shortname
-                self.user.save()
+                # Set flag to prevent circular updates when saving unix_username
+                self.user._syncing_to_userinfo = True
+                try:
+                    self.user.unix_username = self.shortname
+                    self.user.save(update_fields=["unix_username"])
+                finally:
+                    self.user._syncing_to_userinfo = False
 
             self.shortname = self.user.unix_username
+
+        # make sure to copy the shortname to the slug
+        # Set flag to prevent circular updates
+        self.user._syncing_to_userinfo = True
+        try:
+            self.user.slug = shortname
+            self.user.save(update_fields=["slug"])
+        finally:
+            self.user._syncing_to_userinfo = False
 
         if self.shortname and self.shortname != shortname:
             logger.error(
@@ -1142,10 +1218,10 @@ class ProjectInfo(models.Model):
                     self.project.save()
             else:
                 # no shortname set - need to get it from the slug
-                logger.warning(
-                    f"No shortname set for project {self.project} - using slug"
-                )
                 shortname = self.project.slug.strip()
+                logger.warning(
+                    f"No shortname set for project {self.project} - using slug: {shortname}"
+                )
 
                 if len(shortname) == 0:
                     raise ValueError(
@@ -1226,6 +1302,36 @@ class ProjectInfo(models.Model):
         self.shortname = shortname
         self.save(force_accept_changed_shortname=force)
         self.sanitise()
+
+        if self.project:
+            # Set flag to prevent circular updates
+            self.project._syncing_to_projectinfo = True
+            try:
+                if hasattr(self.project, "short_name"):
+                    if self.project.short_name != shortname:
+                        try:
+                            self.project.short_name = shortname
+                            self.project.save(update_fields=["short_name"])
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to save project short_name {shortname} for project {self.project}: {e}"
+                            )
+
+                # Only copy the shortname to the slug if we are NOT in
+                # application_portal_only mode (i.e., we're in Project Management mode)
+                try:
+                    application_portal_only = core_models.Feature.objects.get(
+                        key="deployment.application_portal_only"
+                    ).value
+                except core_models.Feature.DoesNotExist:
+                    # Default to False if feature flag doesn't exist
+                    application_portal_only = False
+
+                if not application_portal_only:
+                    self.project.slug = shortname
+                    self.project.save(update_fields=["slug"])
+            finally:
+                self.project._syncing_to_projectinfo = False
 
     def has_shortname(self) -> bool:
         """
@@ -1680,11 +1786,26 @@ class ProjectTemplate(core_models.UuidMixin, models.Model):
         If the allocation unit does not exist, raise an error.
         """
         if allocation_unit not in self.allocation_units_mapping:
-            raise ValueError(
-                f"Allocation unit {allocation_unit} does not exist in this class."
-            )
+            canonical_unit = openportal.Allocation.canonicalize(allocation_unit)
 
-        return self.allocation_units_mapping[allocation_unit]
+            if (
+                canonical_unit == allocation_unit
+                and allocation_unit.lower().endswith("s")
+                and len(allocation_unit) > 1
+            ):
+                canonical_unit = openportal.Allocation.canonicalize(
+                    allocation_unit[:-1]
+                )
+
+            if canonical_unit not in self.allocation_units_mapping:
+                raise ValueError(
+                    f"Allocation unit {allocation_unit} does not exist in this class. "
+                    f"Available allocation units: {list(self.allocation_units_mapping.keys())}"
+                )
+
+            return self.allocation_units_mapping[canonical_unit]
+        else:
+            return self.allocation_units_mapping[allocation_unit]
 
     def create_allocation_mappings_from_node(self, node: openportal.Node):
         """
@@ -2122,16 +2243,16 @@ class ManagedProject(ReviewMixin, models.Model):
             f"{self.get_remote_identifier()}:{self.get_local_identifier()}"
         )
 
-    def set_details(self, details: openportal.ProjectDetails):
+    def set_details(self, details: openportal.AwardDetails):
         """
         Set the ProjectDetails object for this project.
         If the details are not an instance of ProjectDetails, convert it.
         """
-        if not isinstance(details, openportal.ProjectDetails):
+        if not isinstance(details, openportal.AwardDetails):
             if not isinstance(details, str):
-                details = openportal.ProjectDetails(json.dumps(details))
+                details = openportal.AwardDetails(json.dumps(details))
             else:
-                details = openportal.ProjectDetails(details)
+                details = openportal.AwardDetails(details)
 
         new_details = json.loads(str(details))
 
@@ -2144,12 +2265,12 @@ class ManagedProject(ReviewMixin, models.Model):
             self.details = new_details
             self.save(update_fields=["details"])
 
-    def get_details(self) -> openportal.ProjectDetails:
+    def get_details(self) -> openportal.AwardDetails:
         """
         Get the ProjectDetails object from the project data.
         If the project data is not set, return None.
         """
-        return openportal.ProjectDetails(json.dumps(self.details))
+        return openportal.AwardDetails(json.dumps(self.details))
 
     def get_default_offerings(self) -> list[marketplace_models.Offering]:
         """

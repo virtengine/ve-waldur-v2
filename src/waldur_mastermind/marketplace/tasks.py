@@ -1,10 +1,14 @@
 import collections
 import datetime
+import decimal
 import hashlib
 import logging
+import uuid as uuid_mod
 from datetime import timedelta
+from decimal import Decimal, InvalidOperation
 from typing import cast
 
+import httpx
 import requests
 from celery import shared_task
 from constance import config
@@ -13,6 +17,7 @@ from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
 from django.db.models import Count, Exists, F, OuterRef, Q, Subquery, Sum
 from django.utils import timezone
+from django_fsm import TransitionNotAllowed
 from rest_framework import status
 
 from waldur_core import _get_version
@@ -22,34 +27,75 @@ from waldur_core.core import utils as core_utils
 from waldur_core.core.models import User
 from waldur_core.logging import event_logger
 from waldur_core.logging import models as logging_models
-from waldur_core.logging.enums import EventType
+from waldur_core.logging import tasks as logging_tasks
+from waldur_core.logging.enums import EventType, ObservableObjectType
 from waldur_core.permissions.fixtures import ProjectRole
-from waldur_core.permissions.models import UserRole
+from waldur_core.permissions.models import RoleAvailability, UserRole
 from waldur_core.structure import models as structure_models
+from waldur_core.structure import tasks as structure_tasks
 from waldur_core.structure.managers import get_connected_projects
 from waldur_core.structure.models import Project
 from waldur_mastermind.analytics import models as analytics_models
 from waldur_mastermind.invoices import models as invoices_models
 from waldur_mastermind.invoices import utils as invoice_utils
-from waldur_mastermind.marketplace import exceptions, models, plugins, utils
+from waldur_mastermind.invoices.models import InvoiceItem
+from waldur_mastermind.marketplace import (
+    exceptions,
+    models,
+    plugins,
+    utils,
+)
 from waldur_mastermind.marketplace.catalog_loaders.eessi import EESSICatalogLoader
 from waldur_mastermind.marketplace.catalog_loaders.spack import SpackCatalogLoader
 from waldur_mastermind.marketplace.enums import (
+    BillingTypes,
+    LimitPeriods,
+    MaintenanceState,
     OfferingStates,
     OfferingUserStates,
     OrderStates,
     OrderTypes,
     ResourceStates,
     RobotAccountStates,
+    UsageLimitAction,
 )
 
 # Delayed import to avoid circular import with handlers.py
 from waldur_mastermind.marketplace.utils import (
+    evaluate_usage_limit_restriction,
     get_consumer_approvers,
     get_provider_approvers,
 )
 
 logger = logging.getLogger(__name__)
+
+
+@shared_task(name="waldur_mastermind.marketplace.evaluate_usage_limit_restriction")
+def evaluate_usage_limit_restriction_task(resource_id):
+    """Re-evaluate the usage-limit restriction for a single resource."""
+    resource = models.Resource.objects.filter(pk=resource_id).first()
+    if resource is not None:
+        evaluate_usage_limit_restriction(resource)
+
+
+@shared_task(name="waldur_mastermind.marketplace.re_evaluate_usage_limit_restrictions")
+def re_evaluate_usage_limit_restrictions():
+    """Lift usage-limit restrictions when a new period resets reported usage.
+
+    A restriction applied by ``evaluate_usage_limit_restriction`` is normally
+    lifted on the next usage report. When a new billing period begins and no new
+    usage is reported, this periodic task re-evaluates every currently restricted
+    resource so month/quarter/annual restrictions clear on rollover. ``total``
+    restrictions never roll over and are only lifted when the limit is raised.
+    """
+    restricted = models.Resource.objects.exclude(usage_limit_restriction="").filter(
+        offering__plugin_options__action_on_usage_limit__in=(
+            UsageLimitAction.PAUSE,
+            UsageLimitAction.DOWNSCALE,
+        )
+    )
+    for resource in restricted:
+        evaluate_usage_limit_restriction(resource)
 
 
 def process_order_on_commit(order: models.Order, user):
@@ -72,6 +118,53 @@ def create_screenshot_thumbnail(uuid):
     """Create a thumbnail for a screenshot."""
     screenshot = models.Screenshot.objects.get(uuid=uuid)
     utils.create_screenshot_thumbnail(screenshot)
+
+
+@shared_task
+def create_course_account_task(course_account_uuid_hex: str, owner_username: str):
+    """Create a single course account via the external API.
+
+    Called per-item during bulk creation so each account is processed
+    independently — a failure on one does not block the others.
+    """
+    try:
+        course_account = models.CourseAccount.objects.get(uuid=course_account_uuid_hex)
+    except models.CourseAccount.DoesNotExist:
+        logger.error(
+            "CourseAccount %s not found, skipping task", course_account_uuid_hex
+        )
+        return
+
+    try:
+        response_data = utils.create_course_account(
+            {"email": course_account.email, "project": course_account.project},
+            owner_username,
+        )
+        if response_data is None:
+            # API disabled in settings — leave record in PENDING state
+            return
+        temp_account = response_data.get("tempAccount", {})
+        user, _ = core_models.User.objects.get_or_create(
+            username=temp_account["username"],
+            defaults={
+                "email": temp_account.get("email", course_account.email),
+                "description": "Course Account",
+            },
+        )
+        course_account.user = user
+        course_account.set_state_ok()
+        course_account.save(update_fields=["user", "state"])
+    except Exception as exc:
+        logger.error(
+            "Failed to create course account %s: %s", course_account_uuid_hex, exc
+        )
+        if isinstance(exc, httpx.HTTPStatusError):
+            error_message = str(utils.extract_error_details_from_httpx_error(exc))
+        else:
+            error_message = str(exc)
+        course_account.error_message = error_message
+        course_account.set_state_erred()
+        course_account.save(update_fields=["error_message", "state"])
 
 
 @shared_task
@@ -133,6 +226,111 @@ def notify_provider_about_pending_order(order_uuid):
 
     core_utils.broadcast_mail(
         "marketplace", "notify_provider_about_pending_order", context, approvers
+    )
+
+
+@shared_task
+def notify_consumer_about_provider_info(order_uuid):
+    order = models.Order.objects.get(uuid=order_uuid)
+
+    # Send pubsub message regardless of email notification settings
+    messages = utils.prepare_messages(
+        order.offering,
+        {
+            "order_uuid": order.uuid.hex,
+            "action": "provider_info_set",
+        },
+        ObservableObjectType.ORDER,
+    )
+    if messages:
+        logging_tasks.publish_messages.delay(messages)
+
+    if not order.offering.plugin_options.get("notify_about_provider_consumer_messages"):
+        return
+
+    recipients = set()
+    if order.created_by and order.created_by.email:
+        recipients.add(order.created_by.email)
+    if (
+        order.consumer_reviewed_by
+        and order.consumer_reviewed_by.email
+        and order.consumer_reviewed_by.notifications_enabled
+    ):
+        recipients.add(order.consumer_reviewed_by.email)
+
+    if not recipients:
+        return
+
+    link = core_utils.format_homeport_link(
+        "marketplace-order-details/{order_uuid}/",
+        order_uuid=order.uuid,
+    )
+
+    context = {
+        "order_url": link,
+        "order": order,
+        "site_name": config.SITE_NAME,
+    }
+
+    logger.info(
+        "Sending provider info notification for order %s to %s",
+        order,
+        recipients,
+    )
+
+    core_utils.broadcast_mail(
+        "marketplace",
+        "notify_consumer_about_provider_info",
+        context,
+        list(recipients),
+    )
+
+
+@shared_task
+def notify_provider_about_consumer_info(order_uuid):
+    order = models.Order.objects.get(uuid=order_uuid)
+
+    # Send pubsub message regardless of email notification settings
+    messages = utils.prepare_messages(
+        order.offering,
+        {
+            "order_uuid": order.uuid.hex,
+            "action": "consumer_info_set",
+        },
+        ObservableObjectType.ORDER,
+    )
+    if messages:
+        logging_tasks.publish_messages.delay(messages)
+
+    if not order.offering.plugin_options.get("notify_about_provider_consumer_messages"):
+        return
+
+    approvers = get_provider_approvers(order)
+    if not approvers:
+        return
+
+    link = core_utils.format_homeport_link(
+        "marketplace-order-details/{order_uuid}/",
+        order_uuid=order.uuid,
+    )
+
+    context = {
+        "order_url": link,
+        "order": order,
+        "site_name": config.SITE_NAME,
+    }
+
+    logger.info(
+        "Sending consumer info notification for order %s to %s",
+        order,
+        approvers,
+    )
+
+    core_utils.broadcast_mail(
+        "marketplace",
+        "notify_provider_about_consumer_info",
+        context,
+        list(approvers),
     )
 
 
@@ -211,22 +409,315 @@ def calculate_usage_for_scope(start, end, scope):
         )
 
 
+def _bulk_aggregate_reported_usage(start, end, scope_field):
+    """Aggregate reported usage in bulk, grouped by scope and component."""
+    queryset = (
+        models.ComponentUsage.objects.filter(date__date__gte=start, date__date__lte=end)
+        .exclude(component__parent=None)
+        .values(scope_id=F(scope_field), component_parent_id=F("component__parent_id"))
+        .annotate(total=Sum("usage"))
+    )
+    result = collections.defaultdict(dict)
+    for row in queryset:
+        result[row["scope_id"]][row["component_parent_id"]] = row["total"]
+    return result
+
+
+def _bulk_aggregate_fixed_usage(start, end, scope_field):
+    """Aggregate fixed usage in bulk, grouped by scope and component."""
+    queryset = (
+        models.ResourcePlanPeriod.objects.filter(
+            Q(start__gte=start, end__lte=end)
+            | Q(end__isnull=True)
+            | Q(end__gte=start, end__lte=end)
+        )
+        .values(
+            scope_id=F(scope_field),
+            component_parent_id=F("plan__components__component__parent_id"),
+        )
+        .annotate(total=Sum("plan__components__amount"))
+    )
+    result = collections.defaultdict(dict)
+    for row in queryset:
+        result[row["scope_id"]][row["component_parent_id"]] = row["total"]
+    return result
+
+
 @shared_task(name="waldur_mastermind.marketplace.calculate_usage_for_current_month")
 def calculate_usage_for_current_month():
     """Calculate marketplace resource usage for the current month across all customers and projects."""
     start = invoice_utils.get_current_month_start()
     end = invoice_utils.get_current_month_end()
-    scopes = []
+
+    # Bulk aggregate for projects (4 queries instead of 2*N)
+    project_reported = _bulk_aggregate_reported_usage(
+        start, end, "resource__project_id"
+    )
+    project_fixed = _bulk_aggregate_fixed_usage(start, end, "resource__project_id")
+
+    customer_reported = _bulk_aggregate_reported_usage(
+        start, end, "resource__project__customer_id"
+    )
+    customer_fixed = _bulk_aggregate_fixed_usage(
+        start, end, "resource__project__customer_id"
+    )
+
+    project_ct = ContentType.objects.get_for_model(structure_models.Project)
+    customer_ct = ContentType.objects.get_for_model(structure_models.Customer)
+
+    # Collect the target usage values keyed by (content_type_id, object_id,
+    # component_id) so the writes can be performed in bulk instead of issuing a
+    # SELECT ... FOR UPDATE + UPDATE/INSERT per scope/component pair (N+1).
+    desired = {}
+
+    def collect(content_type, object_id, reported_usage, fixed_usage):
+        fixed_usage.pop(None, None)
+        for component_id in set(reported_usage.keys()) | set(fixed_usage.keys()):
+            desired[(content_type.id, object_id, component_id)] = (
+                reported_usage.get(component_id),
+                fixed_usage.get(component_id),
+            )
 
     for customer in structure_models.Customer.objects.all():
-        scopes.append(customer)
-        for project in structure_models.Project.available_objects.filter(
-            customer=customer
-        ):
-            scopes.append(project)
+        collect(
+            customer_ct,
+            customer.id,
+            customer_reported.get(customer.id, {}),
+            customer_fixed.get(customer.id, {}),
+        )
 
-    for scope in scopes:
-        calculate_usage_for_scope(start, end, scope)
+    # Every available project belongs to a customer, so iterating them once is
+    # equivalent to the previous per-customer filtering without the extra query.
+    for project in structure_models.Project.available_objects.all():
+        collect(
+            project_ct,
+            project.id,
+            project_reported.get(project.id, {}),
+            project_fixed.get(project.id, {}),
+        )
+
+    existing = {
+        (usage.content_type_id, usage.object_id, usage.component_id): usage
+        for usage in models.CategoryComponentUsage.objects.filter(
+            date=start,
+            content_type__in=[customer_ct, project_ct],
+        )
+    }
+
+    to_create = []
+    to_update = []
+    for (content_type_id, object_id, component_id), (
+        reported,
+        fixed,
+    ) in desired.items():
+        usage = existing.get((content_type_id, object_id, component_id))
+        if usage is None:
+            to_create.append(
+                models.CategoryComponentUsage(
+                    content_type_id=content_type_id,
+                    object_id=object_id,
+                    component_id=component_id,
+                    date=start,
+                    reported_usage=reported,
+                    fixed_usage=fixed,
+                )
+            )
+        else:
+            usage.reported_usage = reported
+            usage.fixed_usage = fixed
+            to_update.append(usage)
+
+    if to_create:
+        models.CategoryComponentUsage.objects.bulk_create(to_create)
+    if to_update:
+        models.CategoryComponentUsage.objects.bulk_update(
+            to_update, ["reported_usage", "fixed_usage"]
+        )
+
+
+@shared_task(name="waldur_mastermind.marketplace.sync_component_usage_summaries")
+def sync_component_usage_summaries():
+    """
+    Runs nightly to keep the current month's ComponentUsageMonthly records up to date.
+    """
+    from django.core.management import call_command
+
+    # Re-use the command, but only calculate the current month (months=0)
+    call_command("init_component_usage_reporting", months=0)
+
+
+def calculate_consumed_for_month(
+    component: models.OfferingComponent, year: int, month: int
+) -> Decimal:
+    """
+    Calculates the total consumption for a component in a specific billing period.
+    Source of truth: ComponentUsage records for the specific month.
+    """
+    consumption_agg = models.ComponentUsage.objects.filter(
+        component=component,
+        billing_period__year=year,
+        billing_period__month=month,
+    ).aggregate(total=Sum("usage"))
+
+    total_consumed = consumption_agg["total"]
+
+    if total_consumed is not None and total_consumed > 0:
+        return Decimal(total_consumed)
+
+    now = timezone.now()
+    is_current_month = year == now.year and month == now.month
+
+    if is_current_month:
+        resources = models.Resource.objects.filter(
+            offering=component.offering,
+            modified__year=year,
+            modified__month=month,
+        ).only("current_usages")
+
+        fallback_total = Decimal("0")
+        for resource in resources:
+            # Safely check if current_usages is a dictionary and has the key
+            if not resource.current_usages or not isinstance(
+                resource.current_usages, dict
+            ):
+                continue
+
+            if component.type in resource.current_usages:
+                usage_val = resource.current_usages.get(component.type, 0)
+                try:
+                    fallback_total += Decimal(str(usage_val))
+                except (ValueError, TypeError, decimal.InvalidOperation):
+                    continue
+
+        return fallback_total
+
+    return Decimal("0")
+
+
+def calculate_allocated_for_month(
+    component: models.OfferingComponent, year: int, month: int
+) -> Decimal:
+    """
+    Calculates the total allocated limit for a component in a specific billing period.
+
+    Logic mapping:
+    - Current Month: Reads live `Resource.limits` (JSONB). Falls back to `OfferingComponent.limit_amount`.
+    - Historical TOTAL: Cumulative sum of all incremental `InvoiceItem.quantity` up to the target month.
+    - Historical QUARTERLY/ANNUAL: Finds the latest `InvoiceItem` for each resource within the cycle window.
+    - Historical MONTH: Sums `InvoiceItem.quantity` strictly for the target month.
+    """
+    now = timezone.now()
+    is_current_month = year == now.year and month == now.month
+    target_date = datetime.date(year, month, 1)
+
+    # Global cap defined on the offering component level (common for USAGE billing types)
+    global_limit = Decimal(str(component.limit_amount or 0))
+
+    # --- 1. CURRENT MONTH LOGIC ---
+    if is_current_month:
+        valid_states = [
+            ResourceStates.OK,
+            ResourceStates.UPDATING,
+            ResourceStates.TERMINATING,
+            ResourceStates.ERRED,
+        ]
+
+        # We query resources that have an explicit limit set for this component
+        resources = models.Resource.objects.filter(
+            offering=component.offering,
+            state__in=valid_states,
+            limits__has_key=component.type,
+        ).only("limits")
+
+        total_allocated = Decimal("0")
+        has_custom_limits = False
+
+        for resource in resources:
+            limit_val = resource.limits.get(component.type, 0)
+            try:
+                total_allocated += Decimal(str(limit_val))
+                has_custom_limits = True
+            except (ValueError, TypeError, InvalidOperation):
+                continue
+
+        # If no individual resources have custom limits set, and the component provides
+        # a global limit_amount (e.g., hard cap for USAGE components), we return that.
+        if total_allocated == Decimal("0") and not has_custom_limits:
+            return global_limit
+
+        return total_allocated
+
+    # --- 2. HISTORICAL MONTH LOGIC ---
+    # For past months, the immutable InvoiceItem ledger is the source of truth.
+
+    # If the component is not a LIMIT type, it doesn't generate limit-based InvoiceItems.
+    # Therefore, its historical limit is simply the static global limit.
+    if component.billing_type != BillingTypes.LIMIT:
+        return global_limit
+
+    # Rule A: TOTAL Limits (Incremental billing)
+    # The system writes positive/negative diffs. We must calculate the cumulative sum.
+    if component.limit_period == LimitPeriods.TOTAL:
+        items_agg = (
+            InvoiceItem.objects.filter(plan_component__component=component)
+            .filter(
+                # All years before the target year, OR earlier/same month in the target year
+                Q(invoice__year__lt=year)
+                | Q(invoice__year=year, invoice__month__lte=month)
+            )
+            .aggregate(total=Sum("quantity"))
+        )
+
+        return Decimal(str(items_agg["total"] or 0))
+
+    # Rule B: QUARTERLY or ANNUAL Limits
+    # Invoice items are only generated in the first month of the cycle.
+    # To find the limit for an off-cycle month, we look back through the cycle window.
+    elif component.limit_period in (LimitPeriods.QUARTERLY, LimitPeriods.ANNUAL):
+        months_back = 3 if component.limit_period == LimitPeriods.QUARTERLY else 12
+        cycle_start = target_date - relativedelta(months=months_back - 1)
+
+        # Fetch items from the start of the cycle year onwards to ensure we catch the invoice
+        items = InvoiceItem.objects.filter(
+            plan_component__component=component,
+            invoice__year__gte=cycle_start.year,
+        ).select_related("invoice")
+
+        # We need to map {resource_id: latest_quantity}
+        # because a resource limit might have been updated during the cycle.
+        latest_allocations = {}
+
+        for item in items:
+            item_date = datetime.date(item.invoice.year, item.invoice.month, 1)
+
+            # Only consider items that fall in the lookback window exactly preceding the target month
+            if cycle_start <= item_date <= target_date:
+                resource_id = item.resource_id
+
+                if resource_id not in latest_allocations:
+                    latest_allocations[resource_id] = {
+                        "date": item_date,
+                        "qty": item.quantity,
+                    }
+                elif item_date > latest_allocations[resource_id]["date"]:
+                    latest_allocations[resource_id] = {
+                        "date": item_date,
+                        "qty": item.quantity,
+                    }
+
+        total_allocated = sum(data["qty"] for data in latest_allocations.values())
+        return Decimal(str(total_allocated or 0))
+
+    # Rule C: MONTH Limits (or unhandled fallback)
+    # Items are billed strictly every single month. We just sum the exact target month.
+    else:
+        items_agg = InvoiceItem.objects.filter(
+            plan_component__component=component,
+            invoice__year=year,
+            invoice__month=month,
+        ).aggregate(total=Sum("quantity"))
+
+        return Decimal(str(items_agg["total"] or 0))
 
 
 @shared_task
@@ -240,19 +731,114 @@ def terminate_resource(serialized_resource, serialized_user):
         raise exceptions.ResourceTerminateException(response.rendered_content)
 
 
+def _ready_for_scheduled_termination_filter() -> Q:
+    """Resources eligible for the daily end-date termination sweep.
+
+    Includes resources still in OK/ERRED, plus resources already stuck in
+    TERMINATING because an earlier termination request is awaiting consumer
+    approval (state=PENDING_CONSUMER) that the requester couldn't grant
+    themselves — otherwise such a resource would never be revisited by the
+    sweep, since it no longer matches state__in=(OK, ERRED).
+    """
+    return Q(state__in=(ResourceStates.OK, ResourceStates.ERRED)) | Q(
+        state=ResourceStates.TERMINATING,
+        order__type=OrderTypes.TERMINATE,
+        order__state=OrderStates.PENDING_CONSUMER,
+    )
+
+
 @shared_task(
     name="waldur_mastermind.marketplace.terminate_resources_if_project_end_date_has_been_reached"
 )
 def terminate_resources_if_project_end_date_has_been_reached():
-    """Terminate resources when their project has reached its end date (including grace period)."""
+    """Terminate resources when their project has reached its end date (including grace period).
+
+    Also pauses resources for projects currently in the grace period,
+    if the offering has supports_pausing=True in plugin_options.
+    """
     today = timezone.datetime.today().date()
 
+    # Single pass over projects with an end date: pause resources that are inside
+    # the grace period, and terminate resources whose offering opts out of the
+    # grace period once the raw end date is reached.
+    for project in structure_models.Project.available_objects.exclude(
+        end_date__isnull=True
+    ):
+        # Pause resources for projects currently IN grace period.
+        # Offerings that disable the grace period are excluded here — their
+        # resources are terminated on the project end date (see below), not paused.
+        if project.is_in_grace_period:
+            resources_to_pause = (
+                models.Resource.objects.filter(
+                    project=project,
+                    offering__plugin_options__supports_pausing=True,
+                    paused=False,
+                )
+                .exclude(
+                    state__in=(ResourceStates.TERMINATED, ResourceStates.TERMINATING),
+                )
+                # A plain .exclude(disable_grace_period=True) would also drop rows
+                # where the key is absent: the JSON lookup is SQL NULL and NOT(NULL)
+                # is NULL, so guard the value check with has_key to exclude only
+                # offerings that actually opted in.
+                .exclude(
+                    offering__plugin_options__has_key="disable_grace_period",
+                    offering__plugin_options__disable_grace_period=True,
+                )
+            )
+            for resource in resources_to_pause:
+                resource.paused = True
+                resource.save(update_fields=["paused"])
+                logger.info(
+                    "Resource %s paused due to project %s entering grace period",
+                    resource.uuid,
+                    project.uuid,
+                )
+                event_logger.emit(
+                    "Resource {resource_name} has been paused because "
+                    "project {project_name} has entered the grace period.",
+                    event_type=EventType.MARKETPLACE_RESOURCE_PAUSED,
+                    event_context={
+                        "resource": resource,
+                        "project": project,
+                    },
+                    scopes=[resource, project, project.customer],
+                )
+
+        # Terminate resources whose offering disables the grace period as soon as
+        # the project end date is reached, ignoring the grace window. Projects
+        # whose effective end date (incl. grace) has fully passed are handled by
+        # the expired-projects loop below (which terminates every resource), so
+        # restrict this to projects still inside their grace window to avoid
+        # scheduling the same resource twice.
+        effective_end_date = project.get_effective_end_date()
+        if (
+            project.end_date <= today
+            and effective_end_date
+            and effective_end_date > today
+        ):
+            grace_disabled_resources = models.Resource.objects.filter(
+                _ready_for_scheduled_termination_filter(),
+                project=project,
+                offering__parent=None,
+                offering__plugin_options__disable_grace_period=True,
+            ).distinct()
+            # schedule_resources_termination is a no-op on an empty queryset, so
+            # no explicit emptiness guard is needed here.
+            termination_comment = (
+                f"Project end date has been reached on {timezone.datetime.today()}; "
+                "grace period disabled for this offering."
+            )
+            utils.schedule_resources_termination(
+                grace_disabled_resources,
+                termination_comment=termination_comment,
+            )
+
     # Find projects where the effective end date (including grace period) has passed
-    # Use iterator for memory efficiency with large project counts
     expired_projects = []
     for project in structure_models.Project.available_objects.exclude(
         end_date__isnull=True
-    ).iterator(chunk_size=100):
+    ):
         if (
             project.get_effective_end_date()
             and project.get_effective_end_date() <= today
@@ -275,9 +861,9 @@ def terminate_resources_if_project_end_date_has_been_reached():
 
         # We expect that resources with parents will be removed when parents are removed
         terminatable_resources = project_resources.filter(
-            state__in=(ResourceStates.OK, ResourceStates.ERRED),
+            _ready_for_scheduled_termination_filter(),
             offering__parent=None,
-        )
+        ).distinct()
         logger.info(
             "About to terminate resources from expired project: %s",
             ",".join([f"{r.uuid}, {r.name}" for r in terminatable_resources]),
@@ -482,9 +1068,9 @@ def notify_about_stale_resource():
 def terminate_expired_resources():
     """Terminate marketplace resources that have reached their end date."""
     expired_resources = models.Resource.objects.filter(
+        _ready_for_scheduled_termination_filter(),
         end_date__lte=timezone.datetime.today(),
-        state__in=(ResourceStates.OK, ResourceStates.ERRED),
-    )
+    ).distinct()
     logger.info(
         "About to terminate expired resources: %s",
         ",".join([f"{r.uuid}, {r.name}" for r in expired_resources]),
@@ -493,6 +1079,70 @@ def terminate_expired_resources():
         expired_resources,
         termination_comment=f"Resource expired on {timezone.datetime.today()}",
     )
+
+
+@shared_task(
+    name="waldur_mastermind.marketplace.process_maintenance_announcement_transitions"
+)
+def process_maintenance_announcement_transitions():
+    """Advance scheduled maintenance announcements based on their time window.
+
+    Auto-starts scheduled announcements once their start time has passed and
+    auto-completes in-progress announcements once their end time has passed.
+    Mirrors the manual start/complete actions so the AdminAnnouncement banner is
+    refreshed by the existing post_save handler.
+    """
+    now = timezone.now()
+
+    # .order_by() clears the model's default ordering; row order is irrelevant.
+    to_start = models.MaintenanceAnnouncement.objects.filter(
+        state=MaintenanceState.SCHEDULED, scheduled_start__lte=now
+    ).order_by()
+    for maintenance in to_start:
+        try:
+            # Use the scheduled time, not now(): the task may run late or catch
+            # up after downtime, where now() would misrepresent the window.
+            maintenance.actual_start = maintenance.scheduled_start
+            maintenance.start_maintenance()
+            maintenance.save(update_fields=["state", "actual_start", "modified"])
+            logger.info(
+                "Auto-started maintenance announcement %s (%s).",
+                maintenance.uuid,
+                maintenance.name,
+            )
+        except TransitionNotAllowed:
+            # Benign race with a concurrent run or manual action; already moved on.
+            logger.debug(
+                "Skipping auto-start of maintenance announcement %s: no longer schedulable.",
+                maintenance.uuid,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to auto-start maintenance announcement %s.", maintenance.uuid
+            )
+
+    to_complete = models.MaintenanceAnnouncement.objects.filter(
+        state=MaintenanceState.IN_PROGRESS, scheduled_end__lte=now
+    ).order_by()
+    for maintenance in to_complete:
+        try:
+            maintenance.actual_end = maintenance.scheduled_end
+            maintenance.complete_maintenance()
+            maintenance.save(update_fields=["state", "actual_end", "modified"])
+            logger.info(
+                "Auto-completed maintenance announcement %s (%s).",
+                maintenance.uuid,
+                maintenance.name,
+            )
+        except TransitionNotAllowed:
+            logger.debug(
+                "Skipping auto-complete of maintenance announcement %s: no longer in progress.",
+                maintenance.uuid,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to auto-complete maintenance announcement %s.", maintenance.uuid
+            )
 
 
 @shared_task
@@ -542,14 +1192,45 @@ def notification_about_project_ending():
 
 @shared_task(name="waldur_mastermind.marketplace.notification_about_resource_ending")
 def notification_about_resource_ending():
-    """Send notifications about resources ending in 1 day and 7 days."""
-    date_1 = timezone.datetime.today().date() + datetime.timedelta(days=1)
-    date_7 = timezone.datetime.today().date() + datetime.timedelta(days=7)
-    expired_resources = models.Resource.objects.exclude(end_date__isnull=True).filter(
-        Q(end_date=date_1) | Q(end_date=date_7)
+    """Send notifications about resources ending in 1 day and 7 days.
+
+    "Ending" is the resource's effective end date — the earliest of its own end
+    date and the project-driven termination date. Resources whose offering
+    disables the grace period terminate on the raw project end date (earlier than
+    the project's effective end date that notification_about_project_ending
+    announces), so they are pulled in by their project's raw end date even without
+    an own end date — but only when the project has an actual grace window,
+    otherwise raw == effective and the project-ending notice already covers them.
+    """
+    today = timezone.datetime.today().date()
+    date_1 = today + datetime.timedelta(days=1)
+    date_7 = today + datetime.timedelta(days=7)
+
+    candidate_resources = (
+        models.Resource.objects.filter(
+            Q(end_date__in=(date_1, date_7))
+            | Q(
+                project__end_date__in=(date_1, date_7),
+                offering__parent=None,
+                offering__plugin_options__disable_grace_period=True,
+            )
+        )
+        .exclude(state__in=(ResourceStates.TERMINATED, ResourceStates.TERMINATING))
+        .select_related("project", "project__customer", "offering")
     )
 
-    for resource in expired_resources:
+    for resource in candidate_resources:
+        effective_end_date = resource.effective_end_date
+        if effective_end_date not in (date_1, date_7):
+            continue
+        # Resources pulled in only by their project's raw end date are
+        # grace-disabled; skip them when the project has no grace window, since
+        # then raw == the project's effective end date and the project-ending
+        # notice already covers them on the same day.
+        own_ending = resource.end_date in (date_1, date_7)
+        if not own_ending and resource.project.get_grace_period_days() <= 0:
+            continue
+
         users = (
             resource.project.get_users()
             .exclude(email="")
@@ -566,7 +1247,7 @@ def notification_about_resource_ending():
                 "resource_url": resource_url,
                 "resource": resource,
                 "user": user,
-                "delta": (resource.end_date - timezone.datetime.today().date()).days,
+                "delta": (effective_end_date - today).days,
             }
             core_utils.broadcast_mail(
                 "marketplace",
@@ -623,7 +1304,13 @@ def send_metrics():
     if installation_date_str:
         params["installation_date"] = installation_date_str
     url = config.TELEMETRY_URL + f"v{config.TELEMETRY_VERSION}/metrics/"
-    response = requests.post(url, json=params)
+    try:
+        response = requests.post(url, json=params, timeout=30)
+    except requests.RequestException as e:
+        # Telemetry is best-effort; network failures should not surface as
+        # task errors.
+        logger.warning("Failed to send telemetry metrics to %s: %s", url, e)
+        return None
 
     if response.status_code != 200:
         logger.warning(
@@ -1370,6 +2057,7 @@ def request_offering_user_deletion_for_user(user_uuid: str):
     offering_users_to_request_deletion = (
         models.OfferingUser.objects.filter(
             user=user,
+            offering__plugin_options__offering_user_auto_deletion=True,
             state__in=[
                 OfferingUserStates.OK,
                 OfferingUserStates.CREATING,
@@ -1401,6 +2089,7 @@ def request_offering_user_deletion_for_user(user_uuid: str):
     offering_users_not_provisioned = (
         models.OfferingUser.objects.filter(
             user=user,
+            offering__plugin_options__offering_user_auto_deletion=True,
             state__in=[
                 OfferingUserStates.CREATION_REQUESTED,
             ],
@@ -1427,6 +2116,113 @@ def request_offering_user_deletion_for_user(user_uuid: str):
         offering_user.save(update_fields=["state"])
 
 
+def _get_eligible_offerings_for_project(project):
+    """Return offerings in a project that support offering user creation."""
+    from waldur_mastermind.marketplace.handlers import (
+        OFFERING_USER_ALLOWED_OFFERING_TYPES,
+    )
+
+    resources = (
+        project.resource_set.filter(
+            offering__type__in=OFFERING_USER_ALLOWED_OFFERING_TYPES,
+        )
+        .filter(
+            Q(state=ResourceStates.OK)
+            | Q(
+                state=ResourceStates.CREATING,
+                order__type=OrderTypes.CREATE,
+                order__state__in=[
+                    OrderStates.PENDING_PROVIDER,
+                    OrderStates.EXECUTING,
+                ],
+            )
+        )
+        .distinct()
+    )
+    offering_ids = set(resources.values_list("offering_id", flat=True))
+    offerings = models.Offering.objects.filter(id__in=offering_ids)
+
+    return [
+        o
+        for o in offerings
+        if o.plugin_options.get("service_provider_can_create_offering_user")
+    ]
+
+
+def _create_or_restore_offering_user(user, offering):
+    """Create or restore a single offering user for a given user and offering."""
+    offering_user = models.OfferingUser.objects.filter(
+        offering=offering,
+        user=user,
+    ).first()
+
+    if offering_user:
+        # Restore offering user if it's in deletion flow
+        if offering_user.state in [
+            OfferingUserStates.DELETION_REQUESTED,
+            OfferingUserStates.DELETING,
+            OfferingUserStates.ERROR_DELETING,
+        ]:
+            old_state = offering_user.get_state_display()
+            if offering_user.username:
+                # Account exists on service provider - restore to OK
+                offering_user.set_ok()
+                offering_user.save(update_fields=["state"])
+                event_logger.emit(
+                    f"Account for user {offering_user.user.username} in offering {offering_user.offering.name} has been restored from {old_state} to OK because user regained project access.",
+                    event_type=EventType.MARKETPLACE_OFFERING_USER_UPDATED,
+                    event_context={"offering_user": offering_user},
+                    scopes=[
+                        offering_user.offering,
+                        offering_user.offering.customer,
+                    ],
+                )
+            else:
+                offering_user.state = OfferingUserStates.CREATION_REQUESTED
+                offering_user.save(update_fields=["state"])
+                event_logger.emit(
+                    f"Account creation for user {offering_user.user.username} in offering {offering_user.offering.name} has been requested (was in {old_state}) because user regained project access.",
+                    event_type=EventType.MARKETPLACE_OFFERING_USER_UPDATED,
+                    event_context={"offering_user": offering_user},
+                    scopes=[
+                        offering_user.offering,
+                        offering_user.offering.customer,
+                    ],
+                )
+        elif offering_user.state == OfferingUserStates.DELETED:
+            # DELETED state - request new account creation
+            offering_user.state = OfferingUserStates.CREATION_REQUESTED
+            offering_user.save(update_fields=["state"])
+            event_logger.emit(
+                f"New account creation for user {offering_user.user.username} in offering {offering_user.offering.name} has been requested because user regained project access after offering user was deleted.",
+                event_type=EventType.MARKETPLACE_OFFERING_USER_UPDATED,
+                event_context={"offering_user": offering_user},
+                scopes=[offering_user.offering, offering_user.offering.customer],
+            )
+        else:
+            logger.info("An offering user for %s in %s already exists", user, offering)
+        return
+
+    # Create new offering user
+    username = utils.generate_username(user, offering)
+    state = OfferingUserStates.OK if username else OfferingUserStates.CREATION_REQUESTED
+    offering_user, created = models.OfferingUser.objects.get_or_create(
+        offering=offering,
+        user=user,
+        defaults={
+            "username": username,
+            "state": state,
+        },
+    )
+    if not created:
+        logger.info("An offering user for %s in %s already exists", user, offering)
+        return
+    utils.setup_linux_related_data(offering_user, offering)
+    offering_user.save(update_fields=["backend_metadata"])
+
+    logger.info("The offering user %s has been created", offering_user)
+
+
 @shared_task(
     name="waldur_mastermind.marketplace.create_or_restore_offering_users_for_user"
 )
@@ -1435,96 +2231,32 @@ def create_or_restore_offering_users_for_user(user_uuid: str, project_uuid: str)
     Create or restore offering users when user gains project access.
     Handles both new creation and restoration of offering users in deletion states.
     """
-    from waldur_mastermind.marketplace.handlers import (
-        OFFERING_USER_ALLOWED_OFFERING_TYPES,
-    )
-
     user = User.objects.get(uuid=user_uuid)
     project = structure_models.Project.objects.get(uuid=project_uuid)
 
-    resources = project.resource_set.filter(
-        state=ResourceStates.OK,
-        offering__type__in=OFFERING_USER_ALLOWED_OFFERING_TYPES,
-    )
-    offering_ids = set(resources.values_list("offering_id", flat=True))
-    offerings = models.Offering.objects.filter(id__in=offering_ids)
+    for offering in _get_eligible_offerings_for_project(project):
+        _create_or_restore_offering_user(user, offering)
 
-    for offering in offerings:
-        if not offering.plugin_options.get("service_provider_can_create_offering_user"):
-            logger.info(
-                "It is not allowed to create users for current offering %s.", offering
-            )
-            continue
 
-        offering_user = models.OfferingUser.objects.filter(
-            offering=offering,
-            user=user,
-        ).first()
+@shared_task(
+    name="waldur_mastermind.marketplace.create_or_restore_offering_users_for_project"
+)
+def create_or_restore_offering_users_for_project(project_uuid: str):
+    """
+    Create or restore offering users for ALL users in a project.
+    More efficient than dispatching one task per user — queries
+    resources and offerings once instead of N times.
+    """
+    project = structure_models.Project.objects.get(uuid=project_uuid)
+    eligible_offerings = _get_eligible_offerings_for_project(project)
 
-        if offering_user:
-            # Restore offering user if it's in deletion flow
-            if offering_user.state in [
-                OfferingUserStates.DELETION_REQUESTED,
-                OfferingUserStates.DELETING,
-                OfferingUserStates.ERROR_DELETING,
-            ]:
-                old_state = offering_user.get_state_display()
-                if offering_user.username:
-                    # Account exists on service provider - restore to OK
-                    offering_user.set_ok()
-                    offering_user.save(update_fields=["state"])
-                    event_logger.emit(
-                        f"Account for user {offering_user.user.username} in offering {offering_user.offering.name} has been restored from {old_state} to OK because user regained project access.",
-                        event_type=EventType.MARKETPLACE_OFFERING_USER_UPDATED,
-                        event_context={"offering_user": offering_user},
-                        scopes=[
-                            offering_user.offering,
-                            offering_user.offering.customer,
-                        ],
-                    )
-                else:
-                    offering_user.state = OfferingUserStates.CREATION_REQUESTED
-                    offering_user.save(update_fields=["state"])
-                    event_logger.emit(
-                        f"Account creation for user {offering_user.user.username} in offering {offering_user.offering.name} has been requested (was in {old_state}) because user regained project access.",
-                        event_type=EventType.MARKETPLACE_OFFERING_USER_UPDATED,
-                        event_context={"offering_user": offering_user},
-                        scopes=[
-                            offering_user.offering,
-                            offering_user.offering.customer,
-                        ],
-                    )
-            elif offering_user.state == OfferingUserStates.DELETED:
-                # DELETED state - request new account creation
-                offering_user.state = OfferingUserStates.CREATION_REQUESTED
-                offering_user.save(update_fields=["state"])
-                event_logger.emit(
-                    f"New account creation for user {offering_user.user.username} in offering {offering_user.offering.name} has been requested because user regained project access after offering user was deleted.",
-                    event_type=EventType.MARKETPLACE_OFFERING_USER_UPDATED,
-                    event_context={"offering_user": offering_user},
-                    scopes=[offering_user.offering, offering_user.offering.customer],
-                )
-            else:
-                logger.info(
-                    "An offering user for %s in %s already exists", user, offering
-                )
-            continue
+    if not eligible_offerings:
+        return
 
-        # Create new offering user
-        username = utils.generate_username(user, offering)
-        state = (
-            OfferingUserStates.OK if username else OfferingUserStates.CREATION_REQUESTED
-        )
-        offering_user = models.OfferingUser.objects.create(
-            offering=offering,
-            user=user,
-            username=username,
-            state=state,
-        )
-        utils.setup_linux_related_data(offering_user, offering)
-        offering_user.save(update_fields=["backend_metadata"])
-
-        logger.info("The offering user %s has been created", offering_user)
+    users = project.get_users()
+    for user in users:
+        for offering in eligible_offerings:
+            _create_or_restore_offering_user(user, offering)
 
 
 @shared_task(name="waldur_mastermind.marketplace.cleanup_stale_offering_users")
@@ -1615,39 +2347,110 @@ def update_software_catalogs():
 
             logger.info(f"Updating {catalog_name} catalog")
 
-            # Create loader instance with error handling
-            try:
-                loader_class = catalog_config["loader_class"]
-                loader_kwargs = catalog_config["loader_kwargs"]
-                loader = loader_class(**loader_kwargs)
-            except Exception as loader_error:
-                raise Exception(
-                    f"Failed to initialize {catalog_name} loader: {loader_error}"
-                ) from loader_error
-
-            # Update catalog with full error isolation
-            try:
-                catalog = _update_catalog_with_error_handling(
-                    loader=loader,
-                    catalog_name=catalog_name,
-                    catalog_type=catalog_config["catalog_type"],
+            if catalog_name == "EESSI":
+                # EESSI: update ALL existing catalogs, each with its own version
+                eessi_catalogs = list(
+                    models.SoftwareCatalog.objects.filter(
+                        name="EESSI",
+                        catalog_type=catalog_config["catalog_type"],
+                    )
                 )
-            except Exception as update_error:
-                raise Exception(
-                    f"Failed to update {catalog_name} catalog: {update_error}"
-                ) from update_error
+                if not eessi_catalogs:
+                    results[catalog_name.lower()] = {
+                        "status": "skipped",
+                        "reason": "no_existing_catalog",
+                    }
+                    continue
 
-            # Record success
-            results[catalog_name.lower()] = {
-                "status": "success",
-                "catalog_uuid": str(catalog.uuid),
-                "catalog_name": catalog.name,
-                "catalog_version": catalog.version,
-                "last_update": catalog.last_successful_update.isoformat()
-                if catalog.last_successful_update
-                else None,
-            }
-            logger.info(f"{catalog_name} catalog update completed successfully")
+                updated_catalogs = []
+                for eessi_catalog in eessi_catalogs:
+                    try:
+                        loader_kwargs = dict(catalog_config["loader_kwargs"])
+                        loader_kwargs["catalog_version"] = eessi_catalog.version
+                        loader = catalog_config["loader_class"](**loader_kwargs)
+                    except Exception as loader_error:
+                        raise Exception(
+                            f"Failed to initialize {catalog_name} loader for version {eessi_catalog.version}: {loader_error}"
+                        ) from loader_error
+
+                    try:
+                        update_existing = (
+                            config.SOFTWARE_CATALOG_UPDATE_EXISTING_PACKAGES
+                        )
+                        eessi_catalog.last_update_attempt = timezone.now()
+                        eessi_catalog.save(update_fields=["last_update_attempt"])
+
+                        loader.load_catalog(
+                            update_existing=update_existing,
+                            dry_run=False,
+                            catalog=eessi_catalog,
+                            sync=True,
+                        )
+
+                        eessi_catalog.last_successful_update = timezone.now()
+                        eessi_catalog.update_errors = ""
+                        eessi_catalog.save(
+                            update_fields=["last_successful_update", "update_errors"]
+                        )
+                        updated_catalogs.append(eessi_catalog)
+                    except Exception as update_error:
+                        eessi_catalog.update_errors = (
+                            f"Catalog update failed: {update_error}"
+                        )
+                        eessi_catalog.save(update_fields=["update_errors"])
+                        raise Exception(
+                            f"Failed to update {catalog_name} catalog version {eessi_catalog.version}: {update_error}"
+                        ) from update_error
+
+                # Record success for all EESSI catalogs
+                results[catalog_name.lower()] = {
+                    "status": "success",
+                    "catalogs_updated": len(updated_catalogs),
+                    "catalog_versions": [c.version for c in updated_catalogs],
+                }
+                logger.info(
+                    f"{catalog_name} catalog update completed for {len(updated_catalogs)} catalog(s)"
+                )
+            else:
+                # Non-EESSI catalogs: use standard single-catalog update
+                try:
+                    loader_class = catalog_config["loader_class"]
+                    loader_kwargs = catalog_config["loader_kwargs"]
+                    loader = loader_class(**loader_kwargs)
+                except Exception as loader_error:
+                    raise Exception(
+                        f"Failed to initialize {catalog_name} loader: {loader_error}"
+                    ) from loader_error
+
+                try:
+                    catalog = _update_catalog_with_error_handling(
+                        loader=loader,
+                        catalog_name=catalog_name,
+                        catalog_type=catalog_config["catalog_type"],
+                    )
+                except Exception as update_error:
+                    raise Exception(
+                        f"Failed to update {catalog_name} catalog: {update_error}"
+                    ) from update_error
+
+                if catalog is None:
+                    results[catalog_name.lower()] = {
+                        "status": "skipped",
+                        "reason": "no_existing_catalog",
+                    }
+                    continue
+
+                # Record success
+                results[catalog_name.lower()] = {
+                    "status": "success",
+                    "catalog_uuid": str(catalog.uuid),
+                    "catalog_name": catalog.name,
+                    "catalog_version": catalog.version,
+                    "last_update": catalog.last_successful_update.isoformat()
+                    if catalog.last_successful_update
+                    else None,
+                }
+                logger.info(f"{catalog_name} catalog update completed successfully")
 
         except Exception as e:
             # Log error but continue with next catalog
@@ -1700,35 +2503,41 @@ def _update_catalog_with_error_handling(loader, catalog_name: str, catalog_type:
     """
     Helper to update catalog with proper error handling and logging.
 
+    Only updates existing catalogs — does not create new ones.
+    If no catalog exists for the given name+type, returns None so the
+    daily task skips it instead of producing orphaned catalog records.
+
     Args:
         loader: Catalog loader instance
         catalog_name: Name of the catalog
         catalog_type: Type of the catalog
 
     Returns:
-        Updated SoftwareCatalog instance
-
-    Raises:
-        Exception: If catalog update fails
+        Updated SoftwareCatalog instance, or None if no existing catalog found
     """
-    catalog = None
-    catalog_created = False
-
-    try:
-        # Find or create catalog record for tracking
-        # Lookup by name + catalog_type only - version is updated, not used as lookup key
-        catalog, catalog_created = models.SoftwareCatalog.objects.get_or_create(
+    # Lookup by name + catalog_type only - version is updated, not used as lookup key.
+    # Use filter().first() instead of get_or_create because the unique constraint
+    # includes version, so multiple catalogs with the same name+type but different
+    # versions may exist (PUHURI-PORTALS-EF7).
+    catalog = (
+        models.SoftwareCatalog.objects.filter(
             name=catalog_name,
             catalog_type=catalog_type,
-            defaults={
-                "version": loader.catalog_version,
-                "description": f"{catalog_name} software catalog",
-                "auto_update_enabled": True,
-            },
         )
+        .order_by("-modified")
+        .first()
+    )
 
+    if catalog is None:
+        logger.warning(
+            f"No existing {catalog_name} catalog found (type={catalog_type}). "
+            "Skipping update — create the catalog via the API or management command first."
+        )
+        return None
+
+    try:
         # Update version if it changed
-        if not catalog_created and catalog.version != loader.catalog_version:
+        if catalog.version != loader.catalog_version:
             catalog.version = loader.catalog_version
             catalog.save(update_fields=["version"])
 
@@ -1738,7 +2547,9 @@ def _update_catalog_with_error_handling(loader, catalog_name: str, catalog_type:
 
         # Perform the actual update
         update_existing = config.SOFTWARE_CATALOG_UPDATE_EXISTING_PACKAGES
-        stats = loader.load_catalog(update_existing=update_existing, dry_run=False)
+        stats = loader.load_catalog(
+            update_existing=update_existing, dry_run=False, catalog=catalog
+        )
 
         # Update success timestamp and clear errors
         catalog.last_successful_update = timezone.now()
@@ -1749,18 +2560,9 @@ def _update_catalog_with_error_handling(loader, catalog_name: str, catalog_type:
         return catalog
 
     except Exception as e:
-        # Handle catalog cleanup on failure
         error_msg = f"Catalog update failed: {e}"
-        if catalog:
-            if catalog_created:
-                # If we created the catalog object and update failed, remove it
-                catalog.delete()
-                logger.debug(f"Removed failed catalog object for {catalog_name}")
-            else:
-                # If catalog existed before, just log the error
-                catalog.update_errors = error_msg
-                catalog.save(update_fields=["update_errors"])
-
+        catalog.update_errors = error_msg
+        catalog.save(update_fields=["update_errors"])
         raise e
 
 
@@ -1792,6 +2594,152 @@ def _validate_catalog_config(catalog_config):
         errors.append("Catalog name is required")
 
     return errors
+
+
+def _get_catalog_configs():
+    """Return the list of known catalog configurations."""
+    return [
+        {
+            "name": "EESSI",
+            "enabled_setting": "SOFTWARE_CATALOG_EESSI_UPDATE_ENABLED",
+            "loader_class": EESSICatalogLoader,
+            "loader_kwargs": {
+                "catalog_name": "EESSI",
+                "catalog_version": config.SOFTWARE_CATALOG_EESSI_VERSION or "auto",
+                "api_base_url": config.SOFTWARE_CATALOG_EESSI_API_URL,
+                "include_extensions": config.SOFTWARE_CATALOG_EESSI_INCLUDE_EXTENSIONS,
+            },
+            "catalog_type": "binary_runtime",
+        },
+        {
+            "name": "Spack",
+            "enabled_setting": "SOFTWARE_CATALOG_SPACK_UPDATE_ENABLED",
+            "loader_class": SpackCatalogLoader,
+            "loader_kwargs": {
+                "catalog_name": "Spack",
+                "catalog_version": config.SOFTWARE_CATALOG_SPACK_VERSION or "auto",
+                "data_url": config.SOFTWARE_CATALOG_SPACK_DATA_URL,
+            },
+            "catalog_type": "source_package",
+        },
+    ]
+
+
+NAME_TO_CATALOG_TYPE = {
+    "EESSI": "binary_runtime",
+    "Spack": "source_package",
+}
+
+
+@shared_task(name="marketplace.import_software_catalog")
+def import_software_catalog(name, catalog_type):
+    """Import a new software catalog by creating the record and loading data.
+
+    Args:
+        name: Catalog name (e.g. "EESSI", "Spack")
+        catalog_type: Catalog type (e.g. "binary_runtime", "source_package")
+    """
+    logger.info(f"Importing software catalog: {name} ({catalog_type})")
+
+    catalog_configs = _get_catalog_configs()
+    catalog_config = next(
+        (
+            c
+            for c in catalog_configs
+            if c["name"] == name and c["catalog_type"] == catalog_type
+        ),
+        None,
+    )
+    if catalog_config is None:
+        raise ValueError(f"No loader configuration found for {name} ({catalog_type})")
+
+    loader_class = catalog_config["loader_class"]
+    loader_kwargs = catalog_config["loader_kwargs"]
+    loader = loader_class(**loader_kwargs)
+
+    catalog = models.SoftwareCatalog.objects.create(
+        name=name,
+        catalog_type=catalog_type,
+        version=loader.catalog_version,
+    )
+    catalog.last_update_attempt = timezone.now()
+    catalog.save(update_fields=["last_update_attempt"])
+
+    try:
+        update_existing = config.SOFTWARE_CATALOG_UPDATE_EXISTING_PACKAGES
+        loader.load_catalog(
+            update_existing=update_existing, dry_run=False, catalog=catalog
+        )
+
+        catalog.last_successful_update = timezone.now()
+        catalog.update_errors = ""
+        catalog.save(update_fields=["last_successful_update", "update_errors"])
+        logger.info(f"Successfully imported {name} catalog (uuid={catalog.uuid})")
+    except Exception as e:
+        error_msg = f"Catalog import failed: {e}"
+        catalog.update_errors = error_msg
+        catalog.save(update_fields=["update_errors"])
+        logger.error(error_msg, exc_info=True)
+        raise
+
+
+@shared_task(name="marketplace.update_single_software_catalog")
+def update_single_software_catalog(catalog_uuid_hex):
+    """Trigger an async update for a single existing software catalog.
+
+    Args:
+        catalog_uuid_hex: Hex string of the catalog UUID
+    """
+    catalog = models.SoftwareCatalog.objects.get(uuid=uuid_mod.UUID(catalog_uuid_hex))
+    logger.info(
+        f"Updating single software catalog: {catalog.name} ({catalog.catalog_type})"
+    )
+
+    catalog_configs = _get_catalog_configs()
+    catalog_config = next(
+        (
+            c
+            for c in catalog_configs
+            if c["name"] == catalog.name and c["catalog_type"] == catalog.catalog_type
+        ),
+        None,
+    )
+    if catalog_config is None:
+        raise ValueError(
+            f"No loader configuration found for {catalog.name} ({catalog.catalog_type})"
+        )
+
+    loader_class = catalog_config["loader_class"]
+    loader_kwargs = dict(catalog_config["loader_kwargs"])
+    # Use the catalog's stored version instead of auto-detecting.
+    # Without this, auto-detect picks the latest version (e.g. 2025.06)
+    # and older catalogs (e.g. 2023.06) never get their data loaded.
+    loader_kwargs["catalog_version"] = catalog.version
+    loader = loader_class(**loader_kwargs)
+
+    try:
+        update_existing = config.SOFTWARE_CATALOG_UPDATE_EXISTING_PACKAGES
+        catalog.last_update_attempt = timezone.now()
+        catalog.save(update_fields=["last_update_attempt"])
+
+        loader.load_catalog(
+            update_existing=update_existing,
+            dry_run=False,
+            catalog=catalog,
+            sync=True,
+        )
+
+        catalog.last_successful_update = timezone.now()
+        catalog.update_errors = ""
+        catalog.save(update_fields=["last_successful_update", "update_errors"])
+    except Exception as e:
+        error_msg = f"Catalog update failed: {e}"
+        logger.error(error_msg, exc_info=True)
+        catalog.update_errors = error_msg
+        catalog.save(update_fields=["update_errors"])
+        raise
+
+    logger.info(f"Successfully updated catalog {catalog.name} (uuid={catalog.uuid})")
 
 
 @shared_task(name="marketplace.cleanup_old_software_catalogs")
@@ -1907,10 +2855,17 @@ def _cleanup_duplicate_catalogs():
         )
 
         # Update OfferingSoftwareCatalog references to point to newest catalog
+        # Skip offerings that already link to the newest catalog
+        existing_offering_ids = models.OfferingSoftwareCatalog.objects.filter(
+            catalog=newest_catalog
+        ).values_list("offering_id", flat=True)
+
         for old_catalog in catalogs_to_delete:
-            updated = models.OfferingSoftwareCatalog.objects.filter(
-                catalog=old_catalog
-            ).update(catalog=newest_catalog)
+            updated = (
+                models.OfferingSoftwareCatalog.objects.filter(catalog=old_catalog)
+                .exclude(offering_id__in=existing_offering_ids)
+                .update(catalog=newest_catalog)
+            )
             if updated:
                 logger.info(
                     f"Migrated {updated} offering references from "
@@ -2154,3 +3109,290 @@ def reconcile_robot_account_access():
             f"Error during robot account access reconciliation: {e}", exc_info=True
         )
         raise
+
+
+@shared_task(
+    name="waldur_mastermind.marketplace.cleanup_usage_poll_records",
+)
+def cleanup_usage_poll_records():
+    """Delete ComponentUsagePollRecord entries older than the retention period."""
+    retention_months = getattr(config, "USAGE_POLL_RECORD_RETENTION_MONTHS", 3)
+    cutoff = timezone.now() - timedelta(days=retention_months * 30)
+    deleted, _ = models.ComponentUsagePollRecord.objects.filter(
+        last_poll_time__lt=cutoff
+    ).delete()
+    if deleted:
+        logger.info(
+            "Deleted %d stale usage poll records older than %s", deleted, cutoff
+        )
+
+
+def _revoke_user_roles_for_role_on_offering(role_id, offering):
+    """Revoke active UserRoles for the given role whose scope is a
+    Resource or ResourceProject under this offering. Used by the profile
+    reconcile tasks when a role leaves the catalog."""
+    resource_ct = ContentType.objects.get_for_model(models.Resource)
+    rp_ct = ContentType.objects.get_for_model(models.ResourceProject)
+
+    resource_ids = list(
+        models.Resource.objects.filter(offering=offering).values_list("id", flat=True)
+    )
+    if not resource_ids:
+        return
+
+    rp_ids = list(
+        models.ResourceProject.objects.filter(resource_id__in=resource_ids).values_list(
+            "id", flat=True
+        )
+    )
+
+    qs = UserRole.objects.filter(role_id=role_id, is_active=True).filter(
+        Q(content_type=resource_ct, object_id__in=resource_ids)
+        | Q(content_type=rp_ct, object_id__in=rp_ids)
+    )
+    for ur in qs:
+        ur.revoke(reason="Role removed from offering profile")
+
+
+@shared_task(
+    name="waldur_mastermind.marketplace.reconcile_offering_profile_availabilities",
+)
+def reconcile_offering_profile_availabilities(profile_id):
+    """Bring RoleAvailability rows in line with profile.roles for every
+    offering bound to this profile.
+
+    For each (offering, role-in-profile) pair, ensure a RoleAvailability
+    row exists. For (offering, removed-role) pairs, delete the
+    availability AND explicitly revoke active UserRoles on that offering's
+    Resources / ResourceProjects — bypassing the "last availability =
+    globally available" cascade rule that would otherwise leave them
+    intact.
+    """
+    try:
+        profile = models.OfferingProfile.objects.get(id=profile_id)
+    except models.OfferingProfile.DoesNotExist:
+        logger.info(
+            "OfferingProfile id=%s no longer exists; skip reconcile.", profile_id
+        )
+        return
+
+    offering_ct = ContentType.objects.get_for_model(models.Offering)
+    target_role_ids = set(profile.roles.values_list("id", flat=True))
+    offerings = list(profile.offerings.all())
+
+    for offering in offerings:
+        existing = RoleAvailability.objects.filter(
+            content_type=offering_ct, object_id=offering.id
+        )
+        existing_role_ids = set(existing.values_list("role_id", flat=True))
+
+        for role_id in target_role_ids - existing_role_ids:
+            RoleAvailability.objects.get_or_create(
+                role_id=role_id,
+                content_type=offering_ct,
+                object_id=offering.id,
+            )
+
+        # Drop availability rows for roles no longer in the profile catalog.
+        # Per design, profile-bound offerings own their role catalog
+        # exclusively (no mixing with custom roles), so any availability
+        # outside target_role_ids is stale.
+        stale_role_ids = list(
+            existing.exclude(role_id__in=target_role_ids).values_list(
+                "role_id", flat=True
+            )
+        )
+        for role_id in stale_role_ids:
+            _revoke_user_roles_for_role_on_offering(role_id, offering)
+        if stale_role_ids:
+            existing.filter(role_id__in=stale_role_ids).delete()
+
+
+@shared_task(
+    name="waldur_mastermind.marketplace.reconcile_offering_availabilities",
+)
+def reconcile_offering_availabilities(offering_id):
+    """Reconcile RoleAvailability rows for a single offering against its
+    current profile (if any). Used when offering.profile changes.
+
+    When an offering leaves a profile, all profile-derived availability
+    rows on that offering are deleted and matching UserRoles are revoked.
+    """
+    try:
+        offering = models.Offering.objects.get(id=offering_id)
+    except models.Offering.DoesNotExist:
+        return
+
+    offering_ct = ContentType.objects.get_for_model(models.Offering)
+    existing = RoleAvailability.objects.filter(
+        content_type=offering_ct, object_id=offering.id
+    )
+
+    if offering.profile is None:
+        # Offering left the profile — drop ALL availability rows for it.
+        # Per design, profile-bound offerings own their catalog
+        # exclusively, so on unbinding the offering returns to "no
+        # roles" until staff/owner re-creates them.
+        stale_role_ids = list(existing.values_list("role_id", flat=True))
+        for role_id in stale_role_ids:
+            _revoke_user_roles_for_role_on_offering(role_id, offering)
+        existing.delete()
+        return
+
+    profile_role_ids = set(offering.profile.roles.values_list("id", flat=True))
+    existing_role_ids = set(existing.values_list("role_id", flat=True))
+
+    for role_id in profile_role_ids - existing_role_ids:
+        RoleAvailability.objects.get_or_create(
+            role_id=role_id,
+            content_type=offering_ct,
+            object_id=offering.id,
+        )
+
+    # Drop rows not in the profile catalog (no mixing).
+    stale_role_ids = list(
+        existing.exclude(role_id__in=profile_role_ids).values_list("role_id", flat=True)
+    )
+    for role_id in stale_role_ids:
+        _revoke_user_roles_for_role_on_offering(role_id, offering)
+    if stale_role_ids:
+        existing.filter(role_id__in=stale_role_ids).delete()
+
+
+class _MarketplaceAwareServiceListPullTask(structure_tasks.ServiceListPullTask):
+    """ServiceListPullTask narrowed to ServiceSettings that are the scope of
+    at least one non-archived marketplace Offering."""
+
+    def get_pulled_objects(self):
+        qs = super().get_pulled_objects()
+        settings_ct = ContentType.objects.get_for_model(self.model)
+        referenced_ids = (
+            models.Offering.objects.filter(content_type=settings_ct)
+            .exclude(state=OfferingStates.ARCHIVED)
+            .values_list("object_id", flat=True)
+        )
+        return qs.filter(id__in=referenced_ids)
+
+
+class ServicePropertiesListPullTask(_MarketplaceAwareServiceListPullTask):
+    """Pull service properties from settings tied to live marketplace offerings."""
+
+    name = "waldur_mastermind.marketplace.ServicePropertiesListPullTask"
+    pull_task = structure_tasks.ServicePropertiesPullTask
+
+
+class ServiceResourcesListPullTask(_MarketplaceAwareServiceListPullTask):
+    """Pull resources from settings tied to live marketplace offerings."""
+
+    name = "waldur_mastermind.marketplace.ServiceResourcesListPullTask"
+    pull_task = structure_tasks.ServiceResourcesPullTask
+
+
+@shared_task(
+    name="waldur_mastermind.marketplace.send_resource_limit_change_request_notification"
+)
+def send_resource_limit_change_request_notification(request_uuid):
+    """Notify organization owners when a resource limit change request is created."""
+    try:
+        request = models.ResourceLimitChangeRequest.objects.get(uuid=request_uuid)
+    except models.ResourceLimitChangeRequest.DoesNotExist:
+        logger.warning(
+            "Resource limit change request %s not found, skipping notification",
+            request_uuid,
+        )
+        return
+
+    mails = request.resource.project.customer.get_owner_mails()
+    if not mails:
+        logger.info(
+            "No owner emails for customer %s, skipping resource limit change request notification",
+            request.resource.project.customer.uuid,
+        )
+        return
+
+    resource_url = core_utils.format_homeport_link(
+        "resource-details/{resource_uuid}/?tab=limit-change-requests",
+        resource_uuid=request.resource.uuid.hex,
+    )
+    context = {
+        "resource_limit_change_request": request,
+        "resource_url": resource_url,
+    }
+    core_utils.broadcast_mail(
+        "marketplace",
+        "notification_resource_limit_change_request_created",
+        context,
+        mails,
+    )
+
+
+@shared_task(
+    name="waldur_mastermind.marketplace.send_resource_limit_change_request_approved_notification"
+)
+def send_resource_limit_change_request_approved_notification(request_uuid):
+    """Notify the requester when their resource limit change request is approved."""
+    try:
+        request = models.ResourceLimitChangeRequest.objects.get(uuid=request_uuid)
+    except models.ResourceLimitChangeRequest.DoesNotExist:
+        logger.warning(
+            "Resource limit change request %s not found, skipping approved notification",
+            request_uuid,
+        )
+        return
+
+    if not request.created_by or not request.created_by.email:
+        return
+
+    if not request.created_by.notifications_enabled:
+        return
+
+    resource_url = core_utils.format_homeport_link(
+        "resource-details/{resource_uuid}/",
+        resource_uuid=request.resource.uuid.hex,
+    )
+    context = {
+        "resource_limit_change_request": request,
+        "resource_url": resource_url,
+    }
+    core_utils.broadcast_mail(
+        "marketplace",
+        "notification_resource_limit_change_request_approved",
+        context,
+        [request.created_by.email],
+    )
+
+
+@shared_task(
+    name="waldur_mastermind.marketplace.send_resource_limit_change_request_rejected_notification"
+)
+def send_resource_limit_change_request_rejected_notification(request_uuid):
+    """Notify the requester when their resource limit change request is rejected."""
+    try:
+        request = models.ResourceLimitChangeRequest.objects.get(uuid=request_uuid)
+    except models.ResourceLimitChangeRequest.DoesNotExist:
+        logger.warning(
+            "Resource limit change request %s not found, skipping rejected notification",
+            request_uuid,
+        )
+        return
+
+    if not request.created_by or not request.created_by.email:
+        return
+
+    if not request.created_by.notifications_enabled:
+        return
+
+    resource_url = core_utils.format_homeport_link(
+        "resource-details/{resource_uuid}/",
+        resource_uuid=request.resource.uuid.hex,
+    )
+    context = {
+        "resource_limit_change_request": request,
+        "resource_url": resource_url,
+    }
+    core_utils.broadcast_mail(
+        "marketplace",
+        "notification_resource_limit_change_request_rejected",
+        context,
+        [request.created_by.email],
+    )

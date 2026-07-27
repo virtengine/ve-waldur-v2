@@ -11,6 +11,7 @@ from waldur_mastermind.marketplace import models
 from waldur_mastermind.marketplace.enums import (
     VMWARE_VM_OFFERING,
     BillingTypes,
+    LimitPeriods,
 )
 from waldur_mastermind.marketplace.tests import factories
 from waldur_mastermind.marketplace.tests.test_offerings import BaseOfferingUpdateTest
@@ -128,6 +129,7 @@ class OfferingComponentCreateTest(BaseOfferingUpdateTest):
         self.assertEqual("cores", component.type)
         self.assertEqual("hours", component.measured_unit)
         self.assertEqual(BillingTypes.FIXED, component.billing_type)
+        self.assertEqual(LimitPeriods.MONTH, component.limit_period)
 
 
 class OfferingComponentUpdateTest(BaseOfferingUpdateTest):
@@ -167,6 +169,83 @@ class OfferingComponentUpdateTest(BaseOfferingUpdateTest):
         self.assertEqual("Cores", component.name)
         self.assertEqual("hours", component.measured_unit)
         self.assertEqual(BillingTypes.FIXED, component.billing_type)
+
+    def test_update_without_limit_period_preserves_existing_value(self):
+        component = factories.OfferingComponentFactory(
+            offering=self.offering,
+            type="node",
+            name="Compute",
+            measured_unit="node hours",
+            billing_type=BillingTypes.LIMIT,
+            limit_period=LimitPeriods.QUARTERLY,
+        )
+
+        response = self.update_offering_component(
+            {
+                "type": "node",
+                "name": "Compute",
+                "measured_unit": "node hours",
+                "billing_type": BillingTypes.LIMIT,
+                "uuid": component.uuid.hex,
+            },
+            "owner",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        component.refresh_from_db()
+        self.assertEqual(LimitPeriods.QUARTERLY, component.limit_period)
+
+    def test_update_with_null_limit_period_preserves_existing_value(self):
+        component = factories.OfferingComponentFactory(
+            offering=self.offering,
+            type="node",
+            name="Compute",
+            measured_unit="node hours",
+            billing_type=BillingTypes.LIMIT,
+            limit_period=LimitPeriods.QUARTERLY,
+        )
+
+        response = self.update_offering_component(
+            {
+                "type": "node",
+                "name": "Compute",
+                "measured_unit": "node hours",
+                "billing_type": BillingTypes.LIMIT,
+                "limit_period": None,
+                "uuid": component.uuid.hex,
+            },
+            "owner",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        component.refresh_from_db()
+        self.assertEqual(LimitPeriods.QUARTERLY, component.limit_period)
+
+    def test_update_with_limit_period_changes_value(self):
+        component = factories.OfferingComponentFactory(
+            offering=self.offering,
+            type="node",
+            name="Compute",
+            measured_unit="node hours",
+            billing_type=BillingTypes.LIMIT,
+            limit_period=LimitPeriods.QUARTERLY,
+        )
+
+        response = self.update_offering_component(
+            {
+                "type": "node",
+                "name": "Compute",
+                "measured_unit": "node hours",
+                "billing_type": BillingTypes.LIMIT,
+                "limit_period": LimitPeriods.MONTH,
+                "uuid": component.uuid.hex,
+            },
+            "owner",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        component.refresh_from_db()
+        self.assertEqual(LimitPeriods.MONTH, component.limit_period)
 
     def test_update_event_includes_changes(self):
         """
@@ -380,6 +459,48 @@ class OfferingComponentPrepaidValidationTest(BaseOfferingUpdateTest):
         component_to_update.refresh_from_db()
         self.assertTrue(component_to_update.is_prepaid)
         self.assertEqual(component_to_update.overage_component, overage_component)
+
+    def test_update_non_prepaid_component_with_null_prepaid_fields_succeeds(self):
+        # Regression for WAL-9908: frontend sends null for prepaid/renewal duration
+        # fields on non-prepaid components; null means "no constraint" and must be
+        # accepted instead of rejected as a "set" field.
+        component_to_update = factories.OfferingComponentFactory(
+            offering=self.offering, is_prepaid=False, type="to-update", name="old"
+        )
+
+        payload = {
+            "uuid": component_to_update.uuid.hex,
+            "name": "updated",
+            "is_prepaid": False,
+            "min_prepaid_duration": None,
+            "max_prepaid_duration": None,
+            "prepaid_duration_step": None,
+            "min_renewal_duration": None,
+            "max_renewal_duration": None,
+            "renewal_duration_step": None,
+        }
+
+        response = self.client.post(self.update_url, payload)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        component_to_update.refresh_from_db()
+        self.assertEqual(component_to_update.name, "updated")
+
+    def test_update_non_prepaid_component_with_set_prepaid_field_fails(self):
+        component_to_update = factories.OfferingComponentFactory(
+            offering=self.offering, is_prepaid=False, type="to-update"
+        )
+
+        payload = {
+            "uuid": component_to_update.uuid.hex,
+            "is_prepaid": False,
+            "min_prepaid_duration": 3,
+        }
+
+        response = self.client.post(self.update_url, payload)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("min_prepaid_duration", response.data)
 
 
 class OfferingComponentMigrationTest(BaseOfferingUpdateTest):

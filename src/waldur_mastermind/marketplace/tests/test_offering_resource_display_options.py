@@ -7,7 +7,7 @@ from waldur_mastermind.marketplace import serializers
 from waldur_mastermind.marketplace.tests import factories
 
 
-class OfferingResourceDisplayOptionsSerializerTest(test.APITransactionTestCase):
+class OfferingResourceDisplayOptionsSerializerTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
 
@@ -25,12 +25,21 @@ class OfferingResourceDisplayOptionsSerializerTest(test.APITransactionTestCase):
         self.assertEqual(
             validated_data.get("backend_id_display_label", "Backend ID"), "Backend ID"
         )
+        self.assertEqual(
+            validated_data.get("expose_inference_playground", False), False
+        )
+        self.assertEqual(
+            validated_data.get("require_effective_id_for_highlighted_display", False),
+            False,
+        )
 
     def test_serializer_custom_values(self):
         """Test that the serializer accepts custom values"""
         data = {
             "highlight_backend_id_display": True,
             "backend_id_display_label": "Custom Backend Identifier",
+            "require_effective_id_for_highlighted_display": True,
+            "expose_inference_playground": True,
         }
 
         serializer = serializers.OfferingResourceDisplayOptionsSerializer(data=data)
@@ -42,6 +51,10 @@ class OfferingResourceDisplayOptionsSerializerTest(test.APITransactionTestCase):
         self.assertEqual(
             validated_data["backend_id_display_label"], "Custom Backend Identifier"
         )
+        self.assertEqual(
+            validated_data["require_effective_id_for_highlighted_display"], True
+        )
+        self.assertEqual(validated_data["expose_inference_playground"], True)
 
     def test_serializer_boolean_validation(self):
         """Test that boolean field validates correctly"""
@@ -75,6 +88,7 @@ class OfferingResourceDisplayOptionsSerializerTest(test.APITransactionTestCase):
         data = {
             "highlight_backend_id_display": True,
             "backend_id_display_label": "System ID",
+            "require_effective_id_for_highlighted_display": True,
             # Include other plugin options to ensure compatibility
             "auto_approve_remote_orders": False,
         }
@@ -86,10 +100,13 @@ class OfferingResourceDisplayOptionsSerializerTest(test.APITransactionTestCase):
         validated_data = serializer.validated_data
         self.assertEqual(validated_data["highlight_backend_id_display"], True)
         self.assertEqual(validated_data["backend_id_display_label"], "System ID")
+        self.assertEqual(
+            validated_data["require_effective_id_for_highlighted_display"], True
+        )
         self.assertEqual(validated_data["auto_approve_remote_orders"], False)
 
 
-class OfferingResourceDisplayOptionsIntegrationTest(test.APITransactionTestCase):
+class OfferingResourceDisplayOptionsIntegrationTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_INTEGRATION)
@@ -255,4 +272,54 @@ class OfferingResourceDisplayOptionsIntegrationTest(test.APITransactionTestCase)
         self.assertEqual(
             self.offering.plugin_options["backend_id_display_label"],
             "Manager Set Label",
+        )
+
+    def test_staff_can_update_disabled_resource_actions(self):
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OfferingFactory.get_url(self.offering, "update_integration")
+        plugin_options = {
+            "disabled_resource_actions": ["terminate"],
+        }
+        response = self.client.post(url, {"plugin_options": plugin_options})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.offering.refresh_from_db()
+        self.assertEqual(
+            self.offering.plugin_options["disabled_resource_actions"], ["terminate"]
+        )
+
+    def test_owner_cannot_update_disabled_resource_actions(self):
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.OfferingFactory.get_url(self.offering, "update_integration")
+        plugin_options = {
+            "disabled_resource_actions": ["terminate"],
+        }
+        response = self.client.post(url, {"plugin_options": plugin_options})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("plugin_options", response.data)
+        self.assertEqual(
+            response.data["plugin_options"][0],
+            "Only staff can change list of disabled actions.",
+        )
+
+    def test_owner_can_update_other_plugin_options_with_same_disabled_actions(self):
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.OfferingFactory.get_url(self.offering, "update_integration")
+        # Set initial value for disabled_resource_actions
+        self.offering.plugin_options = {"disabled_resource_actions": ["terminate"]}
+        self.offering.save()
+
+        plugin_options = {
+            "disabled_resource_actions": ["terminate"],  # Same as before
+            "auto_approve_remote_orders": True,
+        }
+        response = self.client.post(url, {"plugin_options": plugin_options})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.offering.refresh_from_db()
+        self.assertEqual(
+            self.offering.plugin_options["auto_approve_remote_orders"], True
+        )
+        self.assertEqual(
+            self.offering.plugin_options["disabled_resource_actions"], ["terminate"]
         )

@@ -1,11 +1,13 @@
+from datetime import timedelta
 from urllib.parse import urlencode
 
 import factory.fuzzy
+from django.utils import timezone
 from rest_framework.authtoken import models as authtoken_models
 from rest_framework.reverse import reverse
 
 from waldur_core.core import models as core_models
-from waldur_core.core.enums import CoreStates
+from waldur_core.core.enums import CoreStates, ReviewStates
 from waldur_core.core.tests.types import BaseMetaFactory
 from waldur_core.core.utils import normalize_unicode
 from waldur_core.structure import models
@@ -19,6 +21,7 @@ class UserFactory(
 ):
     class Meta:
         model = core_models.User
+        skip_postgeneration_save = True
 
     username = factory.Sequence(lambda n: "john%s" % n)
     civil_number = factory.Sequence(lambda n: "%08d" % n)
@@ -45,6 +48,8 @@ class UserFactory(
     @factory.post_generation
     def query_field(self, create, extracted, **kwargs):
         self.query_field = normalize_unicode(self.first_name + " " + self.last_name)
+        if create:
+            self.save(update_fields=["query_field"])
 
     @classmethod
     def get_url(cls, user=None, action=None):
@@ -79,11 +84,13 @@ class SshPublicKeyFactory(
     user = factory.SubFactory(UserFactory)
     name = factory.Sequence(lambda n: "eduteams_%s" % n)
     public_key = factory.Sequence(
-        lambda n: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDDURXDP5YhOQUYoDuTxJ84DuzqMJYJqJ8+SZT28"
-        "TtLm5yBDRLKAERqtlbH2gkrQ3US58gd2r8H9jAmQOydfvgwauxuJUE4eDpaMWupqquMYsYLB5f+vVGhdZbbzfc6DTQ2rY"
-        "dknWoMoArlG7MvRMA/xQ0ye1muTv+mYMipnd7Z+WH0uVArYI9QBpqC/gpZRRIouQ4VIQIVWGoT6M4Kat5ZBXEa9yP+9du"
-        "D2C05GX3gumoSAVyAcDHn/xgej9pYRXGha4l+LKkFdGwAoXdV1z79EG1+9ns7wXuqMJFHM2KDpxAizV0GkZcojISvDwuh"
-        "vEAFdOJcqjyyH4%010d test" % n
+        lambda n: (
+            "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDDURXDP5YhOQUYoDuTxJ84DuzqMJYJqJ8+SZT28"
+            "TtLm5yBDRLKAERqtlbH2gkrQ3US58gd2r8H9jAmQOydfvgwauxuJUE4eDpaMWupqquMYsYLB5f+vVGhdZbbzfc6DTQ2rY"
+            "dknWoMoArlG7MvRMA/xQ0ye1muTv+mYMipnd7Z+WH0uVArYI9QBpqC/gpZRRIouQ4VIQIVWGoT6M4Kat5ZBXEa9yP+9du"
+            "D2C05GX3gumoSAVyAcDHn/xgej9pYRXGha4l+LKkFdGwAoXdV1z79EG1+9ns7wXuqMJFHM2KDpxAizV0GkZcojISvDwuh"
+            "vEAFdOJcqjyyH4%010d test" % n
+        )
     )
 
     @classmethod
@@ -260,6 +267,81 @@ class OrganizationGroupFactory(
         return "http://testserver" + reverse("organization-group-list")
 
 
+class AffiliatedOrganizationFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.AffiliatedOrganization],
+):
+    class Meta:
+        model = models.AffiliatedOrganization
+
+    name = factory.Sequence(lambda n: "AffiliatedOrganization_%s" % n)
+    code = factory.Sequence(lambda n: "AO%s" % n)
+    abbreviation = factory.Sequence(lambda n: "AO%s" % n)
+
+    @classmethod
+    def get_url(cls, affiliated_organization=None, action=None):
+        if affiliated_organization is None:
+            affiliated_organization = AffiliatedOrganizationFactory()
+        url = "http://testserver" + reverse(
+            "affiliated-organization-detail",
+            kwargs={"uuid": affiliated_organization.uuid.hex},
+        )
+        return url if action is None else url + action + "/"
+
+    @classmethod
+    def get_list_url(cls):
+        return "http://testserver" + reverse("affiliated-organization-list")
+
+
+class ScienceDomainFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.ScienceDomain],
+):
+    class Meta:
+        model = models.ScienceDomain
+
+    name = factory.Sequence(lambda n: "ScienceDomain_%s" % n)
+
+    @classmethod
+    def get_url(cls, science_domain=None, action=None):
+        if science_domain is None:
+            science_domain = ScienceDomainFactory()
+        url = "http://testserver" + reverse(
+            "science-domain-detail",
+            kwargs={"uuid": science_domain.uuid.hex},
+        )
+        return url if action is None else url + action + "/"
+
+    @classmethod
+    def get_list_url(cls):
+        return "http://testserver" + reverse("science-domain-list")
+
+
+class ScienceSubDomainFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.ScienceSubDomain],
+):
+    class Meta:
+        model = models.ScienceSubDomain
+
+    name = factory.Sequence(lambda n: "ScienceSubDomain_%s" % n)
+    domain = factory.SubFactory(ScienceDomainFactory)
+
+    @classmethod
+    def get_url(cls, science_sub_domain=None, action=None):
+        if science_sub_domain is None:
+            science_sub_domain = ScienceSubDomainFactory()
+        url = "http://testserver" + reverse(
+            "science-sub-domain-detail",
+            kwargs={"uuid": science_sub_domain.uuid.hex},
+        )
+        return url if action is None else url + action + "/"
+
+    @classmethod
+    def get_list_url(cls):
+        return "http://testserver" + reverse("science-sub-domain-list")
+
+
 class NotificationTemplateFactory(
     factory.django.DjangoModelFactory,
     metaclass=BaseMetaFactory[core_models.NotificationTemplate],
@@ -290,9 +372,11 @@ class NotificationFactory(
     metaclass=BaseMetaFactory[core_models.Notification],
 ):
     key = factory.Sequence(lambda n: "Notification_%s" % n)
+    enabled = True
 
     class Meta:
         model = core_models.Notification
+        skip_postgeneration_save = True
 
     @classmethod
     def get_url(cls, notification=None, action=None):
@@ -411,6 +495,35 @@ class ProjectPermissionReviewFactory(
     @classmethod
     def get_list_url(cls):
         return "http://testserver" + reverse("project-permissions-review-list")
+
+
+class ProjectEndDateChangeRequestFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.ProjectEndDateChangeRequest],
+):
+    class Meta:
+        model = models.ProjectEndDateChangeRequest
+
+    project = factory.SubFactory(ProjectFactory)
+    created_by = factory.SubFactory(UserFactory)
+    requested_end_date = factory.LazyFunction(
+        lambda: (timezone.now() + timedelta(days=30)).date()
+    )
+    state = ReviewStates.PENDING
+
+    @classmethod
+    def get_url(cls, request=None, action=None):
+        if request is None:
+            request = ProjectEndDateChangeRequestFactory()
+        url = "http://testserver" + reverse(
+            "project-end-date-change-request-detail",
+            kwargs={"uuid": request.uuid.hex},
+        )
+        return url if action is None else url + action + "/"
+
+    @classmethod
+    def get_list_url(cls):
+        return "http://testserver" + reverse("project-end-date-change-request-list")
 
 
 class UserAgreementFactory(

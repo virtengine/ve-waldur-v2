@@ -13,7 +13,7 @@ from waldur_mastermind.marketplace.tests import fixtures as marketplace_fixtures
 from waldur_mastermind.policy.models import SlurmPeriodicUsagePolicy
 
 
-class SlurmPeriodicUsagePolicySTOMPTest(test.APITransactionTestCase):
+class SlurmPeriodicUsagePolicySTOMPTest(test.APITestCase):
     """Test STOMP message emission for SLURM periodic usage policy."""
 
     def setUp(self):
@@ -131,7 +131,10 @@ class SlurmPeriodicUsagePolicySTOMPTest(test.APITransactionTestCase):
         settings = payload["settings"]
         self.assertIn("fairshare", settings)
         self.assertIn("grp_tres_mins", settings)  # Should use GrpTRESMins
-        self.assertIn("qos_threshold", settings)
+        # QoS state is no longer carried in the periodic-limits payload; it
+        # flows through resource.paused / resource.downscaled instead.
+        self.assertNotIn("qos_threshold", settings)
+        self.assertNotIn("grace_limit", settings)
 
         print("✅ STOMP message structure validated")
 
@@ -178,9 +181,10 @@ class SlurmPeriodicUsagePolicySTOMPTest(test.APITransactionTestCase):
             self.assertEqual(fairshare, expected_fairshare)
 
             # Validate TRES minutes: nodeHours component should be present
+            # With grace_ratio=0.2, SLURM limit is set at grace level (1.2x base)
             grp_tres_mins = settings["grp_tres_mins"]
             self.assertIn("nodeHours", grp_tres_mins)
-            expected_minutes = int(1150.0 * 60)
+            expected_minutes = int(1150.0 * 1.2 * 60)
             self.assertEqual(grp_tres_mins["nodeHours"], expected_minutes)
 
             print("✅ Settings calculation in STOMP message validated")
@@ -374,10 +378,11 @@ class SlurmPeriodicUsagePolicySTOMPTest(test.APITransactionTestCase):
         self.assertGreater(mock_publish_messages.call_count, 0)
         self.assertLessEqual(mock_publish_messages.call_count, len(resources))
 
-        # Performance assertion
+        # Performance assertion — use a generous threshold to avoid
+        # flaky failures on CI runners with variable load.
         avg_time = duration / len(resources)
         self.assertLess(
-            avg_time, 0.1, f"Policy application too slow: {avg_time:.3f}s per resource"
+            avg_time, 0.5, f"Policy application too slow: {avg_time:.3f}s per resource"
         )
 
         print("✅ STOMP message generation performance acceptable")
@@ -432,8 +437,9 @@ class SlurmPeriodicUsagePolicySTOMPTest(test.APITransactionTestCase):
             expected_fairshare = int(1150.0 // 3)
             self.assertEqual(fairshare, expected_fairshare)
 
+            # With grace_ratio=0.2, SLURM limit is set at grace level (1.2x base)
             grp_tres_mins = settings["grp_tres_mins"]["nodeHours"]
-            expected_minutes = int(1150.0 * 60)
+            expected_minutes = int(1150.0 * 1.2 * 60)
             self.assertEqual(grp_tres_mins, expected_minutes)
 
             print(f"  Applied fairshare: {fairshare}")
@@ -442,7 +448,7 @@ class SlurmPeriodicUsagePolicySTOMPTest(test.APITransactionTestCase):
             print("✅ Realistic carryover scenario STOMP message validated")
 
 
-class SlurmPeriodicUsagePolicyEventTest(test.APITransactionTestCase):
+class SlurmPeriodicUsagePolicyEventTest(test.APITestCase):
     """Test policy event triggering and STOMP messaging patterns."""
 
     def setUp(self):
@@ -642,7 +648,7 @@ class SlurmPeriodicUsagePolicyEventTest(test.APITransactionTestCase):
         print("✅ STOMP message format matches site agent expectations")
 
 
-class SlurmPeriodicUsagePolicyIntegrationTest(test.APITransactionTestCase):
+class SlurmPeriodicUsagePolicyIntegrationTest(test.APITestCase):
     """Integration tests between policy and STOMP messaging."""
 
     def setUp(self):

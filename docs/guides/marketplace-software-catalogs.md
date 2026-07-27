@@ -100,12 +100,14 @@ DJANGO_SETTINGS_MODULE=waldur_core.server.settings uv run waldur load_spack_cata
 
 ### What Gets Created
 
-Both loaders create:
+Both management commands create:
 
 - **SoftwareCatalog** entry with detected version and metadata
 - **SoftwarePackage** entries for each software package
 - **SoftwareVersion** entries for each package version
 - **SoftwareTarget** entries for architecture/platform combinations or build variants
+
+> **Management commands vs daily task:** Management commands (`load_eessi_catalog`, `load_spack_catalog`) will create new catalog records if none exist. The daily automated task (`update_software_catalogs`) only updates existing catalog records — it never creates new ones. This prevents orphaned catalogs from being auto-created when no offering references them.
 
 ## Automated Catalog Updates
 
@@ -117,14 +119,14 @@ Configure automated updates through constance settings:
 
 #### EESSI Settings
 
-- `SOFTWARE_CATALOG_EESSI_UPDATE_ENABLED`: Enable automated EESSI updates (default: true)
+- `SOFTWARE_CATALOG_EESSI_UPDATE_ENABLED`: Enable automated EESSI updates (default: **false**)
 - `SOFTWARE_CATALOG_EESSI_VERSION`: EESSI version to load (auto-detect if empty)
 - `SOFTWARE_CATALOG_EESSI_API_URL`: Base URL for EESSI API data
 - `SOFTWARE_CATALOG_EESSI_INCLUDE_EXTENSIONS`: Include Python/R extensions (default: true)
 
 #### Spack Settings
 
-- `SOFTWARE_CATALOG_SPACK_UPDATE_ENABLED`: Enable automated Spack updates (default: true)
+- `SOFTWARE_CATALOG_SPACK_UPDATE_ENABLED`: Enable automated Spack updates (default: **false**)
 - `SOFTWARE_CATALOG_SPACK_VERSION`: Spack version to load (auto-detect if empty)
 - `SOFTWARE_CATALOG_SPACK_DATA_URL`: URL for Spack repology.json data
 
@@ -138,10 +140,13 @@ Configure automated updates through constance settings:
 
 The `update_software_catalogs` task runs daily at 3 AM and:
 
-1. **Independent Processing**: Each catalog is updated independently - failures don't affect other catalogs
-2. **Configuration Validation**: Validates settings before attempting updates
-3. **Error Isolation**: Individual catalog failures are logged but don't prevent other updates
-4. **Comprehensive Logging**: Detailed logging for monitoring and troubleshooting
+1. **Updates only existing catalogs**: The task never creates new catalog records. If no catalog exists in the database for a given name/type, the task skips it with a warning. Create catalogs first via the API, management commands, or the `discover` endpoint to see what's available.
+2. **Independent Processing**: Each catalog is updated independently - failures don't affect other catalogs
+3. **Configuration Validation**: Validates settings before attempting updates
+4. **Error Isolation**: Individual catalog failures are logged but don't prevent other updates
+5. **Comprehensive Logging**: Detailed logging for monitoring and troubleshooting
+
+> **Note:** Both `SOFTWARE_CATALOG_EESSI_UPDATE_ENABLED` and `SOFTWARE_CATALOG_SPACK_UPDATE_ENABLED` default to `false`. Enable them explicitly after creating the initial catalog records.
 
 ### Manual Trigger
 
@@ -199,7 +204,7 @@ The new EESSI API format includes support for extension packages:
 - **Ruby gems**: Scientific Ruby libraries
 - **Octave packages**: Signal processing, optimization
 
-Extensions are linked to their parent software (e.g., Python packages linked to Python installation).
+Extensions are linked to their parent software packages via a many-to-many relationship. A single extension can belong to multiple parents (e.g., `adwaita-icon-theme` can be an extension of both GTK3 and GTK4). The EESSI loader collects parent information from all versions of an extension, not just the first.
 
 ### Spack Build Variants
 
@@ -235,6 +240,49 @@ The software catalog system provides the following API endpoints:
 - **marketplace-software-packages**: Browse software packages within catalogs
 - **marketplace-software-versions**: View software versions for packages
 - **marketplace-software-targets**: View architecture-specific installations
+
+### Discover Available Catalog Versions
+
+Staff users can check what catalog versions are available upstream without creating anything:
+
+```bash
+curl "https://your-waldur.example.com/api/marketplace-software-catalogs/discover/" \
+  -H "Authorization: Token your-token"
+```
+
+Example response:
+
+```json
+[
+  {
+    "name": "EESSI",
+    "catalog_type": "binary_runtime",
+    "latest_version": "2025.06",
+    "existing": true,
+    "existing_version": "2024.01",
+    "update_available": true
+  },
+  {
+    "name": "Spack",
+    "catalog_type": "source_package",
+    "latest_version": "2026.01.15",
+    "existing": false,
+    "existing_version": null,
+    "update_available": false
+  }
+]
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Catalog name (EESSI or Spack) |
+| `catalog_type` | string | Catalog type identifier |
+| `latest_version` | string or null | Detected upstream version, null if detection failed |
+| `existing` | boolean | Whether a catalog record exists in the database |
+| `existing_version` | string or null | Version of the existing catalog record |
+| `update_available` | boolean | True when upstream version differs from existing |
+
+This endpoint makes lightweight HTTP calls to the upstream sources (EESSI API, Spack repology) to detect the latest version. It does not download package data or modify the database. Requires staff permissions.
 
 ### Software Catalog Management Actions
 
@@ -298,6 +346,9 @@ curl "https://your-waldur.example.com/api/marketplace-software-packages/?extensi
 # Filter by extension name (e.g., packages bundling numpy)
 curl "https://your-waldur.example.com/api/marketplace-software-packages/?extension_name=numpy"
 
+# Filter extensions by parent package UUID
+curl "https://your-waldur.example.com/api/marketplace-software-packages/?parent_software_uuid=parent-uuid"
+
 # Order by catalog version
 curl "https://your-waldur.example.com/api/marketplace-software-packages/?o=catalog_version"
 ```
@@ -339,7 +390,10 @@ Example detailed response:
   "description": "Molecular dynamics simulation package...",
   "homepage": "https://www.gromacs.org/",
   "catalog": "abc-123-def-456",
+  "is_extension": false,
+  "parent_softwares": [],
   "version_count": 2,
+  "extension_count": 0,
   "versions": [
     {
       "uuid": "version-uuid-1",
@@ -373,14 +427,16 @@ Example detailed response:
           "target_type": "cpu_architecture",
           "target_name": "x86_64",
           "target_subtype": "generic",
-          "location": "/cvmfs/software.eessi.io/versions/2023.06/software/linux/x86_64/generic"
+          "location": "/cvmfs/software.eessi.io/versions/2023.06/software/linux/x86_64/generic",
+          "gpu_architectures": ["nvidia/cc70", "nvidia/cc80", "nvidia/cc90"]
         },
         {
           "uuid": "target-uuid-2",
           "target_type": "cpu_architecture",
           "target_name": "aarch64",
           "target_subtype": "generic",
-          "location": "/cvmfs/software.eessi.io/versions/2023.06/software/linux/aarch64/generic"
+          "location": "/cvmfs/software.eessi.io/versions/2023.06/software/linux/aarch64/generic",
+          "gpu_architectures": []
         }
       ]
     }
@@ -421,6 +477,70 @@ curl "https://your-waldur.example.com/api/marketplace-software-targets/?cpu_fami
 # Filter by CPU microarchitecture
 curl "https://your-waldur.example.com/api/marketplace-software-targets/?cpu_microarchitecture=generic"
 ```
+
+### GPU Architecture Filtering
+
+Software targets include a `gpu_architectures` field — a flat list of GPU architectures the target supports (e.g., `["nvidia/cc70", "nvidia/cc80", "nvidia/cc90"]`). This field is extracted from the nested `metadata["gpu_arch"]` structure for efficient filtering.
+
+#### Filter Packages by GPU Support
+
+```bash
+# Find packages with GPU-enabled builds
+curl "https://your-waldur.example.com/api/marketplace-software-packages/?has_gpu=true"
+
+# Find packages without GPU support
+curl "https://your-waldur.example.com/api/marketplace-software-packages/?has_gpu=false"
+
+# Find packages supporting a specific GPU architecture
+curl "https://your-waldur.example.com/api/marketplace-software-packages/?gpu_arch=nvidia/cc90"
+```
+
+#### Filter Versions by GPU Support
+
+```bash
+# Find versions with GPU-enabled builds
+curl "https://your-waldur.example.com/api/marketplace-software-versions/?has_gpu=true"
+
+# Find versions for a specific GPU architecture
+curl "https://your-waldur.example.com/api/marketplace-software-versions/?gpu_arch=nvidia/cc70"
+```
+
+#### Filter Targets by GPU Support
+
+```bash
+# Find targets with GPU architectures
+curl "https://your-waldur.example.com/api/marketplace-software-targets/?has_gpu=true"
+
+# Find targets supporting a specific GPU architecture
+curl "https://your-waldur.example.com/api/marketplace-software-targets/?gpu_arch=nvidia/cc80"
+```
+
+#### GPU Architecture in Responses
+
+Target responses include the `gpu_architectures` field:
+
+```json
+{
+  "uuid": "target-uuid",
+  "target_type": "cpu_architecture",
+  "target_name": "x86_64",
+  "target_subtype": "generic",
+  "location": "/cvmfs/software.eessi.io/versions/2023.06/software/linux/x86_64/generic",
+  "gpu_architectures": ["nvidia/cc70", "nvidia/cc80", "nvidia/cc90"],
+  "metadata": {
+    "full_arch": "x86_64/generic",
+    "gpu_arch": {
+      "x86_64/generic": ["nvidia/cc70", "nvidia/cc80", "nvidia/cc90"]
+    }
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `gpu_architectures` | array of strings | Flat list of supported GPU architectures (e.g., `nvidia/cc70`, `amd/gfx90a`) |
+| `has_gpu` | boolean filter | Filter by presence/absence of GPU support |
+| `gpu_arch` | string filter | Filter by specific GPU architecture string |
 
 ## Linking Catalogs to Offerings
 
@@ -506,7 +626,7 @@ The unified catalog loader framework follows this process:
 
 Both loaders handle:
 
-- **Extension packages**: Link child packages to parent software
+- **Extension packages**: Link child packages to one or more parent software packages
 - **Multiple architectures**: Support diverse target platforms
 - **Metadata preservation**: Store catalog-specific information
 - **Error recovery**: Continue processing despite individual failures
@@ -519,6 +639,7 @@ Both loaders handle:
 - **SoftwarePackage**: Only staff can manage package information
 - **SoftwareVersion**: Only staff can manage version data
 - **SoftwareTarget**: Only staff can manage target information
+- **Discover endpoint**: Only staff can query upstream sources for available versions
 
 ### Offering Integration (Offering Managers)
 
@@ -545,6 +666,9 @@ The EESSI loader uses the dict-based format from [EESSI API PR #11](https://gith
         {
           "version": "2024.4",
           "cpu_arch": ["x86_64/generic", "aarch64/generic"],
+          "gpu_arch": {
+            "x86_64/generic": ["nvidia/cc70", "nvidia/cc80", "nvidia/cc90"]
+          },
           "toolchain": {"name": "foss", "version": "2023b"},
           "toolchain_families_compatibility": ["2023b_foss"],
           "module": {
@@ -580,10 +704,13 @@ The EESSI loader uses the dict-based format from [EESSI API PR #11](https://gith
 |-------|------|-------------|
 | `module` | object | Structured module info: `full_module_name`, `module_name`, `module_version` |
 | `required_modules` | array of objects | Each with `full_module_name`, `module_name`, `module_version` |
+| `gpu_arch` | object | Map of CPU arch to GPU arch lists (e.g., `{"x86_64/generic": ["nvidia/cc70"]}`) |
 | `extensions` | array | Bundled packages with `type`, `name`, `version` |
 | `toolchain_families_compatibility` | array | Compatible toolchain families (e.g., `"2023b_foss"`) |
 
 #### Extension Structure
+
+In the EESSI API, each version of an extension references its parent software. The loader collects parent references from **all** versions, so an extension that references different parents across versions will be linked to all of them via the `parent_softwares` many-to-many relationship.
 
 ```json
 {
@@ -614,6 +741,20 @@ The EESSI loader uses the dict-based format from [EESSI API PR #11](https://gith
       ]
     }
   }
+}
+```
+
+The Waldur API response for extension packages includes a list of parent software objects:
+
+```json
+{
+  "uuid": "extension-uuid",
+  "name": "numpy",
+  "is_extension": true,
+  "parent_softwares": [
+    {"uuid": "parent-uuid-1", "name": "SciPy-bundle", "url": "https://..."},
+    {"uuid": "parent-uuid-2", "name": "Python", "url": "https://..."}
+  ]
 }
 ```
 
@@ -667,4 +808,5 @@ This includes:
 - SLURM partition model configuration
 - Partition management APIs (add, update, remove)
 - Partition-specific software catalog associations
-- CPU architecture targeting for different partitions
+- CPU/GPU architecture targeting for different partitions
+- Connecting software GPU requirements to partition capabilities

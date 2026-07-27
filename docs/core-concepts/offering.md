@@ -32,10 +32,10 @@ flowchart LR
         ROPT["options"]
     end
 
-    OO -->|"defines form"| OA
-    OA -->|"all values"| RA
-    OA -->|"filtered by"| RO
-    RO -->|"matching keys"| ROPT
+    OO -->|defines form| OA
+    OA -->|all values| RA
+    OA -->|filtered by| RO
+    RO -->|matching keys| ROPT
 
     style RA fill:#e1f5fe
     style ROPT fill:#c8e6c9
@@ -142,6 +142,65 @@ Defines which attributes can be modified after resource creation. When an order 
 
 Defines behavioral rules, constraints, and provider-specific settings. This is where most operational configuration lives.
 
+### backend_id_rules
+
+Defines per-offering validation rules for the `backend_id` field on resources. Supports format validation via regex and configurable uniqueness scopes. Default is `{}` (no validation, backward compatible). Empty `backend_id` values always bypass validation.
+
+```json
+{
+  "backend_id_rules": {
+    "format": {
+      "regex": "^[A-Z]{2}-\\d{6}$",
+      "description": "Must be 2 uppercase letters, dash, 6 digits"
+    },
+    "uniqueness": {
+      "scope": "offering",
+      "include_terminated": false
+    }
+  }
+}
+```
+
+Both `format` and `uniqueness` are optional top-level keys.
+
+**Format validation:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `format.regex` | string | Python regex pattern validated with `re.fullmatch`. Max 200 characters. Patterns with nested/adjacent quantifiers are rejected (ReDoS protection) |
+| `format.description` | string | Human-readable description shown in validation errors. Falls back to displaying the regex pattern |
+
+**Uniqueness configuration:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `uniqueness.scope` | string | — | Scope for uniqueness check (see table below) |
+| `uniqueness.include_terminated` | boolean | `true` | Whether terminated resources are included in the uniqueness check |
+
+**Uniqueness scopes:**
+
+| Scope | Description |
+|-------|-------------|
+| `offering` | Unique across resources of this offering |
+| `offering_group` | Unique across all offerings that share the same `offering.backend_id` (e.g. offerings attached to the same vcluster). Falls back to `offering` scope if the offering has no `backend_id` |
+| `service_provider` | Unique across all offerings of the same customer/service provider |
+| `service_provider_category` | Unique across all offerings of the same provider in the same category |
+
+**API endpoints:**
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/marketplace-provider-offerings/{uuid}/update_backend_id_rules/` | POST | Configure rules. Requires `UPDATE_OFFERING_OPTIONS` permission |
+| `/api/marketplace-provider-offerings/{uuid}/check_unique_backend_id/` | POST | Check a backend ID. Set `use_offering_rules: true` to validate format and uniqueness per configured rules |
+
+**Enforcement points:**
+
+- `set_backend_id` action (manual backend ID assignment)
+- `import_resource` action (resource import from external systems)
+- Not applied when backend systems automatically set `backend_id` via processors
+
+**Visibility:** `backend_id_rules` is exposed on the provider offering serializer but excluded from the public offering serializer.
+
 ## Plugin Options Reference
 
 ### Approval and Auto-Processing
@@ -201,6 +260,7 @@ With this configuration:
 | `can_restore_resource` | boolean | `false` | Allow restoring terminated resources |
 | `supports_downscaling` | boolean | `false` | Allow reducing resource limits |
 | `supports_pausing` | boolean | `false` | Allow pausing/resuming resources |
+| `restrict_deletion_with_active_resources` | boolean | `false` | Prevent offering deletion while it has non-terminated resources (applies to all users including staff) |
 
 **Example:**
 
@@ -209,7 +269,8 @@ With this configuration:
   "plugin_options": {
     "is_resource_termination_date_required": true,
     "default_resource_termination_offset_in_days": 90,
-    "max_resource_termination_offset_in_days": 365
+    "max_resource_termination_offset_in_days": 365,
+    "restrict_deletion_with_active_resources": true
   }
 }
 ```
@@ -221,6 +282,57 @@ With this configuration:
 | `create_orders_on_resource_option_change` | boolean | `false` | Create UPDATE orders when resource_options change |
 | `enable_purchase_order_upload` | boolean | `false` | Allow users to attach purchase orders |
 | `require_purchase_order_upload` | boolean | `false` | Require purchase order attachment |
+| `enable_provider_consumer_messaging` | boolean | `false` | Allow providers and consumers to exchange messages with attachments on pending orders |
+| `notify_about_provider_consumer_messages` | boolean | `false` | Send email notifications when providers or consumers exchange messages on pending orders. Requires `enable_provider_consumer_messaging` |
+
+### Resource Naming
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `resource_name_pattern` | string | none | Python format string for generating suggested resource names |
+
+When set, the `suggest_name` endpoint uses this pattern instead of the default `{customer_slug}-{project_slug}-{offering_slug}[-counter]` format.
+
+**Available variables:**
+
+| Variable | Description |
+|----------|-------------|
+| `{customer_name}` | Customer organization name |
+| `{customer_slug}` | Customer slug |
+| `{project_name}` | Project name |
+| `{project_slug}` | Project slug |
+| `{offering_name}` | Offering name |
+| `{offering_slug}` | Offering slug |
+| `{plan_name}` | Selected plan name (empty if no plan provided) |
+| `{counter}` | Incremental counter (empty for first resource, `2` for second, etc.) |
+| `{attributes[KEY]}` | Any order form attribute value (empty if the key is missing) |
+
+**Examples:**
+
+```json
+{
+  "plugin_options": {
+    "resource_name_pattern": "{project_slug}-{offering_slug}-{counter}"
+  }
+}
+```
+
+With attributes from the order form:
+
+```json
+{
+  "plugin_options": {
+    "resource_name_pattern": "{project_slug}-{attributes[environment]}-{counter}"
+  }
+}
+```
+
+Non-alphanumeric characters (except `-`, `_`, `.`) are replaced with hyphens; duplicate hyphens are collapsed; leading/trailing hyphens are stripped. If the pattern is malformed, the endpoint falls back to the default naming behavior.
+
+The related `resource_slug_template` option (e.g. `{project_slug}-{counter}`) generates a unique resource **slug**, which the Waldur Site Agent uses as the backend ID (e.g. the SLURM account name).
+
+!!! warning "Do not combine `resource_slug_template` with the `project_slug` account name policy"
+    For site-agent-managed offerings, the `account_name_generation_policy` plugin option (under [Offering Users](#offering-users-identity-management)) is an **alternative** way to make backend IDs unique. When it is set to `project_slug`, the agent **ignores the resource slug** and instead derives the backend ID from the project slug plus its own incrementing counter — producing IDs like `prefix-test-prj-01-2-31` even when the slug is already unique. If you configure a `resource_slug_template`, leave `account_name_generation_policy` **unset** so the unique slug is used directly.
 
 ### Display and UI
 
@@ -236,6 +348,7 @@ With this configuration:
 |--------|------|---------|-------------|
 | `service_provider_can_create_offering_user` | boolean | `false` | Allow provider to create offering-specific user accounts |
 | `username_generation_policy` | string | `"waldur_username"` | How usernames are generated: `waldur_username`, `anonymized`, `service_provider`, `full_name`, `freeipa`, `eduteams` |
+| `account_name_generation_policy` | string | none | Site-agent backend ID (e.g. SLURM account name) generation. Unset = use the resource slug as-is; `project_slug` = derive from the project slug with an incrementing counter. Do not combine with `resource_slug_template` (see [Resource Naming](#resource-naming)) |
 | `initial_uidnumber` | integer | `5000` | Starting UID for generated users |
 | `initial_primarygroup_number` | integer | `5000` | Starting GID for primary groups |
 | `initial_usergroup_number` | integer | `6000` | Starting GID for user groups |
@@ -337,6 +450,16 @@ When an order is created, the following `plugin_options` are validated:
 2. **`unique_resource_per_attribute`**: Checks if a non-terminated resource with the same attribute value exists
 3. **`minimal_team_count_for_provisioning`**: Validates project team size
 4. **`required_team_role_for_provisioning`**: Validates user has required role
+
+### Backend ID Validation
+
+When `backend_id_rules` is configured on the offering, the following checks run on `set_backend_id` and `import_resource`:
+
+1. If `backend_id` is empty, all validation is skipped
+2. **Format check**: If `format.regex` is set, the value must match using `re.fullmatch`
+3. **Uniqueness check**: If `uniqueness.scope` is set, a duplicate query runs against the configured scope
+
+The `check_unique_backend_id` endpoint performs the same checks when `use_offering_rules` is `true`, returning `is_unique` and `is_valid_format` fields in the response.
 
 ### Approval Flow
 

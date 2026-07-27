@@ -15,12 +15,17 @@ from django.test import TestCase
 from django.utils import timezone
 from freezegun import freeze_time
 
-from waldur_mastermind.marketplace.models import SoftwareCatalog
+from waldur_mastermind.marketplace.models import (
+    OfferingSoftwareCatalog,
+    SoftwareCatalog,
+)
 from waldur_mastermind.marketplace.tasks import (
     _update_catalog_with_error_handling,
     _validate_catalog_config,
+    cleanup_old_software_catalogs,
     update_software_catalogs,
 )
+from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 
 
 class CatalogTasksTest(TestCase):
@@ -46,6 +51,13 @@ class CatalogTasksTest(TestCase):
     @patch("requests.get")
     def test_successful_catalog_updates(self, mock_get):
         """Test successful update of all catalogs."""
+        # Pre-create catalogs — daily task only updates existing ones
+        SoftwareCatalog.objects.create(
+            name="EESSI", version="old", catalog_type="binary_runtime"
+        )
+        SoftwareCatalog.objects.create(
+            name="Spack", version="old", catalog_type="source_package"
+        )
 
         def mock_requests_side_effect(url, **kwargs):
             mock_response = Mock()
@@ -73,7 +85,7 @@ class CatalogTasksTest(TestCase):
         self.assertEqual(result["results"]["eessi"]["status"], "success")
         self.assertEqual(result["results"]["spack"]["status"], "success")
 
-        # Verify database objects were created
+        # Verify database objects still exist (updated, not re-created)
         self.assertEqual(SoftwareCatalog.objects.count(), 2)
 
         eessi_catalog = SoftwareCatalog.objects.get(name="EESSI")
@@ -91,6 +103,13 @@ class CatalogTasksTest(TestCase):
     @patch("requests.get")
     def test_partial_failure_resilience(self, mock_get):
         """Test that one catalog failure doesn't prevent others from updating."""
+        # Pre-create catalogs — daily task only updates existing ones
+        SoftwareCatalog.objects.create(
+            name="EESSI", version="old", catalog_type="binary_runtime"
+        )
+        SoftwareCatalog.objects.create(
+            name="Spack", version="old", catalog_type="source_package"
+        )
 
         def mock_requests_side_effect(url, **kwargs):
             mock_response = Mock()
@@ -120,8 +139,8 @@ class CatalogTasksTest(TestCase):
         self.assertEqual(result["results"]["eessi"]["status"], "error")
         self.assertEqual(result["results"]["spack"]["status"], "success")
 
-        # Verify that successful catalog still created database objects
-        self.assertEqual(SoftwareCatalog.objects.count(), 1)
+        # Verify both catalogs still exist
+        self.assertEqual(SoftwareCatalog.objects.count(), 2)
         spack_catalog = SoftwareCatalog.objects.get(name="Spack")
         self.assertEqual(spack_catalog.catalog_type, "source_package")
 
@@ -133,6 +152,11 @@ class CatalogTasksTest(TestCase):
     @patch("requests.get")
     def test_selective_catalog_updates(self, mock_get):
         """Test updating only enabled catalogs."""
+        # Pre-create Spack catalog — daily task only updates existing ones
+        SoftwareCatalog.objects.create(
+            name="Spack", version="old", catalog_type="source_package"
+        )
+
         mock_response = Mock()
         mock_response.json.return_value = self.spack_data
         mock_response.raise_for_status.return_value = None
@@ -165,6 +189,11 @@ class CatalogTasksTest(TestCase):
     @patch("requests.get")
     def test_configuration_validation_errors(self, mock_get):
         """Test that configuration validation prevents runtime errors."""
+        # Pre-create Spack catalog — daily task only updates existing ones
+        SoftwareCatalog.objects.create(
+            name="Spack", version="old", catalog_type="source_package"
+        )
+
         mock_response = Mock()
         mock_response.json.return_value = self.spack_data
         mock_response.raise_for_status.return_value = None
@@ -190,25 +219,25 @@ class CatalogTasksTest(TestCase):
         SOFTWARE_CATALOG_SPACK_UPDATE_ENABLED=True,
     )
     @patch("requests.get")
-    def test_all_catalogs_fail_scenario(self, mock_get):
-        """Test behavior when all catalogs fail to update."""
-        # All requests fail
+    def test_all_catalogs_skipped_when_none_exist(self, mock_get):
+        """Test that catalogs are skipped when no existing records found."""
+        # All requests fail — but it doesn't matter because there are no
+        # existing catalogs to update so _update_catalog_with_error_handling
+        # returns None before attempting any network calls.
         mock_get.side_effect = requests.exceptions.ConnectionError(
             "Network unreachable"
         )
 
-        # Run the master task
+        # Run the master task with no pre-existing catalogs
         result = update_software_catalogs()
 
-        # Verify failed status
-        self.assertEqual(result["status"], "failed")
+        # Both catalogs skipped because no existing catalog records
         self.assertEqual(result["catalogs_updated"], 0)
-        self.assertEqual(result["catalogs_failed"], 2)
-        self.assertEqual(result["catalogs_skipped"], 0)
+        self.assertEqual(result["catalogs_skipped"], 2)
 
-        # Verify all catalogs show error status
-        self.assertEqual(result["results"]["eessi"]["status"], "error")
-        self.assertEqual(result["results"]["spack"]["status"], "error")
+        # Verify individual skip reasons
+        self.assertEqual(result["results"]["eessi"]["status"], "skipped")
+        self.assertEqual(result["results"]["spack"]["status"], "skipped")
 
         # Verify no database objects were created
         self.assertEqual(SoftwareCatalog.objects.count(), 0)
@@ -258,6 +287,11 @@ class CatalogTasksTest(TestCase):
     @patch("waldur_mastermind.marketplace.tasks.EESSICatalogLoader")
     def test_loader_instantiation_error_handling(self, mock_loader_class):
         """Test handling of loader instantiation errors."""
+        # Pre-create EESSI catalog so the loader instantiation is attempted
+        SoftwareCatalog.objects.create(
+            name="EESSI", version="2023.06", catalog_type="binary_runtime"
+        )
+
         # Make loader instantiation fail
         mock_loader_class.side_effect = Exception("Loader initialization failed")
 
@@ -338,6 +372,54 @@ class CatalogTasksTest(TestCase):
         )
 
 
+class CatalogTaskSkipBehaviorTest(TestCase):
+    """Test that the daily task skips catalogs that don't exist in the database."""
+
+    def test_update_returns_none_when_no_catalog_exists(self):
+        """Test that _update_catalog_with_error_handling returns None for missing catalogs."""
+        mock_loader = Mock()
+        mock_loader.catalog_version = "2026.01"
+
+        result = _update_catalog_with_error_handling(
+            loader=mock_loader,
+            catalog_name="NonExistent",
+            catalog_type="binary_runtime",
+        )
+
+        self.assertIsNone(result)
+        # Loader should never be called when there's no catalog to update
+        mock_loader.load_catalog.assert_not_called()
+        # No catalog should have been created
+        self.assertEqual(SoftwareCatalog.objects.count(), 0)
+
+    @override_config(
+        SOFTWARE_CATALOG_EESSI_UPDATE_ENABLED=True,
+        SOFTWARE_CATALOG_SPACK_UPDATE_ENABLED=True,
+    )
+    @patch("waldur_mastermind.marketplace.tasks.EESSICatalogLoader")
+    @patch("waldur_mastermind.marketplace.tasks.SpackCatalogLoader")
+    def test_task_skips_catalogs_without_existing_records(
+        self, mock_spack_loader, mock_eessi_loader
+    ):
+        """Test that the master task reports skipped status for missing catalogs."""
+        mock_eessi_instance = Mock()
+        mock_eessi_instance.catalog_version = "2023.06"
+        mock_eessi_loader.return_value = mock_eessi_instance
+
+        mock_spack_instance = Mock()
+        mock_spack_instance.catalog_version = "latest"
+        mock_spack_loader.return_value = mock_spack_instance
+
+        # No pre-existing catalogs — both should be skipped
+        result = update_software_catalogs()
+
+        self.assertEqual(result["catalogs_updated"], 0)
+        self.assertEqual(result["catalogs_skipped"], 2)
+        self.assertEqual(result["results"]["eessi"]["reason"], "no_existing_catalog")
+        self.assertEqual(result["results"]["spack"]["reason"], "no_existing_catalog")
+        self.assertEqual(SoftwareCatalog.objects.count(), 0)
+
+
 class CatalogTaskPerformanceTest(TestCase):
     """Performance and resource usage tests for catalog tasks."""
 
@@ -367,6 +449,14 @@ class CatalogTaskPerformanceTest(TestCase):
     @patch("waldur_mastermind.marketplace.tasks.SpackCatalogLoader")
     def test_loader_isolation(self, mock_spack_loader, mock_eessi_loader):
         """Test that loaders are properly isolated from each other."""
+        # Pre-create catalogs — daily task only updates existing ones
+        SoftwareCatalog.objects.create(
+            name="EESSI", version="old", catalog_type="binary_runtime"
+        )
+        SoftwareCatalog.objects.create(
+            name="Spack", version="old", catalog_type="source_package"
+        )
+
         # Setup mock loaders
         mock_eessi_instance = Mock()
         mock_eessi_instance.catalog_version = "2023.06"
@@ -398,7 +488,15 @@ class CatalogTaskPerformanceTest(TestCase):
         self, mock_spack_loader, mock_eessi_loader
     ):
         """Test that first catalog failure doesn't prevent second catalog processing."""
-        # Setup EESSI to fail
+        # Pre-create both catalogs — daily task only updates existing ones
+        SoftwareCatalog.objects.create(
+            name="EESSI", version="2023.06", catalog_type="binary_runtime"
+        )
+        SoftwareCatalog.objects.create(
+            name="Spack", version="old", catalog_type="source_package"
+        )
+
+        # Setup EESSI to fail at loader instantiation (before catalog lookup)
         mock_eessi_loader.side_effect = Exception("EESSI network error")
 
         # Setup Spack to succeed
@@ -432,13 +530,18 @@ class CatalogTaskPerformanceTest(TestCase):
         self, mock_spack_loader, mock_eessi_loader
     ):
         """Test that second catalog failure is handled after first success."""
+        # Pre-create EESSI catalog — daily task only updates existing ones
+        SoftwareCatalog.objects.create(
+            name="EESSI", version="old", catalog_type="binary_runtime"
+        )
+
         # Setup EESSI to succeed
         mock_eessi_instance = Mock()
         mock_eessi_instance.catalog_version = "2023.06"
         mock_eessi_instance.load_catalog.return_value = {"packages_created": 10}
         mock_eessi_loader.return_value = mock_eessi_instance
 
-        # Setup Spack to fail
+        # Setup Spack to fail at loader instantiation (before catalog lookup)
         mock_spack_loader.side_effect = Exception("Spack parsing error")
 
         with override_config(
@@ -482,6 +585,134 @@ class CatalogTaskPerformanceTest(TestCase):
             self.assertIn("Configuration validation failed", catalog_result["error"])
 
 
+class EESSIMultiCatalogUpdateTest(TestCase):
+    """Test that daily task updates ALL existing EESSI catalogs, not just the most recent."""
+
+    def setUp(self):
+        self.fixtures_dir = Path(__file__).parent / "fixtures" / "catalog_data"
+        with open(self.fixtures_dir / "eessi_software_test.json") as f:
+            self.eessi_data = json.load(f)
+
+    @override_config(
+        SOFTWARE_CATALOG_EESSI_UPDATE_ENABLED=True,
+        SOFTWARE_CATALOG_SPACK_UPDATE_ENABLED=False,
+        SOFTWARE_CATALOG_EESSI_API_URL="https://test.eessi.io/",
+        SOFTWARE_CATALOG_UPDATE_EXISTING_PACKAGES=True,
+        SOFTWARE_CATALOG_EESSI_INCLUDE_EXTENSIONS=False,
+    )
+    @patch("requests.get")
+    def test_daily_update_updates_all_eessi_catalogs(self, mock_get):
+        """Test that update_software_catalogs updates ALL EESSI catalogs."""
+
+        def mock_requests_side_effect(url, **kwargs):
+            mock_response = Mock()
+            if "eessi" in url.lower():
+                mock_response.json.return_value = self.eessi_data
+            else:
+                mock_response.json.return_value = {}
+            mock_response.raise_for_status.return_value = None
+            return mock_response
+
+        mock_get.side_effect = mock_requests_side_effect
+
+        # Create two EESSI catalogs with different versions
+        catalog_2023 = SoftwareCatalog.objects.create(
+            name="EESSI",
+            version="2023.06",
+            catalog_type="binary_runtime",
+        )
+        catalog_2025 = SoftwareCatalog.objects.create(
+            name="EESSI",
+            version="2025.06",
+            catalog_type="binary_runtime",
+        )
+
+        result = update_software_catalogs()
+
+        # Both EESSI catalogs should be updated
+        self.assertEqual(result["results"]["eessi"]["status"], "success")
+        self.assertEqual(result["results"]["eessi"]["catalogs_updated"], 2)
+
+        # Verify both catalogs have been updated (have last_successful_update set)
+        catalog_2023.refresh_from_db()
+        catalog_2025.refresh_from_db()
+        self.assertIsNotNone(catalog_2023.last_successful_update)
+        self.assertIsNotNone(catalog_2025.last_successful_update)
+
+    @override_config(
+        SOFTWARE_CATALOG_EESSI_UPDATE_ENABLED=True,
+        SOFTWARE_CATALOG_SPACK_UPDATE_ENABLED=False,
+        SOFTWARE_CATALOG_EESSI_API_URL="https://test.eessi.io/",
+        SOFTWARE_CATALOG_UPDATE_EXISTING_PACKAGES=True,
+        SOFTWARE_CATALOG_EESSI_INCLUDE_EXTENSIONS=False,
+    )
+    @patch("requests.get")
+    def test_each_eessi_catalog_gets_correct_version_data(self, mock_get):
+        """Test that each EESSI catalog is loaded with its own version's data."""
+
+        def mock_requests_side_effect(url, **kwargs):
+            mock_response = Mock()
+            if "eessi" in url.lower():
+                mock_response.json.return_value = self.eessi_data
+            else:
+                mock_response.json.return_value = {}
+            mock_response.raise_for_status.return_value = None
+            return mock_response
+
+        mock_get.side_effect = mock_requests_side_effect
+
+        # Create two EESSI catalogs
+        catalog_2023 = SoftwareCatalog.objects.create(
+            name="EESSI",
+            version="2023.06",
+            catalog_type="binary_runtime",
+        )
+        catalog_2025 = SoftwareCatalog.objects.create(
+            name="EESSI",
+            version="2025.06",
+            catalog_type="binary_runtime",
+        )
+
+        update_software_catalogs()
+
+        # 2023.06 catalog should have ALL, AOFlagger, ASE, JupyterLab(4.0.5)
+        # but NOT NewTool2025
+        from waldur_mastermind.marketplace.models import SoftwarePackage
+
+        pkgs_2023 = set(
+            SoftwarePackage.objects.filter(catalog=catalog_2023).values_list(
+                "name", flat=True
+            )
+        )
+        self.assertIn("ALL", pkgs_2023)
+        self.assertIn("JupyterLab", pkgs_2023)
+        self.assertNotIn("NewTool2025", pkgs_2023)
+
+        # 2025.06 catalog should have JupyterLab(4.2.5) and NewTool2025
+        # but NOT ALL, AOFlagger, ASE
+        pkgs_2025 = set(
+            SoftwarePackage.objects.filter(catalog=catalog_2025).values_list(
+                "name", flat=True
+            )
+        )
+        self.assertNotIn("ALL", pkgs_2025)
+        self.assertIn("JupyterLab", pkgs_2025)
+        self.assertIn("NewTool2025", pkgs_2025)
+
+    @override_config(
+        SOFTWARE_CATALOG_EESSI_UPDATE_ENABLED=True,
+        SOFTWARE_CATALOG_SPACK_UPDATE_ENABLED=False,
+        SOFTWARE_CATALOG_EESSI_API_URL="https://test.eessi.io/",
+    )
+    @patch("requests.get")
+    def test_eessi_skipped_when_no_catalogs_exist(self, mock_get):
+        """Test that EESSI is skipped when no existing catalogs found."""
+        result = update_software_catalogs()
+
+        self.assertEqual(result["results"]["eessi"]["status"], "skipped")
+        self.assertEqual(result["results"]["eessi"]["reason"], "no_existing_catalog")
+
+
 class CatalogCleanupTasksTest(TestCase):
     """Test cases for software catalog cleanup task."""
 
@@ -512,7 +743,6 @@ class CatalogCleanupTasksTest(TestCase):
     )
     def test_cleanup_deletes_old_catalogs(self):
         """Test that cleanup deletes catalogs older than retention period."""
-        from waldur_mastermind.marketplace.tasks import cleanup_old_software_catalogs
 
         result = cleanup_old_software_catalogs()
 
@@ -533,7 +763,6 @@ class CatalogCleanupTasksTest(TestCase):
     @override_config(SOFTWARE_CATALOG_CLEANUP_ENABLED=False)
     def test_cleanup_disabled_does_nothing(self):
         """Test that cleanup does nothing when disabled."""
-        from waldur_mastermind.marketplace.tasks import cleanup_old_software_catalogs
 
         result = cleanup_old_software_catalogs()
 
@@ -552,8 +781,6 @@ class CatalogCleanupTasksTest(TestCase):
     def test_cleanup_respects_retention_days_setting(self):
         """Test that cleanup respects the retention days setting."""
         from datetime import timedelta
-
-        from waldur_mastermind.marketplace.tasks import cleanup_old_software_catalogs
 
         # Create a catalog that's 50 days old (should be deleted with 30 day retention)
         medium_old_catalog = SoftwareCatalog.objects.create(
@@ -587,7 +814,6 @@ class CatalogCleanupTasksTest(TestCase):
     )
     def test_cleanup_with_large_retention_keeps_all(self):
         """Test that cleanup keeps all catalogs when retention is very large."""
-        from waldur_mastermind.marketplace.tasks import cleanup_old_software_catalogs
 
         result = cleanup_old_software_catalogs()
 
@@ -606,8 +832,6 @@ class CatalogCleanupTasksTest(TestCase):
     def test_cleanup_removes_duplicate_catalogs(self):
         """Test that cleanup removes duplicate catalogs, keeping only the newest."""
         from datetime import timedelta
-
-        from waldur_mastermind.marketplace.tasks import cleanup_old_software_catalogs
 
         now = timezone.now()
 
@@ -652,3 +876,52 @@ class CatalogCleanupTasksTest(TestCase):
         self.assertFalse(
             SoftwareCatalog.objects.filter(pk=oldest_duplicate.pk).exists()
         )
+
+    @override_config(
+        SOFTWARE_CATALOG_CLEANUP_ENABLED=True, SOFTWARE_CATALOG_RETENTION_DAYS=200
+    )
+    def test_cleanup_duplicate_catalogs_with_overlapping_offering_links(self):
+        """Cleanup succeeds when an offering links to both newest and old duplicate catalogs."""
+        from datetime import timedelta
+
+        now = timezone.now()
+
+        older_duplicate = SoftwareCatalog.objects.create(
+            name="Spack",
+            version="2026.01.20",
+            catalog_type="source_package",
+            last_successful_update=now - timedelta(days=5),
+        )
+
+        offering = marketplace_factories.OfferingFactory()
+        newest_link = marketplace_factories.OfferingSoftwareCatalogFactory(
+            offering=offering,
+            catalog=self.recent_catalog,
+        )
+        marketplace_factories.OfferingSoftwareCatalogFactory(
+            offering=offering,
+            catalog=older_duplicate,
+        )
+
+        other_offering = marketplace_factories.OfferingFactory()
+        migrated_link = marketplace_factories.OfferingSoftwareCatalogFactory(
+            offering=other_offering,
+            catalog=older_duplicate,
+        )
+
+        result = cleanup_old_software_catalogs()
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["duplicates_deleted"], 1)
+
+        self.assertEqual(
+            OfferingSoftwareCatalog.objects.filter(offering=offering).count(),
+            1,
+        )
+        newest_link.refresh_from_db()
+        self.assertEqual(newest_link.catalog_id, self.recent_catalog.pk)
+
+        migrated_link.refresh_from_db()
+        self.assertEqual(migrated_link.catalog_id, self.recent_catalog.pk)
+
+        self.assertFalse(SoftwareCatalog.objects.filter(pk=older_duplicate.pk).exists())

@@ -4,10 +4,12 @@ from django.contrib.contenttypes.models import ContentType
 from django.db import models
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
+from model_utils import FieldTracker
 
 from waldur_core.checklist import enums as checklist_enums
 from waldur_core.checklist import models as checklist_models
 from waldur_core.core.models import ErrorMessageMixin, TimeStampedModel, User, UuidMixin
+from waldur_core.logging.mixins import LoggableMixin
 from waldur_core.permissions.enums import RoleEnum
 from waldur_core.structure import models as structure_models
 
@@ -65,7 +67,9 @@ class OnboardingQuestionMetadata(UuidMixin, TimeStampedModel):
         return f"{self.question.description[:50]} → {metadata_str}"
 
 
-class OnboardingVerification(UuidMixin, ErrorMessageMixin, TimeStampedModel):
+class OnboardingVerification(
+    UuidMixin, ErrorMessageMixin, TimeStampedModel, LoggableMixin
+):
     """
     Tracks company onboarding validation attempts.
 
@@ -145,12 +149,37 @@ class OnboardingVerification(UuidMixin, ErrorMessageMixin, TimeStampedModel):
         help_text=_("Customer created after successful validation"),
     )
 
+    tracker = FieldTracker(fields=["status"])
+
     class Meta:
         ordering = ["-created"]
 
     def __str__(self):
         method_display = self.validation_method or "manual"
         return f"Verification {self.uuid} - {method_display}/{self.legal_person_identifier or 'pending'} - {self.status}"
+
+    def get_log_fields(self):
+        """Define fields to include in event logs."""
+        return (
+            "uuid",
+            "user_full_name",
+            "user_username",
+            "legal_person_identifier",
+            "company_name",
+            "validation_method",
+            "status",
+            "country",
+        )
+
+    @property
+    def user_full_name(self):
+        """Return user's full name for logging."""
+        return self.user.full_name if self.user else "Unknown"
+
+    @property
+    def user_username(self):
+        """Return user's username for logging."""
+        return self.user.username if self.user else "Unknown"
 
     def get_or_create_checklist_completion(self, checklist_type):
         """
@@ -410,6 +439,7 @@ class OnboardingVerification(UuidMixin, ErrorMessageMixin, TimeStampedModel):
         # These should be pre-normalized by the backend (e.g., Estonian backend)
         address_from_api = self.verified_company_data.get("address")
         postal_from_api = self.verified_company_data.get("postal")
+        vat_number_from_api = self.verified_company_data.get("vat_number")
 
         # Prioritize API data from verified_company_data, fallback to checklist answers
         customer_data = {
@@ -421,15 +451,20 @@ class OnboardingVerification(UuidMixin, ErrorMessageMixin, TimeStampedModel):
                 or self.legal_name  # Third priority: stored legal_name
                 or f"Company {self.legal_person_identifier}"  # Fallback: generated name
             ),
-            "country": self.country or extracted["customer_data"].get("country"),
             "registration_code": self.legal_person_identifier,
         }
+
+        country = self.country or extracted["customer_data"].get("country")
+        if country:
+            customer_data["country"] = country
 
         # Add address and postal from API if available
         if address_from_api:
             customer_data["address"] = address_from_api
         if postal_from_api:
             customer_data["postal"] = postal_from_api
+        if vat_number_from_api:
+            customer_data["vat_code"] = vat_number_from_api
 
         # Add any additional fields from checklist answers
         for key, value in extracted["customer_data"].items():
@@ -440,8 +475,9 @@ class OnboardingVerification(UuidMixin, ErrorMessageMixin, TimeStampedModel):
         self.customer = structure_models.Customer.objects.create(**customer_data)
         self.save(update_fields=["customer"])
 
-        # Add user as customer owner
-        self.customer.add_user(self.user, RoleEnum.CUSTOMER_OWNER)
+        # Add user as customer owner. force=True: the creator must own the new
+        # organization even if that role is concealed for it.
+        self.customer.add_user(self.user, RoleEnum.CUSTOMER_OWNER, force=True)
 
         logger.info(
             "Customer (ID=%s) created from onboarding verification (UUID=%s)",

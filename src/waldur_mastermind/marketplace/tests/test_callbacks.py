@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from freezegun import freeze_time
 from rest_framework import test
 
@@ -5,11 +7,12 @@ from waldur_mastermind.common.utils import parse_datetime
 from waldur_mastermind.marketplace import callbacks, models
 from waldur_mastermind.marketplace.enums import OrderStates, OrderTypes, ResourceStates
 from waldur_mastermind.marketplace.tests import factories
+from waldur_mastermind.policy import models as policy_models
 from waldur_openstack.tests.factories import InstanceFactory
 
 
 @freeze_time("2018-11-01")
-class CallbacksTest(test.APITransactionTestCase):
+class CallbacksTest(test.APITestCase):
     def test_when_resource_is_created_new_period_is_opened(self):
         # Arrange
         start = parse_datetime("2018-11-01")
@@ -93,6 +96,27 @@ class CallbacksTest(test.APITransactionTestCase):
         period.refresh_from_db()
         self.assertEqual(period.end, end)
 
+    def test_terminate_deletes_api_key_rows(self):
+        # The Resource row survives termination (state=Terminated), so the
+        # ResourceApiKey FK cascade never fires. The callback must delete the key
+        # rows so no orphan OK key stays revealable after the gateway secret is gone.
+        resource = factories.ResourceFactory()
+        factories.OrderFactory(
+            state=OrderStates.EXECUTING,
+            type=OrderTypes.TERMINATE,
+            resource=resource,
+        )
+        models.ResourceApiKey.objects.create(
+            resource=resource, client_id="cid-1", state=models.ResourceApiKey.States.OK
+        )
+        models.ResourceApiKey.objects.create(
+            resource=resource, client_id="cid-2", state=models.ResourceApiKey.States.OK
+        )
+
+        callbacks.resource_deletion_succeeded(resource)
+
+        self.assertEqual(resource.api_keys.count(), 0)
+
     def test_when_resource_is_terminated_directly_old_period_is_closed(self):
         # Arrange
         start = parse_datetime("2018-10-01")
@@ -138,3 +162,198 @@ class CallbacksTest(test.APITransactionTestCase):
         order.refresh_from_db()
         self.assertEqual(order.error_message, error_message)
         self.assertEqual(order.error_traceback, error_traceback)
+
+
+@freeze_time("2018-11-01")
+class RestoreCallbacksTest(test.APITestCase):
+    def test_restore_succeeded_transitions_order_to_done(self):
+        resource = factories.ResourceFactory(state=ResourceStates.CREATING)
+        order = factories.OrderFactory(
+            state=OrderStates.EXECUTING,
+            type=OrderTypes.RESTORE,
+            resource=resource,
+        )
+
+        callbacks.resource_restore_succeeded(resource)
+
+        order.refresh_from_db()
+        self.assertEqual(order.state, OrderStates.DONE)
+
+    def test_restore_succeeded_sets_resource_ok(self):
+        resource = factories.ResourceFactory(state=ResourceStates.CREATING)
+        factories.OrderFactory(
+            state=OrderStates.EXECUTING,
+            type=OrderTypes.RESTORE,
+            resource=resource,
+        )
+
+        callbacks.resource_restore_succeeded(resource)
+
+        resource.refresh_from_db()
+        self.assertEqual(resource.state, ResourceStates.OK)
+
+    def test_restore_failed_sets_resource_erred(self):
+        resource = factories.ResourceFactory(state=ResourceStates.CREATING)
+        order = factories.OrderFactory(
+            state=OrderStates.EXECUTING,
+            type=OrderTypes.RESTORE,
+            resource=resource,
+        )
+
+        callbacks.resource_restore_failed(resource)
+
+        order.refresh_from_db()
+        self.assertEqual(order.state, OrderStates.ERRED)
+
+        resource.refresh_from_db()
+        self.assertEqual(resource.state, ResourceStates.ERRED)
+
+    def test_restore_canceled_sets_resource_terminated(self):
+        resource = factories.ResourceFactory(state=ResourceStates.CREATING)
+        order = factories.OrderFactory(
+            state=OrderStates.EXECUTING,
+            type=OrderTypes.RESTORE,
+            resource=resource,
+        )
+
+        callbacks.resource_restore_canceled(resource)
+
+        order.refresh_from_db()
+        self.assertEqual(order.state, OrderStates.CANCELED)
+
+        resource.refresh_from_db()
+        self.assertEqual(resource.state, ResourceStates.TERMINATED)
+
+    def test_sync_order_state_dispatches_restore_done(self):
+        resource = factories.ResourceFactory(state=ResourceStates.CREATING)
+        order = factories.OrderFactory(
+            state=OrderStates.EXECUTING,
+            type=OrderTypes.RESTORE,
+            resource=resource,
+        )
+
+        callbacks.sync_order_state(order, OrderStates.DONE)
+
+        order.refresh_from_db()
+        self.assertEqual(order.state, OrderStates.DONE)
+
+        resource.refresh_from_db()
+        self.assertEqual(resource.state, ResourceStates.OK)
+
+
+class LimitUpdateTriggersPolicyReevaluationTest(test.APITestCase):
+    def setUp(self):
+        self.offering = factories.OfferingFactory(
+            type="Marketplace.Slurm",
+            plugin_options={"supports_downscaling": True, "supports_pausing": True},
+        )
+        self.component = factories.OfferingComponentFactory(
+            offering=self.offering,
+            type="node-hours",
+            name="Node hours",
+            billing_type="limit",
+        )
+        self.resource = factories.ResourceFactory(
+            offering=self.offering,
+            state=ResourceStates.UPDATING,
+            limits={"node-hours": 1000},
+            downscaled=True,
+        )
+        self.policy = policy_models.SlurmPeriodicUsagePolicy.objects.create(
+            scope=self.offering,
+            actions="request_slurm_resource_downscaling,request_slurm_resource_pausing",
+            apply_to_all=True,
+            grace_ratio=0.2,
+            carryover_enabled=False,
+            period=3,
+        )
+        policy_models.OfferingComponentLimit.objects.create(
+            policy=self.policy,
+            component=self.component,
+            limit=1000,
+        )
+
+    def _create_update_order(self, **kwargs):
+        defaults = dict(
+            state=OrderStates.EXECUTING,
+            type=OrderTypes.UPDATE,
+            resource=self.resource,
+            offering=self.offering,
+            project=self.resource.project,
+        )
+        defaults.update(kwargs)
+        return factories.OrderFactory(**defaults)
+
+    @patch("waldur_mastermind.policy.tasks.evaluate_resource_against_policy.delay")
+    def test_limit_increase_on_downscaled_resource_triggers_reevaluation(
+        self, mock_delay
+    ):
+        order = self._create_update_order(limits={"node-hours": 2000})
+
+        with self.captureOnCommitCallbacks(execute=True):
+            callbacks.resource_update_succeeded(order.resource)
+
+        mock_delay.assert_called_once_with(
+            str(self.resource.uuid), str(self.policy.uuid)
+        )
+
+    @patch("waldur_mastermind.policy.tasks.evaluate_resource_against_policy.delay")
+    def test_limit_increase_on_paused_resource_triggers_reevaluation(self, mock_delay):
+        self.resource.downscaled = False
+        self.resource.paused = True
+        self.resource.save()
+
+        order = self._create_update_order(limits={"node-hours": 2000})
+
+        with self.captureOnCommitCallbacks(execute=True):
+            callbacks.resource_update_succeeded(order.resource)
+
+        mock_delay.assert_called_once_with(
+            str(self.resource.uuid), str(self.policy.uuid)
+        )
+
+    @patch("waldur_mastermind.policy.tasks.evaluate_resource_against_policy.delay")
+    def test_limit_increase_on_normal_resource_does_not_trigger_reevaluation(
+        self, mock_delay
+    ):
+        self.resource.downscaled = False
+        self.resource.paused = False
+        self.resource.save()
+
+        order = self._create_update_order(limits={"node-hours": 2000})
+
+        with self.captureOnCommitCallbacks(execute=True):
+            callbacks.resource_update_succeeded(order.resource)
+
+        mock_delay.assert_not_called()
+
+    @patch("waldur_mastermind.policy.tasks.evaluate_resource_against_policy.delay")
+    def test_plan_change_without_limit_change_does_not_trigger_reevaluation(
+        self, mock_delay
+    ):
+        new_plan = factories.PlanFactory()
+        order = self._create_update_order(plan=new_plan)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            callbacks.resource_update_succeeded(order.resource)
+
+        mock_delay.assert_not_called()
+
+    @patch("waldur_mastermind.policy.tasks.evaluate_resource_against_policy.delay")
+    def test_limit_change_with_non_limit_component_key_does_not_raise(self, mock_delay):
+        # The resource may carry limits for keys that are not limit components
+        # (e.g. usage-based components); building the email context must not crash.
+        self.resource.limits = {"node-hours": 1000, "max_tokens": 1000000000}
+        self.resource.save()
+
+        order = self._create_update_order(
+            limits={"node-hours": 2000, "max_tokens": 1000000000}
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            callbacks.resource_update_succeeded(order.resource)
+
+        order.resource.refresh_from_db()
+        self.assertEqual(
+            order.resource.limits, {"node-hours": 2000, "max_tokens": 1000000000}
+        )

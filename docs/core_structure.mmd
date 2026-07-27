@@ -27,9 +27,17 @@ classDiagram
         +string vat_name
         +string vat_address
         +string country
+        +string address
+        +string contact_details
+        +string city
+        +string state
+        +string parish
+        +string street
+        +string house_nr
+        +string apartment_nr
+        +string household
         +string native_name
         +string abbreviation
-        +string contact_details
         +string agreement_number
         +int sponsor_number
         +string email
@@ -39,7 +47,6 @@ classDiagram
         +string registration_code
         +string homepage
         +string domain
-        +string address
         +string postal
         +string bank_name
         +string bank_account
@@ -52,7 +59,9 @@ classDiagram
         +bool display_billing_info_in_projects
         +Checklist project_metadata_checklist [FK]
         +int grace_period_days
+        +string project_slug_template
         +OrganizationGroup organization_groups
+        +AffiliatedOrganization default_affiliations
     }
     class ProjectType {
         +int id [PK]
@@ -82,6 +91,7 @@ classDiagram
         +date start_date
         +date end_date
         +User end_date_requested_by [FK]
+        +datetime end_date_updated_at
         +ProjectType type [FK]
         +bool is_industry
         +Customer customer [FK]
@@ -89,6 +99,8 @@ classDiagram
         +JSONField termination_metadata
         +string staff_notes
         +int grace_period_days
+        +AffiliatedOrganization affiliation [FK]
+        +ScienceSubDomain science_sub_domain [FK]
     }
     Customer "*" -- "*" OrganizationGroup : organization_groups
     OrganizationGroup "*" -- "1" OrganizationGroup : parent

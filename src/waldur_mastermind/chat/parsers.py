@@ -1,6 +1,4 @@
-import json
 import logging
-import re
 from collections.abc import Generator
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -8,43 +6,6 @@ from enum import Enum, auto
 from waldur_mastermind.chat.ui_registry import ui_registry
 
 logger = logging.getLogger(__name__)
-
-
-def parse_tool_call(content):
-    """
-    Try to parse a tool call from LLM response content.
-    Handles cases where LLM adds prefix text or wraps in markdown.
-    """
-    content = content.strip()
-
-    # Strip markdown code blocks if present
-    if content.startswith("```"):
-        content = re.sub(r"^```\w*\s*", "", content)
-        content = re.sub(r"\s*```$", "", content)
-        content = content.strip()
-
-    # Try parsing as-is first (handles clean JSON responses)
-    try:
-        data = json.loads(content)
-        if isinstance(data, dict) and "tool" in data:
-            return data
-    except json.JSONDecodeError:
-        pass
-
-    # Try to extract JSON from content with prefix/suffix text
-    # Match JSON objects that contain "tool" key
-    json_pattern = r'\{[^{}]*"tool"\s*:\s*"[^"]+"[^{}]*\}'
-    matches = re.finditer(json_pattern, content)
-
-    for match in matches:
-        try:
-            data = json.loads(match.group(0))
-            if isinstance(data, dict) and "tool" in data and "arguments" in data:
-                return data
-        except json.JSONDecodeError:
-            continue
-
-    return None
 
 
 class ParserState(Enum):
@@ -91,7 +52,7 @@ class StreamParser:
         self._trailing_backticks = ""  # Last 1-2 chars (potential partial fence)
         self._incomplete_fence = None  # Complete fence awaiting tag determination
 
-    def parse(self, chunk: str) -> Generator[dict, None, None]:
+    def parse(self, chunk: str) -> Generator[dict]:
         """
         Parse a chunk of streaming markdown text.
         Yields: UI component dictionaries for rendering
@@ -120,7 +81,7 @@ class StreamParser:
         # Flush text buffer if it's large enough
         yield from self._flush_text_if_threshold_met()
 
-    def flush(self) -> Generator[dict, None, None]:
+    def flush(self) -> Generator[dict]:
         """Force flush all buffers at end of stream."""
         # Treat incomplete fence as regular text
         if self._incomplete_fence:
@@ -171,7 +132,7 @@ class StreamParser:
 
     def _handle_fence_crossing(
         self, segment: str, is_last_segment: bool
-    ) -> Generator[dict, None, None]:
+    ) -> Generator[dict]:
         """
         Handle crossing a fence delimiter (```).
 
@@ -222,9 +183,7 @@ class StreamParser:
 
         return TagExtractionResult(None, "", needs_more_data=True)
 
-    def _open_block(
-        self, tag: str, initial_content: str
-    ) -> Generator[dict, None, None]:
+    def _open_block(self, tag: str, initial_content: str) -> Generator[dict]:
         """
         Transition to INSIDE_BLOCK state and emit loading indicator.
         """
@@ -239,7 +198,7 @@ class StreamParser:
         # Emit loading indicator if block type supports it
         yield from self._emit_loading_indicator(tag)
 
-    def _close_current_block(self) -> Generator[dict, None, None]:
+    def _close_current_block(self) -> Generator[dict]:
         """
         Transition to OUTSIDE_BLOCK state and emit the completed block.
         """
@@ -251,7 +210,7 @@ class StreamParser:
         self._block_buffer = []
         self._current_block_tag = None
 
-    def _flush_text_if_threshold_met(self) -> Generator[dict, None, None]:
+    def _flush_text_if_threshold_met(self) -> Generator[dict]:
         if self._state == ParserState.INSIDE_BLOCK:
             return
 
@@ -259,7 +218,7 @@ class StreamParser:
         if buffered_size >= self.MIN_CHUNK_SIZE:
             yield from self._flush_text_buffer()
 
-    def _flush_text_buffer(self) -> Generator[dict, None, None]:
+    def _flush_text_buffer(self) -> Generator[dict]:
         """Emit buffered text as markdown and clear buffer."""
         if not self._text_buffer:
             return
@@ -270,12 +229,8 @@ class StreamParser:
         ui_component = ui_registry.create_content("markdown", {"c": content})
         yield self._to_ui_dict(ui_component)
 
-    def _render_block_content(
-        self, tag: str, content: str
-    ) -> Generator[dict, None, None]:
-        """
-        Render a code block using UI registry with fallback.
-        """
+    def _render_block_content(self, tag: str, content: str) -> Generator[dict]:
+        """Render a code block using UI registry with fallback."""
         try:
             ui_component = ui_registry.create_content_from_block(
                 {"c": content, "t": tag}
@@ -290,7 +245,7 @@ class StreamParser:
             ui_component = ui_registry.create_content("code", {"c": content, "t": tag})
             yield self._to_ui_dict(ui_component)
 
-    def _emit_loading_indicator(self, tag: str) -> Generator[dict, None, None]:
+    def _emit_loading_indicator(self, tag: str) -> Generator[dict]:
         """
         Emit loading indicator for block types that support it.
         """
@@ -307,14 +262,30 @@ class StreamParser:
     def parse_tool_result(self, result: dict) -> dict | None:
         """
         Parse tool execution result into UI component.
-        Returns None for errors (which should not be displayed to users).
+
+        Returns None for internal system errors (which should be hidden from users).
+        Displays validation errors and successes to users.
+
+        Result types:
+        - "success": Tool executed successfully
+        - "validation_error": User-facing error (e.g., "Flavor not found")
+        - "error": Internal system error (hidden from users, logged server-side)
         """
-        if result.get("type") == "error":
-            # Don't display errors to users - they're logged in tool_executor
+        result_type = result.get("type")
+
+        if result_type == "error":
+            # Hide internal system errors from users - they're logged in tool_executor
             return None
 
-        # Extract UI component info from tool result
-        ui_key = result.get("ui_component", "markdown")
+        # Tools that deliberately omit ui_component want the LLM to own the
+        # prose — don't auto-render the summary as a markdown block, as that
+        # duplicates whatever the LLM narrates next. Tools that DO want a
+        # visible surface (homeport_nav, resource_list, vm_order, etc.) must
+        # set ui_component explicitly.
+        if "ui_component" not in result:
+            return None
+
+        ui_key = result["ui_component"]
         ui_data = result.get("ui_data", {"c": result.get("summary", "")})
 
         try:
@@ -325,7 +296,6 @@ class StreamParser:
                 "Failed to create UI content for tool result, falling back to markdown",
                 exc_info=True,
             )
-            # Fallback to markdown with summary
             ui_component = ui_registry.create_content(
                 "markdown", {"c": result.get("summary", "")}
             )

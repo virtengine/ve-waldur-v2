@@ -14,7 +14,12 @@ from django.utils import timezone
 from python_freeipa import exceptions as freeipa_exceptions
 
 from waldur_core.core import models as core_models
-from waldur_core.core.utils import broadcast_mail, format_homeport_link, pwgen
+from waldur_core.core.utils import (
+    broadcast_mail,
+    format_homeport_link,
+    is_robot_user,
+    pwgen,
+)
 from waldur_core.structure import models as structure_models
 from waldur_core.users import models, utils
 from waldur_core.users.enums import InvitationState
@@ -64,6 +69,17 @@ def cancel_expired_invitations(invitations=None):
             logger.warning(
                 "Skipping expired invitation notification for %s: scope was deleted",
                 invitation.uuid,
+            )
+            continue
+
+        # Robot-created invitations would notify SITE_EMAIL,
+        # producing a helpdesk ticket per expired invitation
+        if is_robot_user(invitation.created_by):
+            logger.info(
+                "Skipping expired invitation notification for %s: "
+                "created by robot account %s",
+                invitation.uuid,
+                invitation.created_by.username,
             )
             continue
 
@@ -245,7 +261,12 @@ def send_reminder_for_pending_invitations():
             )
             continue
 
-        context = utils.get_invitation_context(invitation, invitation.created_by.email)
+        sender = (
+            invitation.created_by.full_name
+            or invitation.created_by.email
+            or invitation.created_by.username
+        )
+        context = utils.get_invitation_context(invitation, sender)
         context["link"] = utils.get_invitation_link(invitation.uuid)
         site_link = format_homeport_link()
         context["site_host"] = urlparse(site_link).hostname
@@ -384,11 +405,22 @@ def send_mail_notification_about_permission_request_has_been_submitted(
     permission_request_id,
 ):
     permission_request = models.PermissionRequest.objects.get(id=permission_request_id)
-    requests_link = format_homeport_link("profile/permission-requests/")
+    customer_uuid = permission_request.invitation.customer.uuid.hex
+    requests_link = format_homeport_link(
+        "organizations/{customer_uuid}/group-invitations/",
+        customer_uuid=customer_uuid,
+    )
     users = utils.get_users_for_notification_about_request_has_been_submitted(
         permission_request
     )
-    emails = [u.email for u in users if u.email] if users else []
+    customer = permission_request.invitation.customer
+    emails = [u.email for u in users if u.email]
+    emails += utils.get_customer_notification_emails(customer)
+    # Fall back to staff when there are no approvers and no customer emails.
+    if not any(email for email in emails):
+        emails = [u.email for u in utils.get_staff_users_for_notification() if u.email]
+    # Preserve order while dropping blanks and duplicates.
+    emails = list(dict.fromkeys(email for email in emails if email))
 
     if emails:
         broadcast_mail(
@@ -397,6 +429,36 @@ def send_mail_notification_about_permission_request_has_been_submitted(
             {"permission_request": permission_request, "requests_link": requests_link},
             emails,
         )
+    else:
+        logger.warning(
+            "No recipients found for permission request %s notification: "
+            "customer %s (%s) has no owners with the create permission, no "
+            "contact or notification emails, and no staff are available.",
+            permission_request.uuid.hex,
+            customer.name,
+            customer.uuid.hex,
+        )
+
+
+@shared_task(
+    name="waldur_core.users.send_mail_notification_about_permission_request_has_been_rejected"
+)
+def send_mail_notification_about_permission_request_has_been_rejected(
+    permission_request_id,
+):
+    """Notify the requester that their permission request has been rejected."""
+    permission_request = models.PermissionRequest.objects.get(id=permission_request_id)
+    requester = permission_request.created_by
+
+    if not requester.email:
+        return
+
+    broadcast_mail(
+        "users",
+        "permission_request_rejected",
+        {"permission_request": permission_request},
+        [requester.email],
+    )
 
 
 @shared_task(name="waldur_core.users.process_pending_project_invitations")

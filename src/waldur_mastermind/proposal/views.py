@@ -4,22 +4,36 @@ from datetime import datetime, timedelta
 from typing import cast
 
 from django.contrib.auth import get_user_model
-from django.db.models import Count, OuterRef, ProtectedError, Q
+from django.db import transaction
+from django.db.models import (
+    Avg,
+    Count,
+    DurationField,
+    Exists,
+    ExpressionWrapper,
+    F,
+    Max,
+    OuterRef,
+    ProtectedError,
+    Q,
+    Subquery,
+)
 from django.db.models.functions import Coalesce
 from django.shortcuts import get_object_or_404
 from django.utils import timezone as timezone
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view
 from rest_framework import decorators, exceptions, mixins, response, status, viewsets
 from rest_framework import permissions as rf_permissions
 
+from waldur_core.checklist import enums as checklist_enums
 from waldur_core.checklist import models as checklist_models
 from waldur_core.checklist import serializers as checklist_serializers
 from waldur_core.checklist.enums import ChecklistTypes
 from waldur_core.checklist.mixins import ReviewerChecklistMixin, UserChecklistMixin
 from waldur_core.core import validators as core_validators
-from waldur_core.core.enums import ReviewStates
 from waldur_core.core.exceptions import IncorrectStateException
 from waldur_core.core.models import User
 from waldur_core.core.utils import SubqueryCount
@@ -34,7 +48,10 @@ from waldur_core.permissions import utils as permissions_utils
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CallRole, ProposalRole
 from waldur_core.permissions.models import UserRole
-from waldur_core.permissions.utils import has_permission, permission_factory
+from waldur_core.permissions.utils import (
+    has_permission,
+    permission_factory,
+)
 from waldur_core.permissions.views import UserRoleMixin
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure.managers import (
@@ -53,9 +70,14 @@ from waldur_mastermind.proposal import (
     serializers,
     tasks,
     utils,
+    workflow_service,
 )
+from waldur_mastermind.proposal import enums as proposal_enums
 from waldur_mastermind.proposal import permissions as proposal_permissions
 from waldur_mastermind.proposal.enums import (
+    MANDATORY_STEPS,
+    WORKFLOW_STEPS,
+    WORKFLOW_STEPS_MAP,
     AffinityMatrixScopes,
     CallStates,
     COIDetectionJobStates,
@@ -68,13 +90,27 @@ from waldur_mastermind.proposal.enums import (
     RequestedOfferingStates,
     ReviewerPoolInvitationStatuses,
     ReviewerSuggestionStatuses,
+    TransitionModes,
+    WorkflowStepInstanceStatuses,
 )
 
 from .managers import get_connected_call_organizers, get_connected_calls
 from .models import Proposal
-from .serializers import ReviewSubmitSerializer
+from .serializers import ReviewSubmitSerializer, _is_reviewer_only_view
 
 logger = logging.getLogger(__name__)
+
+
+def validate_call_not_archived(nested_obj):
+    """Reject update/delete of a nested object whose parent call is archived.
+
+    Used as an ``action_detail_method`` validator: it receives the nested
+    object (RequestedOffering / CallResourceTemplate / CallWorkflowStep /
+    ProposalProjectRoleMapping), all of which reach their call via ``.call``.
+    An archived call is read-only across its whole edit surface.
+    """
+    if nested_obj.call.state == CallStates.ARCHIVED:
+        raise IncorrectStateException()
 
 
 class CallManagingOrganisationViewSet(
@@ -170,6 +206,224 @@ class CallManagingOrganisationViewSet(
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(
+        description="Get call performance statistics across all calls.",
+        responses={200: serializers.CallPerformanceStatSerializer(many=True)},
+    )
+    @decorators.action(detail=False)
+    def global_stats_performance(self, request):
+        if not request.user.is_staff:
+            raise exceptions.PermissionDenied()
+        calls = models.Call.objects.all()
+        now = timezone.now()
+        data = []
+        for call in calls:
+            proposals = models.Proposal.objects.filter(round__call=call)
+            proposals_counts = proposals.aggregate(
+                total=Count("id"),
+                draft=Count("id", filter=Q(state=ProposalStates.DRAFT)),
+                submitted=Count("id", filter=Q(state=ProposalStates.SUBMITTED)),
+                in_review=Count("id", filter=Q(state=ProposalStates.IN_REVIEW)),
+                accepted=Count("id", filter=Q(state=ProposalStates.ACCEPTED)),
+                rejected=Count("id", filter=Q(state=ProposalStates.REJECTED)),
+                canceled=Count("id", filter=Q(state=ProposalStates.CANCELED)),
+                last_submission=Max(
+                    "created",
+                    filter=Q(
+                        state__in=[
+                            ProposalStates.SUBMITTED,
+                            ProposalStates.ACCEPTED,
+                            ProposalStates.REJECTED,
+                        ]
+                    ),
+                ),
+            )
+
+            reviews = models.Review.objects.filter(proposal__round__call=call)
+            reviews_stats = reviews.aggregate(
+                total=Count("id"),
+                completed=Count("id", filter=Q(state=models.Review.States.SUBMITTED)),
+                avg_score=Avg(
+                    "summary_score", filter=Q(state=models.Review.States.SUBMITTED)
+                ),
+            )
+
+            active_rounds = call.round_set.filter(
+                start_time__lte=now, cutoff_time__gte=now
+            ).count()
+
+            accepted = proposals_counts["accepted"]
+            rejected = proposals_counts["rejected"]
+            total_decided = accepted + rejected
+            acceptance_rate = (
+                (accepted / total_decided * 100) if total_decided > 0 else 0
+            )
+
+            data.append(
+                {
+                    "call_uuid": call.uuid,
+                    "call_name": call.name,
+                    "managing_organization_name": call.manager.customer.name,
+                    "state": call.state,
+                    "total_proposals": proposals_counts["total"],
+                    "proposals_draft": proposals_counts["draft"],
+                    "proposals_submitted": proposals_counts["submitted"],
+                    "proposals_in_review": proposals_counts["in_review"],
+                    "proposals_accepted": proposals_counts["accepted"],
+                    "proposals_rejected": proposals_counts["rejected"],
+                    "proposals_canceled": proposals_counts["canceled"],
+                    "acceptance_rate": acceptance_rate,
+                    "total_reviews": reviews_stats["total"],
+                    "reviews_completed": reviews_stats["completed"],
+                    "average_score": reviews_stats["avg_score"],
+                    "active_rounds": active_rounds,
+                    "last_submission_date": proposals_counts["last_submission"].date()
+                    if proposals_counts["last_submission"]
+                    else None,
+                }
+            )
+
+        serializer = serializers.CallPerformanceStatSerializer(data, many=True)
+        return response.Response(serializer.data, status=status.HTTP_200_OK)
+
+    @extend_schema(
+        description="Get review progress statistics across all reviewers.",
+        responses={200: serializers.ReviewProgressStatSerializer(many=True)},
+    )
+    @decorators.action(detail=False)
+    def global_stats_review_progress(self, request):
+        if not request.user.is_staff:
+            raise exceptions.PermissionDenied()
+        reviews = models.Review.objects.all()
+        reviewers = User.objects.filter(
+            id__in=reviews.values_list("reviewer_id", flat=True)
+        ).distinct()
+
+        data = []
+        for reviewer in reviewers:
+            reviewer_reviews = reviews.filter(reviewer=reviewer)
+            stats = reviewer_reviews.aggregate(
+                total=Count("id"),
+                pending=Count("id", filter=Q(state=models.Review.States.IN_REVIEW)),
+                completed=Count("id", filter=Q(state=models.Review.States.SUBMITTED)),
+                rejected=Count("id", filter=Q(state=models.Review.States.REJECTED)),
+                avg_score=Avg(
+                    "summary_score", filter=Q(state=models.Review.States.SUBMITTED)
+                ),
+            )
+
+            # Calculate average review time in days for completed reviews
+            completed_reviews = reviewer_reviews.filter(
+                state=models.Review.States.SUBMITTED
+            )
+            durations = completed_reviews.annotate(
+                duration=ExpressionWrapper(
+                    F("modified") - F("created"), output_field=DurationField()
+                )
+            ).aggregate(avg_duration=Avg("duration"))
+
+            avg_time = (
+                durations["avg_duration"].total_seconds() / 86400
+                if durations["avg_duration"]
+                else None
+            )
+
+            total = stats["total"]
+            completion_rate = (stats["completed"] / total * 100) if total > 0 else 0
+
+            data.append(
+                {
+                    "reviewer_uuid": reviewer.uuid,
+                    "reviewer_name": reviewer.full_name,
+                    "reviewer_email": reviewer.email,
+                    "total_assigned": total,
+                    "pending": stats["pending"],
+                    "in_progress": stats["pending"],  # For now same as pending
+                    "completed": stats["completed"],
+                    "declined": stats["rejected"],
+                    "average_score": stats["avg_score"],
+                    "average_review_time_days": avg_time,
+                    "completion_rate": completion_rate,
+                }
+            )
+
+        serializer = serializers.ReviewProgressStatSerializer(data, many=True)
+        return response.Response(serializer.data, status=status.HTTP_200_OK)
+
+    @extend_schema(
+        description="Get resource demand statistics across all calls and offerings.",
+        responses={200: serializers.ResourceDemandStatSerializer(many=True)},
+    )
+    @decorators.action(detail=False)
+    def global_stats_resource_demand(self, request):
+        if not request.user.is_staff:
+            raise exceptions.PermissionDenied()
+        requested_offerings = models.RequestedOffering.objects.all()
+        offerings = marketplace_models.Offering.objects.filter(
+            id__in=requested_offerings.values_list("offering_id", flat=True)
+        ).distinct()
+
+        data = []
+        for offering in offerings:
+            offer_requests = requested_offerings.filter(offering=offering)
+            resources = models.RequestedResource.objects.filter(
+                requested_offering__in=offer_requests
+            )
+
+            stats = resources.aggregate(
+                proposal_count=Count("proposal", distinct=True),
+                request_count=Count("id"),
+                approved_count=Count(
+                    "id", filter=Q(proposal__state=ProposalStates.ACCEPTED)
+                ),
+                pending_count=Count(
+                    "id",
+                    filter=Q(
+                        proposal__state__in=[
+                            ProposalStates.SUBMITTED,
+                            ProposalStates.IN_REVIEW,
+                        ]
+                    ),
+                ),
+            )
+
+            total_requested_limits = {}
+            total_approved_limits = {}
+
+            all_resources = resources.all()
+            for res in all_resources:
+                limits = res.limits or {}
+                for key, val in limits.items():
+                    try:
+                        fval = float(val)
+                        total_requested_limits[key] = (
+                            total_requested_limits.get(key, 0) + fval
+                        )
+                        if res.proposal.state == ProposalStates.ACCEPTED:
+                            total_approved_limits[key] = (
+                                total_approved_limits.get(key, 0) + fval
+                            )
+                    except (ValueError, TypeError):
+                        continue
+
+            data.append(
+                {
+                    "offering_uuid": offering.uuid,
+                    "offering_name": offering.name,
+                    "offering_type": offering.type,
+                    "provider_name": offering.customer.name,
+                    "proposal_count": stats["proposal_count"],
+                    "request_count": stats["request_count"],
+                    "approved_count": stats["approved_count"],
+                    "pending_count": stats["pending_count"],
+                    "total_requested_limits": total_requested_limits,
+                    "total_approved_limits": total_approved_limits,
+                }
+            )
+
+        serializer = serializers.ResourceDemandStatSerializer(data, many=True)
+        return response.Response(serializer.data, status=status.HTTP_200_OK)
+
 
 class PublicCallViewSet(viewsets.ReadOnlyModelViewSet):
     lookup_field = "uuid"
@@ -226,6 +480,12 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     filterset_class = filters.CallFilter
     filter_backends = [DjangoFilterBackend]
     destroy_validators = [core_validators.StateValidator(CallStates.DRAFT)]
+    # An archived call is read-only: block core field edits (name/description/
+    # reference_code/external_url/fixed_duration + visibility + COI settings)
+    # while keeping draft and active calls fully editable.
+    update_validators = partial_update_validators = [
+        core_validators.StateValidator(CallStates.DRAFT, CallStates.ACTIVE)
+    ]
 
     queryset = models.Call.objects.all()
 
@@ -233,6 +493,20 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         return filter_queryset_for_user(
             super().get_queryset(), self.request.user
         ).order_by("created")
+
+    def can_view_scope_team(self, user, call):
+        # Core walks the call's customer/project tree (customer_path =
+        # "manager__customer"), which never reaches the CallManagingOrganisation
+        # where a Call organizer's CUSTOMER.CALL_ORGANIZER role is actually bound.
+        # Without this, an organiser opening the "Team" tab of a call they can
+        # edit gets a 403 on list_users while staff/owners pass. The call creator
+        # is covered explicitly for preset/imported calls where the role grant
+        # never ran.
+        if call.created_by_id == user.id:
+            return True
+        if super().can_view_scope_team(user, call):
+            return True
+        return call.manager_id in get_connected_call_organizers(user)
 
     @extend_schema(
         methods=["get"],
@@ -270,6 +544,12 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
                 if valid_state_filter:
                     queryset = queryset.filter(state__in=valid_state_filter)
 
+            page = self.paginate_queryset(queryset)
+            if page is not None:
+                serializer = self.get_serializer(
+                    page, context=self.get_serializer_context(), many=True
+                )
+                return self.get_paginated_response(serializer.data)
             serializer = self.get_serializer(
                 queryset,
                 context=self.get_serializer_context(),
@@ -277,18 +557,25 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             )
             return response.Response(serializer.data, status=status.HTTP_200_OK)
 
-        return self.action_list_method("requestedoffering_set")(self, request, uuid)
+        return self.action_list_method(
+            "requestedoffering_set",
+            additional_validators=["validate_call_not_archived"],
+        )(self, request, uuid)
 
     offerings_serializer_class = serializers.RequestedOfferingSerializer
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.RequestedOfferingSerializer}
+    )
     def offering_detail(self, request, uuid=None, obj_uuid=None):
         return self.action_detail_method(
             "requestedoffering_set",
-            delete_validators=[],
+            delete_validators=[validate_call_not_archived],
             update_validators=[
+                validate_call_not_archived,
                 core_validators.StateValidator(
                     models.RequestedOffering.States.REQUESTED
-                )
+                ),
             ],
         )(self, request, uuid, obj_uuid)
 
@@ -305,6 +592,33 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         if call.round_set.count() == 0:
             raise exceptions.ValidationError(
                 _("Call must have a round to be activated.")
+            )
+        if not call.workflow_steps.filter(is_enabled=True).exists():
+            raise exceptions.ValidationError(
+                _("Call must have at least one enabled workflow step.")
+            )
+        enabled_step_ids = set(
+            call.workflow_steps.filter(is_enabled=True).values_list("step", flat=True)
+        )
+        missing = [s for s in MANDATORY_STEPS if s not in enabled_step_ids]
+        if missing:
+            missing_names = [
+                WORKFLOW_STEPS_MAP[s].name if s in WORKFLOW_STEPS_MAP else s
+                for s in missing
+            ]
+            raise exceptions.ValidationError(
+                _("Mandatory workflow steps are missing: %s.")
+                % ", ".join(missing_names)
+            )
+        # Require an *accepted* offering: only accepted offerings yield the
+        # resource templates applicants can request, and it matches the call
+        # serializer's `offerings` field (accepted-only) so the frontend gate
+        # agrees exactly with this check.
+        if not call.requestedoffering_set.filter(
+            state=RequestedOfferingStates.ACCEPTED
+        ).exists():
+            raise exceptions.ValidationError(
+                _("Call must have at least one accepted offering to be activated.")
             )
         call.state = CallStates.ACTIVE
         call.save()
@@ -332,6 +646,43 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             status=status.HTTP_200_OK,
         )
 
+    @extend_schema(
+        operation_id="proposal_protected_calls_duplicate",
+        description=(
+            "Duplicate a call. The new call inherits the source call's "
+            "configuration (offerings, rounds, workflow steps, resource "
+            "templates, role mappings, documents, and COI/matching/"
+            "assignment/applicant-visibility settings) and starts in draft "
+            "state. Proposals, reviews, team permissions, and reviewer-pool "
+            "memberships are not copied."
+        ),
+        request=serializers.DuplicateCallRequestSerializer,
+        responses={201: serializers.ProtectedCallSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def duplicate(self, request, uuid=None):
+        source = self.get_object()
+        payload = serializers.DuplicateCallRequestSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        new_name = payload.validated_data.pop("name")
+        new_call = utils.duplicate_call(
+            source=source,
+            new_name=new_name,
+            created_by=request.user,
+            sections=payload.validated_data,
+        )
+        return response.Response(
+            serializers.ProtectedCallSerializer(
+                new_call, context=self.get_serializer_context()
+            ).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    duplicate_permissions = [
+        permission_factory(PermissionEnum.CREATE_CALL, ["manager"])
+    ]
+    duplicate_serializer_class = serializers.DuplicateCallRequestSerializer
+
     archive_validators = [
         core_validators.StateValidator(CallStates.DRAFT, CallStates.ACTIVE)
     ]
@@ -358,6 +709,8 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         method = self.request.method
 
         if method == "POST":
+            if call.state == CallStates.ARCHIVED:
+                raise IncorrectStateException()
             repeat = request.query_params.get("repeat", "false")
             count = request.query_params.get("count", "1")
 
@@ -407,7 +760,12 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
                     status=status.HTTP_201_CREATED,
                 )
         queryset = call.round_set.all().order_by("-start_time")
-
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(
+                page, context=self.get_serializer_context(), many=True
+            )
+            return self.get_paginated_response(serializer.data)
         return response.Response(
             self.get_serializer(
                 queryset,
@@ -419,6 +777,37 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
 
     rounds_serializer_class = serializers.ProtectedRoundSerializer
 
+    @extend_schema(
+        operation_id="proposal_protected_calls_rounds_bulk_set",
+        description=(
+            "Create multiple rounds on a call at a fixed cadence. Spacing is "
+            "controlled by ``cadence`` (monthly/quarterly/biannual/yearly/"
+            "custom). Each round's ``cutoff_time`` is derived as "
+            "``start_time + submission_window_days``. Fixed-date allocation "
+            "is not supported in bulk mode."
+        ),
+        request=serializers.BulkRoundCreateRequestSerializer,
+        responses={201: serializers.ProtectedRoundSerializer(many=True)},
+    )
+    @decorators.action(detail=True, methods=["post"], url_path="rounds-bulk-set")
+    def rounds_bulk_set(self, request, uuid=None):
+        call: models.Call = self.get_object()
+        if call.state == CallStates.ARCHIVED:
+            raise IncorrectStateException()
+        payload = serializers.BulkRoundCreateRequestSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        rounds = utils.bulk_create_rounds(call, payload.validated_data)
+        return response.Response(
+            serializers.ProtectedRoundSerializer(
+                rounds, many=True, context=self.get_serializer_context()
+            ).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    rounds_bulk_set_permissions = [permission_factory(PermissionEnum.UPDATE_CALL)]
+    rounds_bulk_set_serializer_class = serializers.BulkRoundCreateRequestSerializer
+
+    @extend_schema(responses={status.HTTP_200_OK: serializers.ProtectedRoundSerializer})
     def round_detail(self, request, uuid=None, obj_uuid=None):
         def validate_call_state(call_round):
             if call_round.call.state == CallStates.ARCHIVED:
@@ -441,6 +830,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
 
     round_detail_serializer_class = serializers.ProtectedRoundSerializer
 
+    @extend_schema(responses={status.HTTP_200_OK: OpenApiTypes.STR})
     def close_round(self, request, uuid=None, obj_uuid=None):
         call: models.Call = self.get_object()
 
@@ -478,7 +868,13 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     def attach_documents(self, request, uuid=None):
         instance: models.Call = self.get_object()
 
-        documents = request.data.getlist("documents", [])
+        if instance.state == CallStates.ARCHIVED:
+            raise IncorrectStateException()
+
+        if hasattr(request.data, "getlist"):
+            documents = request.data.getlist("documents", [])
+        else:
+            documents = request.data.get("documents", [])
         description = request.data.get("description", "")
 
         for file_data in documents:
@@ -510,7 +906,12 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     @decorators.action(detail=True, methods=["post"])
     def detach_documents(self, request, uuid=None):
         instance: models.Call = self.get_object()
-        documents = request.data.getlist("documents", [])
+        if instance.state == CallStates.ARCHIVED:
+            raise IncorrectStateException()
+        if hasattr(request.data, "getlist"):
+            documents = request.data.getlist("documents", [])
+        else:
+            documents = request.data.get("documents", [])
         for file_data in documents:
             models.CallDocument.objects.get(
                 call=instance,
@@ -544,20 +945,117 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         responses=serializers.CallResourceTemplateSerializer,
         description="Create resource template for a call.",
     )
+    @extend_schema(responses={status.HTTP_200_OK: dict})
     @decorators.action(detail=True, methods=["get", "post"])
     def resource_templates(self, request, uuid=None):
-        return self.action_list_method("resource_templates")(self, request, uuid)
+        return self.action_list_method(
+            "resource_templates",
+            additional_validators=["validate_call_not_archived"],
+        )(self, request, uuid)
 
     resource_templates_serializer_class = serializers.CallResourceTemplateSerializer
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.CallResourceTemplateSerializer}
+    )
     def resource_template_detail(self, request, uuid=None, obj_uuid=None):
         return self.action_detail_method(
-            "resource_templates", delete_validators=[], update_validators=[]
+            "resource_templates",
+            delete_validators=[validate_call_not_archived],
+            update_validators=[validate_call_not_archived],
         )(self, request, uuid, obj_uuid)
 
     resource_template_detail_serializer_class = (
         serializers.CallResourceTemplateSerializer
     )
+
+    # Workflow Step Configuration Endpoints
+
+    @extend_schema(
+        methods=["get"],
+        operation_id="proposal_protected_calls_workflow_steps_list",
+        request=None,
+        responses=serializers.CallWorkflowStepSerializer(many=True),
+        description="List workflow steps for a call.",
+        filters=False,
+    )
+    @extend_schema(
+        methods=["post"],
+        operation_id="proposal_protected_calls_workflow_steps_set",
+        request=serializers.CallWorkflowStepSerializer,
+        responses=serializers.CallWorkflowStepSerializer,
+        description="Create or update a workflow step for a call.",
+    )
+    @decorators.action(detail=True, methods=["get", "post"])
+    def workflow_steps(self, request, uuid=None):
+        """GET returns the call's steps sorted by display_order then catalog
+        order; POST delegates to action_list_method for the standard
+        create/update path."""
+        if request.method == "GET":
+            call = self.get_object()
+            catalog_index = {
+                step.id: index
+                for index, step in enumerate(proposal_enums.WORKFLOW_STEPS)
+            }
+            steps = sorted(
+                call.workflow_steps.all(),
+                key=lambda s: (
+                    s.display_order
+                    if s.display_order is not None
+                    else catalog_index.get(s.step, len(catalog_index)),
+                    s.created,
+                ),
+            )
+            serializer = self.get_serializer(
+                steps, context=self.get_serializer_context(), many=True
+            )
+            return response.Response(serializer.data, status=status.HTTP_200_OK)
+        return self.action_list_method(
+            "workflow_steps",
+            additional_validators=["validate_call_not_archived"],
+        )(self, request, uuid)
+
+    workflow_steps_serializer_class = serializers.CallWorkflowStepSerializer
+
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.CallWorkflowStepSerializer}
+    )
+    def workflow_step_detail(self, request, uuid=None, obj_uuid=None):
+        return self.action_detail_method(
+            "workflow_steps",
+            delete_validators=[validate_call_not_archived],
+            update_validators=[validate_call_not_archived],
+        )(self, request, uuid, obj_uuid)
+
+    workflow_step_detail_serializer_class = serializers.CallWorkflowStepSerializer
+
+    @extend_schema(
+        description=(
+            "List checklists that can be attached to a workflow step "
+            "(WORKFLOW_STEP-typed). Available to call managers so the workflow "
+            "config UI can populate its checklist picker without staff-only "
+            "access to the checklist admin API."
+        ),
+        responses={
+            status.HTTP_200_OK: checklist_serializers.ChecklistShortSerializer(
+                many=True
+            )
+        },
+    )
+    @decorators.action(detail=False, methods=["get"])
+    def step_checklists(self, request):
+        checklists = checklist_models.Checklist.objects.filter(
+            checklist_type=checklist_enums.ChecklistTypes.WORKFLOW_STEP
+        ).order_by("name")
+        serializer = checklist_serializers.ChecklistShortSerializer(
+            checklists, many=True
+        )
+        return response.Response(serializer.data, status=status.HTTP_200_OK)
+
+    # Any authenticated user may read the WORKFLOW_STEP checklist catalogue; the
+    # templates are non-sensitive and only actionable by call managers who can
+    # already edit the step config.
+    step_checklists_permissions = []
 
     # Call Manager Compliance Endpoints
     compliance_overview_permissions = [permission_factory(PermissionEnum.UPDATE_CALL)]
@@ -933,7 +1431,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     reviewer_pool_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["manager"],
+            ["*", "manager"],
         )
     ]
 
@@ -994,8 +1492,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             invitation_status=ReviewerPoolInvitationStatuses.PENDING,
         )
 
-        # TODO: Send invitation email
-        # tasks.send_reviewer_invitation_email.delay(pool_member.uuid)
+        tasks.send_reviewer_invitation_email.delay(pool_member.uuid)
 
         return response.Response(
             serializers.CallReviewerPoolSerializer(
@@ -1007,7 +1504,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     invite_by_email_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["manager"],
+            ["*", "manager"],
         )
     ]
 
@@ -1058,7 +1555,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     generate_suggestions_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["manager"],
+            ["*", "manager"],
         )
     ]
 
@@ -1088,7 +1585,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     suggestions_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["manager"],
+            ["*", "manager"],
         )
     ]
 
@@ -1165,7 +1662,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     send_invitations_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["manager"],
+            ["*", "manager"],
         )
     ]
 
@@ -1207,7 +1704,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     coi_configuration_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["manager"],
+            ["*", "manager"],
         )
     ]
 
@@ -1243,7 +1740,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     conflicts_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["manager"],
+            ["*", "manager"],
         )
     ]
 
@@ -1296,7 +1793,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     conflict_summary_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["manager"],
+            ["*", "manager"],
         )
     ]
 
@@ -1338,7 +1835,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     detect_conflicts_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["manager"],
+            ["*", "manager"],
         )
     ]
 
@@ -1382,11 +1879,12 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     matching_configuration_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["manager"],
+            ["*", "manager"],
         )
     ]
 
     @extend_schema(
+        request=None,
         description="Compute affinity scores for all reviewer-proposal pairs.",
         responses={200: serializers.ComputeAffinitiesResponseSerializer},
     )
@@ -1407,7 +1905,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     compute_affinities_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["manager"],
+            ["*", "manager"],
         )
     ]
 
@@ -1439,7 +1937,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     affinity_matrix_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["manager"],
+            ["*", "manager"],
         )
     ]
 
@@ -1472,7 +1970,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     proposed_assignments_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["manager"],
+            ["*", "manager"],
         )
     ]
 
@@ -1740,7 +2238,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     generate_assignments_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["manager"],
+            ["*", "manager"],
         )
     ]
 
@@ -1795,7 +2293,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     send_all_assignments_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["manager"],
+            ["*", "manager"],
         )
     ]
 
@@ -1925,73 +2423,18 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     create_manual_assignment_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["manager"],
+            ["*", "manager"],
         )
     ]
 
-    @extend_schema(
-        description="Get applicant attribute exposure configuration for this call.",
-        request=None,
-        responses=serializers.CallApplicantAttributeConfigSerializer,
-    )
-    @decorators.action(detail=True, methods=["get"])
-    def applicant_attribute_config(self, request, uuid=None):
-        """Get applicant attribute exposure configuration for this call."""
-        call = self.get_object()
-        try:
-            config = call.applicant_attribute_config
-        except models.CallApplicantAttributeConfig.DoesNotExist:
-            # Return default config (unsaved instance with model defaults)
-            config = models.CallApplicantAttributeConfig(call=call)
 
-        serializer = serializers.CallApplicantAttributeConfigSerializer(config)
-        return response.Response(serializer.data)
-
-    applicant_attribute_config_permissions = [
-        permission_factory(PermissionEnum.UPDATE_CALL)
-    ]
-
-    @extend_schema(
-        description="Create or update applicant attribute exposure configuration.",
-        request=serializers.CallApplicantAttributeConfigSerializer,
-        responses=serializers.CallApplicantAttributeConfigSerializer,
-    )
-    @decorators.action(detail=True, methods=["post", "patch"])
-    def update_applicant_attribute_config(self, request, uuid=None):
-        """Create or update applicant attribute exposure configuration."""
-        call = self.get_object()
-        config, created = models.CallApplicantAttributeConfig.objects.get_or_create(
-            call=call
-        )
-        serializer = serializers.CallApplicantAttributeConfigSerializer(
-            config, data=request.data, partial=True
-        )
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
-        return response.Response(serializer.data)
-
-    update_applicant_attribute_config_permissions = [
-        permission_factory(PermissionEnum.UPDATE_CALL)
-    ]
-
-    @extend_schema(
-        description="Delete custom applicant attribute config, reverting to system defaults.",
-        request=None,
-        responses={204: None},
-    )
-    @decorators.action(detail=True, methods=["delete"])
-    def delete_applicant_attribute_config(self, request, uuid=None):
-        """Delete custom config, reverting to system defaults."""
-        call = self.get_object()
-        try:
-            call.applicant_attribute_config.delete()
-            return response.Response(status=status.HTTP_204_NO_CONTENT)
-        except models.CallApplicantAttributeConfig.DoesNotExist:
-            return response.Response(status=status.HTTP_204_NO_CONTENT)
-
-    delete_applicant_attribute_config_permissions = [
-        permission_factory(PermissionEnum.UPDATE_CALL)
-    ]
+def _terminal_workflow_detail(proposal_state):
+    """Human-readable detail for a workflow that reached its terminal step."""
+    return {
+        ProposalStates.ACCEPTED: "Workflow completed. Proposal accepted.",
+        ProposalStates.REJECTED: "Workflow completed. Proposal rejected.",
+        ProposalStates.CANCELED: "Workflow completed. Proposal canceled.",
+    }.get(proposal_state, "Workflow completed.")
 
 
 class ProposalViewSet(
@@ -2008,9 +2451,57 @@ class ProposalViewSet(
     model = models.Proposal
 
     def get_queryset(self):
-        return filter_queryset_for_user(
-            models.Proposal.objects.all(), self.request.user
-        ).order_by("created")
+        # Annotate the inputs to workflow_service.is_awaiting_manual_advance so
+        # ProposalSerializer.awaiting_manual_advance is computable without a
+        # per-row query (N+1 on list). Keep these expressions in sync with
+        # workflow_service.is_awaiting_manual_advance.
+        latest_step_status = (
+            models.ProposalWorkflowStepInstance.objects.filter(
+                proposal=OuterRef("pk"), step=OuterRef("workflow_step")
+            )
+            .order_by("-created")
+            .values("status")[:1]
+        )
+        return (
+            filter_queryset_for_user(models.Proposal.objects.all(), self.request.user)
+            .annotate(
+                _awaiting_manual_step=Exists(
+                    models.CallWorkflowStep.objects.filter(
+                        call=OuterRef("round__call"),
+                        step=OuterRef("workflow_step"),
+                        transition_mode=TransitionModes.MANUAL,
+                    )
+                ),
+                _latest_step_status=Subquery(latest_step_status),
+            )
+            .order_by("created")
+        )
+
+    def can_view_scope_team(self, user, proposal):
+        # Core walks the proposal's customer/project tree, which misses users
+        # whose only role is directly on the call. Call managers — and the
+        # reviewers/panel members assigned to the call — may view the proposal
+        # team read-only, so the review interface renders (rather than crashing
+        # its team section on a 403) and evaluators can comment on it.
+        # The proposal author always sees their own team, even before the
+        # ProposalRole.MANAGER grant lands (e.g. preset/imported proposals).
+        if proposal.created_by_id == user.id:
+            return True
+        if super().can_view_scope_team(user, proposal):
+            return True
+        call_id = proposal.round.call_id
+        return any(
+            call_id in get_connected_calls(user, role)
+            for role in (CallRole.MANAGER, CallRole.REVIEWER, CallRole.PANEL_MEMBER)
+        )
+
+    def filter_user_roles_representation(self, data, scope, request):
+        # Role expiration is team-admin metadata irrelevant to evaluation, so
+        # conceal it from reviewers viewing the proposal team read-only.
+        if _is_reviewer_only_view(request.user, scope):
+            for item in data:
+                item.pop("expiration_time", None)
+        return data
 
     # Both mixins use the default implementation (obj.checklist_completion)
     # UserChecklistMixin permissions - for proposal managers only
@@ -2021,6 +2512,12 @@ class ProposalViewSet(
 
         user = request.user
         if user.is_staff:
+            return
+
+        # The author always reads the compliance answers they submitted, even
+        # before the ProposalRole.MANAGER grant lands (e.g. preset/imported
+        # proposals, or a co-author who never held MANAGE_PROPOSAL).
+        if obj.created_by_id == user.id:
             return
 
         if permissions_utils.has_permission(
@@ -2129,9 +2626,76 @@ class ProposalViewSet(
     @decorators.action(detail=True, methods=["post"])
     def submit(self, request, uuid=None):
         proposal = self.get_object()
-        previous_state = proposal.state
-        proposal.state = ProposalStates.SUBMITTED
-        proposal.save()
+
+        # The whole block (step instances + proposal state) must be atomic —
+        # a partial failure would leave orphan instances and wedge the
+        # (proposal, step) unique constraint on retry. The row lock + state
+        # re-check serialises concurrent submits that both passed the outer
+        # StateValidator before either had committed.
+        with transaction.atomic():
+            locked = models.Proposal.objects.select_for_update().get(pk=proposal.pk)
+            if locked.state != ProposalStates.DRAFT:
+                return response.Response(
+                    {"detail": "Proposal has already been submitted."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            proposal = locked
+            previous_state = proposal.state
+
+            # A proposal must have a project team before it can be submitted.
+            # (The creator is normally auto-added, so a solo-PI proposal passes;
+            # this enforces the invariant server-side and blocks the degenerate
+            # empty-team case that the DRAFT state validator alone would allow.)
+            if not permissions_utils.get_users(proposal).exists():
+                return response.Response(
+                    {"detail": "Proposal must have a project team before submission."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            call = proposal.round.call
+            enabled_steps = list(
+                models.CallWorkflowStep.objects.filter(call=call, is_enabled=True)
+            )
+            enabled_step_ids = {s.step for s in enabled_steps}
+            first_step_id = next(
+                (s.id for s in WORKFLOW_STEPS if s.id in enabled_step_ids), None
+            )
+
+            instances_to_create = [
+                models.ProposalWorkflowStepInstance(
+                    proposal=proposal,
+                    step=step_def.id,
+                    status=(
+                        WorkflowStepInstanceStatuses.PENDING
+                        if step_def.id in enabled_step_ids
+                        else WorkflowStepInstanceStatuses.SKIPPED
+                    ),
+                )
+                for step_def in WORKFLOW_STEPS
+            ]
+            models.ProposalWorkflowStepInstance.objects.bulk_create(instances_to_create)
+
+            if first_step_id:
+                first_step = models.ProposalWorkflowStepInstance.objects.get(
+                    proposal=proposal, step=first_step_id
+                )
+                first_step.status = WorkflowStepInstanceStatuses.ACTIVE
+                first_step.started_at = timezone.now()
+                call_step = next(
+                    (s for s in enabled_steps if s.step == first_step_id), None
+                )
+                if call_step and call_step.duration_in_days:
+                    first_step.deadline = first_step.started_at + timedelta(
+                        days=call_step.duration_in_days
+                    )
+                first_step.save(update_fields=["status", "started_at", "deadline"])
+                proposal.state = ProposalStates.IN_REVIEW
+                proposal.workflow_step = first_step_id
+            else:
+                proposal.state = ProposalStates.SUBMITTED
+
+            proposal.save()
+
         tasks.notify_user_about_proposal_state_update.delay(
             proposal.uuid, previous_state, proposal.state
         )
@@ -2180,6 +2744,9 @@ class ProposalViewSet(
 
     resources_serializer_class = serializers.RequestedResourceSerializer
 
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.RequestedResourceSerializer}
+    )
     def resource_detail(self, request, uuid=None, obj_uuid=None):
         def validate_proposal_state(requested_resource):
             if requested_resource.proposal.state != ProposalStates.DRAFT:
@@ -2220,6 +2787,364 @@ class ProposalViewSet(
 
     attach_document_serializer_class = serializers.ProposalDocumentationSerializer
 
+    # Workflow Step Endpoints
+
+    @extend_schema(
+        description="List all workflow step instances for this proposal.",
+        request=None,
+        responses={
+            status.HTTP_200_OK: serializers.ProposalWorkflowStepInstanceSerializer(
+                many=True
+            )
+        },
+    )
+    @decorators.action(detail=True, methods=["get"])
+    def workflow_states(self, request, uuid=None):
+        # Access control is the viewset-level queryset filter
+        # (filter_queryset_for_user): unrelated users get an empty queryset
+        # and self.get_object() returns 404 before any of this code runs.
+        # Applicants, project members, and call team all reach the same
+        # response shape — the per-field visibility (internal_notes) is
+        # gated below via the serializer context.
+        proposal = self.get_object()
+        instances = proposal.workflow_step_instances.all()
+        # Pre-load step configs once (max ~6 rows per proposal) so the
+        # serializer's derived fields don't trigger a per-row query for
+        # applicant_visible / duration_in_days / responsible_role. Use
+        # ``call_id`` rather than ``call`` so we don't fetch the Call row
+        # we never read fields from.
+        step_configs_by_key = {
+            cs.step: cs
+            for cs in models.CallWorkflowStep.objects.filter(
+                call_id=proposal.round.call_id
+            )
+            .select_related("checklist")
+            .only(
+                "step",
+                "applicant_visible",
+                "duration_in_days",
+                "responsible_role",
+                "checklist",
+                "checklist_required",
+                "checklist__name",
+            )
+        }
+        can_view_internal_notes = proposal_permissions.user_can_view_internal_notes(
+            request.user, proposal
+        )
+        serializer = serializers.ProposalWorkflowStepInstanceSerializer(
+            instances,
+            many=True,
+            context={
+                "step_configs_by_key": step_configs_by_key,
+                "can_view_internal_notes": can_view_internal_notes,
+                # completed_by can reveal reviewer / panel-member identity;
+                # only the call team (same gate as internal notes) or calls
+                # that reveal reviewer identity to submitters may see it.
+                "can_view_step_actors": (
+                    can_view_internal_notes
+                    or proposal.round.call.reviewer_identity_visible_to_submitters
+                ),
+                # outcome / outcome_reason on the peer-review steps are review
+                # content, gated by reviews_visible_to_submitters.
+                "can_view_review_content": (
+                    can_view_internal_notes
+                    or proposal.round.call.reviews_visible_to_submitters
+                ),
+            },
+        )
+        return response.Response(serializer.data, status=status.HTTP_200_OK)
+
+    workflow_states_serializer_class = (
+        serializers.ProposalWorkflowStepInstanceSerializer
+    )
+
+    @extend_schema(
+        description="Complete the current workflow step with an outcome.",
+        request=serializers.CompleteWorkflowStepSerializer,
+        responses={
+            status.HTTP_200_OK: serializers.CompleteWorkflowStepResponseSerializer
+        },
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def complete_workflow_step(self, request, uuid=None):
+        proposal = self.get_object()
+
+        if proposal.state != ProposalStates.IN_REVIEW:
+            return response.Response(
+                {"detail": "Proposal must be in review state."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        if not proposal.workflow_step:
+            return response.Response(
+                {"detail": "Proposal has no active workflow step."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Pass active_step in context so the serializer can validate the
+        # outcome against the per-step allow-list.
+        input_serializer = serializers.CompleteWorkflowStepSerializer(
+            data=request.data,
+            context={"active_step": proposal.workflow_step},
+        )
+        input_serializer.is_valid(raise_exception=True)
+
+        outcome = input_serializer.validated_data["outcome"]
+        client_step_uuid = input_serializer.validated_data["step_uuid"]
+        outcome_reason = input_serializer.validated_data.get("outcome_reason", "")
+        # Drop internal_notes for callers who can't read it back. The
+        # responsible-role check on this action lets an applicant act on
+        # applicant-owned steps (e.g. award_response); without this guard
+        # they could silently inject text into a field the call-management
+        # team treats as internal.
+        internal_notes = (
+            input_serializer.validated_data.get("internal_notes", "")
+            if proposal_permissions.user_can_view_internal_notes(request.user, proposal)
+            else ""
+        )
+
+        with transaction.atomic():
+            # Lock the proposal row first so complete/reject/advance serialise
+            # on the same resource, in a consistent lock order (proposal then
+            # step instance) to avoid deadlocks.
+            models.Proposal.objects.select_for_update().get(pk=proposal.pk)
+            # Lock the active step row to serialise concurrent completions.
+            current_instance = (
+                proposal.workflow_step_instances.select_for_update()
+                .filter(
+                    step=proposal.workflow_step,
+                    status=WorkflowStepInstanceStatuses.ACTIVE,
+                    uuid=client_step_uuid,
+                )
+                .first()
+            )
+            if current_instance is None:
+                return response.Response(
+                    {"detail": "Workflow step has changed; refresh and retry."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            try:
+                next_instance = workflow_service.complete_step(
+                    proposal=proposal,
+                    current_instance=current_instance,
+                    outcome=outcome,
+                    outcome_reason=outcome_reason,
+                    completed_by=request.user,
+                    internal_notes=internal_notes,
+                )
+            except ValueError as e:
+                # Step gate not satisfied (e.g. too few reviews / score below
+                # threshold). Roll back and surface the reason to the caller.
+                raise exceptions.ValidationError({"detail": str(e)})
+            # Step-activation notifications were intentionally removed; see
+            # commit d2d5fb77c "Drop step-activation notifications [WAL-9346]".
+            # Re-introducing them requires a debounce/digest policy first.
+
+        if next_instance is None:
+            if workflow_service.is_awaiting_manual_advance(proposal):
+                response_serializer = (
+                    serializers.CompleteWorkflowStepResponseSerializer(
+                        {"detail": "Step completed. Awaiting manual advance."}
+                    )
+                )
+                return response.Response(
+                    response_serializer.data, status=status.HTTP_200_OK
+                )
+            # Terminal step reached: complete_step set the final state — accepted
+            # (and provisioned), or rejected / canceled on a negative outcome.
+            # Notify with the actual outcome so a rejected/canceled terminal
+            # never sends an "accepted" email.
+            proposal.refresh_from_db()
+            tasks.notify_proposal_decision(
+                proposal.uuid, ProposalStates.IN_REVIEW, proposal.state
+            )
+            response_serializer = serializers.CompleteWorkflowStepResponseSerializer(
+                {
+                    "detail": _terminal_workflow_detail(proposal.state),
+                    "proposal_state": proposal.state,
+                }
+            )
+            return response.Response(
+                response_serializer.data, status=status.HTTP_200_OK
+            )
+
+        next_step_def = next(
+            (s for s in WORKFLOW_STEPS if s.id == next_instance.step), None
+        )
+        response_serializer = serializers.CompleteWorkflowStepResponseSerializer(
+            {
+                "detail": f"Step completed. Advanced to: {next_step_def.name if next_step_def else next_instance.step}",
+                "next_step": next_instance.step,
+            }
+        )
+        return response.Response(response_serializer.data, status=status.HTTP_200_OK)
+
+    complete_workflow_step_serializer_class = serializers.CompleteWorkflowStepSerializer
+    complete_workflow_step_permissions = [
+        proposal_permissions.can_act_on_active_workflow_step
+    ]
+
+    @extend_schema(
+        description="Reject the proposal at the current workflow step.",
+        request=serializers.RejectWorkflowStepSerializer,
+        responses={
+            status.HTTP_200_OK: serializers.RejectWorkflowStepResponseSerializer
+        },
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def reject_workflow_step(self, request, uuid=None):
+        proposal = self.get_object()
+        input_serializer = serializers.RejectWorkflowStepSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+
+        if proposal.state != ProposalStates.IN_REVIEW:
+            return response.Response(
+                {"detail": "Proposal must be in review state."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        client_step_uuid = input_serializer.validated_data["step_uuid"]
+        reason = input_serializer.validated_data["reason"]
+        # See complete_workflow_step for the symmetric write-side gate: only
+        # call-management-team users may persist internal_notes; applicants
+        # acting on their own step would otherwise leak private text.
+        internal_notes = (
+            input_serializer.validated_data.get("internal_notes", "")
+            if proposal_permissions.user_can_view_internal_notes(request.user, proposal)
+            else ""
+        )
+
+        with transaction.atomic():
+            # Lock the proposal row first (consistent order with
+            # complete/advance) to serialise concurrent workflow mutations.
+            models.Proposal.objects.select_for_update().get(pk=proposal.pk)
+            current_instance = (
+                proposal.workflow_step_instances.select_for_update()
+                .filter(
+                    step=proposal.workflow_step,
+                    status=WorkflowStepInstanceStatuses.ACTIVE,
+                    uuid=client_step_uuid,
+                )
+                .first()
+            )
+            if current_instance is None:
+                return response.Response(
+                    {"detail": "Workflow step has changed; refresh and retry."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            workflow_service.reject_at_step(
+                proposal=proposal,
+                current_instance=current_instance,
+                reason=reason,
+                completed_by=request.user,
+                internal_notes=internal_notes,
+            )
+
+        response_serializer = serializers.RejectWorkflowStepResponseSerializer(
+            {"detail": "Proposal rejected.", "proposal_state": ProposalStates.REJECTED}
+        )
+        return response.Response(response_serializer.data, status=status.HTTP_200_OK)
+
+    reject_workflow_step_serializer_class = serializers.RejectWorkflowStepSerializer
+    reject_workflow_step_permissions = [
+        proposal_permissions.can_act_on_active_workflow_step
+    ]
+
+    @extend_schema(
+        description=(
+            "Manually advance a workflow that is awaiting call-manager confirmation."
+        ),
+        request=None,
+        responses={
+            status.HTTP_200_OK: serializers.CompleteWorkflowStepResponseSerializer,
+        },
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def advance_workflow_step(self, request, uuid=None):
+        proposal = self.get_object()
+
+        if proposal.state != ProposalStates.IN_REVIEW:
+            return response.Response(
+                {"detail": "Proposal must be in review state."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        from_step = proposal.workflow_step
+        actor = request.user.full_name or request.user.username
+
+        with transaction.atomic():
+            # Lock the proposal row to serialise concurrent advances.
+            locked = models.Proposal.objects.select_for_update().get(pk=proposal.pk)
+            # Re-check state under the lock: a concurrent transition could
+            # have moved the proposal out of IN_REVIEW between the pre-lock
+            # read above and the lock acquisition here.
+            if locked.state != ProposalStates.IN_REVIEW:
+                return response.Response(
+                    {"detail": "Proposal must be in review state."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            try:
+                next_instance = workflow_service.advance_step(
+                    proposal=locked, acting_user=request.user
+                )
+            except ValueError as e:
+                return response.Response(
+                    {"detail": str(e)}, status=status.HTTP_409_CONFLICT
+                )
+
+            target = (
+                "workflow completion" if next_instance is None else next_instance.step
+            )
+            # Pass user-controlled strings as named placeholders in
+            # event_context rather than f-string interpolation. The emit
+            # helper calls .format(**context) on the template, so an f-string
+            # that already contains a name like "{user_token_lifetime}" would
+            # otherwise resolve against the event context at emit time.
+            event_logger.emit(
+                "Proposal {proposal_name} workflow manually advanced "
+                "from {from_step} to {target} by {actor}.",
+                event_type=EventType.PROPOSAL_WORKFLOW_ADVANCED,
+                event_context={
+                    "proposal": locked,
+                    "from_step": from_step,
+                    "target": target,
+                    "actor": actor,
+                },
+                scopes=[_get_customer(locked)],
+            )
+
+        if next_instance is None:
+            # Manual advance reached the terminal step: accepted + provisioned
+            # inside advance_step. Fire the shared decision notifications.
+            tasks.notify_proposal_decision(
+                proposal.uuid, ProposalStates.IN_REVIEW, ProposalStates.ACCEPTED
+            )
+            response_serializer = serializers.CompleteWorkflowStepResponseSerializer(
+                {
+                    "detail": "Workflow completed. Proposal accepted.",
+                    "proposal_state": ProposalStates.ACCEPTED,
+                }
+            )
+            return response.Response(
+                response_serializer.data, status=status.HTTP_200_OK
+            )
+
+        next_step_def = next(
+            (s for s in WORKFLOW_STEPS if s.id == next_instance.step), None
+        )
+        response_serializer = serializers.CompleteWorkflowStepResponseSerializer(
+            {
+                "detail": f"Advanced to: {next_step_def.name if next_step_def else next_instance.step}",
+                "next_step": next_instance.step,
+            }
+        )
+        return response.Response(response_serializer.data, status=status.HTTP_200_OK)
+
+    advance_workflow_step_permissions = [proposal_permissions.can_advance_workflow_step]
+
     @extend_schema(
         request=serializers.ProposalDetachDocumentsSerializer,
         responses=None,
@@ -2257,81 +3182,11 @@ class ProposalViewSet(
 
     detach_documents_serializer_class = serializers.ProposalDetachDocumentsSerializer
 
-    @extend_schema(
-        description="Approve a proposal.",
-        request=serializers.ProposalApproveSerializer,
-        responses={status.HTTP_200_OK: None},
-    )
-    @decorators.action(detail=True, methods=["post"])
-    def approve(self, request, uuid=None):
-        proposal = self.get_object()
-        previous_state = proposal.state
-        utils.allocate_proposal(proposal)
-        proposal.state = ProposalStates.ACCEPTED
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        proposal.allocation_comment = serializer.validated_data.get(
-            "allocation_comment", ""
-        )
-        proposal.save()
-        tasks.notify_user_about_proposal_state_update.delay(
-            proposal.uuid, previous_state, proposal.state
-        )
-        tasks.notify_reviewer_on_proposal_decision.delay(proposal.uuid)
-        return response.Response(
-            "Proposal has been approved.",
-            status=status.HTTP_200_OK,
-        )
-
-    approve_validators = [
-        core_validators.StateValidator(
-            ProposalStates.SUBMITTED,
-            ProposalStates.IN_REVIEW,
-            ProposalStates.REJECTED,
-            state_enum=ReviewStates,
-        )
-    ]
-
-    @extend_schema(
-        description="Reject a proposal.",
-        request=serializers.ProposalApproveSerializer,
-        responses={status.HTTP_200_OK: None},
-    )
-    @decorators.action(detail=True, methods=["post"])
-    def reject(self, request, uuid=None):
-        proposal = self.get_object()
-        previous_state = proposal.state
-        proposal.state = ProposalStates.REJECTED
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        proposal.allocation_comment = serializer.validated_data.get(
-            "allocation_comment", ""
-        )
-        proposal.save()
-        tasks.notify_user_about_proposal_state_update.delay(
-            proposal.uuid, previous_state, proposal.state
-        )
-        tasks.notify_reviewer_on_proposal_decision.delay(proposal.uuid)
-        return response.Response(
-            "Proposal has been rejected.",
-            status=status.HTTP_200_OK,
-        )
-
-    reject_validators = [
-        core_validators.StateValidator(
-            ProposalStates.SUBMITTED,
-            ProposalStates.IN_REVIEW,
-        )
-    ]
-    reject_permissions = approve_permissions = [
-        permission_factory(
-            PermissionEnum.APPROVE_AND_REJECT_PROPOSALS,
-            ["round.call", "round.call.manager"],
-        )
-    ]
-    reject_serializer_class = approve_serializer_class = (
-        serializers.ProposalApproveSerializer
-    )
+    # NOTE: the legacy one-click `approve`/`reject` actions were removed — every
+    # proposal is now driven through the workflow engine (complete/advance/reject
+    # workflow-step actions), which is the single provisioning path. See the
+    # data migration that backfilled any pre-engine `submitted`/`in_review`
+    # proposals with workflow instances.
 
     # Checklist Integration Endpoints
     # Checklist methods are now provided by ChecklistViewSetMixin
@@ -2408,6 +3263,213 @@ class ProposalViewSet(
         )
 
         return response.Response(response_serializer.data)
+
+    # -- Per-step checklists (WAL-9484) -----------------------------------
+    # The actions above are hardwired to the single call-level compliance
+    # checklist. These step-parameterized variants address the checklist
+    # attached to an individual workflow step (CallWorkflowStep.checklist),
+    # reusing the same request/response serializers so the frontend renders
+    # them with the same components.
+
+    def _resolve_step_checklist(self, request, obj):
+        """Return (call_step, error_response). error_response is None on success."""
+        query_params = getattr(request, "query_params", request.GET)
+        step_key = query_params.get("step")
+        if not step_key:
+            return None, response.Response(
+                {"detail": "The 'step' query parameter is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        call_step = models.CallWorkflowStep.objects.filter(
+            call=obj.round.call, step=step_key
+        ).first()
+        if call_step is None or not call_step.checklist_id:
+            return None, response.Response(
+                {"detail": "No checklist is configured for this workflow step."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return call_step, None
+
+    @extend_schema(
+        description="Get a workflow step's checklist with questions and answers.",
+        parameters=[
+            OpenApiParameter(
+                name="step",
+                location=OpenApiParameter.QUERY,
+                required=True,
+                description="Workflow step key (e.g. technical_assessment).",
+            ),
+            OpenApiParameter(
+                name="include_all",
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Return all questions ignoring dynamic visibility.",
+            ),
+        ],
+        responses={
+            200: checklist_serializers.ChecklistResponseSerializer,
+            400: {"description": "No step/checklist"},
+        },
+    )
+    @decorators.action(detail=True, methods=["get"], url_path="step-checklist")
+    def step_checklist(self, request, uuid=None):
+        obj = self.get_object()
+        call_step, error = self._resolve_step_checklist(request, obj)
+        if error is not None:
+            return error
+        checklist = call_step.checklist
+        # Provision the completion lazily so answers and completion status
+        # serialize cleanly even before the responsible role has answered.
+        completion = obj.ensure_checklist_completion_for(checklist)
+        query_params = getattr(request, "query_params", request.GET)
+        include_all = query_params.get("include_all", "false").lower() == "true"
+        if include_all:
+            questions = checklist.questions.all().order_by("order")
+        else:
+            questions = checklist.get_visible_questions(completion)
+        response_serializer = checklist_serializers.ChecklistResponseSerializer(
+            {"checklist": checklist, "completion": completion, "questions": questions},
+            context={
+                "request": request,
+                "completion": completion,
+                # Multi-writer steps (e.g. technical_assessment) share one
+                # completion; scope the seeded answer to the requesting user so a
+                # reviewer never sees/edits a peer's answer.
+                "answer_user": request.user,
+            },
+        )
+        return response.Response(response_serializer.data)
+
+    step_checklist_permissions = [proposal_permissions.can_read_step_checklist]
+
+    @extend_schema(
+        description="Submit answers to a workflow step's checklist.",
+        parameters=[
+            OpenApiParameter(
+                name="step",
+                location=OpenApiParameter.QUERY,
+                required=True,
+                description="Workflow step key (e.g. technical_assessment).",
+            ),
+        ],
+        request=checklist_serializers.AnswerSubmitSerializer(many=True),
+        responses={
+            200: serializers.ProposalChecklistAnswerSubmitResponseSerializer,
+            400: {"description": "Validation error or no checklist configured"},
+        },
+    )
+    @decorators.action(
+        detail=True, methods=["post"], url_path="submit-step-checklist-answers"
+    )
+    def submit_step_checklist_answers(self, request, uuid=None):
+        obj = self.get_object()
+        call_step, error = self._resolve_step_checklist(request, obj)
+        if error is not None:
+            return error
+        completion = obj.ensure_checklist_completion_for(call_step.checklist)
+
+        submit_serializer = checklist_serializers.AnswerSubmitSerializer(
+            data=request.data,
+            many=True,
+            context={"completion": completion, "request": request},
+        )
+        submit_serializer.is_valid(raise_exception=True)
+
+        for answer_data in submit_serializer.validated_data:
+            question = answer_data["question"]
+            answer_value = answer_data["answer_data"]
+            if answer_value is None:
+                checklist_models.Answer.objects.filter(
+                    completion=completion, question=question, user=request.user
+                ).delete()
+            else:
+                checklist_models.Answer.objects.update_or_create(
+                    completion=completion,
+                    question=question,
+                    user=request.user,
+                    defaults={"answer_data": answer_value},
+                )
+
+        completion.update_completion_status()
+        completion.refresh_from_db()
+
+        response_serializer = (
+            serializers.ProposalChecklistAnswerSubmitResponseSerializer(
+                {"detail": "Answers submitted successfully", "completion": completion},
+                context={"request": request},
+            )
+        )
+        return response.Response(response_serializer.data)
+
+    submit_step_checklist_answers_permissions = [
+        proposal_permissions.can_submit_step_checklist_answers
+    ]
+
+    @extend_schema(
+        description=(
+            "List a workflow step's checklist answers grouped by reviewer, for "
+            "the threaded technical-assessment view. Each technical reviewer "
+            "(offering manager) answers the same checklist; this returns every "
+            "reviewer's decision and comment."
+        ),
+        parameters=[
+            OpenApiParameter(
+                name="step",
+                location=OpenApiParameter.QUERY,
+                required=True,
+                description="Workflow step key (e.g. technical_assessment).",
+            ),
+        ],
+        responses={
+            200: serializers.StepChecklistResponseGroupSerializer(many=True),
+            400: {"description": "No step/checklist"},
+        },
+    )
+    @decorators.action(
+        detail=True, methods=["get"], url_path="step-checklist-responses"
+    )
+    def step_checklist_responses(self, request, uuid=None):
+        obj = self.get_object()
+        call_step, error = self._resolve_step_checklist(request, obj)
+        if error is not None:
+            return error
+        completion = obj.get_checklist_completion_for(call_step.checklist)
+        if completion is None:
+            return response.Response([])
+
+        answers = (
+            checklist_models.Answer.objects.filter(completion=completion)
+            .select_related("user", "question")
+            .order_by("user_id", "question__order")
+        )
+        # Group by reviewer, preserving each reviewer's earliest answer time so
+        # the threaded list can order reviewers by when they first responded.
+        groups = {}
+        for answer in answers:
+            group = groups.setdefault(
+                answer.user_id,
+                {
+                    "user": answer.user,
+                    "answers": [],
+                    "submitted_at": answer.modified,
+                    "_first": answer.created,
+                },
+            )
+            group["answers"].append(answer)
+            if answer.modified and answer.modified > group["submitted_at"]:
+                group["submitted_at"] = answer.modified
+            if answer.created and answer.created < group["_first"]:
+                group["_first"] = answer.created
+
+        ordered = sorted(groups.values(), key=lambda g: g["_first"])
+        serializer = serializers.StepChecklistResponseGroupSerializer(
+            ordered, many=True, context={"request": request, "proposal": obj}
+        )
+        return response.Response(serializer.data)
+
+    step_checklist_responses_permissions = [
+        proposal_permissions.can_view_step_checklist_responses
+    ]
 
 
 class ReviewViewSet(ActionsViewSet):
@@ -2713,6 +3775,12 @@ class ProposalProjectRoleMappingViewSet(ActionsViewSet):
     filterset_class = filters.ProposalProjectRoleMappingFilter
     filter_backends = (DjangoFilterBackend,)
     permission_classes = [proposal_permissions.CanUpdateCallPermission]
+    # Archived calls are read-only. Update/delete run against the mapping
+    # (which reaches its call via ``.call``); create is guarded in the
+    # serializer's ``validate`` where the target call is known.
+    update_validators = partial_update_validators = destroy_validators = [
+        validate_call_not_archived
+    ]
 
 
 # =============================================================================
@@ -2828,114 +3896,14 @@ class ReviewerProfileViewSet(ActionsViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-    # Nested affiliations management
-    @extend_schema(
-        methods=["get"],
-        operation_id="reviewer_profiles_affiliations_list",
-        responses=serializers.ReviewerAffiliationSerializer(many=True),
-        description="List affiliations for a reviewer profile.",
-        filters=False,
-    )
-    @extend_schema(
-        methods=["post"],
-        operation_id="reviewer_profiles_affiliations_create",
-        request=serializers.ReviewerAffiliationSerializer,
-        responses=serializers.ReviewerAffiliationSerializer,
-        description="Create affiliation for a reviewer profile.",
-    )
-    @decorators.action(detail=True, methods=["get", "post"])
-    def affiliations(self, request, uuid=None):
-        profile = self.get_object()
-
-        if request.method == "GET":
-            serializer = serializers.ReviewerAffiliationSerializer(
-                profile.affiliations.all(),
-                many=True,
-                context=self.get_serializer_context(),
-            )
-            return response.Response(serializer.data)
-
-        # POST - create new affiliation
-        serializer = serializers.ReviewerAffiliationSerializer(
-            data=request.data, context=self.get_serializer_context()
-        )
-        serializer.is_valid(raise_exception=True)
-        serializer.save(reviewer_profile=profile)
-        return response.Response(serializer.data, status=status.HTTP_201_CREATED)
-
-    affiliations_serializer_class = serializers.ReviewerAffiliationSerializer
-
-    # Nested expertise management
-    @extend_schema(
-        methods=["get"],
-        operation_id="reviewer_profiles_expertise_list",
-        responses=serializers.ReviewerExpertiseSerializer(many=True),
-        description="List expertise keywords for a reviewer profile.",
-        filters=False,
-    )
-    @extend_schema(
-        methods=["post"],
-        operation_id="reviewer_profiles_expertise_create",
-        request=serializers.ReviewerExpertiseSerializer,
-        responses=serializers.ReviewerExpertiseSerializer,
-        description="Create expertise entry for a reviewer profile.",
-    )
-    @decorators.action(detail=True, methods=["get", "post"])
-    def expertise(self, request, uuid=None):
-        profile = self.get_object()
-
-        if request.method == "GET":
-            serializer = serializers.ReviewerExpertiseSerializer(
-                profile.expertise_set.all(),
-                many=True,
-                context=self.get_serializer_context(),
-            )
-            return response.Response(serializer.data)
-
-        serializer = serializers.ReviewerExpertiseSerializer(
-            data=request.data, context=self.get_serializer_context()
-        )
-        serializer.is_valid(raise_exception=True)
-        serializer.save(reviewer_profile=profile)
-        return response.Response(serializer.data, status=status.HTTP_201_CREATED)
-
-    expertise_serializer_class = serializers.ReviewerExpertiseSerializer
-
-    # Nested publications management
-    @extend_schema(
-        methods=["get"],
-        operation_id="reviewer_profiles_publications_list",
-        responses=serializers.ReviewerPublicationSerializer(many=True),
-        description="List publications for a reviewer profile.",
-        filters=False,
-    )
-    @extend_schema(
-        methods=["post"],
-        operation_id="reviewer_profiles_publications_create",
-        request=serializers.ReviewerPublicationSerializer,
-        responses=serializers.ReviewerPublicationSerializer,
-        description="Create publication for a reviewer profile.",
-    )
-    @decorators.action(detail=True, methods=["get", "post"])
-    def publications(self, request, uuid=None):
-        profile = self.get_object()
-
-        if request.method == "GET":
-            serializer = serializers.ReviewerPublicationSerializer(
-                profile.publications.all(),
-                many=True,
-                context=self.get_serializer_context(),
-            )
-            return response.Response(serializer.data)
-
-        serializer = serializers.ReviewerPublicationSerializer(
-            data=request.data, context=self.get_serializer_context()
-        )
-        serializer.is_valid(raise_exception=True)
-        serializer.save(reviewer_profile=profile)
-        return response.Response(serializer.data, status=status.HTTP_201_CREATED)
-
-    publications_serializer_class = serializers.ReviewerPublicationSerializer
+    # Note: Nested affiliations, expertise, and publications management
+    # are handled by dedicated ViewSets (ReviewerProfileAffiliationViewSet,
+    # ReviewerProfileExpertiseViewSet, ReviewerProfilePublicationViewSet)
+    # registered in waldur_core/server/urls.py using NestedSimpleRouter.
+    # These provide full CRUD operations at endpoints like:
+    # /api/reviewer-profiles/{uuid}/affiliations/
+    # /api/reviewer-profiles/{uuid}/expertise/
+    # /api/reviewer-profiles/{uuid}/publications/
 
     # ORCID Integration
     @extend_schema(
@@ -3258,6 +4226,11 @@ class ConflictOfInterestViewSet(ActionsViewSet):
         return models.ConflictOfInterest.objects.filter(
             Q(call__in=get_connected_calls(user, CallRole.MANAGER))
             | Q(call__manager__customer__in=get_connected_customers(user))
+            | Q(
+                call__manager__customer__callmanagingorganisation__in=get_connected_call_organizers(
+                    user
+                )
+            )
             | Q(reviewer__user=user)  # Reviewers can see their own COIs
         ).order_by("-detected_at")
 
@@ -3278,6 +4251,8 @@ class ConflictOfInterestViewSet(ActionsViewSet):
         coi.reviewed_at = timezone.now()
         coi.review_notes = serializer.validated_data.get("review_notes", "")
         coi.save()
+
+        self._unblock_related_assignments(coi)
 
         return response.Response(
             self.get_serializer(coi).data,
@@ -3307,6 +4282,8 @@ class ConflictOfInterestViewSet(ActionsViewSet):
         coi.review_notes = serializer.validated_data.get("review_notes", "")
         coi.management_plan = serializer.validated_data["management_plan"]
         coi.save()
+
+        self._unblock_related_assignments(coi)
 
         return response.Response(
             self.get_serializer(coi).data,
@@ -3383,6 +4360,35 @@ class ConflictOfInterestViewSet(ActionsViewSet):
             state__in=[models.Review.States.IN_REVIEW],
         ).update(state=models.Review.States.REJECTED)
 
+    def _unblock_related_assignments(self, coi):
+        """
+        Unblock assignment items that were blocked by this COI.
+
+        Only unblocks items if no other unresolved COIs remain for
+        the same reviewer-proposal pair.
+        """
+        if not coi.proposal or not coi.reviewer:
+            return
+
+        blocked_items = models.AssignmentItem.objects.filter(
+            proposal=coi.proposal,
+            batch__reviewer_pool_entry__reviewer=coi.reviewer,
+            status=models.AssignmentItemStatuses.COI_BLOCKED,
+        )
+
+        for item in blocked_items:
+            # Check if there are other unresolved COIs (pending or recused)
+            # excluding the one being dismissed/waived
+            other_blocking_cois = item.coi_records.filter(
+                status__in=[COIStatuses.PENDING, COIStatuses.RECUSED],
+            ).exclude(pk=coi.pk)
+
+            if not other_blocking_cois.exists():
+                item.status = models.AssignmentItemStatuses.PENDING
+                item.has_coi = False
+                item.save(update_fields=["status", "has_coi"])
+                item.coi_records.remove(coi)
+
     dismiss_permissions = waive_permissions = recuse_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
@@ -3413,6 +4419,11 @@ class COIDisclosureViewSet(ActionsViewSet):
             Q(reviewer__user=user)
             | Q(call__in=get_connected_calls(user, CallRole.MANAGER))
             | Q(call__manager__customer__in=get_connected_customers(user))
+            | Q(
+                call__manager__customer__callmanagingorganisation__in=get_connected_call_organizers(
+                    user
+                )
+            )
         ).order_by("-created")
 
     def perform_create(self, serializer):
@@ -3587,7 +4598,7 @@ class CallReviewerPoolViewSet(InvitationAcceptanceMixin, ActionsViewSet):
     partial_update_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["manager"],
+            ["call", "call.manager"],
         )
     ]
 
@@ -3599,6 +4610,11 @@ class CallReviewerPoolViewSet(InvitationAcceptanceMixin, ActionsViewSet):
             qs = models.CallReviewerPool.objects.filter(
                 Q(call__in=get_connected_calls(user, CallRole.MANAGER))
                 | Q(call__manager__customer__in=get_connected_customers(user))
+                | Q(
+                    call__manager__customer__callmanagingorganisation__in=get_connected_call_organizers(
+                        user
+                    )
+                )
                 | Q(reviewer__user=user)
                 | Q(invited_user=user)  # Include user-based invitations
                 | Q(invited_email=user.email)  # Include email-based invitations
@@ -3766,6 +4782,66 @@ class CallReviewerPoolViewSet(InvitationAcceptanceMixin, ActionsViewSet):
 
         return response.Response({"detail": _("Invitation declined.")})
 
+    @extend_schema(
+        description="Force-accept a pool invitation (manager override).",
+        request=serializers.ForceAcceptPoolSerializer,
+        responses={200: serializers.CallReviewerPoolSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"], url_path="force-accept")
+    def force_accept(self, request, uuid=None):
+        """Force-accept a pool invitation with a reason."""
+        invitation = self.get_object()
+
+        if invitation.invitation_status == ReviewerPoolInvitationStatuses.ACCEPTED:
+            return response.Response(
+                {"error": _("This invitation is already accepted.")},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if invitation.invitation_status not in [
+            ReviewerPoolInvitationStatuses.PENDING,
+            ReviewerPoolInvitationStatuses.DECLINED,
+            ReviewerPoolInvitationStatuses.EXPIRED,
+        ]:
+            return response.Response(
+                {"error": _("This invitation cannot be force-accepted.")},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not invitation.reviewer:
+            return response.Response(
+                {
+                    "error": _(
+                        "Cannot force-accept an email-only invitation without a reviewer profile."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = serializers.ForceAcceptPoolSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        invitation.invitation_status = ReviewerPoolInvitationStatuses.ACCEPTED
+        invitation.response_date = timezone.now()
+        invitation.override_reason = serializer.validated_data["override_reason"]
+        invitation.overridden_by = request.user
+        invitation.overridden_at = timezone.now()
+        invitation.save()
+
+        return response.Response(
+            serializers.CallReviewerPoolSerializer(
+                invitation, context=self.get_serializer_context()
+            ).data,
+            status=status.HTTP_200_OK,
+        )
+
+    force_accept_permissions = [
+        permission_factory(
+            PermissionEnum.MANAGE_PROPOSAL_REVIEW,
+            ["call", "call.manager"],
+        )
+    ]
+
 
 class COIDetectionJobViewSet(ReadOnlyActionsViewSet):
     """ViewSet for viewing COI detection job status."""
@@ -3783,6 +4859,11 @@ class COIDetectionJobViewSet(ReadOnlyActionsViewSet):
         return models.COIDetectionJob.objects.filter(
             Q(call__in=get_connected_calls(user, CallRole.MANAGER))
             | Q(call__manager__customer__in=get_connected_customers(user))
+            | Q(
+                call__manager__customer__callmanagingorganisation__in=get_connected_call_organizers(
+                    user
+                )
+            )
         ).order_by("-created")
 
 
@@ -3809,6 +4890,11 @@ class ReviewerSuggestionViewSet(ReadOnlyActionsViewSet):
         return models.ReviewerSuggestion.objects.filter(
             Q(call__in=get_connected_calls(user, CallRole.MANAGER))
             | Q(call__manager__customer__in=get_connected_customers(user))
+            | Q(
+                call__manager__customer__callmanagingorganisation__in=get_connected_call_organizers(
+                    user
+                )
+            )
         ).order_by("-affinity_score")
 
     @extend_schema(
@@ -3836,7 +4922,7 @@ class ReviewerSuggestionViewSet(ReadOnlyActionsViewSet):
     destroy_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["call.manager"],
+            ["call", "call.manager"],
         )
     ]
 
@@ -4087,6 +5173,11 @@ class ReviewerBidViewSet(ActionsViewSet):
             Q(reviewer__user=user)
             | Q(call__in=get_connected_calls(user, CallRole.MANAGER))
             | Q(call__manager__customer__in=get_connected_customers(user))
+            | Q(
+                call__manager__customer__callmanagingorganisation__in=get_connected_call_organizers(
+                    user
+                )
+            )
         ).order_by("-submitted_at")
 
     @extend_schema(
@@ -4570,7 +5661,7 @@ class AssignmentBatchViewSet(ActionsViewSet):
     send_permissions = cancel_permissions = extend_deadline_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["call.manager"],
+            ["call", "call.manager"],
         )
     ]
 
@@ -4738,7 +5829,7 @@ class AssignmentItemViewSet(ActionsViewSet):
     suggest_alternatives_permissions = reassign_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
-            ["batch.call.manager"],
+            ["batch.call", "batch.call.manager"],
         )
     ]
 
@@ -5009,6 +6100,54 @@ class AssignmentItemViewSet(ActionsViewSet):
             },
             status=status.HTTP_200_OK,
         )
+
+    @extend_schema(
+        description="Force-unblock a COI-blocked assignment item (manager override).",
+        request=serializers.ForceUnblockSerializer,
+        responses={200: serializers.AssignmentItemSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"], url_path="force-unblock")
+    def force_unblock(self, request, uuid=None):
+        """Force-unblock a COI-blocked assignment item with a reason."""
+        item: models.AssignmentItem = self.get_object()
+
+        if item.status != models.AssignmentItemStatuses.COI_BLOCKED:
+            return response.Response(
+                {"error": _("Only COI-blocked items can be force-unblocked.")},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = serializers.ForceUnblockSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        item.status = models.AssignmentItemStatuses.PENDING
+        item.has_coi = False
+        item.override_reason = serializer.validated_data["override_reason"]
+        item.overridden_by = request.user
+        item.overridden_at = timezone.now()
+        item.save(
+            update_fields=[
+                "status",
+                "has_coi",
+                "override_reason",
+                "overridden_by",
+                "overridden_at",
+            ]
+        )
+
+        return response.Response(
+            serializers.AssignmentItemSerializer(
+                item, context=self.get_serializer_context()
+            ).data,
+            status=status.HTTP_200_OK,
+        )
+
+    force_unblock_permissions = [
+        permission_factory(
+            PermissionEnum.MANAGE_PROPOSAL_REVIEW,
+            ["batch.call", "batch.call.manager"],
+        )
+    ]
 
 
 class CallAssignmentConfigurationViewSet(ActionsViewSet):

@@ -24,10 +24,23 @@ logger = logging.getLogger(__name__)
 
 
 class SmaxServiceBackend(SupportBackend):
-    def __init__(self):
-        self.manager = SmaxBackend()
+    def __init__(self, settings_override=None):
+        self._settings_override = settings_override or {}
+        self.manager = SmaxBackend(settings_override=self._settings_override)
 
     backend_name = SupportBackendType.SMAX
+
+    def _get_config(self, key, default=None):
+        """Get config value from provider settings override or Constance."""
+        if key in self._settings_override:
+            return self._settings_override[key]
+        return getattr(config, key, default)
+
+    @classmethod
+    def from_settings(cls, settings_dict):
+        """Create a SmaxServiceBackend with provider-specific settings."""
+        return cls(settings_override=settings_dict)
+
     summary_max_length = 140
     message_format = SupportedFormat.HTML
 
@@ -110,9 +123,25 @@ class SmaxServiceBackend(SupportBackend):
         return smax_issue
 
     def update_waldur_issue_from_smax(self, issue):
+        # Skip issues that have not been pushed to SMAX yet — SMAX returns
+        # HTTP 500 "Invalid entity id 'None'" when we query with a missing id.
+        if not issue.backend_id:
+            logger.debug(
+                "Skipping SMAX sync for issue %s: no backend_id assigned yet.",
+                issue.id,
+            )
+            return
+
         # update an issue
         try:
             backend_issue = self.manager.get_issue(issue.backend_id)
+            if backend_issue is None:
+                logger.warning(
+                    "SMAX returned no data for issue %s (backend_id=%s); skipping sync.",
+                    issue.id,
+                    issue.backend_id,
+                )
+                return
             issue.description = backend_issue.description
             issue.summary = backend_issue.summary
             issue.status = backend_issue.status
@@ -133,6 +162,14 @@ class SmaxServiceBackend(SupportBackend):
                     continue
 
                 backend_user = self.manager.get_user(backend_comment.backend_user_id)
+                if backend_user is None:
+                    logger.warning(
+                        "SMAX returned no user for comment %s (issue=%s, backend_user_id=%s); skipping.",
+                        backend_comment.id,
+                        issue.id,
+                        backend_comment.backend_user_id,
+                    )
+                    continue
 
                 # Check for duplicates before get_or_create
                 existing_users = models.SupportUser.objects.filter(
@@ -199,6 +236,14 @@ class SmaxServiceBackend(SupportBackend):
                     continue
 
                 backend_user = self.manager.get_user(backend_attachment.backend_user_id)
+                if backend_user is None:
+                    logger.warning(
+                        "SMAX returned no user for attachment %s (issue=%s, backend_user_id=%s); skipping.",
+                        backend_attachment.id,
+                        issue.id,
+                        backend_attachment.backend_user_id,
+                    )
+                    continue
 
                 # Check for duplicates before get_or_create
                 existing_users = models.SupportUser.objects.filter(
@@ -462,7 +507,9 @@ class SmaxServiceBackend(SupportBackend):
         # SMAX doesn't support new lines
         body = text2html(body)
 
-        integration_user_upn = self.manager.get_user_by_upn(config.SMAX_LOGIN)
+        integration_user_upn = self.manager.get_user_by_upn(
+            self._get_config("SMAX_LOGIN")
+        )
         comment = Comment(
             description=body,
             backend_user_id=integration_user_upn.id,

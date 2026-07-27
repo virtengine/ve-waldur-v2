@@ -1,7 +1,13 @@
+from waldur_core.core import views as core_views
 from waldur_core.structure import views
 
 
 def register_in(router):
+    router.register(
+        r"personal-access-tokens",
+        core_views.PersonalAccessTokenViewSet,
+        basename="personal-access-token",
+    )
     router.register(r"customers", views.CustomerViewSet)
     router.register(r"project-types", views.ProjectTypeViewSet, basename="project_type")
     router.register(r"projects", views.ProjectViewSet)
@@ -15,6 +21,11 @@ def register_in(router):
         views.ProjectPermissionReviewViewSet,
         basename="project-permissions-review",
     )
+    router.register(
+        r"project-end-date-change-requests",
+        views.ProjectEndDateChangeRequestViewSet,
+        basename="project-end-date-change-request",
+    )
     router.register(r"service-settings", views.ServiceSettingsViewSet)
     router.register(r"users", views.UserViewSet)
     router.register(r"keys", views.SshKeyViewSet)
@@ -22,6 +33,21 @@ def register_in(router):
         r"organization-groups",
         views.OrganizationGroupViewSet,
         basename="organization-group",
+    )
+    router.register(
+        r"affiliated-organizations",
+        views.AffiliatedOrganizationViewSet,
+        basename="affiliated-organization",
+    )
+    router.register(
+        r"science-domains",
+        views.ScienceDomainViewSet,
+        basename="science-domain",
+    )
+    router.register(
+        r"science-sub-domains",
+        views.ScienceSubDomainViewSet,
+        basename="science-sub-domain",
     )
     router.register(
         r"user-agreements",

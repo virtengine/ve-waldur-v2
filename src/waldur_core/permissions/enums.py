@@ -1,11 +1,12 @@
-from enum import Enum
+from enum import StrEnum
 from typing import Literal
 
 
-class RoleEnum(str, Enum):
+class RoleEnum(StrEnum):
     CUSTOMER_OWNER = "CUSTOMER.OWNER"
     CUSTOMER_SUPPORT = "CUSTOMER.SUPPORT"
     CUSTOMER_MANAGER = "CUSTOMER.MANAGER"
+    CUSTOMER_READER = "CUSTOMER.READER"
 
     PROJECT_ADMIN = "PROJECT.ADMIN"
     PROJECT_MANAGER = "PROJECT.MANAGER"
@@ -14,6 +15,7 @@ class RoleEnum(str, Enum):
     OFFERING_MANAGER = "OFFERING.MANAGER"
     CALL_REVIEWER = "CALL.REVIEWER"
     CALL_MANAGER = "CALL.MANAGER"
+    CALL_PANEL_MEMBER = "CALL.PANEL_MEMBER"
 
     PROPOSAL_MEMBER = "PROPOSAL.MEMBER"
     PROPOSAL_MANAGER = "PROPOSAL.MANAGER"
@@ -38,9 +40,16 @@ TYPE_MAP = {
     "call_organizer": ("proposal", "callmanagingorganisation"),
     "project": ("structure", "project"),
     "offering": ("marketplace", "offering"),
+    "resource": ("marketplace", "resource"),
+    "resource_project": ("marketplace", "resourceproject"),
     "call": ("proposal", "call"),
     "proposal": ("proposal", "proposal"),
 }
+
+# Inverse of TYPE_MAP — (app_label, model) → type key. Used by PAT
+# serialization and the list-filter backend to map a ContentType back to
+# its TYPE_KEYS string without rebuilding the dict on every call.
+TYPE_KEY_BY_CT = {pair: key for key, pair in TYPE_MAP.items()}
 
 TYPE_KEYS = Literal[
     "customer",
@@ -48,12 +57,14 @@ TYPE_KEYS = Literal[
     "call_organizer",
     "project",
     "offering",
+    "resource",
+    "resource_project",
     "call",
     "proposal",
 ]
 
 
-class PermissionEnum(str, Enum):
+class PermissionEnum(StrEnum):
     REGISTER_SERVICE_PROVIDER = "SERVICE_PROVIDER.REGISTER"
 
     CREATE_OFFERING = "OFFERING.CREATE"
@@ -84,16 +95,19 @@ class PermissionEnum(str, Enum):
     UPDATE_OFFERING_USER = "OFFERING.UPDATE_USER"
     DELETE_OFFERING_USER = "OFFERING.DELETE_USER"
     MANAGE_OFFERING_USER_ROLE = "OFFERING.MANAGE_USER_ROLE"
+    MANAGE_POSIX_ID_POOL = "POSIX_ID_POOL.MANAGE"
     CREATE_RESOURCE_ROBOT_ACCOUNT = "RESOURCE.CREATE_ROBOT_ACCOUNT"
     UPDATE_RESOURCE_ROBOT_ACCOUNT = "RESOURCE.UPDATE_ROBOT_ACCOUNT"
     DELETE_RESOURCE_ROBOT_ACCOUNT = "RESOURCE.DELETE_ROBOT_ACCOUNT"
 
     LIST_ORDERS = "ORDER.LIST"
+    CREATE_ORDER = "ORDER.CREATE"
     APPROVE_PRIVATE_ORDER = "ORDER.APPROVE_PRIVATE"
     APPROVE_ORDER = "ORDER.APPROVE"
     REJECT_ORDER = "ORDER.REJECT"
     DESTROY_ORDER = "ORDER.DESTROY"
     CANCEL_ORDER = "ORDER.CANCEL"
+    SET_CONSUMER_ORDER_INFO = "ORDER.SET_CONSUMER_INFO"
 
     LIST_RESOURCES = "RESOURCE.LIST"
     UPDATE_RESOURCE = "RESOURCE.UPDATE"
@@ -106,11 +120,18 @@ class PermissionEnum(str, Enum):
     SET_RESOURCE_BACKEND_ID = "RESOURCE.SET_BACKEND_ID"
     SUBMIT_RESOURCE_REPORT = "RESOURCE.SUBMIT_REPORT"
     SET_RESOURCE_BACKEND_METADATA = "RESOURCE.SET_BACKEND_METADATA"
+    MANAGE_RESOURCE_API_KEY = "RESOURCE.MANAGE_API_KEY"
     SET_RESOURCE_STATE = "RESOURCE.SET_STATE"
     UPDATE_RESOURCE_OPTIONS = "RESOURCE.UPDATE_OPTIONS"
     ACCEPT_BOOKING_REQUEST = "RESOURCE.ACCEPT_BOOKING_REQUEST"
     REJECT_BOOKING_REQUEST = "RESOURCE.REJECT_BOOKING_REQUEST"
     MANAGE_RESOURCE_USERS = "RESOURCE.MANAGE_USERS"
+    CREATE_RESOURCE_PERMISSION = "RESOURCE.CREATE_PERMISSION"
+    UPDATE_RESOURCE_PERMISSION = "RESOURCE.UPDATE_PERMISSION"
+    DELETE_RESOURCE_PERMISSION = "RESOURCE.DELETE_PERMISSION"
+    CREATE_RESOURCE_PROJECT_PERMISSION = "RESOURCE_PROJECT.CREATE_PERMISSION"
+    UPDATE_RESOURCE_PROJECT_PERMISSION = "RESOURCE_PROJECT.UPDATE_PERMISSION"
+    DELETE_RESOURCE_PROJECT_PERMISSION = "RESOURCE_PROJECT.DELETE_PERMISSION"
     RESOURCE_CONSUMPTION_LIMITATION = "RESOURCE.CONSUMPTION_LIMITATION"
     MANAGE_OFFERING_BACKEND_RESOURCES = "OFFERING.MANAGE_BACKEND_RESOURCES"
 
@@ -138,6 +159,7 @@ class PermissionEnum(str, Enum):
     GET_SERVICE_PROVIDER_ROBOT_ACCOUNT_PROJECTS = (
         "SERVICE_PROVIDER.GET_ROBOT_ACCOUNT_PROJECTS"
     )
+    MANAGE_MAINTENANCE_ANNOUNCEMENT = "SERVICE_PROVIDER.MANAGE_MAINTENANCE_ANNOUNCEMENT"
 
     CREATE_PROJECT_PERMISSION = "PROJECT.CREATE_PERMISSION"
     CREATE_CUSTOMER_PERMISSION = "CUSTOMER.CREATE_PERMISSION"
@@ -170,6 +192,7 @@ class PermissionEnum(str, Enum):
     REVIEW_PROJECT_MEMBERSHIP = "PROJECT.REVIEW_MEMBERSHIP"
 
     UPDATE_CUSTOMER = "CUSTOMER.UPDATE"
+    CUSTOMER_CONTACT_UPDATE = "CUSTOMER.CONTACT_UPDATE"
 
     LIST_CUSTOMER_USERS = "CUSTOMER.LIST_USERS"
 
@@ -180,6 +203,14 @@ class PermissionEnum(str, Enum):
     CREATE_ACCESS_SUBNET = "ACCESS_SUBNET.CREATE"
     UPDATE_ACCESS_SUBNET = "ACCESS_SUBNET.UPDATE"
     DELETE_ACCESS_SUBNET = "ACCESS_SUBNET.DELETE"
+
+    CREATE_RESOURCE_ACCESS_SUBNET = "RESOURCE_ACCESS_SUBNET.CREATE"
+    UPDATE_RESOURCE_ACCESS_SUBNET = "RESOURCE_ACCESS_SUBNET.UPDATE"
+    DELETE_RESOURCE_ACCESS_SUBNET = "RESOURCE_ACCESS_SUBNET.DELETE"
+
+    CREATE_OFFERING_ACCESS_SUBNET = "OFFERING_ACCESS_SUBNET.CREATE"
+    UPDATE_OFFERING_ACCESS_SUBNET = "OFFERING_ACCESS_SUBNET.UPDATE"
+    DELETE_OFFERING_ACCESS_SUBNET = "OFFERING_ACCESS_SUBNET.DELETE"
 
     UPDATE_OFFERING_USER_RESTRICTION = "OFFERINGUSER.UPDATE_RESTRICTION"
 
@@ -206,6 +237,13 @@ class PermissionEnum(str, Enum):
     CAN_MANAGE_OPENSTACK_INSTANCE_POWER = "OPENSTACK_INSTANCE.MANAGE_POWER"
     CAN_MANAGE_OPENSTACK_INSTANCE = "OPENSTACK_INSTANCE.MANAGE"
 
+    # OpenStack Router permissions
+    CAN_MANAGE_OPENSTACK_ROUTER_GATEWAY = "OPENSTACK_ROUTER.MANAGE_GATEWAY"
+
+    # Staff/support access scopes for PATs
+    STAFF_ACCESS = "STAFF.ACCESS"
+    SUPPORT_ACCESS = "SUPPORT.ACCESS"
+
 
 CREATE_PERMISSIONS = {
     "customer": PermissionEnum.CREATE_CUSTOMER_PERMISSION,
@@ -213,8 +251,14 @@ CREATE_PERMISSIONS = {
     "offering": PermissionEnum.CREATE_OFFERING_PERMISSION,
     "call": PermissionEnum.CREATE_CALL_PERMISSION,
     "proposal": PermissionEnum.MANAGE_PROPOSAL,
-    "call_organizer": PermissionEnum.CREATE_CALL_PERMISSION,
+    # Keyed by model_name (see get_create_permission); CallManagingOrganisation's
+    # model_name is "callmanagingorganisation", not the scope-type alias
+    # "call_organizer", so the alias key never resolved and granting the
+    # organizer role 403'd for everyone but staff.
+    "callmanagingorganisation": PermissionEnum.CREATE_CALL_PERMISSION,
     "service_provider": PermissionEnum.CREATE_CUSTOMER_PERMISSION,
+    "resource": PermissionEnum.CREATE_RESOURCE_PERMISSION,
+    "resourceproject": PermissionEnum.CREATE_RESOURCE_PROJECT_PERMISSION,
 }
 
 
@@ -224,8 +268,10 @@ UPDATE_PERMISSIONS = {
     "offering": PermissionEnum.UPDATE_OFFERING_PERMISSION,
     "call": PermissionEnum.UPDATE_CALL_PERMISSION,
     "proposal": PermissionEnum.UPDATE_PROPOSAL_PERMISSION,
-    "call_organizer": PermissionEnum.UPDATE_CALL_PERMISSION,
+    "callmanagingorganisation": PermissionEnum.UPDATE_CALL_PERMISSION,
     "service_provider": PermissionEnum.UPDATE_CUSTOMER_PERMISSION,
+    "resource": PermissionEnum.UPDATE_RESOURCE_PERMISSION,
+    "resourceproject": PermissionEnum.UPDATE_RESOURCE_PROJECT_PERMISSION,
 }
 
 
@@ -235,8 +281,10 @@ DELETE_PERMISSIONS = {
     "offering": PermissionEnum.DELETE_OFFERING_PERMISSION,
     "call": PermissionEnum.DELETE_CALL_PERMISSION,
     "proposal": PermissionEnum.DELETE_PROPOSAL_PERMISSION,
-    "call_organizer": PermissionEnum.DELETE_CALL_PERMISSION,
+    "callmanagingorganisation": PermissionEnum.DELETE_CALL_PERMISSION,
     "service_provider": PermissionEnum.DELETE_CUSTOMER_PERMISSION,
+    "resource": PermissionEnum.DELETE_RESOURCE_PERMISSION,
+    "resourceproject": PermissionEnum.DELETE_RESOURCE_PROJECT_PERMISSION,
 }
 
 
@@ -299,7 +347,9 @@ def categorize_permission(category, action):
     category_mapping = {
         "OFFERING": "Offering",
         "ORDER": "Order",
-        "RESOURCE": "Provider actions"
+        "RESOURCE": "Team members"
+        if "PERMISSION" in action
+        else "Provider actions"
         if action
         in [
             "SET_USAGE",
@@ -324,7 +374,12 @@ def categorize_permission(category, action):
         "SERVICE_ACCOUNT": "Provider actions",
         "LEXIS_LINK": "Other",
         "ACCESS_SUBNET": "Other",
+        "RESOURCE_ACCESS_SUBNET": "Customer actions for resources",
+        "OFFERING_ACCESS_SUBNET": "Offering",
         "OFFERINGUSER": "Offering",
+        "OPENSTACK_INSTANCE": "Openstack",
+        "OPENSTACK_ROUTER": "Openstack",
+        "RESOURCE_PROJECT": "Team members",
     }
 
     return category_mapping.get(category, category.capitalize())

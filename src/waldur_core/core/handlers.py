@@ -1,3 +1,4 @@
+import reversion
 from django.conf import settings
 from django.contrib.auth.hashers import is_password_usable
 from django.core.cache import cache
@@ -12,6 +13,21 @@ from waldur_core.logging.enums import EventType
 from waldur_core.permissions.enums import RoleEnum
 from waldur_core.structure.managers import get_connected_customers
 from waldur_core.structure.models import Customer
+
+
+def create_initial_revision(sender, instance, created=False, **kwargs):
+    """Create an initial reversion snapshot when an object is first created.
+
+    This ensures that the history API returns the initial state of the object,
+    rather than only recording changes from the first update onward.
+    """
+    if not created:
+        return
+    if not reversion.is_registered(sender):
+        return
+    with reversion.create_revision():
+        reversion.add_to_revision(instance)
+        reversion.set_comment("Initial version")
 
 
 def create_auth_token(sender, instance: User, created=False, **kwargs):
@@ -142,9 +158,17 @@ def log_user_save(sender, instance: User, created=False, **kwargs):
                 and old_value != getattr(instance, field_name)
             ]
 
+            change_source = getattr(instance, "_change_source", None)
+            source_suffix = f" Source: {change_source}." if change_source else ""
+
+            # Escape braces in diff values to avoid .format() interpretation
+            safe_diff = "\n".join(
+                line.replace("{", "{{").replace("}", "}}") for line in diff
+            )
+
             event_logger.emit(
-                "User {affected_user_username} has been updated. Details:\n%s"
-                % "\n".join(diff),
+                "User {affected_user_username} has been updated.%s Details:\n%s"
+                % (source_suffix, safe_diff),
                 event_type=EventType.USER_UPDATE_SUCCEEDED,
                 event_context={"affected_user": instance},
                 scopes=[instance],
@@ -234,6 +258,31 @@ def log_token_create(sender, instance: Token, created=False, **kwargs):
             event_context={"affected_user": instance.user},
             scopes=[instance.user],
         )
+
+
+def revoke_user_pats_on_deactivation(sender, instance: User, **kwargs):
+    """Revoke all active PATs when a user is deactivated."""
+    if instance.pk is None:
+        return
+    old_values = getattr(instance, "_old_values", None)
+    if old_values is None:
+        return
+    # Only act when is_active changes from True to False
+    if old_values.get("is_active") and not instance.is_active:
+        count = instance.personal_access_tokens.filter(is_active=True).update(
+            is_active=False
+        )
+        if count:
+            from waldur_core.logging import event_logger as _event_logger
+            from waldur_core.logging.enums import EventType
+
+            _event_logger.emit(
+                f"All personal access tokens ({count}) for user {{affected_user_username}} "
+                "have been revoked due to user deactivation.",
+                event_type=EventType.PAT_REVOKED,
+                event_context={"affected_user": instance},
+                scopes=[instance],
+            )
 
 
 def constance_updated(sender, key, old_value, new_value, **kwargs):

@@ -32,6 +32,126 @@ A notification sent out when an email change is requested. Recipient is the old 
 
 ```
 
+### structure.notification_project_end_date_change_request_approved
+
+Notifies the requester when their project end date change request is approved.
+
+#### Templates
+
+=== "structure/notification_project_end_date_change_request_approved_subject.txt"
+
+```txt
+
+    Project end date change request for {{ project_end_date_change_request.project.name }} has been approved
+
+```
+
+=== "structure/notification_project_end_date_change_request_approved_message.txt"
+
+```txt
+
+    Hello!
+
+    Your request to change the end date of project {{ project_end_date_change_request.project.name }} to {{ project_end_date_change_request.requested_end_date }} has been approved.
+
+    You can view the project here:
+    {{ project_url }}
+
+    Thank you!
+
+```
+
+=== "structure/notification_project_end_date_change_request_approved_message.html"
+
+```txt
+
+    <p>Hello!</p>
+    <p>Your request to change the end date of project <strong>{{ project_end_date_change_request.project.name }}</strong> to <strong>{{ project_end_date_change_request.requested_end_date }}</strong> has been approved.</p>
+    <p>You can <a href="{{ project_url }}">view the project here</a>.</p>
+    <p>Thank you!</p>
+
+```
+
+### structure.notification_project_end_date_change_request_created
+
+Notifies organization owners when a project member requests to change project end date.
+
+#### Templates
+
+=== "structure/notification_project_end_date_change_request_created_subject.txt"
+
+```txt
+
+    Project end date change request for {{ project_end_date_change_request.project.name }}
+
+```
+
+=== "structure/notification_project_end_date_change_request_created_message.txt"
+
+```txt
+
+    Hello!
+
+    {{ project_end_date_change_request.created_by.full_name }} has requested to change the end date of project {{ project_end_date_change_request.project.name }} from {{ project_end_date_change_request.project.end_date }} to {{ project_end_date_change_request.requested_end_date }}.
+
+    Please review and approve or reject the request:
+    {{ project_url }}
+
+    Thank you!
+
+```
+
+=== "structure/notification_project_end_date_change_request_created_message.html"
+
+```txt
+
+    <p>Hello!</p>
+    <p>{{ project_end_date_change_request.created_by.full_name }} has requested to change the end date of project <strong>{{ project_end_date_change_request.project.name }}</strong> to <strong>{{ project_end_date_change_request.requested_end_date }}</strong>.</p>
+    <p>Please <a href="{{ project_url }}">review and approve or reject the request</a>.</p>
+    <p>Thank you!</p>
+
+```
+
+### structure.notification_project_end_date_change_request_rejected
+
+Notifies the requester when their project end date change request is rejected.
+
+#### Templates
+
+=== "structure/notification_project_end_date_change_request_rejected_subject.txt"
+
+```txt
+
+    Project end date change request for {{ project_end_date_change_request.project.name }} has been rejected
+
+```
+
+=== "structure/notification_project_end_date_change_request_rejected_message.txt"
+
+```txt
+
+    Hello!
+
+    Your request to change the end date of project {{ project_end_date_change_request.project.name }} to {{ project_end_date_change_request.requested_end_date }} has been rejected.
+
+    You can view the project here:
+    {{ project_url }}
+
+    Thank you!
+
+```
+
+=== "structure/notification_project_end_date_change_request_rejected_message.html"
+
+```txt
+
+    <p>Hello!</p>
+    <p>Your request to change the end date of project <strong>{{ project_end_date_change_request.project.name }}</strong> to <strong>{{ project_end_date_change_request.requested_end_date }}</strong> has been rejected.</p>
+    <p>You can <a href="{{ project_url }}">view the project here</a>.</p>
+    <p>Thank you!</p>
+
+```
+
 ### structure.notifications_profile_changes_operator
 
 A notification sent to Waldur operators when a user's profile is updated.
@@ -526,9 +646,62 @@ Sent to staff users so they can approve or reject a pending invitation.
 
 ```
 
+### users.permission_request_rejected
+
+Sent to the user who submitted a permission request to inform them that their request has been rejected.
+
+#### Templates
+
+=== "users/permission_request_rejected_subject.txt"
+
+```txt
+
+    Your permission request has been rejected
+
+```
+
+=== "users/permission_request_rejected_message.txt"
+
+```txt
+
+    Hello!
+
+    Your permission request for {{ permission_request.invitation }} has been rejected.
+    {% if permission_request.review_comment %}
+    Reviewer comment: {{ permission_request.review_comment }}
+    {% endif %}
+
+```
+
+=== "users/permission_request_rejected_message.html"
+
+```txt
+
+    <html>
+    <head lang="en">
+      <meta charset="UTF-8">
+      <title>Your permission request has been rejected</title>
+    </head>
+    <body>
+    <p>
+      Hello!
+    </p>
+    <p>
+      Your permission request for {{ permission_request.invitation }} has been rejected.
+    </p>
+    {% if permission_request.review_comment %}
+    <p>
+      Reviewer comment: {{ permission_request.review_comment }}
+    </p>
+    {% endif %}
+    </body>
+    </html>
+
+```
+
 ### users.permission_request_submitted
 
-Sent to staff or customer owners about a submitted permission request.
+Sent about a submitted permission request to the organization owners and managers who can approve it, and to the organization's contact and notification emails. Falls back to staff when none of these are available.
 
 #### Templates
 
@@ -1267,10 +1440,11 @@ Notifies project users about a resource that is nearing its end date.
 
     Hello {{ user.full_name }}!
 
-    The following projects are ending {% if delta == 1 %} tomorrow {% else %} in {{ delta }} days{% endif %}:
+    The following projects will have their resources terminated {% if delta == 1 %} tomorrow {% else %} in {{ delta }} days{% endif %} (on {{ end_date|date:'d/m/Y' }}):
 
     {% for project in projects %}
-        - {{ project.name }} ({{ project.url }})
+        - {{ project.name }} ({{ project.url }}){% if project.grace_period_days %}
+          End date: {{ project.end_date|date:'d/m/Y' }} | Grace period: {{ project.grace_period_days }} days | Termination date: {{ project.effective_end_date|date:'d/m/Y' }}{% endif %}
     {% endfor %}
 
     End of the project will lead to termination of all resources in the project.
@@ -1292,10 +1466,15 @@ Notifies project users about a resource that is nearing its end date.
     </head>
     <body>
     <p>Hello {{ user.full_name }}!</p>
-    <p>The following projects are ending {% if delta == 1 %} tomorrow {% else %} in {{ delta }} days{% endif %}:</p>
+    <p>The following projects will have their resources terminated {% if delta == 1 %} tomorrow {% else %} in {{ delta }} days{% endif %} (on {{ end_date|date:'d/m/Y' }}):</p>
     <ul>
     {% for project in projects %}
-        <li><a href="{{ project.url }}">{{ project.name }}</a></li>
+        <li>
+            <a href="{{ project.url }}">{{ project.name }}</a>
+            {% if project.grace_period_days %}
+            <br /><small>End date: {{ project.end_date|date:'d/m/Y' }} | Grace period: {{ project.grace_period_days }} days | Termination date: {{ project.effective_end_date|date:'d/m/Y' }}</small>
+            {% endif %}
+        </li>
     {% endfor %}
     </ul>
     <p>
@@ -1423,6 +1602,131 @@ Notifies organization owners about active resources that have not generated cost
 
 ```
 
+### marketplace.notification_resource_limit_change_request_approved
+
+Notifies the requester when their resource limit change request is approved.
+
+#### Templates
+
+=== "marketplace/notification_resource_limit_change_request_approved_subject.txt"
+
+```txt
+
+    Resource limit change request approved for {{ resource_limit_change_request.resource.name }}
+
+```
+
+=== "marketplace/notification_resource_limit_change_request_approved_message.txt"
+
+```txt
+
+    Hello!
+
+    Your request to change limits of resource {{ resource_limit_change_request.resource.name }} has been approved.
+
+    A marketplace order has been created to apply the new limits. You can track its progress here:
+    {{ resource_url }}
+
+    Thank you!
+
+```
+
+=== "marketplace/notification_resource_limit_change_request_approved_message.html"
+
+```txt
+
+    <p>Hello!</p>
+    <p>Your request to change limits of resource <strong>{{ resource_limit_change_request.resource.name }}</strong> has been approved.</p>
+    <p>A marketplace order has been created to apply the new limits. You can <a href="{{ resource_url }}">track its progress here</a>.</p>
+    <p>Thank you!</p>
+
+```
+
+### marketplace.notification_resource_limit_change_request_created
+
+Notifies organization owners when a project member requests a resource limit change.
+
+#### Templates
+
+=== "marketplace/notification_resource_limit_change_request_created_subject.txt"
+
+```txt
+
+    Resource limit change request for {{ resource_limit_change_request.resource.name }}
+
+```
+
+=== "marketplace/notification_resource_limit_change_request_created_message.txt"
+
+```txt
+
+    Hello!
+
+    {{ resource_limit_change_request.created_by.full_name }} has requested to change limits of resource {{ resource_limit_change_request.resource.name }} in project {{ resource_limit_change_request.resource.project.name }}.
+
+    Requested limits: {{ resource_limit_change_request.requested_limits }}
+
+    Please review and approve or reject the request:
+    {{ resource_url }}
+
+    Thank you!
+
+```
+
+=== "marketplace/notification_resource_limit_change_request_created_message.html"
+
+```txt
+
+    <p>Hello!</p>
+    <p>{{ resource_limit_change_request.created_by.full_name }} has requested to change limits of resource <strong>{{ resource_limit_change_request.resource.name }}</strong> in project <strong>{{ resource_limit_change_request.resource.project.name }}</strong>.</p>
+    <p>Please <a href="{{ resource_url }}">review and approve or reject the request</a>.</p>
+    <p>Thank you!</p>
+
+```
+
+### marketplace.notification_resource_limit_change_request_rejected
+
+Notifies the requester when their resource limit change request is rejected.
+
+#### Templates
+
+=== "marketplace/notification_resource_limit_change_request_rejected_subject.txt"
+
+```txt
+
+    Resource limit change request rejected for {{ resource_limit_change_request.resource.name }}
+
+```
+
+=== "marketplace/notification_resource_limit_change_request_rejected_message.txt"
+
+```txt
+
+    Hello!
+
+    Your request to change limits of resource {{ resource_limit_change_request.resource.name }} has been rejected.
+
+    {% if resource_limit_change_request.review_comment %}Review comment: {{ resource_limit_change_request.review_comment }}{% endif %}
+
+    You can view the resource here:
+    {{ resource_url }}
+
+    Thank you!
+
+```
+
+=== "marketplace/notification_resource_limit_change_request_rejected_message.html"
+
+```txt
+
+    <p>Hello!</p>
+    <p>Your request to change limits of resource <strong>{{ resource_limit_change_request.resource.name }}</strong> has been rejected.</p>
+    {% if resource_limit_change_request.review_comment %}<p>Review comment: {{ resource_limit_change_request.review_comment }}</p>{% endif %}
+    <p>You can <a href="{{ resource_url }}">view the resource here</a>.</p>
+    <p>Thank you!</p>
+
+```
+
 ### marketplace.notification_to_user_that_order_been_rejected
 
 Notification to user whose order been rejected.
@@ -1444,6 +1748,12 @@ Notification to user whose order been rejected.
     Hello!
 
     Your order {{ link }} to {{ order_type }} a resource {{ order.resource.name }} has been rejected.
+    {% if order.consumer_rejection_comment %}
+    Consumer rejection reason: {{ order.consumer_rejection_comment }}
+    {% endif %}
+    {% if order.provider_rejection_comment %}
+    Provider rejection reason: {{ order.provider_rejection_comment }}
+    {% endif %}
 
 ```
 
@@ -1463,6 +1773,16 @@ Notification to user whose order been rejected.
     <p>
         Your <a href="{{ link }}">order</a> to {{ order_type }} a resource {{ order.resource.name }} has been rejected.
     </p>
+    {% if order.consumer_rejection_comment %}
+    <p>
+        Consumer rejection reason: {{ order.consumer_rejection_comment }}
+    </p>
+    {% endif %}
+    {% if order.provider_rejection_comment %}
+    <p>
+        Provider rejection reason: {{ order.provider_rejection_comment }}
+    </p>
+    {% endif %}
     </body>
     </html>
 
@@ -1573,6 +1893,108 @@ Notifies project members with approval permissions about a pending order.
     </p>
     <p>
         Please visit <a href="{{ order_link }}">{{ site_name }}</a> to find out more details.
+    </p>
+    </body>
+    </html>
+
+```
+
+### marketplace.notify_consumer_about_provider_info
+
+Notifies the order creator when the provider sends a message on a pending order.
+
+#### Templates
+
+=== "marketplace/notify_consumer_about_provider_info_subject.txt"
+
+```txt
+
+    Message from provider regarding your order for {{ order.offering.name }}{% if order.resource %} ({{ order.resource.name }}){% endif %}
+
+```
+
+=== "marketplace/notify_consumer_about_provider_info_message.txt"
+
+```txt
+
+    Hello!
+
+    Service provider has sent a message regarding your order for {{ order.offering.name }}{% if order.resource %} ({{ order.resource.name }}){% endif %}.
+
+    Please visit {{ order_url }} to find out more details.
+
+```
+
+=== "marketplace/notify_consumer_about_provider_info_message.html"
+
+```txt
+
+    <html>
+    <head lang="en">
+        <meta charset="UTF-8">
+        <title>Message from provider regarding your order for {{ order.offering.name }}</title>
+    </head>
+    <body>
+    <p>
+        Hello!
+    </p>
+    <p>
+        Service provider has sent a message regarding your order
+        for <b>{{ order.offering.name }}</b>{% if order.resource %} ({{ order.resource.name }}){% endif %}.
+    </p>
+    <p>
+        Please visit <a href="{{ order_url }}">{{ site_name }}</a> to find out more details.
+    </p>
+    </body>
+    </html>
+
+```
+
+### marketplace.notify_provider_about_consumer_info
+
+Notifies the provider when the consumer responds with a message on a pending order.
+
+#### Templates
+
+=== "marketplace/notify_provider_about_consumer_info_subject.txt"
+
+```txt
+
+    Response from {{ order.created_by.get_full_name }} regarding order for {{ order.offering.name }}{% if order.resource %} ({{ order.resource.name }}){% endif %}
+
+```
+
+=== "marketplace/notify_provider_about_consumer_info_message.txt"
+
+```txt
+
+    Hello!
+
+    {{ order.created_by.get_full_name }} has responded to your message regarding an order for {{ order.offering.name }}{% if order.resource %} ({{ order.resource.name }}){% endif %}.
+
+    Please visit {{ order_url }} to find out more details.
+
+```
+
+=== "marketplace/notify_provider_about_consumer_info_message.html"
+
+```txt
+
+    <html>
+    <head lang="en">
+        <meta charset="UTF-8">
+        <title>Response from {{ order.created_by.get_full_name }} regarding order for {{ order.offering.name }}</title>
+    </head>
+    <body>
+    <p>
+        Hello!
+    </p>
+    <p>
+        <b>{{ order.created_by.get_full_name }}</b> has responded to your message regarding an order
+        for <b>{{ order.offering.name }}</b>{% if order.resource %} ({{ order.resource.name }}){% endif %}.
+    </p>
+    <p>
+        Please visit <a href="{{ order_url }}">{{ site_name }}</a> to find out more details.
     </p>
     </body>
     </html>
@@ -1936,6 +2358,83 @@ Notifies users about a completed project update request, detailing the changes.
 
 ```
 
+### marketplace_remote.resource_end_date_pulled_from_remote
+
+Notification sent when a resource's end date is automatically updated from the remote allocation system because the local date was in the past.
+
+#### Templates
+
+=== "marketplace_remote/resource_end_date_pulled_from_remote_subject.txt"
+
+```txt
+
+    Resource {{ resource.name }} end date updated automatically.
+
+```
+
+=== "marketplace_remote/resource_end_date_pulled_from_remote_message.txt"
+
+```txt
+
+    Hello!
+
+    The end date of resource {{ resource.name }} in project {{ resource.project.name }} has been updated automatically.
+
+    Previous end date: {{ old_end_date }}
+    New end date: {{ new_end_date }}
+
+    Reason: The local end date was in the past and has been synced from the central allocation system.
+
+    You can view the resource here: {{ resource_url }}
+    {% if remote_events %}
+    Recent related events from the central system:
+    {% for event in remote_events %}  - {{ event.message }}
+    {% endfor %}{% endif %}
+    Thank you!
+
+```
+
+=== "marketplace_remote/resource_end_date_pulled_from_remote_message.html"
+
+```txt
+
+    <html>
+    <head lang="en">
+        <meta charset="UTF-8">
+        <title>Resource {{ resource.name }} end date updated automatically.</title>
+    </head>
+    <body>
+    <p>
+        Hello!
+    </p>
+    <p>
+        The end date of resource <a href="{{ resource_url }}">{{ resource.name }}</a>
+        in project <strong>{{ resource.project.name }}</strong> has been updated automatically.
+    </p>
+    <ul>
+        <li>Previous end date: {{ old_end_date }}</li>
+        <li>New end date: {{ new_end_date }}</li>
+    </ul>
+    <p>
+        <strong>Reason:</strong> The local end date was in the past and has been synced
+        from the central allocation system.
+    </p>
+    {% if remote_events %}
+    <p>Recent related events from the central system:</p>
+    <ul>
+        {% for event in remote_events %}
+        <li>{{ event.message }}</li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+    <p>
+        Thank you!
+    </p>
+    </body>
+    </html>
+
+```
+
 ### marketplace_policy.notification_about_project_cost_exceeded_limit
 
 Notification about project cost exceeded limit. The recipients are all customer owners of the project.
@@ -2278,6 +2777,205 @@ Notification about an update in the issue. The recipient is issue caller.
     </p>
     </body>
     </html>
+
+```
+
+### support.provider_email_comment
+
+Email a provider a customer comment via the email support backend.
+
+#### Templates
+
+=== "support/provider_email_comment_subject.txt"
+
+```txt
+
+    [{{ issue.key }}] New comment on ticket: {{ issue.summary }}
+
+```
+
+=== "support/provider_email_comment_message.txt"
+
+```txt
+
+    A new comment has been added to ticket {{ issue.key }}.
+
+    Comment by {{ comment.author.name }}:
+    {{ comment.description }}
+
+```
+
+=== "support/provider_email_comment_message.html"
+
+```txt
+
+    <p>A new comment has been added to ticket <strong>{{ issue.key }}</strong>.</p>
+    <p><strong>Comment by {{ comment.author.name }}:</strong></p>
+    <p>{{ comment.description }}</p>
+
+```
+
+### support.provider_email_new_ticket
+
+Email a provider a new ticket via the email support backend.
+
+#### Templates
+
+=== "support/provider_email_new_ticket_subject.txt"
+
+```txt
+
+    [{{ issue.key }}] New support ticket: {{ issue.summary }}
+
+```
+
+=== "support/provider_email_new_ticket_message.txt"
+
+```txt
+
+    A new support ticket has been routed to your helpdesk.
+
+    Ticket: {{ issue.key }}
+    Summary: {{ issue.summary }}
+    Type: {{ issue.type }}
+    Priority: {{ issue.priority }}
+
+    Description:
+    {{ issue.description }}
+
+```
+
+=== "support/provider_email_new_ticket_message.html"
+
+```txt
+
+    <p>A new support ticket has been routed to your helpdesk.</p>
+    <p><strong>Ticket:</strong> {{ issue.key }}<br>
+    <strong>Summary:</strong> {{ issue.summary }}<br>
+    <strong>Type:</strong> {{ issue.type }}<br>
+    <strong>Priority:</strong> {{ issue.priority }}</p>
+    <p><strong>Description:</strong></p>
+    <p>{{ issue.description }}</p>
+
+```
+
+### support.provider_escalation
+
+Notify a provider helpdesk that a routed ticket has been escalated.
+
+#### Templates
+
+=== "support/provider_escalation_subject.txt"
+
+```txt
+
+    [{{ issue.key }}] ESCALATED: {{ issue.summary }}
+
+```
+
+=== "support/provider_escalation_message.txt"
+
+```txt
+
+    Ticket {{ issue.key }} has been escalated.
+
+    Reason: {{ reason }}
+
+    Summary: {{ issue.summary }}
+    Priority: {{ issue.priority }}
+
+```
+
+=== "support/provider_escalation_message.html"
+
+```txt
+
+    <p>Ticket <strong>{{ issue.key }}</strong> has been escalated.</p>
+    <p><strong>Reason:</strong> {{ reason }}</p>
+    <p><strong>Summary:</strong> {{ issue.summary }}<br>
+    <strong>Priority:</strong> {{ issue.priority }}</p>
+
+```
+
+### support.provider_new_ticket
+
+Notify a provider helpdesk about a new ticket routed to them.
+
+#### Templates
+
+=== "support/provider_new_ticket_subject.txt"
+
+```txt
+
+    [{{ issue.key }}] New ticket: {{ issue.summary }}
+
+```
+
+=== "support/provider_new_ticket_message.txt"
+
+```txt
+
+    A new support ticket has been assigned to your helpdesk.
+
+    Ticket: {{ issue.key }}
+    Summary: {{ issue.summary }}
+    Type: {{ issue.type }}
+    Priority: {{ issue.priority }}
+
+    Description:
+    {{ issue.description }}
+
+```
+
+=== "support/provider_new_ticket_message.html"
+
+```txt
+
+    <p>A new support ticket has been assigned to your helpdesk.</p>
+    <p><strong>Ticket:</strong> {{ issue.key }}<br>
+    <strong>Summary:</strong> {{ issue.summary }}<br>
+    <strong>Type:</strong> {{ issue.type }}<br>
+    <strong>Priority:</strong> {{ issue.priority }}</p>
+    <p><strong>Description:</strong></p>
+    <p>{{ issue.description }}</p>
+
+```
+
+### support.provider_ticket_withdrawn
+
+Notify a provider helpdesk that a ticket previously routed to them was rerouted away.
+
+#### Templates
+
+=== "support/provider_ticket_withdrawn_subject.txt"
+
+```txt
+
+    [{{ issue.key }}] Ticket withdrawn: {{ issue.summary }}
+
+```
+
+=== "support/provider_ticket_withdrawn_message.txt"
+
+```txt
+
+    A support ticket previously routed to your helpdesk has been withdrawn and reassigned to a different provider.
+
+    Ticket: {{ issue.key }}
+    Summary: {{ issue.summary }}
+
+    No further action is required on your side. If you have already opened a corresponding ticket in your system, you may close it.
+
+```
+
+=== "support/provider_ticket_withdrawn_message.html"
+
+```txt
+
+    <p>A support ticket previously routed to your helpdesk has been withdrawn and reassigned to a different provider.</p>
+    <p><strong>Ticket:</strong> {{ issue.key }}<br>
+    <strong>Summary:</strong> {{ issue.summary }}</p>
+    <p>No further action is required on your side. If you have already opened a corresponding ticket in your system, you may close it.</p>
 
 ```
 
@@ -2768,6 +3466,79 @@ A notification about the proposal state changes (submitted → in review → acc
 
 ```
 
+### proposal.proposal_submission_deadline_approaching
+
+Reminds proposal creators to submit draft proposals during the last 3 days before the round cutoff.
+
+#### Templates
+
+=== "proposal/proposal_submission_deadline_approaching_subject.txt"
+
+```txt
+
+    Reminder: Proposal {{ proposal_name }} submission deadline approaching for {{ call_name }}
+
+```
+
+=== "proposal/proposal_submission_deadline_approaching_message.txt"
+
+```txt
+
+    Dear {{ proposal_creator_name }},
+
+    This is a friendly reminder that the submission deadline for your draft proposal "{{ proposal_name }}" in call "{{ call_name }}" is approaching.
+
+    Deadline information:
+    - Round: {{ round_name }}
+    - Submission deadline: {{ deadline_date }}
+    - Time remaining: {{ time_remaining_days }} days {{ time_remaining_hours }} hours
+
+    Your proposal is currently in DRAFT state. To be considered for review, you must submit your proposal before the deadline.
+
+    Please ensure you have completed all required sections and finalized your resource requests before submission.
+
+    Complete and submit proposal: {{ proposal_url }}
+
+    Any proposals left in draft state after the deadline will be automatically canceled and will not be considered for resource allocation.
+
+    This is an automated message from the {{ site_name }}. Please do not reply to this email.
+
+```
+
+=== "proposal/proposal_submission_deadline_approaching_message.html"
+
+```txt
+
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>Proposal submission deadline reminder</title>
+    </head>
+    <body>
+        <p>Dear {{ proposal_creator_name }},</p>
+
+        <p>This is a friendly reminder that the submission deadline for your draft proposal "{{ proposal_name }}" in call "{{ call_name }}" is approaching.</p>
+
+        <p><strong>Deadline information:</strong><br>
+            - Round: {{ round_name }}<br>
+            - Submission deadline: {{ deadline_date }}<br>
+            - Time remaining: {{ time_remaining_days }} days {{ time_remaining_hours }} hours
+        </p>
+
+        <p>Your proposal is currently in <strong>DRAFT</strong> state. To be considered for review, you must submit your proposal before the deadline.</p>
+
+        <p>Please ensure you have completed all required sections and finalized your resource requests before submission.</p>
+
+        <p>Complete and submit proposal: <a href="{{ proposal_url }}">{{ proposal_url }}</a></p>
+
+        <p>Any proposals left in draft state after the deadline will be automatically canceled and will not be considered for resource allocation.</p>
+
+        <p>This is an automated message from the {{ site_name }}. Please do not reply to this email.</p>
+    </body>
+    </html>
+
+```
+
 ### proposal.requested_offering_decision
 
 A notification to call manager about the decision on requested offering (accepted/rejected).
@@ -2917,6 +3688,69 @@ A notification to a reviewer about a new review assignment.
 
 ```
 
+### proposal.review_deadline_approaching
+
+Reminds reviewers to submit in-review assignments 3 days before deadline.
+
+#### Templates
+
+=== "proposal/review_deadline_approaching_subject.txt"
+
+```txt
+
+    Reminder: Review due in {{ time_remaining_days }} days for {{ proposal_name }}
+
+```
+
+=== "proposal/review_deadline_approaching_message.txt"
+
+```txt
+
+    Dear {{ reviewer_name }},
+
+    This is a friendly reminder that your review for the proposal "{{ proposal_name }}" in call "{{ call_name }}" is due soon.
+
+    Review deadline:
+    - Due date: {{ review_deadline }}
+    - Time remaining: {{ time_remaining_days }} days
+
+    Please log in to the platform to complete and submit your review as soon as possible. If you have any questions or need assistance, please contact the call manager.
+
+    Continue review: {{ review_url }}
+
+    This is an automated message from the {{ site_name }}. Please do not reply to this email.
+
+```
+
+=== "proposal/review_deadline_approaching_message.html"
+
+```txt
+
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>Review deadline reminder</title>
+    </head>
+    <body>
+        <p>Dear {{ reviewer_name }},</p>
+
+        <p>This is a friendly reminder that your review for the proposal "{{ proposal_name }}" in call "{{ call_name }}" is due soon.</p>
+
+        <p><strong>Review deadline:</strong><br>
+            - Due date: {{ review_deadline }}<br>
+            - Time remaining: {{ time_remaining_days }} days
+        </p>
+
+        <p>Please log in to the platform to complete and submit your review as soon as possible. If you have any questions or need assistance, please contact the call manager.</p>
+
+        <p>Continue review: <a href="{{ review_url }}">{{ review_url }}</a></p>
+
+        <p>This is an automated message from the {{ site_name }}. Please do not reply to this email.</p>
+    </body>
+    </html>
+
+```
+
 ### proposal.review_rejected
 
 A notification to the call managers about a rejected review.
@@ -2998,6 +3832,59 @@ A notification to the call managers about a rejected review.
         <p>
             This is an automated message from the {{ site_name }}. Please do not reply to this email.
         </p>
+    </body>
+    </html>
+
+```
+
+### proposal.reviewer_invitation
+
+Sent to a person invited to join the reviewer pool for a call.
+
+#### Templates
+
+=== "proposal/reviewer_invitation_subject.txt"
+
+```txt
+
+    You are invited to join the reviewer pool for "{{ call_name }}"
+
+```
+
+=== "proposal/reviewer_invitation_message.txt"
+
+```txt
+
+    You have been invited by {{ invited_by_name }} to join the reviewer pool for the call "{{ call_name }}" on {{ site_name }}.
+
+    To accept or decline this invitation, please follow the link below:
+
+    {{ invitation_link }}
+
+    If you do not yet have an account, you will need to register and create a reviewer profile before accepting.
+
+    This is an automated message from {{ site_name }}. Please do not reply to this email.
+
+```
+
+=== "proposal/reviewer_invitation_message.html"
+
+```txt
+
+    <html>
+    <head>
+        <meta charset="UTF-8">
+    </head>
+    <body>
+    <p>You have been invited by <strong>{{ invited_by_name }}</strong> to join the reviewer pool for the call "<strong>{{ call_name }}</strong>" on {{ site_name }}.</p>
+
+    <p>To accept or decline this invitation, please follow the link below:</p>
+
+    <p><a href="{{ invitation_link }}">{{ invitation_link }}</a></p>
+
+    <p>If you do not yet have an account, you will need to register and create a reviewer profile before accepting.</p>
+
+    <p><em>This is an automated message from {{ site_name }}. Please do not reply to this email.</em></p>
     </body>
     </html>
 
@@ -3367,5 +4254,57 @@ A daily digest notification sent to users with pending actions.
 
     <p>Please acknowledge or resolve these actions here:<br/>
     <a href="{{ actions_url }}">{{ actions_url }}</a></p>
+
+```
+
+## WALDUR_OPENPORTAL
+
+### openportal.managed_project_rejected
+
+Sent to Project admins and Project managers when their resource allocation request is rejected.
+
+#### Templates
+
+=== "openportal/managed_project_rejected_subject.txt"
+
+```txt
+
+    Resource allocation request for {{ project_name }} has been rejected
+
+```
+
+=== "openportal/managed_project_rejected_message.txt"
+
+```txt
+
+    Dear {% if recipient_first_name %}{{ recipient_first_name }}{% else %}user{% endif %},
+
+    This message is from your {{ site_name }} self-service portal. {{ reviewer_organization|default:reviewer_full_name }} has rejected the resource allocation request for project {{ project_name }}.
+
+    {% if review_comment %}Rejection reason: {{ review_comment }}
+
+    {% endif %}Please contact your Resource Allocator for details: {{ reviewer_email }}
+
+    Best regards,
+    {{ reviewer_full_name }}
+    {% if reviewer_organization %}{{ reviewer_organization }}
+    {% endif %}{{ reviewer_email }}
+
+```
+
+=== "openportal/managed_project_rejected_message.html"
+
+```txt
+
+    <html lang="en">
+    <head><meta charset="UTF-8"><title>Resource allocation request rejected</title></head>
+    <body>
+    <p>Dear {% if recipient_first_name %}{{ recipient_first_name }}{% else %}user{% endif %},</p>
+    <p>This message is from your <strong>{{ site_name }}</strong> self-service portal. <strong>{{ reviewer_organization|default:reviewer_full_name }}</strong> has rejected the resource allocation request for project <strong>{{ project_name }}</strong>.</p>
+    {% if review_comment %}<p>Rejection reason: {{ review_comment }}</p>{% endif %}
+    <p>Please contact your Resource Allocator for details: <a href="mailto:{{ reviewer_email }}">{{ reviewer_email }}</a></p>
+    <p>Best regards,<br>{{ reviewer_full_name }}<br>{% if reviewer_organization %}{{ reviewer_organization }}<br>{% endif %}{{ reviewer_email }}</p>
+    </body>
+    </html>
 
 ```

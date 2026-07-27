@@ -19,17 +19,35 @@ from waldur_mastermind.invoices.models import (
     ProjectCredit,
 )
 from waldur_mastermind.invoices.tests import factories as invoices_factories
+from waldur_mastermind.marketplace.enums import RobotAccountStates
 from waldur_mastermind.marketplace.models import (
     Category,
     ComponentUsage,
     Offering,
     OfferingComponent,
+    OfferingPartition,
+    OfferingSoftwareCatalog,
+    OfferingUser,
+    OfferingUserGroup,
     Order,
     Plan,
     PlanComponent,
     Resource,
+    RobotAccount,
+    SoftwareCatalog,
 )
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
+from waldur_mastermind.policy.models import (
+    CustomerEstimatedCostPolicy,
+    ProjectEstimatedCostPolicy,
+    SlurmPeriodicUsagePolicy,
+)
+from waldur_mastermind.policy.tests import factories as policy_factories
+from waldur_mastermind.proposal.models import (
+    CallWorkflowStep,
+    ProposalWorkflowStepInstance,
+)
+from waldur_mastermind.proposal.tests import factories as proposal_factories
 
 
 class ImportStructureCommandTest(TestCase):
@@ -1093,6 +1111,51 @@ class ImportStructureCommandTest(TestCase):
         self.assertEqual(resource2.name, "Test Resource 2")
         self.assertIsNone(resource2.plan)
 
+    def test_import_preserves_paused_flag_against_post_save(self):
+        """A resource imported as paused stays paused even when a post_save
+        handler clears it mid-import. The loader re-applies authored
+        paused/downscaled/restrict_member_access flags via a signal-free
+        update as its final step, so policy re-evaluation triggered by usage
+        or invoice import cannot leave the resource in the wrong state.
+        """
+        from django.db.models.signals import post_save
+
+        customer = structure_factories.CustomerFactory()
+        project = structure_factories.ProjectFactory(customer=customer)
+        offering = marketplace_factories.OfferingFactory()
+        plan = marketplace_factories.PlanFactory(offering=offering)
+
+        # Stand in for the policy app: aggressively clear paused on every
+        # resource save during import. The end-of-import re-apply must win.
+        def _clear_paused(sender, instance, **kwargs):
+            if instance.paused:
+                Resource.objects.filter(pk=instance.pk).update(paused=False)
+
+        post_save.connect(
+            _clear_paused,
+            sender=Resource,
+            dispatch_uid="test_clear_paused",
+        )
+        try:
+            resources_data = [
+                {
+                    "uuid": "cccccccc-dddd-eeee-ffff-333333333333",
+                    "name": "Paused Resource",
+                    "state": 2,
+                    "offering_uuid": offering.uuid.hex,
+                    "plan_uuid": plan.uuid.hex,
+                    "project_uuid": project.uuid.hex,
+                    "paused": True,
+                }
+            ]
+            self._create_test_json({"resources": resources_data})
+            self._call_import_command("-i", self.test_file_path)
+        finally:
+            post_save.disconnect(sender=Resource, dispatch_uid="test_clear_paused")
+
+        resource = Resource.objects.get(uuid="cccccccc-dddd-eeee-ffff-333333333333")
+        self.assertTrue(resource.paused)
+
     def test_import_resources_with_created_date(self):
         """Test that importing resources with created field preserves the date."""
         # Create dependencies
@@ -1529,6 +1592,60 @@ class ImportStructureCommandTest(TestCase):
         # Check that user sync was skipped
         self.assertIn("Skipping user activation status sync", output)
         self.assertNotIn("Syncing user activation status", output)
+
+    def test_import_preserves_deactivation_reason(self):
+        """Test that deactivation_reason is imported for both new and updated users."""
+        users_data = [
+            {
+                "uuid": "33333333-3333-3333-3333-333333333333",
+                "username": "deactivated_user",
+                "email": "deactivated@example.com",
+                "is_active": False,
+                "deactivation_reason": "All roles were revoked",
+                "first_name": "Deactivated",
+                "last_name": "User",
+                "date_joined": "2023-01-01T00:00:00Z",
+            }
+        ]
+
+        test_data = {"users": users_data}
+        self._create_test_json(test_data)
+
+        self._call_import_command(input=self.test_file_path, skip_user_sync=True)
+
+        user = User.all_objects.get(uuid="33333333-3333-3333-3333-333333333333")
+        self.assertFalse(user.is_active)
+        self.assertEqual(user.deactivation_reason, "All roles were revoked")
+
+    def test_import_update_preserves_deactivation_reason(self):
+        """Test that deactivation_reason is updated on existing users."""
+        from waldur_core.structure.tests import factories as structure_factories
+
+        existing = structure_factories.UserFactory(
+            is_active=True,
+            deactivation_reason="",
+        )
+        users_data = [
+            {
+                "uuid": str(existing.uuid),
+                "username": existing.username,
+                "email": existing.email,
+                "is_active": False,
+                "deactivation_reason": "Manually deactivated by admin",
+                "date_joined": "2023-01-01T00:00:00Z",
+            }
+        ]
+
+        test_data = {"users": users_data}
+        self._create_test_json(test_data)
+
+        self._call_import_command(
+            input=self.test_file_path, update=True, skip_user_sync=True
+        )
+
+        existing.refresh_from_db()
+        self.assertFalse(existing.is_active)
+        self.assertEqual(existing.deactivation_reason, "Manually deactivated by admin")
 
     def test_cleanup_structure_skip_side_effects_flag(self):
         """Test that cleanup_structure accepts --skip-rabbitmq-messages flag."""
@@ -2169,6 +2286,62 @@ class ImportStructureCommandTest(TestCase):
             "token_lifetime should be None (unlimited) but was overwritten with default",
         )
 
+    def test_import_new_user_with_minus_one_token_lifetime(self):
+        """Test that token_lifetime=-1 (new export format for unlimited) is converted to None."""
+        new_user_uuid = "550e8400-e29b-41d4-a716-446655440333"
+
+        test_data = {
+            "users": [
+                {
+                    "uuid": new_user_uuid,
+                    "email": "minus1user@example.com",
+                    "username": "new_user_minus1_token",
+                    "first_name": "MinusOne",
+                    "last_name": "User",
+                    "token_lifetime": -1,  # New export format for unlimited
+                }
+            ]
+        }
+
+        self._create_test_json(test_data)
+        self._call_import_command("-i", self.test_file_path)
+
+        from waldur_core.core.models import User
+
+        new_user = User.all_objects.filter(uuid=new_user_uuid).first()
+        self.assertIsNotNone(new_user)
+        self.assertIsNone(
+            new_user.token_lifetime,
+            "token_lifetime=-1 should be imported as None (unlimited)",
+        )
+
+    def test_update_existing_user_with_minus_one_token_lifetime(self):
+        """Test that updating a user with token_lifetime=-1 sets it to None."""
+        existing_user = structure_factories.UserFactory(
+            email="existing@example.com",
+            username="existing_user",
+            token_lifetime=7200,
+        )
+
+        test_data = {
+            "users": [
+                {
+                    "uuid": str(existing_user.uuid),
+                    "email": "existing@example.com",
+                    "username": "existing_user",
+                    "first_name": "Test",
+                    "last_name": "User",
+                    "token_lifetime": -1,
+                }
+            ]
+        }
+
+        self._create_test_json(test_data)
+        self._call_import_command("-i", self.test_file_path, "--update")
+
+        existing_user.refresh_from_db()
+        self.assertIsNone(existing_user.token_lifetime)
+
     # Credit Import Tests
 
     def test_import_customer_credits_with_all_fields(self):
@@ -2536,3 +2709,781 @@ class ImportStructureCommandTest(TestCase):
         self.assertEqual(imported_credit.offerings.count(), 2)
         self.assertIn(offering1, imported_credit.offerings.all())
         self.assertIn(offering2, imported_credit.offerings.all())
+
+    def test_import_software_catalogs(self):
+        """Test that importing software catalogs creates catalog objects."""
+        catalogs_data = [
+            {
+                "uuid": "11111111-1111-1111-1111-111111111111",
+                "name": "EESSI",
+                "version": "2023.06",
+                "catalog_type": "binary_runtime",
+                "source_url": "https://eessi.io",
+                "description": "EESSI software catalog",
+                "metadata": {"arch_mapping": {"x86_64": "generic"}},
+                "auto_update_enabled": True,
+                "update_errors": "",
+            }
+        ]
+
+        data = {"software_catalogs": catalogs_data}
+        self._create_test_json(data)
+
+        output = self._call_import_command("-i", self.test_file_path)
+
+        self.assertEqual(SoftwareCatalog.objects.count(), 1)
+
+        catalog = SoftwareCatalog.objects.get(
+            uuid="11111111-1111-1111-1111-111111111111"
+        )
+        self.assertEqual(catalog.name, "EESSI")
+        self.assertEqual(catalog.version, "2023.06")
+        self.assertEqual(catalog.catalog_type, "binary_runtime")
+        self.assertEqual(catalog.source_url, "https://eessi.io")
+        self.assertEqual(catalog.description, "EESSI software catalog")
+        self.assertEqual(catalog.metadata, {"arch_mapping": {"x86_64": "generic"}})
+        self.assertTrue(catalog.auto_update_enabled)
+
+        self.assertIn("Created: 1", output)
+
+    def test_import_offering_partitions(self):
+        """Test that importing offering partitions creates partition objects."""
+        offering = marketplace_factories.OfferingFactory()
+
+        partitions_data = [
+            {
+                "uuid": "22222222-2222-2222-2222-222222222222",
+                "offering_uuid": offering.uuid.hex,
+                "partition_name": "gpu",
+                "cpu_bind": 1,
+                "def_cpu_per_gpu": 4,
+                "max_cpus_per_node": 64,
+            }
+        ]
+
+        data = {"offering_partitions": partitions_data}
+        self._create_test_json(data)
+
+        output = self._call_import_command("-i", self.test_file_path)
+
+        self.assertEqual(OfferingPartition.objects.count(), 1)
+
+        partition = OfferingPartition.objects.get(
+            uuid="22222222-2222-2222-2222-222222222222"
+        )
+        self.assertEqual(partition.offering, offering)
+        self.assertEqual(partition.partition_name, "gpu")
+        self.assertEqual(partition.cpu_bind, 1)
+        self.assertEqual(partition.def_cpu_per_gpu, 4)
+        self.assertEqual(partition.max_cpus_per_node, 64)
+
+        self.assertIn("Created: 1", output)
+
+    def test_import_offering_software_catalogs(self):
+        """Test that importing offering-software-catalog links creates link objects."""
+        offering = marketplace_factories.OfferingFactory()
+        catalog = marketplace_factories.SoftwareCatalogFactory()
+        partition = marketplace_factories.OfferingPartitionFactory(offering=offering)
+
+        links_data = [
+            {
+                "uuid": "33333333-3333-3333-3333-333333333333",
+                "offering_uuid": offering.uuid.hex,
+                "catalog_uuid": catalog.uuid.hex,
+                "partition_uuid": partition.uuid.hex,
+                "enabled_cpu_family": ["x86_64", "aarch64"],
+                "enabled_cpu_microarchitectures": ["generic", "zen3"],
+            }
+        ]
+
+        data = {"offering_software_catalogs": links_data}
+        self._create_test_json(data)
+
+        output = self._call_import_command("-i", self.test_file_path)
+
+        self.assertEqual(OfferingSoftwareCatalog.objects.count(), 1)
+
+        link = OfferingSoftwareCatalog.objects.get(
+            uuid="33333333-3333-3333-3333-333333333333"
+        )
+        self.assertEqual(link.offering, offering)
+        self.assertEqual(link.catalog, catalog)
+        self.assertEqual(link.partition, partition)
+        self.assertEqual(link.enabled_cpu_family, ["x86_64", "aarch64"])
+        self.assertEqual(link.enabled_cpu_microarchitectures, ["generic", "zen3"])
+
+        self.assertIn("Created: 1", output)
+
+    def test_import_offering_software_catalogs_without_partition(self):
+        """Test that importing links without partition works correctly."""
+        offering = marketplace_factories.OfferingFactory()
+        catalog = marketplace_factories.SoftwareCatalogFactory()
+
+        links_data = [
+            {
+                "uuid": "44444444-4444-4444-4444-444444444444",
+                "offering_uuid": offering.uuid.hex,
+                "catalog_uuid": catalog.uuid.hex,
+                "enabled_cpu_family": ["x86_64"],
+                "enabled_cpu_microarchitectures": [],
+            }
+        ]
+
+        data = {"offering_software_catalogs": links_data}
+        self._create_test_json(data)
+
+        self._call_import_command("-i", self.test_file_path)
+
+        link = OfferingSoftwareCatalog.objects.get(
+            uuid="44444444-4444-4444-4444-444444444444"
+        )
+        self.assertEqual(link.offering, offering)
+        self.assertEqual(link.catalog, catalog)
+        self.assertIsNone(link.partition)
+
+    def test_import_software_catalogs_skip_existing(self):
+        """Test that import skips existing software catalogs."""
+        marketplace_factories.SoftwareCatalogFactory(
+            uuid="55555555-5555-5555-5555-555555555555",
+            name="Existing",
+            version="1.0",
+        )
+
+        catalogs_data = [
+            {
+                "uuid": "55555555-5555-5555-5555-555555555555",
+                "name": "Updated Name",
+                "version": "2.0",
+                "catalog_type": "binary_runtime",
+            }
+        ]
+
+        data = {"software_catalogs": catalogs_data}
+        self._create_test_json(data)
+
+        output = self._call_import_command("-i", self.test_file_path)
+
+        catalog = SoftwareCatalog.objects.get(
+            uuid="55555555-5555-5555-5555-555555555555"
+        )
+        self.assertEqual(catalog.name, "Existing")
+        self.assertEqual(catalog.version, "1.0")
+
+        self.assertIn("Skipped: 1", output)
+
+    def test_import_software_catalogs_update_existing(self):
+        """Test that import updates existing catalogs with --update flag."""
+        marketplace_factories.SoftwareCatalogFactory(
+            uuid="66666666-6666-6666-6666-666666666666",
+            name="Existing",
+            version="1.0",
+        )
+
+        catalogs_data = [
+            {
+                "uuid": "66666666-6666-6666-6666-666666666666",
+                "name": "Updated Name",
+                "version": "2.0",
+                "catalog_type": "source_package",
+            }
+        ]
+
+        data = {"software_catalogs": catalogs_data}
+        self._create_test_json(data)
+
+        output = self._call_import_command("-i", self.test_file_path, "--update")
+
+        catalog = SoftwareCatalog.objects.get(
+            uuid="66666666-6666-6666-6666-666666666666"
+        )
+        self.assertEqual(catalog.name, "Updated Name")
+        self.assertEqual(catalog.version, "2.0")
+        self.assertEqual(catalog.catalog_type, "source_package")
+
+        self.assertIn("Updated: 1", output)
+
+    def test_import_software_catalogs_roundtrip(self):
+        """Test full export-import roundtrip for software catalogs."""
+        offering = marketplace_factories.OfferingFactory(name="SLURM Offering")
+        catalog = marketplace_factories.SoftwareCatalogFactory(
+            name="EESSI",
+            version="2023.06",
+            catalog_type="binary_runtime",
+        )
+        partition = marketplace_factories.OfferingPartitionFactory(
+            offering=offering,
+            partition_name="gpu",
+        )
+        link = marketplace_factories.OfferingSoftwareCatalogFactory(
+            offering=offering,
+            catalog=catalog,
+            partition=partition,
+            enabled_cpu_family=["x86_64"],
+            enabled_cpu_microarchitectures=["zen3"],
+        )
+
+        catalog_uuid = catalog.uuid
+        partition_uuid = partition.uuid
+        link_uuid = link.uuid
+
+        export_output = StringIO()
+        call_command(
+            "export_structure", "-o", self.test_file_path, stdout=export_output
+        )
+
+        OfferingSoftwareCatalog.objects.all().delete()
+        OfferingPartition.objects.all().delete()
+        SoftwareCatalog.objects.all().delete()
+
+        import_output = StringIO()
+        call_command(
+            "import_structure", "-i", self.test_file_path, stdout=import_output
+        )
+
+        restored_catalog = SoftwareCatalog.objects.get(uuid=catalog_uuid)
+        self.assertEqual(restored_catalog.name, "EESSI")
+        self.assertEqual(restored_catalog.version, "2023.06")
+
+        restored_partition = OfferingPartition.objects.get(uuid=partition_uuid)
+        self.assertEqual(restored_partition.partition_name, "gpu")
+        self.assertEqual(restored_partition.offering, offering)
+
+        restored_link = OfferingSoftwareCatalog.objects.get(uuid=link_uuid)
+        self.assertEqual(restored_link.offering, offering)
+        self.assertEqual(restored_link.catalog, restored_catalog)
+        self.assertEqual(restored_link.partition, restored_partition)
+        self.assertEqual(restored_link.enabled_cpu_family, ["x86_64"])
+        self.assertEqual(restored_link.enabled_cpu_microarchitectures, ["zen3"])
+
+    def test_offering_user_import_skips_duplicate_offering_user_pair(self):
+        """Test that importing an offering user with a different UUID but the same
+        (offering, user) pair as an existing record is skipped gracefully
+        instead of raising an IntegrityError.
+        """
+        offering = marketplace_factories.OfferingFactory()
+        user1 = structure_factories.UserFactory()
+        user2 = structure_factories.UserFactory()
+
+        # Pre-create an offering user so the second entry has a duplicate pair
+        existing = marketplace_factories.OfferingUserFactory(
+            offering=offering,
+            user=user1,
+            username="existing",
+        )
+
+        data = {
+            "offering_users": [
+                {
+                    # Different UUID but same (offering, user) pair — should be skipped
+                    "uuid": "aaaaaaaa000000000000000000000002",
+                    "offering_uuid": offering.uuid.hex,
+                    "user_uuid": user1.uuid.hex,
+                    "username": "duplicate",
+                },
+                {
+                    # This should succeed
+                    "uuid": "aaaaaaaa000000000000000000000003",
+                    "offering_uuid": offering.uuid.hex,
+                    "user_uuid": user2.uuid.hex,
+                    "username": "newuser",
+                },
+            ],
+        }
+
+        self._create_test_json(data)
+        output = self._call_import_command("-i", self.test_file_path)
+
+        # The duplicate pair should NOT cause an error
+        self.assertNotIn("Failed to import offering user", output)
+
+        # The existing offering user should be unchanged (skipped, not updated)
+        existing.refresh_from_db()
+        self.assertEqual(existing.username, "existing")
+
+        # The second offering user should have been created successfully
+        self.assertTrue(
+            OfferingUser.objects.filter(
+                uuid="aaaaaaaa000000000000000000000003"
+            ).exists(),
+        )
+
+    def test_offering_user_import_updates_duplicate_pair_when_update_existing(self):
+        """Test that importing an offering user with a duplicate (offering, user)
+        pair updates the existing record when --update-existing is set.
+        """
+        offering = marketplace_factories.OfferingFactory()
+        user1 = structure_factories.UserFactory()
+
+        existing = marketplace_factories.OfferingUserFactory(
+            offering=offering,
+            user=user1,
+            username="old_username",
+        )
+
+        data = {
+            "offering_users": [
+                {
+                    "uuid": "aaaaaaaa000000000000000000000002",
+                    "offering_uuid": offering.uuid.hex,
+                    "user_uuid": user1.uuid.hex,
+                    "username": "new_username",
+                },
+            ],
+        }
+
+        self._create_test_json(data)
+        output = self._call_import_command("-i", self.test_file_path, "--update")
+
+        self.assertNotIn("Failed to import offering user", output)
+
+        existing.refresh_from_db()
+        self.assertEqual(existing.username, "new_username")
+
+    def test_import_project_estimated_cost_policies(self):
+        """Test that project estimated cost policies are imported correctly."""
+        project = structure_factories.ProjectFactory()
+        policy_uuid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+        data = {
+            "project_estimated_cost_policies": [
+                {
+                    "uuid": policy_uuid,
+                    "project_uuid": project.uuid.hex,
+                    "limit_cost": 500,
+                    "period": 2,
+                    "actions": "notify_project_team",
+                    "options": {},
+                    "has_fired": False,
+                }
+            ]
+        }
+
+        self._create_test_json(data)
+        self._call_import_command("-i", self.test_file_path)
+
+        self.assertEqual(ProjectEstimatedCostPolicy.objects.count(), 1)
+        policy = ProjectEstimatedCostPolicy.objects.first()
+        self.assertEqual(str(policy.uuid), policy_uuid)
+        self.assertEqual(policy.scope, project)
+        self.assertEqual(policy.limit_cost, 500)
+        self.assertEqual(policy.actions, "notify_project_team")
+
+    def test_import_customer_estimated_cost_policies(self):
+        """Test that customer estimated cost policies are imported correctly."""
+        customer = structure_factories.CustomerFactory()
+        policy_uuid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+        data = {
+            "customer_estimated_cost_policies": [
+                {
+                    "uuid": policy_uuid,
+                    "customer_uuid": customer.uuid.hex,
+                    "limit_cost": 1000,
+                    "period": 3,
+                    "actions": "notify_organization_owners",
+                    "options": {},
+                    "has_fired": False,
+                }
+            ]
+        }
+
+        self._create_test_json(data)
+        self._call_import_command("-i", self.test_file_path)
+
+        self.assertEqual(CustomerEstimatedCostPolicy.objects.count(), 1)
+        policy = CustomerEstimatedCostPolicy.objects.first()
+        self.assertEqual(str(policy.uuid), policy_uuid)
+        self.assertEqual(policy.scope, customer)
+        self.assertEqual(policy.limit_cost, 1000)
+
+    def test_import_project_cost_policy_skips_missing_project(self):
+        """Test that import skips policies referencing nonexistent projects."""
+        data = {
+            "project_estimated_cost_policies": [
+                {
+                    "uuid": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+                    "project_uuid": "00000000-0000-0000-0000-000000000000",
+                    "limit_cost": 100,
+                    "actions": "notify_project_team",
+                }
+            ]
+        }
+
+        self._create_test_json(data)
+        self._call_import_command("-i", self.test_file_path)
+
+        self.assertEqual(ProjectEstimatedCostPolicy.objects.count(), 0)
+
+    def test_cleanup_deletes_cost_policies(self):
+        """Test that cleanup_structure deletes cost policies."""
+        policy_factories.ProjectEstimatedCostPolicyFactory()
+        policy_factories.CustomerEstimatedCostPolicyFactory()
+
+        self.assertEqual(ProjectEstimatedCostPolicy.objects.count(), 1)
+        self.assertEqual(CustomerEstimatedCostPolicy.objects.count(), 1)
+
+        output = StringIO()
+        call_command("cleanup_structure", stdout=output)
+
+        self.assertEqual(ProjectEstimatedCostPolicy.objects.count(), 0)
+        self.assertEqual(CustomerEstimatedCostPolicy.objects.count(), 0)
+
+    def test_cleanup_deletes_slurm_periodic_policies(self):
+        """Test that cleanup_structure deletes SLURM periodic policies."""
+        policy_factories.SlurmPeriodicUsagePolicyFactory()
+
+        self.assertEqual(SlurmPeriodicUsagePolicy.objects.count(), 1)
+
+        output = StringIO()
+        call_command("cleanup_structure", stdout=output)
+
+        self.assertEqual(SlurmPeriodicUsagePolicy.objects.count(), 0)
+
+    def test_export_import_roundtrip_cost_policies(self):
+        """Test that cost policies survive export → cleanup → import cycle."""
+        project_policy = policy_factories.ProjectEstimatedCostPolicyFactory(
+            limit_cost=500,
+        )
+        customer_policy = policy_factories.CustomerEstimatedCostPolicyFactory(
+            limit_cost=1000,
+        )
+
+        # Export
+        export_path = os.path.join(self.temp_dir, "export.json")
+        call_command("export_structure", "-o", export_path, stdout=StringIO())
+
+        # Cleanup
+        call_command("cleanup_structure", stdout=StringIO())
+        self.assertEqual(ProjectEstimatedCostPolicy.objects.count(), 0)
+        self.assertEqual(CustomerEstimatedCostPolicy.objects.count(), 0)
+
+        # Import
+        call_command("import_structure", "-i", export_path, stdout=StringIO())
+
+        self.assertEqual(ProjectEstimatedCostPolicy.objects.count(), 1)
+        self.assertEqual(CustomerEstimatedCostPolicy.objects.count(), 1)
+
+        imported_project_policy = ProjectEstimatedCostPolicy.objects.first()
+        self.assertEqual(str(imported_project_policy.uuid), str(project_policy.uuid))
+        self.assertEqual(imported_project_policy.limit_cost, 500)
+
+        imported_customer_policy = CustomerEstimatedCostPolicy.objects.first()
+        self.assertEqual(str(imported_customer_policy.uuid), str(customer_policy.uuid))
+        self.assertEqual(imported_customer_policy.limit_cost, 1000)
+
+    def test_import_offering_users_with_backend_metadata(self):
+        """Test that importing offering users preserves backend_metadata."""
+        offering = marketplace_factories.OfferingFactory()
+        user = structure_factories.UserFactory()
+        backend_metadata = {
+            "uidnumber": 7001,
+            "primarygroup": 8001,
+            "loginShell": "/bin/bash",
+            "homeDir": "/home/e2e/alice",
+        }
+
+        data = {
+            "offering_users": [
+                {
+                    "uuid": "abcdabcd-1111-2222-3333-444444444444",
+                    "offering_uuid": offering.uuid.hex,
+                    "user_uuid": user.uuid.hex,
+                    "username": "alice",
+                    "state": 5,
+                    "backend_metadata": backend_metadata,
+                }
+            ]
+        }
+        self._create_test_json(data)
+
+        self._call_import_command("-i", self.test_file_path)
+
+        offering_user = OfferingUser.objects.get(
+            uuid="abcdabcd-1111-2222-3333-444444444444"
+        )
+        self.assertEqual(offering_user.username, "alice")
+        self.assertEqual(offering_user.backend_metadata, backend_metadata)
+
+    def test_import_robot_accounts_creates_new_accounts(self):
+        """Test that importing robot accounts creates new robot account objects."""
+        resource = marketplace_factories.ResourceFactory()
+        user = structure_factories.UserFactory()
+
+        data = {
+            "robot_accounts": [
+                {
+                    "uuid": "abcdabcd-aaaa-bbbb-cccc-111111111111",
+                    "resource_uuid": resource.uuid.hex,
+                    "username": "robot1",
+                    "type": "cicd",
+                    "keys": ["ssh-rsa AAAA robot1@example.com"],
+                    "state": RobotAccountStates.OK,
+                    "backend_metadata": {"uidnumber": 7100, "primarygroup": 8100},
+                    "backend_id": "robot-backend-1",
+                    "user_uuids": [user.uuid.hex],
+                },
+                {
+                    "uuid": "abcdabcd-aaaa-bbbb-cccc-222222222222",
+                    "resource_uuid": resource.uuid.hex,
+                    "username": "robot2",
+                    "type": "cli",
+                    "keys": [],
+                    "state": RobotAccountStates.ERROR,
+                    "backend_metadata": {},
+                    "user_uuids": [],
+                },
+            ]
+        }
+        self._create_test_json(data)
+
+        self._call_import_command("-i", self.test_file_path)
+
+        self.assertEqual(RobotAccount.objects.count(), 2)
+
+        robot1 = RobotAccount.objects.get(uuid="abcdabcd-aaaa-bbbb-cccc-111111111111")
+        self.assertEqual(robot1.username, "robot1")
+        self.assertEqual(robot1.type, "cicd")
+        self.assertEqual(robot1.resource.uuid, resource.uuid)
+        self.assertEqual(robot1.keys, ["ssh-rsa AAAA robot1@example.com"])
+        self.assertEqual(robot1.state, RobotAccountStates.OK)
+        self.assertEqual(
+            robot1.backend_metadata, {"uidnumber": 7100, "primarygroup": 8100}
+        )
+        self.assertEqual(robot1.backend_id, "robot-backend-1")
+        self.assertEqual(list(robot1.users.all()), [user])
+
+        robot2 = RobotAccount.objects.get(uuid="abcdabcd-aaaa-bbbb-cccc-222222222222")
+        self.assertEqual(robot2.state, RobotAccountStates.ERROR)
+        self.assertEqual(robot2.users.count(), 0)
+
+    def test_import_robot_accounts_skips_missing_resource(self):
+        """Test that robot accounts referencing unknown resources are skipped."""
+        data = {
+            "robot_accounts": [
+                {
+                    "uuid": "abcdabcd-aaaa-bbbb-cccc-333333333333",
+                    "resource_uuid": "00000000-0000-0000-0000-000000000000",
+                    "username": "orphan",
+                    "type": "cli",
+                }
+            ]
+        }
+        self._create_test_json(data)
+
+        output = self._call_import_command("-i", self.test_file_path)
+
+        self.assertEqual(RobotAccount.objects.count(), 0)
+        self.assertIn("not found", output)
+
+    def test_import_offering_user_groups_creates_new_groups(self):
+        """Test that importing offering user groups creates groups with projects."""
+        offering = marketplace_factories.OfferingFactory()
+        project = structure_factories.ProjectFactory()
+
+        data = {
+            "offering_user_groups": [
+                {
+                    "offering_uuid": offering.uuid.hex,
+                    "backend_metadata": {"gid": 8501},
+                    "project_uuids": [project.uuid.hex],
+                }
+            ]
+        }
+        self._create_test_json(data)
+
+        self._call_import_command("-i", self.test_file_path)
+
+        group = OfferingUserGroup.objects.get(
+            offering=offering, backend_metadata__gid=8501
+        )
+        self.assertEqual(group.backend_metadata, {"gid": 8501})
+        self.assertEqual(list(group.projects.all()), [project])
+
+        # Re-importing must not create a duplicate (matched by offering + gid)
+        self._call_import_command("-i", self.test_file_path)
+        self.assertEqual(OfferingUserGroup.objects.count(), 1)
+
+    def test_export_import_roundtrip_glauth_entities(self):
+        """Test that glauth-related entities survive export -> cleanup -> import."""
+        offering = marketplace_factories.OfferingFactory()
+        user = structure_factories.UserFactory()
+        project = structure_factories.ProjectFactory()
+        resource = marketplace_factories.ResourceFactory(offering=offering)
+
+        offering_user = marketplace_factories.OfferingUserFactory(
+            offering=offering,
+            user=user,
+            username="roundtrip-user",
+        )
+        offering_user.backend_metadata = {"uidnumber": 7001, "primarygroup": 8001}
+        offering_user.save(update_fields=["backend_metadata"])
+
+        robot_account = marketplace_factories.RobotAccountFactory(
+            resource=resource,
+            username="roundtrip-robot",
+            type="cicd",
+            keys=["ssh-rsa AAAA robot@example.com"],
+            backend_metadata={"uidnumber": 7100},
+        )
+        robot_account.users.add(user)
+
+        group = OfferingUserGroup.objects.create(
+            offering=offering, backend_metadata={"gid": 8501}
+        )
+        group.projects.add(project)
+
+        # Export
+        export_path = os.path.join(self.temp_dir, "export.json")
+        call_command("export_structure", "-o", export_path, stdout=StringIO())
+
+        # Cleanup
+        call_command("cleanup_structure", stdout=StringIO())
+        self.assertEqual(OfferingUser.objects.count(), 0)
+        self.assertEqual(RobotAccount.objects.count(), 0)
+        self.assertEqual(OfferingUserGroup.objects.count(), 0)
+
+        # Import
+        call_command("import_structure", "-i", export_path, stdout=StringIO())
+
+        restored_offering_user = OfferingUser.objects.get(uuid=offering_user.uuid)
+        self.assertEqual(
+            restored_offering_user.backend_metadata,
+            {"uidnumber": 7001, "primarygroup": 8001},
+        )
+
+        restored_robot = RobotAccount.objects.get(uuid=robot_account.uuid)
+        self.assertEqual(restored_robot.username, "roundtrip-robot")
+        self.assertEqual(restored_robot.backend_metadata, {"uidnumber": 7100})
+        self.assertEqual(
+            [u.uuid for u in restored_robot.users.all()],
+            [user.uuid],
+        )
+
+        restored_group = OfferingUserGroup.objects.get(backend_metadata__gid=8501)
+        self.assertEqual(restored_group.offering.uuid, offering.uuid)
+        self.assertEqual(
+            [p.uuid for p in restored_group.projects.all()],
+            [project.uuid],
+        )
+
+    def test_import_auth_tokens_replaces_auto_created_token(self):
+        """Importing a declared token must replace the user's existing token.
+
+        Importing users auto-creates a token per user, so without replacement
+        a preset could never pin a deterministic token value.
+        """
+        from rest_framework.authtoken.models import Token
+
+        user = structure_factories.UserFactory()
+        Token.objects.filter(user=user).delete()
+        Token.objects.create(user=user, key="0" * 40)
+
+        declared_key = "e2e0abababababababababababababababababab"
+        data = {
+            "auth_tokens": [
+                {
+                    "key": declared_key,
+                    "user_uuid": user.uuid.hex,
+                    "created": "2026-01-01T00:00:00Z",
+                }
+            ]
+        }
+        self._create_test_json(data)
+
+        self._call_import_command("-i", self.test_file_path)
+
+        token = Token.objects.get(user=user)
+        self.assertEqual(token.key, declared_key)
+
+
+class ImportWorkflowEngineStateTest(TestCase):
+    """The importer seeds per-call workflow step config and per-proposal
+    workflow step instances — engine state otherwise created only by the
+    runtime submit/advance actions, so absent from directly-imported presets.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.test_file_path = os.path.join(self.temp_dir, "test_structure.json")
+
+    def tearDown(self):
+        if os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir)
+
+    def _run(self, data):
+        with open(self.test_file_path, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        output = StringIO()
+        call_command("import_structure", input=self.test_file_path, stdout=output)
+        return output.getvalue()
+
+    def test_seeds_step_config_and_instances(self):
+        proposal = proposal_factories.ProposalFactory()
+        call = proposal.round.call
+        actor = structure_factories.UserFactory()
+
+        self._run(
+            {
+                "call_workflow_steps": [
+                    {
+                        "call_uuid": call.uuid.hex,
+                        "step": "expert_review",
+                        "is_enabled": True,
+                        "blind_review": True,
+                        "responsible_role": "reviewer",
+                        "transition_mode": "manual",
+                    },
+                ],
+                "proposal_workflow_step_instances": [
+                    {
+                        "uuid": "cf000000000000000000000000000001",
+                        "proposal_uuid": proposal.uuid.hex,
+                        "step": "administrative_check",
+                        "status": "completed",
+                        "outcome": "eligible",
+                        "completed_by_uuid": actor.uuid.hex,
+                    },
+                    {
+                        "uuid": "cf000000000000000000000000000002",
+                        "proposal_uuid": proposal.uuid.hex,
+                        "step": "expert_review",
+                        "status": "active",
+                    },
+                ],
+            }
+        )
+
+        # Step config overrides the row auto-seeded by the call's post-save
+        # signal (matched by call + step, not uuid).
+        step = CallWorkflowStep.objects.get(call=call, step="expert_review")
+        self.assertTrue(step.is_enabled)
+        self.assertTrue(step.blind_review)
+
+        instances = ProposalWorkflowStepInstance.objects.filter(proposal=proposal)
+        self.assertEqual(instances.count(), 2)
+        completed = instances.get(step="administrative_check")
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(completed.outcome, "eligible")
+        self.assertEqual(completed.completed_by, actor)
+        self.assertEqual(instances.get(step="expert_review").status, "active")
+
+        # The active instance keeps the proposal's workflow_step pointer in sync.
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.workflow_step, "expert_review")
+
+    def test_instance_without_uuid_is_skipped(self):
+        proposal = proposal_factories.ProposalFactory()
+        self._run(
+            {
+                "proposal_workflow_step_instances": [
+                    {
+                        "proposal_uuid": proposal.uuid.hex,
+                        "step": "expert_review",
+                        "status": "active",
+                    },
+                ],
+            }
+        )
+        self.assertEqual(
+            ProposalWorkflowStepInstance.objects.filter(proposal=proposal).count(), 0
+        )

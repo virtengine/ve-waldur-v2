@@ -1,9 +1,17 @@
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied
 
 from waldur_core.logging import enums as logging_enums
+from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.permissions.utils import has_permission
 from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_mastermind.marketplace.enums import SITE_AGENT_OFFERING
+from waldur_mastermind.marketplace.enums import (
+    BASIC_OFFERING,
+    OPENSTACK_TENANT_OFFERING,
+    SCRIPT_OFFERING,
+    SITE_AGENT_OFFERING,
+)
 from waldur_mastermind.marketplace_site_agent import enums, models
 
 
@@ -136,16 +144,45 @@ class AgentServiceStatisticsSerializer(serializers.Serializer):
     )
 
 
+class AgentDependencySerializer(serializers.Serializer):
+    package = serializers.CharField()
+    version = serializers.CharField()
+
+
 class AgentIdentitySerializer(serializers.HyperlinkedModelSerializer):
     offering = serializers.SlugRelatedField(
         slug_field="uuid",
-        queryset=marketplace_models.Offering.objects.filter(type=SITE_AGENT_OFFERING),
-        help_text="UUID of an offering with type 'Marketplace.Slurm'. "
-        "Only site-agent offerings are accepted.",
+        queryset=marketplace_models.Offering.objects.filter(
+            type__in=[
+                SITE_AGENT_OFFERING,
+                SCRIPT_OFFERING,
+                OPENSTACK_TENANT_OFFERING,
+                BASIC_OFFERING,
+            ]
+        ),
+        help_text="UUID of an offering with a site-agent compatible type.",
+    )
+    created_by = serializers.SlugRelatedField(
+        slug_field="uuid",
+        read_only=True,
+        allow_null=True,
     )
     services = NestedAgentServiceSerializer(
         many=True, read_only=True, source="agentservice_set"
     )
+    dependencies = AgentDependencySerializer(many=True, required=False)
+
+    def validate_offering(self, value):
+        # An agent identity's offering is fixed at creation. The field's queryset
+        # is not scoped to the caller, and update (PUT) only gates on managing
+        # the CURRENT offering — so allowing a change would let an offering
+        # manager repoint the record onto an offering they don't control. A PUT
+        # that re-sends the same offering (a full round-trip) is still fine.
+        if self.instance is not None and value != self.instance.offering:
+            raise serializers.ValidationError(
+                "Offering cannot be changed after the agent identity is created."
+            )
+        return value
 
     class Meta:
         model = models.AgentIdentity
@@ -153,6 +190,7 @@ class AgentIdentitySerializer(serializers.HyperlinkedModelSerializer):
             "uuid",
             "url",
             "offering",
+            "created_by",
             "name",
             "version",
             "dependencies",
@@ -186,6 +224,46 @@ class AgentEventSubscriptionCreateSerializer(serializers.Serializer):
     )
 
 
+class AgentQueueRegistrationSerializer(serializers.Serializer):
+    # No `description` field: unlike the legacy EventSubscription, EventConsumer
+    # has nowhere to store it and register_queue never read it — exposing it in
+    # the schema implied a persistence that never happened.
+    object_types = serializers.ListField(
+        child=serializers.ChoiceField(
+            choices=[
+                (member.value, member.value)
+                for member in logging_enums.ObservableObjectType
+            ],
+        ),
+        required=False,
+        # No default: an omitted field means "keep the current filter", an
+        # explicit [] means "all types". With default=list an agent that simply
+        # stopped sending the field on restart would silently widen its queue
+        # from a narrow set back to the full firehose.
+        help_text=(
+            "List of observable object types to receive. An explicit empty list "
+            "means all types; omitting the field leaves the current filter "
+            "unchanged."
+        ),
+    )
+
+
+class AgentQueueRegistrationResponseSerializer(serializers.Serializer):
+    rmq_username = serializers.CharField(
+        help_text="RabbitMQ username (UUID hex) for STOMP authentication",
+    )
+    queue_name = serializers.CharField(
+        help_text="RabbitMQ queue name (consumer_{consumer_uuid})",
+    )
+    vhost = serializers.CharField(
+        help_text="RabbitMQ virtual host (user UUID)",
+    )
+    observable_object_types = serializers.ListField(
+        child=serializers.CharField(),
+        help_text="List of observable object types routed to this queue",
+    )
+
+
 class CleanupRequestSerializer(serializers.Serializer):
     dry_run = serializers.BooleanField(
         default=True,
@@ -198,34 +276,100 @@ class CleanupRequestSerializer(serializers.Serializer):
     )
 
 
+class CleanupResponseItemSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField()
+    name = serializers.CharField()
+    offering__name = serializers.CharField(required=False)
+    created = serializers.DateTimeField(required=False)
+    identity__name = serializers.CharField(required=False)
+    state = serializers.CharField(required=False)
+    modified = serializers.DateTimeField(required=False)
+
+
 class CleanupResponseSerializer(serializers.Serializer):
     deleted_count = serializers.IntegerField(
         help_text="Number of items deleted (or would be deleted in dry run)"
     )
     dry_run = serializers.BooleanField(help_text="Whether this was a dry run")
-    items = serializers.ListField(
-        child=serializers.DictField(),
+    items = CleanupResponseItemSerializer(
+        many=True,
         help_text="List of deleted (or to-be-deleted) items",
     )
 
 
+class AgentStatsOfferingCountSerializer(serializers.Serializer):
+    offering__name = serializers.CharField()
+    offering__uuid = serializers.UUIDField()
+    count = serializers.IntegerField()
+
+
+class AgentStatsIdentitiesSerializer(serializers.Serializer):
+    total = serializers.IntegerField()
+    by_offering = AgentStatsOfferingCountSerializer(many=True)
+
+
+class AgentStatsServicesStateSerializer(serializers.Serializer):
+    active = serializers.IntegerField()
+    idle = serializers.IntegerField()
+    error = serializers.IntegerField()
+
+
+class AgentStatsServicesSerializer(serializers.Serializer):
+    total = serializers.IntegerField()
+    by_state = AgentStatsServicesStateSerializer()
+    stale_count = serializers.IntegerField()
+
+
+class AgentStatsBackendTypeSerializer(serializers.Serializer):
+    backend_type = serializers.CharField(allow_null=True)
+    count = serializers.IntegerField()
+
+
+class AgentStatsProcessorsSerializer(serializers.Serializer):
+    total = serializers.IntegerField()
+    by_backend_type = AgentStatsBackendTypeSerializer(many=True)
+    stale_count = serializers.IntegerField()
+
+
 class AgentStatsResponseSerializer(serializers.Serializer):
-    identities = serializers.DictField(help_text="Statistics about agent identities")
-    services = serializers.DictField(help_text="Statistics about agent services")
-    processors = serializers.DictField(help_text="Statistics about agent processors")
+    identities = AgentStatsIdentitiesSerializer(
+        help_text="Statistics about agent identities"
+    )
+    services = AgentStatsServicesSerializer(help_text="Statistics about agent services")
+    processors = AgentStatsProcessorsSerializer(
+        help_text="Statistics about agent processors"
+    )
+
+
+class ActiveAgentTaskSerializer(serializers.Serializer):
+    id = serializers.CharField()
+    name = serializers.CharField()
+    args = serializers.ListField(child=serializers.CharField(), required=False)
+    worker = serializers.CharField()
+
+
+class ScheduledAgentTaskSerializer(serializers.Serializer):
+    id = serializers.CharField()
+    name = serializers.CharField()
+    eta = serializers.CharField()
+
+
+class ReservedAgentTaskSerializer(serializers.Serializer):
+    id = serializers.CharField()
+    name = serializers.CharField()
 
 
 class AgentTaskStatsResponseSerializer(serializers.Serializer):
-    active_tasks = serializers.ListField(
-        child=serializers.DictField(),
+    active_tasks = ActiveAgentTaskSerializer(
+        many=True,
         help_text="Currently running agent-related tasks",
     )
-    scheduled_tasks = serializers.ListField(
-        child=serializers.DictField(),
+    scheduled_tasks = ScheduledAgentTaskSerializer(
+        many=True,
         help_text="Scheduled agent-related tasks",
     )
-    reserved_tasks = serializers.ListField(
-        child=serializers.DictField(),
+    reserved_tasks = ReservedAgentTaskSerializer(
+        many=True,
         help_text="Reserved agent-related tasks",
     )
     error = serializers.CharField(
@@ -414,3 +558,67 @@ class AgentConnectionStatsResponseSerializer(serializers.Serializer):
         read_only=True,
         help_text="Summary statistics",
     )
+
+
+class SiteAgentLogCreateSerializer(serializers.Serializer):
+    """Input: one log entry. The agent sends a list of these."""
+
+    agent_identity_uuid = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=models.AgentIdentity.objects.filter(
+            offering__type__in=[
+                SITE_AGENT_OFFERING,
+                SCRIPT_OFFERING,
+                OPENSTACK_TENANT_OFFERING,
+                BASIC_OFFERING,
+            ]
+        ),
+    )
+    timestamp = serializers.FloatField()
+    level = serializers.ChoiceField(choices=enums.LogLevel.CHOICES)
+    message = serializers.CharField()
+    module = serializers.CharField(max_length=255)
+
+    def validate_agent_identity_uuid(self, agent_identity):
+        request = self.context.get("request")
+        if request:
+            checked = self.context.setdefault("_checked_identity_pks", set())
+            if agent_identity.pk not in checked:
+                offering = agent_identity.offering
+                can_push = has_permission(
+                    request, PermissionEnum.CREATE_OFFERING, offering.customer
+                ) or has_permission(request, PermissionEnum.UPDATE_OFFERING, offering)
+                if not can_push:
+                    raise PermissionDenied()
+                checked.add(agent_identity.pk)
+        return agent_identity
+
+
+class SiteAgentLogSerializer(serializers.ModelSerializer):
+    offering_uuid = serializers.UUIDField(
+        source="agent_identity.offering.uuid", read_only=True
+    )
+    offering = serializers.HyperlinkedRelatedField(
+        source="agent_identity.offering",
+        view_name="marketplace-provider-offering-detail",
+        read_only=True,
+        lookup_field="uuid",
+    )
+    agent_identity_uuid = serializers.UUIDField(
+        source="agent_identity.uuid",
+        read_only=True,
+    )
+
+    class Meta:
+        model = models.SiteAgentLog
+        fields = (
+            "uuid",
+            "offering",
+            "offering_uuid",
+            "agent_identity_uuid",
+            "timestamp",
+            "level",
+            "message",
+            "module",
+            "created",
+        )

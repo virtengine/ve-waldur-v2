@@ -2,6 +2,7 @@ import logging
 
 from django.core.validators import MinValueValidator
 from django.utils.translation import gettext_lazy as _
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import exceptions as rf_exceptions
 from rest_framework import serializers as rf_serializers
 
@@ -255,6 +256,131 @@ class HistoricalRemoteAllocationSerializer(rf_serializers.HyperlinkedModelSerial
         }
 
 
+class UsageSerializer(rf_serializers.Serializer):
+    seconds = rf_serializers.IntegerField()
+
+
+class DailyProjectUsageReportSerializer(rf_serializers.Serializer):
+    reports = rf_serializers.DictField(
+        child=UsageSerializer(), help_text="local_username → Usage"
+    )
+    components = rf_serializers.DictField(
+        child=rf_serializers.DictField(child=UsageSerializer()),
+        required=False,
+        help_text='component_name → local_username → Usage. e.g. { "cpu": { "chris.aiproject": { "seconds": 41055 } } }',
+    )
+    user_job_counts = rf_serializers.DictField(
+        child=rf_serializers.IntegerField(),
+        required=False,
+        help_text="local_username → job count",
+    )
+    user_wait_seconds = rf_serializers.DictField(
+        child=rf_serializers.IntegerField(),
+        required=False,
+        help_text="local_username → wait seconds",
+    )
+    num_jobs = rf_serializers.IntegerField(required=False)
+    total_wait_seconds = rf_serializers.IntegerField(required=False)
+    is_complete = rf_serializers.BooleanField()
+
+
+class ProjectUsageReportSerializer(rf_serializers.Serializer):
+    project = rf_serializers.CharField(
+        help_text='ProjectIdentifier string e.g. "aiproject.brics"'
+    )
+    reports = rf_serializers.DictField(
+        child=DailyProjectUsageReportSerializer(),
+        help_text='"YYYY-MM-DD" → DailyProjectUsageReportJson',
+    )
+    users = rf_serializers.DictField(
+        child=rf_serializers.CharField(),
+        help_text='UserIdentifier → local_username. e.g. { "chris.aiproject.brics": "chris.aiproject" }',
+    )
+
+
+class OpenPortalQuotaSerializer(rf_serializers.Serializer):
+    limit = rf_serializers.CharField(
+        help_text='Size limit. "unlimited" or a size string e.g. "1024.00 GB"'
+    )
+    usage = rf_serializers.CharField(
+        required=False,
+        help_text='Size usage e.g. "24.00 KB". Absent when the server has no usage data.',
+    )
+
+
+class DailyStorageReportSerializer(rf_serializers.Serializer):
+    project = rf_serializers.CharField()
+    generated_at = rf_serializers.CharField(help_text="RFC3339 timestamp")
+    project_quotas = rf_serializers.DictField(
+        child=OpenPortalQuotaSerializer(), help_text="Volume → Quota"
+    )
+    user_quotas = rf_serializers.DictField(
+        child=rf_serializers.DictField(child=OpenPortalQuotaSerializer()),
+        help_text="UserIdentifier → (Volume → Quota)",
+    )
+
+
+class ProjectStorageReportSerializer(rf_serializers.Serializer):
+    project = rf_serializers.CharField()
+    generated_at = rf_serializers.CharField(help_text="RFC3339 timestamp")
+    project_quotas = rf_serializers.DictField(
+        child=OpenPortalQuotaSerializer(), help_text="Volume → Quota"
+    )
+    user_quotas = rf_serializers.DictField(
+        child=rf_serializers.DictField(child=OpenPortalQuotaSerializer()),
+        help_text="UserIdentifier → (Volume → Quota)",
+    )
+    users = rf_serializers.DictField(
+        child=rf_serializers.CharField(), help_text="UserIdentifier → local_username"
+    )
+    daily_reports = rf_serializers.DictField(
+        child=DailyStorageReportSerializer(),
+        required=False,
+        help_text='"YYYY-MM-DD" → DailyStorageReportJson. Absent from JSON when there are no daily snapshots.',
+    )
+
+
+@extend_schema_field(ProjectUsageReportSerializer)
+class ProjectUsageReportField(rf_serializers.JSONField):
+    pass
+
+
+@extend_schema_field(ProjectStorageReportSerializer)
+class ProjectStorageReportField(rf_serializers.JSONField):
+    pass
+
+
+class CachedProjectUsageReportSerializer(rf_serializers.ModelSerializer):
+    report = ProjectUsageReportField()
+
+    class Meta:
+        model = models.CachedProjectUsageReport
+        fields = (
+            "id",
+            "year",
+            "month",
+            "project_identifier",
+            "resource",
+            "is_complete",
+            "report",
+        )
+
+
+class CachedProjectStorageReportSerializer(rf_serializers.ModelSerializer):
+    report = ProjectStorageReportField()
+
+    class Meta:
+        model = models.CachedProjectStorageReport
+        fields = (
+            "id",
+            "year",
+            "month",
+            "project_identifier",
+            "resource",
+            "report",
+        )
+
+
 class UserInfoSerializer(rf_serializers.HyperlinkedModelSerializer):
     class Meta:
         model = models.UserInfo
@@ -353,7 +479,7 @@ class ProjectTemplateSerializer(
         lookup_field="uuid",
     )
 
-    provider_data = structure_serializers.CustomerSerializer(
+    provider_data = structure_serializers.BasicCustomerSerializer(
         source="provider", read_only=True
     )
 
@@ -363,7 +489,7 @@ class ProjectTemplateSerializer(
         lookup_field="uuid",
     )
 
-    customer_data = structure_serializers.CustomerSerializer(
+    customer_data = structure_serializers.BasicCustomerSerializer(
         source="customer", read_only=True
     )
 
@@ -374,7 +500,7 @@ class ProjectTemplateSerializer(
         lookup_field="uuid",
     )
 
-    offerings_data = marketplace_serializers.ProviderOfferingDetailsSerializer(
+    offerings_data = marketplace_serializers.ResourceOfferingSerializer(
         source="offerings", many=True, read_only=True
     )
 
@@ -424,6 +550,65 @@ class ProjectTemplateSerializer(
         return ("provider", "customer", "offerings")
 
 
+class ProjectAccountingSummarySerializer(rf_serializers.Serializer):
+    """
+    Read-only serializer for project accounting summaries.
+    Data is derived from invoice items and project credits via get_project_spend_info.
+    """
+
+    project_uuid = rf_serializers.UUIDField(source="uuid", read_only=True)
+    project_name = rf_serializers.CharField(source="name", read_only=True)
+    customer_uuid = rf_serializers.UUIDField(source="customer.uuid", read_only=True)
+    customer_name = rf_serializers.CharField(source="customer.name", read_only=True)
+    start_date = rf_serializers.DateField(read_only=True, allow_null=True)
+    end_date = rf_serializers.DateField(read_only=True, allow_null=True)
+    total_credits = rf_serializers.DecimalField(
+        max_digits=20, decimal_places=2, read_only=True
+    )
+    total_spend = rf_serializers.DecimalField(
+        max_digits=20, decimal_places=2, read_only=True
+    )
+    current_month_spend = rf_serializers.DecimalField(
+        max_digits=20, decimal_places=2, read_only=True
+    )
+
+    def to_representation(self, project):
+        import decimal
+
+        from . import utils as openportal_utils
+
+        data = {
+            "project_uuid": str(project.uuid),
+            "project_name": project.name,
+            "customer_uuid": str(project.customer.uuid),
+            "customer_name": project.customer.name,
+            "start_date": (project.start_date or project.created.date()).isoformat(),
+            "end_date": project.end_date.isoformat() if project.end_date else None,
+        }
+
+        try:
+            (credits_no_current, spend_no_current) = (
+                openportal_utils.get_project_spend_info(
+                    project, include_current_month=False, silent=True
+                )
+            )
+            (credits_with_current, spend_with_current) = (
+                openportal_utils.get_project_spend_info(
+                    project, include_current_month=True, silent=True
+                )
+            )
+            data["total_credits"] = credits_with_current
+            data["total_spend"] = spend_no_current
+            data["current_month_spend"] = spend_with_current - spend_no_current
+        except Exception as e:
+            logger.error(f"Error computing spend info for project {project}: {e}")
+            data["total_credits"] = decimal.Decimal(0)
+            data["total_spend"] = decimal.Decimal(0)
+            data["current_month_spend"] = decimal.Decimal(0)
+
+        return data
+
+
 class ProjectAttachSerializer(rf_serializers.Serializer):
     project_uuid = rf_serializers.UUIDField(
         help_text="UUID of the project to attach to this managed project"
@@ -440,11 +625,19 @@ class ProjectAttachSerializer(rf_serializers.Serializer):
             )
 
 
+class ManagedProjectDetailsSerializer(rf_serializers.Serializer):
+    name = rf_serializers.CharField(required=False, allow_null=True)
+    description = rf_serializers.CharField(required=False, allow_null=True)
+    allocation = rf_serializers.CharField(required=False, allow_null=True)
+    start_date = rf_serializers.CharField(required=False, allow_null=True)
+    end_date = rf_serializers.CharField(required=False, allow_null=True)
+
+
 class ManagedProjectSerializer(
     structure_serializers.PermissionFieldFilteringMixin,
     rf_serializers.ModelSerializer,
 ):
-    state = rf_serializers.ReadOnlyField(source="get_state_display")
+    state = rf_serializers.CharField(read_only=True, source="get_state_display")
 
     reviewed_by_full_name = rf_serializers.CharField(
         read_only=True, source="reviewed_by.full_name"
@@ -459,14 +652,11 @@ class ManagedProjectSerializer(
         lookup_field="uuid",
     )
 
-    project_data = structure_serializers.ProjectSerializer(
+    project_data = structure_serializers.BasicProjectSerializer(
         source="project", read_only=True
     )
 
-    details = rf_serializers.JSONField(
-        read_only=True,
-        help_text=_("Details of the project as provided by the remote OpenPortal."),
-    )
+    details = ManagedProjectDetailsSerializer(read_only=True)
 
     project_template = rf_serializers.HyperlinkedRelatedField(
         queryset=models.ProjectTemplate.objects.all(),
@@ -502,3 +692,43 @@ class ManagedProjectSerializer(
 
     def get_filtered_field_names(self):
         return ("project",)
+
+
+class AccessResourceSerializer(rf_serializers.Serializer):
+    name = rf_serializers.CharField()
+    username = rf_serializers.CharField()
+
+
+class AccessProjectSerializer(rf_serializers.Serializer):
+    name = rf_serializers.CharField()
+    resources = AccessResourceSerializer(many=True)
+
+
+class AccessResponseSerializer(rf_serializers.Serializer):
+    email = rf_serializers.EmailField()
+    status = rf_serializers.CharField()
+    short_name = rf_serializers.CharField()
+    projects = rf_serializers.DictField(child=AccessProjectSerializer())
+    invited_by = rf_serializers.CharField(allow_blank=True)
+    reason = rf_serializers.CharField(allow_blank=True)
+
+
+class OfferingMappingSerializer(rf_serializers.Serializer):
+    uuid = rf_serializers.CharField()
+    name = rf_serializers.CharField()
+    description = rf_serializers.CharField()
+    slug = rf_serializers.CharField()
+
+
+class ProjectMappingSerializer(rf_serializers.Serializer):
+    uuid = rf_serializers.CharField()
+    name = rf_serializers.CharField()
+    customer_uuid = rf_serializers.CharField()
+    customer_name = rf_serializers.CharField()
+
+
+class UserMappingSerializer(rf_serializers.Serializer):
+    uuid = rf_serializers.CharField()
+    full_name = rf_serializers.CharField()
+    email = rf_serializers.EmailField()
+    username = rf_serializers.CharField()

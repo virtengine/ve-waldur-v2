@@ -8,7 +8,7 @@ from rest_framework import test
 
 from waldur_auth_social.const import ProviderChoices
 from waldur_core.permissions.enums import RoleEnum
-from waldur_core.permissions.fixtures import ProjectRole
+from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
 from waldur_core.structure.tests.factories import UserFactory
 from waldur_mastermind.marketplace.enums import REMOTE_OFFERING
 from waldur_mastermind.marketplace.tests import fixtures as marketplace_fixtures
@@ -141,7 +141,7 @@ class RemoteProjectPermissionsTestCase(test.APITransactionTestCase):
         mock_list_projects = self.mock_list_projects()
         mock_list_users = self.mock_list_users([])
 
-        expiration_time = datetime.now() + timedelta(days=1)
+        expiration_time = datetime.now(UTC) + timedelta(days=1)
         add_user_mock = self.mock_add_user()
         self.project.add_user(
             user=self.new_user,
@@ -176,8 +176,8 @@ class RemoteProjectPermissionsTestCase(test.APITransactionTestCase):
         self.mock_remote_eduteams()
         self.mock_list_projects()
 
-        old_expiration_time = datetime.now() + timedelta(days=1)
-        new_expiration_time = (datetime.now() + timedelta(days=2)).replace(tzinfo=UTC)
+        old_expiration_time = datetime.now(UTC) + timedelta(days=1)
+        new_expiration_time = datetime.now(UTC) + timedelta(days=2)
         self.mock_list_users([{"expiration_time": old_expiration_time.isoformat()}])
         update_user_mock = self.mock_update_user()
 
@@ -220,6 +220,19 @@ class RemoteProjectPermissionsTestCase(test.APITransactionTestCase):
                 "role": RoleEnum.PROJECT_ADMIN.value,
             },
         )
+
+    def test_organization_owner_is_not_synced(self):
+        # Only project-level permissions are propagated to remote Waldur;
+        # granting an organization owner must not trigger any remote calls.
+        mock_eduteams = self.mock_remote_eduteams()
+        mock_list_projects = self.mock_list_projects()
+        add_user_mock = self.mock_add_user()
+
+        self.customer.add_user(user=self.new_user, role=CustomerRole.OWNER)
+
+        self.assertFalse(mock_eduteams.called)
+        self.assertFalse(mock_list_projects.called)
+        self.assertFalse(add_user_mock.called)
 
     @skip("Unstable in CI/CD")
     def test_sync_resource_team(self):

@@ -17,7 +17,7 @@ from . import factories
 
 
 @ddt
-class PublicCallGetTest(test.APITransactionTestCase):
+class PublicCallGetTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
 
@@ -46,7 +46,7 @@ class PublicCallGetTest(test.APITransactionTestCase):
 
 
 @ddt
-class CallGetTest(test.APITransactionTestCase):
+class CallGetTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
 
@@ -82,7 +82,7 @@ class CallGetTest(test.APITransactionTestCase):
 
 
 @ddt
-class CallCreateTest(test.APITransactionTestCase):
+class CallCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.manager = self.fixture.manager
@@ -211,7 +211,7 @@ class CallUpdateTest(test.APITransactionTestCase):
 
 
 @ddt
-class CallDeleteTest(test.APITransactionTestCase):
+class CallDeleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.draft_call = self.fixture.new_call
@@ -263,12 +263,23 @@ class CallDeleteTest(test.APITransactionTestCase):
 
 
 @ddt
-class CallActivateTest(test.APITransactionTestCase):
+class CallActivateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.draft_call = self.fixture.new_call
         self.active_call = self.fixture.call
         self.draft_call.add_user(self.fixture.call_manager, CallRole.MANAGER)
+        # A call must have at least one offering to be activated.
+        factories.RequestedOfferingFactory(call=self.draft_call)
+
+    def test_user_can_not_activate_call_without_offering(self):
+        factories.RoundFactory(call=self.draft_call)
+        self.draft_call.requestedoffering_set.all().delete()
+        response = self.activate_call("staff", self.draft_call)
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
+        self.assertEqual(self.draft_call.state, CallStates.DRAFT)
 
     @data(
         "staff",
@@ -327,7 +338,7 @@ class CallActivateTest(test.APITransactionTestCase):
 
 
 @ddt
-class CallArchiveTest(test.APITransactionTestCase):
+class CallArchiveTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.draft_call = self.fixture.new_call
@@ -362,7 +373,107 @@ class CallArchiveTest(test.APITransactionTestCase):
 
 
 @ddt
-class RequestedOfferingsGetTest(test.APITransactionTestCase):
+class CallDuplicateTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProposalFixture()
+        self.source = self.fixture.call
+        self.source.add_user(self.fixture.call_manager, CallRole.MANAGER)
+        # Seed config that should follow the duplicate.
+        factories.RoundFactory(call=self.source)
+        factories.RequestedOfferingFactory(call=self.source)
+
+    @data("staff", "call_organizer_user")
+    def test_user_can_duplicate_call(self, user):
+        response = self.duplicate_call(user, self.source, name="Copy of call")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        new_uuid = response.data["uuid"]
+        self.assertNotEqual(new_uuid, self.source.uuid.hex)
+        new_call = models.Call.objects.get(uuid=new_uuid)
+        self.assertEqual(new_call.name, "Copy of call")
+        self.assertEqual(new_call.state, CallStates.DRAFT)
+        # Config travels with the duplicate.
+        self.assertEqual(new_call.round_set.count(), self.source.round_set.count())
+        self.assertEqual(
+            new_call.requestedoffering_set.count(),
+            self.source.requestedoffering_set.count(),
+        )
+        # New offerings start in REQUESTED state regardless of source state.
+        self.assertTrue(
+            all(
+                ro.state == RequestedOfferingStates.REQUESTED
+                for ro in new_call.requestedoffering_set.all()
+            )
+        )
+        # Source unchanged.
+        self.source.refresh_from_db()
+        self.assertEqual(self.source.state, CallStates.ACTIVE)
+
+    def test_call_manager_can_not_duplicate_call(self):
+        # CallRole.MANAGER can update an existing call but lacks CREATE_CALL,
+        # which is required to spawn a new one.
+        response = self.duplicate_call("call_manager", self.source, name="Copy of call")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+
+    @data("user", "owner", "customer_support")
+    def test_user_can_not_duplicate_call(self, user):
+        response = self.duplicate_call(user, self.source, name="Copy of call")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND, response.data)
+
+    def test_duplicate_requires_name(self):
+        response = self.duplicate_call("staff", self.source, name="")
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
+
+    def test_duplicate_does_not_copy_proposals(self):
+        # Attach a proposal to the source's first round so we can prove it
+        # does not appear in the duplicate.
+        source_round = self.source.round_set.first()
+        factories.ProposalFactory(round=source_round)
+        response = self.duplicate_call("staff", self.source, name="Copy")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        new_call = models.Call.objects.get(uuid=response.data["uuid"])
+        proposal_count = sum(r.proposal_set.count() for r in new_call.round_set.all())
+        self.assertEqual(proposal_count, 0)
+
+    def test_duplicate_can_skip_sections(self):
+        # Skip rounds and offerings on the duplicate; expect zero of each.
+        response = self.duplicate_call(
+            "staff",
+            self.source,
+            name="Skinny copy",
+            copy_rounds=False,
+            copy_offerings=False,
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        new_call = models.Call.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(new_call.round_set.count(), 0)
+        self.assertEqual(new_call.requestedoffering_set.count(), 0)
+
+    def test_duplicate_skips_resource_templates_when_offerings_excluded(self):
+        # Resource templates depend on RequestedOffering; skipping offerings
+        # must also drop the templates to avoid orphan FKs.
+        ro = self.source.requestedoffering_set.first()
+        factories.CallResourceTemplateFactory(call=self.source, requested_offering=ro)
+        response = self.duplicate_call(
+            "staff",
+            self.source,
+            name="No-offerings copy",
+            copy_offerings=False,
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        new_call = models.Call.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(new_call.resource_templates.count(), 0)
+
+    def duplicate_call(self, user, call, *, name, **section_flags):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        url = factories.CallFactory.get_protected_url(call, "duplicate")
+        return self.client.post(url, {"name": name, **section_flags})
+
+
+@ddt
+class RequestedOfferingsGetTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.url = factories.RequestedOfferingFactory.get_list_url(self.fixture.call)
@@ -492,7 +603,7 @@ class RequestedOfferingsGetTest(test.APITransactionTestCase):
 
 
 @ddt
-class RequestedOfferingsCreateTest(test.APITransactionTestCase):
+class RequestedOfferingsCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.url = factories.RequestedOfferingFactory.get_list_url(self.fixture.call)
@@ -557,7 +668,7 @@ class RequestedOfferingsCreateTest(test.APITransactionTestCase):
 
 
 @ddt
-class RequestedOfferingsUpdateTest(test.APITransactionTestCase):
+class RequestedOfferingsUpdateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.requested_offering = self.fixture.requested_offering
@@ -605,7 +716,7 @@ class RequestedOfferingsUpdateTest(test.APITransactionTestCase):
 
 
 @ddt
-class RequestedOfferingsDeleteTest(test.APITransactionTestCase):
+class RequestedOfferingsDeleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.requested_offering = self.fixture.requested_offering
@@ -653,7 +764,7 @@ class RequestedOfferingsDeleteTest(test.APITransactionTestCase):
 
 
 @ddt
-class AvailableChecklistsTest(test.APITransactionTestCase):
+class AvailableChecklistsTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.checklist = checklist_factories.ChecklistFactory(
@@ -739,7 +850,7 @@ class AvailableChecklistsTest(test.APITransactionTestCase):
         self.assertIn("category_uuid", checklist_data)
 
 
-class CallProposalSlugTemplateSerializerTest(test.APITransactionTestCase):
+class CallProposalSlugTemplateSerializerTest(test.APITestCase):
     """Tests for proposal_slug_template field validation in Call serializer."""
 
     def setUp(self):

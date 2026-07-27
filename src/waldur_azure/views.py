@@ -1,10 +1,11 @@
 from django.db import transaction
 from django.utils.translation import gettext_lazy as _
+from drf_spectacular.utils import extend_schema
 from rest_framework import decorators, response, status, viewsets
 
 from waldur_core.core import validators as core_validators
 from waldur_core.core.enums import CoreStates
-from waldur_core.core.serializers import EmptySerializer
+from waldur_core.core.serializers import StatusSerializer
 from waldur_core.structure import views as structure_views
 
 from . import executors, filters, models, serializers
@@ -58,6 +59,7 @@ class VirtualMachineViewSet(
     delete_executor = executors.VirtualMachineDeleteExecutor
     pull_executor = executors.VirtualMachinePullExecutor
 
+    @extend_schema(request=None, responses={status.HTTP_202_ACCEPTED: StatusSerializer})
     @decorators.action(detail=True, methods=["post"])
     def start(self, request, uuid=None):
         virtual_machine: models.VirtualMachine = self.get_object()
@@ -70,8 +72,8 @@ class VirtualMachineViewSet(
         core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator("stopped"),
     ]
-    start_serializer_class = EmptySerializer
 
+    @extend_schema(request=None, responses={status.HTTP_202_ACCEPTED: StatusSerializer})
     @decorators.action(detail=True, methods=["post"])
     def stop(self, request, uuid=None):
         virtual_machine: models.VirtualMachine = self.get_object()
@@ -84,8 +86,8 @@ class VirtualMachineViewSet(
         core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator("running"),
     ]
-    stop_serializer_class = EmptySerializer
 
+    @extend_schema(request=None, responses={status.HTTP_202_ACCEPTED: StatusSerializer})
     @decorators.action(detail=True, methods=["post"])
     def restart(self, request, uuid=None):
         virtual_machine: models.VirtualMachine = self.get_object()
@@ -98,7 +100,6 @@ class VirtualMachineViewSet(
         core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator("running"),
     ]
-    restart_serializer_class = EmptySerializer
 
 
 class SQLServerViewSet(
@@ -110,6 +111,11 @@ class SQLServerViewSet(
     create_executor = executors.SQLServerCreateExecutor
     delete_executor = executors.SQLServerDeleteExecutor
 
+    @extend_schema(
+        responses={
+            status.HTTP_202_ACCEPTED: serializers.AzureSqlDatabaseCreateResponseSerializer
+        }
+    )
     @decorators.action(detail=True, methods=["post"])
     def create_database(self, request, uuid=None):
         serializer = self.get_serializer(data=request.data)

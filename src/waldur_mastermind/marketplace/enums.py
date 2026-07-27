@@ -55,6 +55,50 @@ class LimitPeriods:
     )
 
 
+class UsageLimitAction:
+    """Restriction applied to a resource when reported usage reaches a component limit.
+
+    Configured per offering via ``plugin_options["action_on_usage_limit"]``.
+    A single value keeps the two restrictions mutually exclusive.
+    """
+
+    PAUSE = "pause"
+    DOWNSCALE = "downscale"
+
+    CHOICES = (
+        (PAUSE, "Pause resources when reported usage reaches the component limit."),
+        (
+            DOWNSCALE,
+            "Downscale resources when reported usage reaches the component limit.",
+        ),
+    )
+
+    # Maps a configured action to the Resource boolean flag it drives.
+    FLAG = {
+        PAUSE: "paused",
+        DOWNSCALE: "downscaled",
+    }
+
+    # Reverse: the flag stored in Resource.usage_limit_restriction.
+    FLAG_CHOICES = (
+        ("paused", "Paused"),
+        ("downscaled", "Downscaled"),
+    )
+
+
+class DiscountAggregations:
+    # each resource of the offering is discounted on its own component usage
+    PER_RESOURCE = "resource"
+    # the component usage is summed across all of the customer's resources of
+    # the offering and a single discount percentage is applied to the total
+    PER_CUSTOMER = "customer"
+
+    CHOICES = (
+        (PER_RESOURCE, "Per resource"),
+        (PER_CUSTOMER, "Aggregated per customer"),
+    )
+
+
 class OfferingStates:
     DRAFT = 1
     ACTIVE = 2
@@ -69,6 +113,8 @@ class OfferingStates:
         (ARCHIVED, "Archived"),
         (UNAVAILABLE, "Unavailable"),
     )
+
+    ISD_ALLOWED_STATES = (ACTIVE, PAUSED, UNAVAILABLE)
 
     VALUES = [val for (_, val) in CHOICES]
 
@@ -135,6 +181,38 @@ OfferingUserStatesType = Literal[
     "Deleted",
     "Error creating",
     "Error deleting",
+]
+
+
+class OfferingUserRuntimeStates:
+    """Runtime/operational state of an offering user account.
+
+    Separate from the lifecycle state, this tracks whether the user can
+    actually access the service (e.g. TOU accepted, account linked).
+    Can be set freely by the service provider at any lifecycle state
+    except Deleted.
+
+    String values are stored in the DB and used directly in the API,
+    matching the RuntimeStateMixin pattern used by VMs.
+    """
+
+    ACTIVE = "Active"
+    PENDING_ACCOUNT_LINKING = "Pending account linking"
+    PENDING_ADDITIONAL_VALIDATION = "Pending additional validation"
+
+    CHOICES = (
+        (ACTIVE, ACTIVE),
+        (PENDING_ACCOUNT_LINKING, PENDING_ACCOUNT_LINKING),
+        (PENDING_ADDITIONAL_VALIDATION, PENDING_ADDITIONAL_VALIDATION),
+    )
+
+    VALUES = [val for (val, _) in CHOICES]
+
+
+OfferingUserRuntimeStatesType = Literal[
+    "Active",
+    "Pending account linking",
+    "Pending additional validation",
 ]
 
 
@@ -284,6 +362,25 @@ class ImpactLevel:
     )
 
 
+class MaintenanceTimingBucket:
+    """Classification of a maintenance's start/end timing (see
+    MaintenanceAnnouncement.timing_bucket)."""
+
+    PENDING = "pending"
+    OVERRUN = "overrun"
+    LATE_START = "late_start"
+    EARLY = "early"
+    ON_TIME = "on_time"
+
+    CHOICES = (
+        (PENDING, "Pending"),
+        (OVERRUN, "Overrun"),
+        (LATE_START, "Late start"),
+        (EARLY, "Early"),
+        (ON_TIME, "On time"),
+    )
+
+
 class RemoteResourceSyncStatus:
     IN_SYNC = "in_sync"
     OUT_OF_SYNC = "out_of_sync"
@@ -309,6 +406,27 @@ class ServiceAccountState:
     VALUES = [val for (_, val) in CHOICES]
 
 
+class ResourceApiKeyStates:
+    # Reuses the resource state vocabulary so the portal renders keys with the
+    # standard StateIndicator: Creating/Updating/Terminating show a spinner,
+    # OK is green, Erred is red.
+    CREATING = "Creating"
+    OK = "OK"
+    UPDATING = "Updating"
+    TERMINATING = "Terminating"
+    ERRED = "Erred"
+
+    CHOICES = (
+        (CREATING, CREATING),
+        (OK, OK),
+        (UPDATING, UPDATING),
+        (TERMINATING, TERMINATING),
+        (ERRED, ERRED),
+    )
+
+    VALUES = [val for (_, val) in CHOICES]
+
+
 ServiceAccountStatesType = Literal[
     "OK",
     "Closed",
@@ -320,6 +438,7 @@ class CourseAccountState(models.IntegerChoices):
     OK = 1, _("OK")
     CLOSED = 2, _("Closed")
     ERRED = 3, _("Erred")
+    PENDING = 4, _("Pending")
 
 
 SUPPORT_OFFERING = "Support.OfferingTemplate"
@@ -334,3 +453,47 @@ REMOTE_OFFERING = "Waldur.RemoteOffering"
 SCRIPT_OFFERING = "Marketplace.Script"
 SLURM_OFFERING = "SlurmInvoices.SlurmPackage"
 SITE_AGENT_OFFERING = "Marketplace.Slurm"
+
+# Offering types that can be swapped between each other in-place via the
+# `update_type` action. The site-agent processors inherit from the Basic
+# processors and only no-op the send paths (delegating to the external
+# waldur-site-agent), so the persisted data shape is interchangeable.
+SWAPPABLE_OFFERING_TYPES = frozenset({BASIC_OFFERING, SITE_AGENT_OFFERING})
+
+
+class ResourceAction:
+    TERMINATE = "terminate"
+    SWITCH_PLAN = "switch_plan"
+    UPDATE_LIMITS = "update_limits"
+    EDIT_TERMINATION_DATE = "edit_termination_date"
+    UPDATE_BACKEND_ID = "update_backend_id"
+    UNLINK = "unlink"
+    MOVE_RESOURCE = "move_resource"
+    SET_SLUG = "set_slug"
+    SHOW_USAGE = "show_usage"
+    SET_AS_ERRED = "set_as_erred"
+    CREATE_ROBOT_ACCOUNT = "create_robot_account"
+    SUBMIT_REPORT = "submit_report"
+    REPORT_USAGE = "report_usage"
+    VIEW_DETAILS = "view_details"
+    SYNCHRONIZE = "synchronize"
+    VERSION_HISTORY = "version_history"
+
+    CHOICES = (
+        (TERMINATE, _("Terminate")),
+        (SWITCH_PLAN, _("Switch plan")),
+        (UPDATE_LIMITS, _("Update limits")),
+        (EDIT_TERMINATION_DATE, _("Edit termination date")),
+        (UPDATE_BACKEND_ID, _("Update backend ID")),
+        (UNLINK, _("Unlink")),
+        (MOVE_RESOURCE, _("Move resource")),
+        (SET_SLUG, _("Set slug")),
+        (SHOW_USAGE, _("Show usage")),
+        (SET_AS_ERRED, _("Set as erred")),
+        (CREATE_ROBOT_ACCOUNT, _("Create robot account")),
+        (SUBMIT_REPORT, _("Submit report")),
+        (REPORT_USAGE, _("Report usage")),
+        (VIEW_DETAILS, _("View details")),
+        (SYNCHRONIZE, _("Synchronize")),
+        (VERSION_HISTORY, _("Version history")),
+    )

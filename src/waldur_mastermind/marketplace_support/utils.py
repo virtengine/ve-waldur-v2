@@ -9,6 +9,7 @@ from rest_framework import exceptions as rf_exceptions
 from waldur_core.core.utils import format_homeport_link, text2html
 from waldur_core.structure.exceptions import ServiceBackendError
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import OrderTypes
 from waldur_mastermind.marketplace.utils import format_limits_list, get_order_url
 from waldur_mastermind.support import backend as support_backend
 from waldur_mastermind.support import exceptions as support_exceptions
@@ -42,6 +43,11 @@ def format_description(template_name, context):
 def format_create_description(order):
     result = []
 
+    if order.type == OrderTypes.RESTORE:
+        result.append(
+            "This is a restoration request for a previously terminated resource."
+        )
+
     for key in order.offering.options.get("order") or []:
         if key not in order.attributes:
             continue
@@ -72,6 +78,19 @@ def format_create_description(order):
                 result.append(
                     f"\n{component.name} ({component.type}): {value} {component.measured_unit}"
                 )
+
+    # Add total cost (includes prepaid duration multiplier via order.init_cost)
+    if order.cost is not None:
+        result.append(f"\nTotal cost: {order.cost:.2f}")
+
+    # Add resource, project and customer slugs
+    resource = order.resource
+    if resource:
+        result.append(f"\nResource slug: {resource.slug}")
+    if order.project:
+        result.append(f"Project slug: {order.project.slug}")
+        if order.project.customer:
+            result.append(f"Customer slug: {order.project.customer.slug}")
 
     description = "\n".join(result)
 
@@ -154,6 +173,18 @@ def create_issue(order, description, summary, confirmation_comment=None):
         except ServiceBackendError as e:
             logger.exception("Unable to create confirmation comment: %s", e)
 
+    if order.attachment:
+        try:
+            attachment = support_models.Attachment.objects.create(
+                issue=issue,
+                file=order.attachment,
+            )
+            active_backend.create_attachment(attachment)
+        except Exception as e:
+            logger.exception(
+                "Unable to attach purchase order for order %s: %s", order.uuid, e
+            )
+
     return issue
 
 
@@ -181,6 +212,34 @@ def format_update_limits_description(order):
         "update_limits_template",
         context,
     )
+
+
+def format_renewal_description(order):
+    offering = order.resource.offering
+    request_url = get_request_link(order.resource)
+    components_map = offering.get_limit_components()
+    old_limits = format_limits_list(
+        components_map, order.attributes.get("old_limits", {})
+    )
+    new_limits = format_limits_list(components_map, order.limits)
+    resource = order.resource
+    context = {
+        "order": order,
+        "request_url": request_url,
+        "old_limits": old_limits,
+        "new_limits": new_limits,
+        "extension_months": order.attributes.get("extension_months", "N/A"),
+        "old_end_date": order.attributes.get("old_end_date", "N/A"),
+        "new_end_date": order.attributes.get("new_end_date", "N/A"),
+        "cost": f"{order.cost:.2f}" if order.cost is not None else "N/A",
+        "request_comment": order.request_comment or "",
+        "resource_slug": getattr(resource, "slug", ""),
+        "project_slug": getattr(order.project, "slug", "") if order.project else "",
+        "customer_slug": getattr(order.project.customer, "slug", "")
+        if order.project and order.project.customer
+        else "",
+    }
+    return format_description("renewal_template", context)
 
 
 def format_delete_description(order):

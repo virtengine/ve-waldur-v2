@@ -7,7 +7,8 @@ from rest_framework import status, test
 from waldur_core.logging import enums as logging_enums
 from waldur_core.logging import models as logging_models
 from waldur_core.permissions.enums import PermissionEnum
-from waldur_core.permissions.fixtures import CustomerRole
+from waldur_core.permissions.fixtures import CustomerRole, OfferingRole
+from waldur_core.structure.tests.factories import UserFactory
 from waldur_mastermind.marketplace import enums
 from waldur_mastermind.marketplace.tests import fixtures as marketplace_fixtures
 from waldur_mastermind.marketplace_site_agent import models
@@ -15,7 +16,7 @@ from waldur_mastermind.marketplace_site_agent.tests import factories
 
 
 @ddt
-class AgentIdentityCreateTest(test.APITransactionTestCase):
+class AgentIdentityCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -41,20 +42,20 @@ class AgentIdentityCreateTest(test.APITransactionTestCase):
                   resource_import_enabled: false
             """),
             "dependencies": [
-                "paho-mqtt=v2.1.0",
-                "pyyaml=v6.0.1",
-                "requests=v2.32.3",
-                "sentry-sdk=v2.3.1",
-                "stomp-py=v8.2.0",
-                "types-pyyaml=v6.0.12.20250822",
-                "waldur-api-client=v7.8.0",
-                "ruff=v0.12.11",
+                {"package": "pyyaml", "version": "v6.0.1"},
+                {"package": "requests", "version": "v2.32.3"},
+                {"package": "sentry-sdk", "version": "v2.3.1"},
+                {"package": "stomp-py", "version": "v8.2.0"},
+                {"package": "types-pyyaml", "version": "v6.0.12.20250822"},
+                {"package": "waldur-api-client", "version": "v7.8.0"},
+                {"package": "ruff", "version": "v0.12.11"},
             ],
         }
 
         CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_OFFERING)
+        OfferingRole.MANAGER.add_permission(PermissionEnum.UPDATE_OFFERING)
 
-    @data("staff", "offering_owner")
+    @data("staff", "offering_owner", "offering_manager")
     def test_agent_identity_create_allowed(self, user_role):
         user = getattr(self.fixture, user_role)
         self.client.force_login(user)
@@ -63,13 +64,13 @@ class AgentIdentityCreateTest(test.APITransactionTestCase):
         response = self.client.post(url, self.payload)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.json())
 
-        self.assertTrue(
-            models.AgentIdentity.objects.filter(
-                name="Agent Test 00", offering=self.offering
-            ).exists()
+        agent_identity = models.AgentIdentity.objects.get(
+            name="Agent Test 00", offering=self.offering
         )
+        self.assertEqual(agent_identity.dependencies, self.payload["dependencies"])
+        self.assertEqual(response.json()["dependencies"], self.payload["dependencies"])
 
-    @data("offering_manager", "offering_admin", "admin", "manager", "global_support")
+    @data("offering_admin", "admin", "manager", "global_support")
     def test_agent_identity_create_forbidden(self, user_role):
         user = getattr(self.fixture, user_role)
         self.client.force_login(user)
@@ -82,7 +83,7 @@ class AgentIdentityCreateTest(test.APITransactionTestCase):
 
 
 @ddt
-class AgentIdentityListTest(test.APITransactionTestCase):
+class AgentIdentityListTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.fixture.offering_admin
@@ -134,7 +135,7 @@ class AgentIdentityListTest(test.APITransactionTestCase):
 @mock.patch(
     "waldur_core.logging.backend.RabbitMQManagementBackend.assign_rabbitmq_vhost_permissions"
 )
-class AgentIdentityEventSubscriptionTest(test.APITransactionTestCase):
+class AgentIdentityEventSubscriptionTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -142,6 +143,7 @@ class AgentIdentityEventSubscriptionTest(test.APITransactionTestCase):
         self.offering.save()
 
         CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_OFFERING)
+        OfferingRole.MANAGER.add_permission(PermissionEnum.UPDATE_OFFERING)
 
     def _create_agent_identity(self):
         """Helper method to create an AgentIdentity instance for testing."""
@@ -155,7 +157,7 @@ class AgentIdentityEventSubscriptionTest(test.APITransactionTestCase):
             agent_identity, action="register_event_subscription"
         )
 
-    @data("staff", "offering_owner")
+    @data("staff", "offering_owner", "offering_manager")
     def test_register_event_subscription_success(
         self,
         user_role,
@@ -339,7 +341,7 @@ class AgentIdentityEventSubscriptionTest(test.APITransactionTestCase):
         mock_create_rabbitmq_user.assert_called_once()
         mock_assign_rabbitmq_vhost_permissions.assert_called_once()
 
-    @data("offering_manager", "offering_admin", "admin", "manager", "global_support")
+    @data("offering_admin", "admin", "manager", "global_support")
     def test_register_event_subscription_forbidden(
         self,
         user_role,
@@ -455,7 +457,7 @@ class AgentIdentityEventSubscriptionTest(test.APITransactionTestCase):
 
 
 @ddt
-class AgentIdentityRegisterServiceTest(test.APITransactionTestCase):
+class AgentIdentityRegisterServiceTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -463,6 +465,7 @@ class AgentIdentityRegisterServiceTest(test.APITransactionTestCase):
         self.offering.save()
 
         CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_OFFERING)
+        OfferingRole.MANAGER.add_permission(PermissionEnum.UPDATE_OFFERING)
 
         self.agent_identity = factories.AgentIdentityFactory(
             offering=self.offering, name="Test Agent Identity"
@@ -474,7 +477,7 @@ class AgentIdentityRegisterServiceTest(test.APITransactionTestCase):
             self.agent_identity, action="register_service"
         )
 
-    @data("staff", "offering_owner")
+    @data("staff", "offering_owner", "offering_manager")
     def test_register_service_success(self, user_role):
         """Test successful registration of a new service."""
         user = getattr(self.fixture, user_role)
@@ -567,7 +570,7 @@ class AgentIdentityRegisterServiceTest(test.APITransactionTestCase):
         self.assertEqual(response1.json()["uuid"], response2.json()["uuid"])
         self.assertEqual(response2.json()["mode"], payload["mode"])
 
-    @data("staff", "offering_owner")
+    @data("staff", "offering_owner", "offering_manager")
     def test_register_multiple_services(self, user_role):
         """Test registering multiple services for the same identity."""
         user = getattr(self.fixture, user_role)
@@ -597,7 +600,7 @@ class AgentIdentityRegisterServiceTest(test.APITransactionTestCase):
         self.assertIn(payload1["name"], service_names)
         self.assertIn(payload2["name"], service_names)
 
-    @data("offering_manager", "offering_admin", "admin", "manager", "global_support")
+    @data("offering_admin", "admin", "manager", "global_support")
     def test_register_service_forbidden(self, user_role):
         """Test that forbidden roles cannot register services."""
         user = getattr(self.fixture, user_role)
@@ -673,3 +676,104 @@ class AgentIdentityRegisterServiceTest(test.APITransactionTestCase):
 
         response = self.client.post(url, payload, format="json")
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class IdentityManagerAgentIdentityTest(test.APITestCase):
+    """Identity managers can create agent identities for non-archived/draft offerings
+    and manage only their own."""
+
+    def setUp(self):
+        self.fixture = marketplace_fixtures.MarketplaceFixture()
+        self.offering = self.fixture.offering
+        self.offering.type = enums.SITE_AGENT_OFFERING
+        self.offering.save()
+
+        self.identity_manager = UserFactory(
+            is_identity_manager=True,
+            managed_isds=["isd:efp"],
+        )
+
+        self.other_identity_manager = UserFactory(
+            is_identity_manager=True,
+            managed_isds=["isd:fenix"],
+        )
+
+        self.payload = {
+            "name": "Agent from IdM",
+            "offering": self.offering.uuid.hex,
+        }
+
+    def test_identity_manager_can_create_without_offering_users(self):
+        """ISD manager can create agent identity even without any offering users."""
+        self.client.force_authenticate(user=self.identity_manager)
+        url = factories.AgentIdentityFactory.get_list_url()
+        response = self.client.post(url, self.payload)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        agent = models.AgentIdentity.objects.get(name="Agent from IdM")
+        self.assertEqual(agent.created_by, self.identity_manager)
+
+    def test_other_identity_manager_can_also_create(self):
+        """Any ISD manager with managed_isds can create, regardless of ISD values."""
+        self.client.force_authenticate(user=self.other_identity_manager)
+        url = factories.AgentIdentityFactory.get_list_url()
+        response = self.client.post(url, self.payload)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_identity_manager_cannot_create_for_archived_offering(self):
+        self.offering.state = enums.OfferingStates.ARCHIVED
+        self.offering.save()
+        self.client.force_authenticate(user=self.identity_manager)
+        url = factories.AgentIdentityFactory.get_list_url()
+        response = self.client.post(url, self.payload)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_identity_manager_cannot_create_for_draft_offering(self):
+        self.offering.state = enums.OfferingStates.DRAFT
+        self.offering.save()
+        self.client.force_authenticate(user=self.identity_manager)
+        url = factories.AgentIdentityFactory.get_list_url()
+        response = self.client.post(url, self.payload)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_identity_manager_can_destroy_own_agent_identity(self):
+        agent_identity = factories.AgentIdentityFactory(
+            offering=self.offering,
+            name="My Agent",
+            created_by=self.identity_manager,
+        )
+        self.client.force_authenticate(user=self.identity_manager)
+        url = factories.AgentIdentityFactory.get_url(agent_identity)
+        response = self.client.delete(url)
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_identity_manager_cannot_destroy_others_agent_identity(self):
+        agent_identity = factories.AgentIdentityFactory(
+            offering=self.offering,
+            name="Other's Agent",
+            created_by=self.other_identity_manager,
+        )
+        self.client.force_authenticate(user=self.identity_manager)
+        url = factories.AgentIdentityFactory.get_url(agent_identity)
+        response = self.client.delete(url)
+        self.assertIn(
+            response.status_code,
+            [status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND],
+        )
+
+    def test_identity_manager_can_list_own_agent_identities(self):
+        factories.AgentIdentityFactory(
+            offering=self.offering,
+            name="My Agent",
+            created_by=self.identity_manager,
+        )
+        factories.AgentIdentityFactory(
+            offering=self.offering,
+            name="Other's Agent",
+            created_by=self.other_identity_manager,
+        )
+        self.client.force_authenticate(user=self.identity_manager)
+        url = factories.AgentIdentityFactory.get_list_url()
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["name"], "My Agent")

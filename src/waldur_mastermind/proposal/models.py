@@ -1,10 +1,10 @@
 import logging
 from datetime import datetime, timedelta
-from decimal import Decimal
 from typing import Literal, cast
 
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import MinValueValidator
 from django.db import models
 from django.db.models import Q
@@ -25,7 +25,11 @@ from waldur_core.permissions.models import Role
 from waldur_core.permissions.utils import get_users
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_mastermind.marketplace.models import SafeAttributesMixin
+from waldur_mastermind.marketplace.models import (
+    SafeAttributesMixin,
+    UserAttributeConfigBase,
+)
+from waldur_mastermind.proposal import enums
 from waldur_mastermind.proposal.enums import (
     AssignmentBatchStatuses,
     AssignmentItemStatuses,
@@ -228,73 +232,215 @@ class Call(
                 )
 
 
-class CallApplicantAttributeConfig(TimeStampedModel, core_models.UuidMixin):
-    """
-    Configures which applicant attributes are exposed to call managers and reviewers.
-    Supports GDPR compliance by declaring personal data processing for proposals.
-    Following the pattern of OfferingUserAttributeConfig from marketplace.
-    """
+class CallApplicantVisibilityConfig(UserAttributeConfigBase):
+    """Configures which applicant fields are visible to reviewers during evaluation."""
+
+    SCOPE_RELATED_NAME = "applicant_visibility_config"
+    DEFAULT_CONSTANCE_KEY = "DEFAULT_CALL_USER_ATTRIBUTES"
 
     call = models.OneToOneField(
-        "Call",
+        Call,
         on_delete=models.CASCADE,
-        related_name="applicant_attribute_config",
+        related_name="applicant_visibility_config",
     )
 
-    # Core attributes (enabled by default for proposals)
-    expose_full_name = models.BooleanField(default=True)
-    expose_email = models.BooleanField(default=True)
+    def __str__(self):
+        return f"Applicant visibility config for {self.call}"
 
-    # Organization/Affiliation attributes
-    expose_organization = models.BooleanField(default=True)
-    expose_affiliations = models.BooleanField(default=False)
-    expose_organization_type = models.BooleanField(default=False)
-    expose_organization_country = models.BooleanField(default=False)
+    @classmethod
+    def get_exposed_fields_for_call(cls, call, default_attributes=None) -> list[str]:
+        return cls.get_exposed_fields_for_scope(call, default_attributes)
 
-    # Geographic/Nationality attributes
-    expose_nationality = models.BooleanField(default=False)
-    expose_nationalities = models.BooleanField(default=False)
-    expose_country_of_residence = models.BooleanField(default=False)
 
-    # Identity assurance attributes
-    expose_eduperson_assurance = models.BooleanField(default=False)
-    expose_identity_source = models.BooleanField(default=False)
+class CallWorkflowStep(
+    TimeStampedModel,
+    core_models.UuidMixin,
+):
+    """Per-call configuration of a workflow step.
 
-    # Control reviewer visibility (separate from call manager visibility)
-    reviewers_see_applicant_details = models.BooleanField(
-        default=False,
-        help_text=_(
-            "If True, reviewers see applicant identity. "
-            "If False, proposals are anonymized for reviewers."
+    Defines which evaluation steps are enabled for a call, their durations,
+    and evaluation checklists. Authorisation for acting on a step is resolved
+    through the parent Call's role assignments — see
+    ``permissions._user_can_act_on_active_step``.
+    """
+
+    class Permissions:
+        customer_path = "call__manager__customer"
+
+    call = models.ForeignKey(
+        Call,
+        on_delete=models.CASCADE,
+        related_name="workflow_steps",
+    )
+    step = models.CharField(
+        max_length=64,
+        choices=enums.WORKFLOW_STEPS_CHOICES,
+    )
+    is_enabled = models.BooleanField(
+        default=True,
+        help_text="Whether this step is enabled. Disabled steps are skipped.",
+    )
+    duration_in_days = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Duration in days. Used to calculate deadlines.",
+    )
+
+    # Evaluation form (reuses Checklist system)
+    checklist = models.ForeignKey(
+        "checklist.Checklist",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        help_text="Evaluation form for this step.",
+    )
+    checklist_required = models.BooleanField(
+        default=True,
+        help_text=(
+            "When the step has a checklist, block completion until its required "
+            "questions are answered. Set False to make the checklist advisory."
         ),
     )
 
+    # Review behavior
+    blind_review = models.BooleanField(
+        default=False,
+        help_text="Evaluators cannot see each other's assessments.",
+    )
+    requires_coi_confirmation = models.BooleanField(
+        default=False,
+        help_text="Evaluator must confirm absence of conflict of interest.",
+    )
+    min_reviewers = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Minimum reviews required before step can complete.",
+    )
+    min_score_threshold = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text=(
+            "Minimum average score required before this step can complete "
+            "(a completion gate; it does not auto-reject lower scores)."
+        ),
+    )
+
+    # Visibility
+    applicant_visible = models.BooleanField(
+        default=False,
+        help_text="Whether the applicant can see step details (not just status).",
+    )
+
+    # Responsibility and transition behavior
+    responsible_role = models.CharField(
+        max_length=32,
+        choices=enums.ResponsibleRoles.CHOICES,
+        null=True,
+        blank=True,
+        help_text="Role expected to act on this step.",
+    )
+    transition_mode = models.CharField(
+        max_length=32,
+        choices=enums.TransitionModes.CHOICES,
+        default=enums.TransitionModes.AUTOMATIC_ON_COMPLETION,
+        help_text=(
+            "How this step advances once a human completes it. 'Automatic' "
+            "advances to the next step immediately; 'Manual' waits for a "
+            "separate advance action. Neither auto-decides from review scores."
+        ),
+    )
+
+    # Per-step extras
+    include_award_response = models.BooleanField(
+        default=False,
+        help_text=(
+            "Allocation decision: require applicant award response after decision."
+        ),
+    )
+    allocation_time = models.CharField(
+        max_length=15,
+        choices=enums.AllocationTimes.CHOICES,
+        default=enums.AllocationTimes.ON_DECISION,
+        help_text=(
+            "Allocation decision: when a granted proposal takes effect — "
+            "immediately (on_decision) or on the round's allocation date "
+            "(fixed_date)."
+        ),
+    )
+    display_order = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="Optional override of catalog ordering.",
+    )
+
     class Meta:
-        verbose_name = _("Call applicant attribute config")
-        verbose_name_plural = _("Call applicant attribute configs")
+        unique_together = ("call", "step")
+        ordering = ["created"]
+        verbose_name = _("Workflow step")
+        verbose_name_plural = _("Workflow steps")
 
     def __str__(self):
-        return f"Applicant attribute config for {self.call}"
+        return f"{self.call.name} — {self.get_step_display()}"
 
-    @classmethod
-    def get_url_name(cls):
-        return "call-applicant-attribute-config"
+    def save(self, *args, **kwargs):
+        # Apply the catalog default for the responsible role on first save so
+        # callers can omit it. Done in save() rather than __init__ to avoid
+        # mutating instances hydrated from the database.
+        if not self.responsible_role and self.step:
+            step_def = enums.WORKFLOW_STEPS_MAP.get(self.step)
+            if step_def and step_def.default_responsible_role:
+                self.responsible_role = step_def.default_responsible_role
+        super().save(*args, **kwargs)
 
-    def get_exposed_fields(self) -> list[str]:
-        """Return list of field names configured for exposure."""
-        return [
-            field.name[7:]  # Remove 'expose_' prefix
-            for field in self._meta.fields
-            if field.name.startswith("expose_") and getattr(self, field.name)
-        ]
+    def clean(self):
+        """Validate step dependencies and mandatory rules."""
+        step_def = enums.WORKFLOW_STEPS_MAP.get(self.step)
+        if not step_def:
+            return
 
-    @classmethod
-    def get_exposed_fields_for_call(cls, call) -> list[str]:
-        """Get exposed fields for call, falling back to defaults."""
-        try:
-            return call.applicant_attribute_config.get_exposed_fields()
-        except cls.DoesNotExist:
-            return ["full_name", "email", "organization"]  # Default fields
+        if not self.is_enabled and step_def.is_mandatory:
+            raise DjangoValidationError(
+                f"Step '{step_def.name}' is mandatory and cannot be disabled."
+            )
+
+        if self.is_enabled and step_def.dependencies:
+            enabled_steps = set(
+                CallWorkflowStep.objects.filter(call=self.call, is_enabled=True)
+                .exclude(pk=self.pk)
+                .values_list("step", flat=True)
+            )
+            for dep in step_def.dependencies:
+                if dep not in enabled_steps:
+                    dep_name = enums.WORKFLOW_STEPS_MAP.get(dep, dep)
+                    raise DjangoValidationError(
+                        f"Step '{step_def.name}' requires '{dep_name}' to be enabled."
+                    )
+
+
+class WorkflowCriterion(
+    TimeStampedModel,
+    core_models.UuidMixin,
+):
+    """Named evaluation criterion attached to a workflow step (e.g. expert review)."""
+
+    workflow_step = models.ForeignKey(
+        CallWorkflowStep,
+        on_delete=models.CASCADE,
+        related_name="criteria",
+    )
+    name = models.CharField(max_length=255)
+    order = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        ordering = ["order", "id"]
+        unique_together = [("workflow_step", "name")]
+        verbose_name = _("Workflow criterion")
+        verbose_name_plural = _("Workflow criteria")
+
+    def __str__(self):
+        return f"{self.workflow_step} — {self.name}"
 
 
 def filter_call_proposal_project_role_mappings(user):
@@ -440,65 +586,18 @@ class Round(
     core_models.UuidMixin,
     core_models.SlugMixin,
 ):
-    """Time-bounded submission periods within calls, with configurable review strategies, allocation strategies, and scoring thresholds."""
+    """Time-bounded submission and allocation-scheduling window within a call.
 
-    class ReviewStrategies:
-        AFTER_ROUND = "after_round"
-        AFTER_PROPOSAL = "after_proposal"
-
-        CHOICES = (
-            (AFTER_ROUND, "After round is closed"),
-            (AFTER_PROPOSAL, "After proposal submission"),
-        )
-
-    class AllocationStrategies:
-        BY_CALL_MANAGER = "by_call_manager"
-        AUTOMATIC = "automatic"
-
-        CHOICES = (
-            (BY_CALL_MANAGER, "By call manager"),
-            (AUTOMATIC, "Automatic based on review scoring"),
-        )
-
-    class AllocationTimes:
-        ON_DECISION = "on_decision"
-        FIXED_DATE = "fixed_date"
-
-        CHOICES = (
-            (ON_DECISION, "On decision"),
-            (FIXED_DATE, "Fixed date"),
-        )
+    Review and allocation *policy* (which steps run, how many reviewers, score
+    thresholds, manual vs automatic transitions) lives on the per-call workflow
+    step configuration (``CallWorkflowStep``), not here — the Round only carries
+    scheduling (submission window, review duration, allocation timing).
+    """
 
     class Statuses(RoundStatuses):
         pass
 
-    review_strategy = models.CharField(
-        default=ReviewStrategies.AFTER_ROUND,
-        choices=ReviewStrategies.CHOICES,
-        db_index=True,
-        max_length=15,
-    )
-    deciding_entity = models.CharField(
-        default=AllocationStrategies.AUTOMATIC,
-        choices=AllocationStrategies.CHOICES,
-        db_index=True,
-        max_length=15,
-    )
-    allocation_time = models.CharField(
-        default=AllocationTimes.ON_DECISION,
-        choices=AllocationTimes.CHOICES,
-        db_index=True,
-        max_length=15,
-    )
     review_duration_in_days = models.PositiveIntegerField(null=True, blank=True)
-    minimum_number_of_reviewers = models.PositiveIntegerField(null=True, blank=True)
-    minimal_average_scoring = models.DecimalField(
-        max_digits=5,
-        decimal_places=1,
-        null=True,
-        blank=True,
-        validators=[MinValueValidator(Decimal("0"))],
-    )
     allocation_date = models.DateTimeField(null=True, blank=True)
     start_time = models.DateTimeField()
     cutoff_time = models.DateTimeField()
@@ -574,6 +673,11 @@ def filter_proposals(user):
             )
         )
         | Q(round__call__in=managers.get_connected_calls(user))
+        # Offering managers (technical reviewers) act on the technical_assessment
+        # step, so they must be able to retrieve the non-draft proposals that
+        # requested one of their accepted offerings (not every proposal on the
+        # call).
+        | Q(pk__in=managers.get_offering_manager_proposals(user))
     )
 
 
@@ -627,6 +731,23 @@ class Proposal(
 
     resources = models.ManyToManyField(RequestedOffering, through="RequestedResource")
     allocation_comment = models.CharField(blank=True, max_length=150, null=True)
+    science_sub_domain = models.ForeignKey(
+        "structure.ScienceSubDomain",
+        verbose_name=_("science sub-domain"),
+        blank=True,
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name="proposals",
+    )
+
+    # Workflow tracking
+    workflow_step = models.CharField(
+        max_length=64,
+        choices=enums.WORKFLOW_STEPS_CHOICES,
+        null=True,
+        default=None,
+        help_text="Current active workflow step for this proposal.",
+    )
 
     # Note: checklist_completions relationship is automatically available via ChecklistCompletion.scope
 
@@ -655,15 +776,39 @@ class Proposal(
         if not self.round.call.compliance_checklist:
             return None
 
-        try:
-            proposal_content_type = ContentType.objects.get_for_model(self)
-            return checklist_models.ChecklistCompletion.objects.get(
-                scope_content_type=proposal_content_type,
-                scope_object_id=self.id,
-                checklist=self.round.call.compliance_checklist,
-            )
-        except checklist_models.ChecklistCompletion.DoesNotExist:
+        return self.get_checklist_completion_for(self.round.call.compliance_checklist)
+
+    def get_checklist_completion_for(self, checklist):
+        """Return this proposal's completion for an arbitrary checklist, or None.
+
+        ``ChecklistCompletion`` is keyed on ``(scope, checklist)``, so a proposal
+        can hold a distinct completion per attached checklist (e.g. one per
+        workflow step) alongside the call-level compliance completion.
+        """
+        if checklist is None:
             return None
+        proposal_content_type = ContentType.objects.get_for_model(self)
+        return checklist_models.ChecklistCompletion.objects.filter(
+            scope_content_type=proposal_content_type,
+            scope_object_id=self.id,
+            checklist=checklist,
+        ).first()
+
+    def ensure_checklist_completion_for(self, checklist):
+        """Get-or-create this proposal's completion for a checklist.
+
+        Called when a workflow step with an attached checklist becomes active so
+        the responsible role has a completion to answer against.
+        """
+        if checklist is None:
+            return None
+        proposal_content_type = ContentType.objects.get_for_model(self)
+        completion, _ = checklist_models.ChecklistCompletion.objects.get_or_create(
+            scope_content_type=proposal_content_type,
+            scope_object_id=self.id,
+            checklist=checklist,
+        )
+        return completion
 
     def can_submit(self):
         """Check if proposal can be submitted."""
@@ -789,6 +934,87 @@ class RequestedResource(
     proposal = models.ForeignKey(Proposal, on_delete=models.CASCADE)
 
 
+class ProposalWorkflowStepInstance(
+    TimeStampedModel,
+    core_models.UuidMixin,
+):
+    """Tracks the status and outcome of each workflow step for a specific proposal.
+
+    One instance per proposal per enabled step. Created when a proposal is submitted.
+    """
+
+    proposal = models.ForeignKey(
+        Proposal,
+        on_delete=models.CASCADE,
+        related_name="workflow_step_instances",
+    )
+    step = models.CharField(
+        max_length=64,
+        choices=enums.WORKFLOW_STEPS_CHOICES,
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=enums.WorkflowStepInstanceStatuses.CHOICES,
+        default=enums.WorkflowStepInstanceStatuses.PENDING,
+    )
+    outcome = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        help_text="Step-specific outcome (e.g., eligible, feasible, approved).",
+    )
+    outcome_reason = models.TextField(
+        blank=True,
+        help_text="Explanation for the outcome (e.g., rejection reason).",
+    )
+    started_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When this step became active.",
+    )
+    completed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+    completed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    deadline = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Computed from started_at + step duration_in_days.",
+    )
+    internal_notes = models.TextField(
+        blank=True,
+        help_text=(
+            "Notes captured by the call-management team when completing or "
+            "rejecting the step. Never shown to the applicant. Visible in API "
+            "responses to staff and to any user who holds an active role on "
+            "the proposal's call (see permissions.user_can_view_internal_notes)."
+        ),
+    )
+
+    class Meta:
+        unique_together = ("proposal", "step")
+        ordering = ["created"]
+        verbose_name = _("Proposal workflow step")
+        verbose_name_plural = _("Proposal workflow steps")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["proposal"],
+                condition=Q(status=enums.WorkflowStepInstanceStatuses.ACTIVE),
+                name="unique_active_workflow_step_per_proposal",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.proposal.slug} — {self.get_step_display()} [{self.status}]"
+
+
 class Review(
     TimeStampedModel,
     core_models.UuidMixin,
@@ -840,6 +1066,17 @@ class Review(
     reviewer = models.ForeignKey[core_models.User](
         to=settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="+"
     )
+
+    # Reviewer's per-proposal attestation of absence of conflict of interest.
+    # Enforced at review submission only when the call has an enabled workflow
+    # step with ``requires_coi_confirmation`` set. This is the "no conflict"
+    # counterpart to the ConflictOfInterest model (which records conflicts that
+    # *do* exist); keeping it here avoids polluting that manager-resolution queue.
+    coi_confirmed = models.BooleanField(
+        default=False,
+        help_text="Reviewer confirmed absence of conflict of interest with this proposal.",
+    )
+    coi_confirmed_at = models.DateTimeField(null=True, blank=True)
 
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
@@ -1654,6 +1891,20 @@ class CallReviewerPool(
     )
     invitation_expires_at = models.DateTimeField(null=True, blank=True)
 
+    # Manager override fields
+    override_reason = models.TextField(
+        blank=True,
+        help_text=_("Reason for manager override of invitation status."),
+    )
+    overridden_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    overridden_at = models.DateTimeField(null=True, blank=True)
+
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
     class Permissions:
@@ -1683,7 +1934,8 @@ class CallReviewerPool(
             ),
             # Ensure either reviewer or invited_email is provided
             models.CheckConstraint(
-                check=models.Q(reviewer__isnull=False) | models.Q(invited_email__gt=""),
+                condition=models.Q(reviewer__isnull=False)
+                | models.Q(invited_email__gt=""),
                 name="reviewer_or_email_required",
             ),
         ]
@@ -2412,6 +2664,20 @@ class AssignmentItem(
         default=0,
         help_text=_("Number of times this proposal has been reassigned."),
     )
+
+    # Manager override fields
+    override_reason = models.TextField(
+        blank=True,
+        help_text=_("Reason for manager override of COI block."),
+    )
+    overridden_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    overridden_at = models.DateTimeField(null=True, blank=True)
 
     tracker = cast(FieldInstanceTracker, FieldTracker())
 

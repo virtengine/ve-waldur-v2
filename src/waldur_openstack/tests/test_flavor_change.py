@@ -9,7 +9,7 @@ from . import factories, fixtures
 
 
 @ddt
-class FlavorListRetrieveTestCase(test.APITransactionTestCase):
+class FlavorListRetrieveTestCase(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.flavor = self.fixture.flavor
@@ -24,7 +24,7 @@ class FlavorListRetrieveTestCase(test.APITransactionTestCase):
 
 
 @ddt
-class FlavorChangeInstanceTestCase(test.APITransactionTestCase):
+class FlavorChangeInstanceTestCase(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.instance = self.fixture.instance
@@ -195,9 +195,9 @@ class FlavorChangeInstanceTestCase(test.APITransactionTestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertDictContainsSubset(
-            {"flavor": ["New flavor is not visible in tenant."]},
-            response.data,
+        self.assertIn("flavor", response.data)
+        self.assertEqual(
+            response.data["flavor"], ["New flavor is not visible in tenant."]
         )
 
         reread_instance = Instance.objects.get(pk=self.instance.pk)

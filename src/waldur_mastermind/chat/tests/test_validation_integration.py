@@ -24,7 +24,7 @@ class ScenarioEvaluationTest(unittest.TestCase):
             s for s in self.scenarios if s.name == "greeting_no_tool"
         )
 
-        # Mock LLM response to a greeting (should NOT include a tool call)
+        # Mock AI Assistant response to a greeting (should NOT include a tool call)
         llm_response = "Hello! How can I help you today?"
 
         # Evaluate the response
@@ -38,19 +38,21 @@ class ScenarioEvaluationTest(unittest.TestCase):
         self.assertIn("avoided tool usage", result.message.lower())
 
     def test_evaluate_greeting_scenario_failure(self):
-        """Test that greeting with tool call fails evaluation."""
+        """Test that greeting with unexpected native tool call fails evaluation."""
         # Find the greeting scenario
         greeting_scenario = next(
             s for s in self.scenarios if s.name == "greeting_no_tool"
         )
 
-        # Mock LLM response with unexpected tool call
-        llm_response = '{"tool": "show_user_resources", "arguments": {}}'
+        # Simulate: AI Assistant response text + a native function call in config
+        llm_response = "Here are your resources."
+        config = dict(greeting_scenario.evaluations[0].config)
+        config["tool_calls"] = [{"name": "display_user_resources"}]
 
         # Evaluate the response
         evaluation_criteria = greeting_scenario.evaluations[0]
         evaluator = get_evaluator(evaluation_criteria.type)
-        result = evaluator.evaluate(llm_response, evaluation_criteria.config)
+        result = evaluator.evaluate(llm_response, config)
 
         # Verify evaluation failed
         self.assertFalse(result.passed)
@@ -64,13 +66,15 @@ class ScenarioEvaluationTest(unittest.TestCase):
             s for s in self.scenarios if s.name == "show_resources_uses_tool"
         )
 
-        # Mock LLM response with correct tool call
-        llm_response = '{"tool": "show_user_resources", "arguments": {"limit": 10}}'
+        # Simulate: AI Assistant response text + native function call in config
+        llm_response = "Here are your resources."
+        config = dict(show_resources_scenario.evaluations[0].config)
+        config["tool_calls"] = [{"name": "display_user_resources"}]
 
         # Evaluate the response
         evaluation_criteria = show_resources_scenario.evaluations[0]
         evaluator = get_evaluator(evaluation_criteria.type)
-        result = evaluator.evaluate(llm_response, evaluation_criteria.config)
+        result = evaluator.evaluate(llm_response, config)
 
         # Verify evaluation passed
         self.assertTrue(result.passed)
@@ -84,7 +88,7 @@ class ScenarioEvaluationTest(unittest.TestCase):
             s for s in self.scenarios if s.name == "greeting_no_tool"
         )
 
-        # Mock LLM response
+        # Mock AI Assistant response
         llm_response = "Hi there! What would you like to know?"
 
         # Get evaluator
@@ -92,7 +96,7 @@ class ScenarioEvaluationTest(unittest.TestCase):
         evaluator = get_evaluator(evaluation_criteria.type)
 
         # Test that each input could be evaluated
-        # (In real usage, each input would be sent to LLM separately)
+        # (In real usage, each input would be sent to AI Assistant separately)
         for input_text in greeting_scenario.inputs:
             # Just verify the scenario structure is valid
             self.assertIsInstance(input_text, str)

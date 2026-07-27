@@ -2,6 +2,7 @@ import datetime
 
 import factory
 from django.contrib.contenttypes.models import ContentType
+from django.utils import timezone
 from rest_framework.reverse import reverse
 
 from waldur_core.checklist import models as checklist_models
@@ -179,8 +180,12 @@ class RoundFactory(
         model = models.Round
 
     call = factory.SubFactory(CallFactory)
-    start_time = datetime.date.today() + datetime.timedelta(days=5)
-    cutoff_time = datetime.date.today() + datetime.timedelta(days=10)
+    start_time = factory.LazyFunction(
+        lambda: timezone.now() + datetime.timedelta(days=5)
+    )
+    cutoff_time = factory.LazyFunction(
+        lambda: timezone.now() + datetime.timedelta(days=10)
+    )
 
     @classmethod
     def get_url(cls, call=None, call_round=None, action=None):
@@ -450,7 +455,7 @@ class ReviewerExpertiseFactory(
         model = models.ReviewerExpertise
 
     reviewer_profile = factory.SubFactory(ReviewerProfileFactory)
-    expertise_keyword = factory.Faker("word")
+    expertise_keyword = factory.Sequence(lambda n: f"expertise_{n}")
     expertise_category = None
     proficiency_level = ExpertiseProficiencyLevels.EXPERT
     years_experience = factory.Faker("random_int", min=1, max=30)
@@ -525,6 +530,21 @@ class ConflictOfInterestFactory(
     evidence_description = factory.Faker("sentence")
     evidence_data = factory.LazyFunction(dict)
     status = COIStatuses.PENDING
+
+    @classmethod
+    def get_url(cls, coi=None, action=None):
+        if coi is None:
+            coi = ConflictOfInterestFactory()
+        url = "http://testserver" + reverse(
+            "conflict-of-interest-detail",
+            kwargs={"uuid": coi.uuid.hex},
+        )
+        return url if action is None else url + action + "/"
+
+    @classmethod
+    def get_list_url(cls, action=None):
+        url = "http://testserver" + reverse("conflict-of-interest-list")
+        return url if action is None else url + action + "/"
 
 
 class COIDisclosureFormFactory(
@@ -669,3 +689,45 @@ class AssignmentItemFactory(
     def get_list_url(cls, action=None):
         url = "http://testserver" + reverse("assignment-item-list")
         return url if action is None else url + action + "/"
+
+
+# =============================================================================
+# Workflow Step Factories
+# =============================================================================
+
+
+class CallWorkflowStepFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.CallWorkflowStep],
+):
+    class Meta:
+        model = models.CallWorkflowStep
+
+    call = factory.SubFactory(CallFactory)
+    step = "administrative_check"
+    is_enabled = True
+
+    @classmethod
+    def _create(cls, model_class, *args, **kwargs):
+        # Mandatory steps (e.g. allocation_decision) are pre-seeded on Call
+        # creation; reuse the existing row instead of triggering unique_together.
+        call = kwargs.pop("call")
+        step = kwargs.pop("step")
+        instance, _ = model_class.objects.update_or_create(
+            call=call, step=step, defaults=kwargs
+        )
+        return instance
+
+    @classmethod
+    def get_list_url(cls, call):
+        return CallFactory.get_protected_url(call, action="workflow_steps")
+
+    @classmethod
+    def get_url(cls, call=None, workflow_step=None):
+        if workflow_step is None:
+            workflow_step = CallWorkflowStepFactory()
+        return (
+            CallFactory.get_protected_url(call, action="workflow_steps")
+            + workflow_step.uuid.hex
+            + "/"
+        )

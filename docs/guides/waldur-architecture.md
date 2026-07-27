@@ -34,6 +34,7 @@
 
 - **Cloud Providers**: OpenStack, AWS, Azure, VMware, DigitalOcean
 - **Compute Platforms**: Rancher, SLURM, Kubernetes
+- **Identity Management**: Keycloak (generic offering-level integration)
 - **Authentication**: SAML2, Social/OAuth, Valimo
 
 ## URL Routing and API Structure
@@ -72,7 +73,8 @@
 - **Multi-modal Auth**: Token, Session, OIDC, SAML2 support
 - **Impersonation**: Staff user impersonation with audit trail
 - **RBAC System**: Hierarchical role-based access control
-- **Scope-based Permissions**: Customer/Project/Resource level permissions
+- **Scope-based Permissions**: Customer/Project/Resource/ResourceProject level permissions
+- **Offering Roles**: Per-offering role definitions with `RoleAvailability` scoping (see `resource-projects.md`)
 - **Time-based Roles**: Role assignments with expiration
 
 ## Signal Handlers

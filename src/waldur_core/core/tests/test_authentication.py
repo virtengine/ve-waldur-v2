@@ -1,3 +1,5 @@
+from unittest import mock
+
 import httpx
 import jwt
 import respx
@@ -5,19 +7,20 @@ from constance.test.unittest import override_config
 from django.conf import settings
 from django.core.cache import cache
 from django.core.exceptions import ObjectDoesNotExist
+from django.db import IntegrityError
 from django.urls import reverse
 from django.utils import timezone
 from freezegun import freeze_time
 from rest_framework import status, test
 from rest_framework.authtoken.models import Token
 
-from waldur_core.core.authentication import refresh_token
+from waldur_core.core.authentication import DEFAULT_TOKEN_UPDATE_INTERVAL, refresh_token
 from waldur_core.core.models import User
 
 from . import helpers
 
 
-class TokenAuthenticationTest(test.APITransactionTestCase):
+class TokenAuthenticationTest(test.APITestCase):
     def setUp(self):
         self.username = "test"
         self.password = "secret"
@@ -125,6 +128,101 @@ class TokenAuthenticationTest(test.APITransactionTestCase):
             token = refresh_token(self.user)
         self.assertLess(token.created, timezone.now())
 
+    def test_refresh_token_tolerates_concurrent_rotation(self):
+        """A concurrent request/task may rotate an expired token between our
+        read and our write. Because Token.user is unique, the racing create()
+        raises IntegrityError; refresh_token must recover by reusing the
+        surviving token instead of bubbling up a 500 on the
+        authtoken_token_user_id_key unique constraint."""
+        self.user.token_lifetime = 10
+        self.user.save()
+        original, _ = Token.objects.get_or_create(user=self.user)
+
+        expired_time = timezone.now() + timezone.timedelta(seconds=20)
+        with freeze_time(expired_time):
+            # Simulate losing the rotation race: our create() collides on the
+            # unique user constraint. The atomic savepoint rolls back our
+            # delete, so the surviving token is returned.
+            with mock.patch.object(
+                Token.objects,
+                "create",
+                side_effect=IntegrityError("duplicate key value"),
+            ):
+                token = refresh_token(self.user)
+
+        self.assertEqual(Token.objects.filter(user=self.user).count(), 1)
+        self.assertEqual(token.key, original.key)
+
+    def test_token_not_refreshed_within_half_lifetime(self):
+        """When user has token_lifetime set, the debounce interval is
+        token_lifetime / 2. Token created timestamp should NOT be updated
+        if less than half the lifetime has elapsed."""
+        self.user.token_lifetime = 3600
+        self.user.save()
+        token = Token.objects.get(user=self.user)
+        original_created = token.created
+
+        # 1799 seconds is less than 3600 / 2 = 1800 debounce interval
+        frozen_time = original_created + timezone.timedelta(seconds=1799)
+        with freeze_time(frozen_time):
+            refresh_token(self.user)
+
+        token.refresh_from_db()
+        self.assertEqual(token.created, original_created)
+
+    def test_token_refreshed_after_half_lifetime(self):
+        """When user has token_lifetime set, the debounce interval is
+        token_lifetime / 2. Token created timestamp SHOULD be updated
+        if more than half the lifetime has elapsed."""
+        self.user.token_lifetime = 3600
+        self.user.save()
+        token = Token.objects.get(user=self.user)
+        original_created = token.created
+
+        # 1801 seconds is more than 3600 / 2 = 1800 debounce interval
+        frozen_time = original_created + timezone.timedelta(seconds=1801)
+        with freeze_time(frozen_time):
+            refresh_token(self.user)
+
+        token.refresh_from_db()
+        self.assertGreater(token.created, original_created)
+
+    def test_token_not_refreshed_within_default_interval_when_no_lifetime(self):
+        """When user has no token_lifetime, the debounce interval falls back
+        to DEFAULT_TOKEN_UPDATE_INTERVAL (600s). Token created timestamp
+        should NOT be updated if less than 600 seconds have elapsed."""
+        self.user.token_lifetime = None
+        self.user.save()
+        token = Token.objects.get(user=self.user)
+        original_created = token.created
+
+        # 599 seconds is less than the 600s default interval
+        frozen_time = original_created + timezone.timedelta(seconds=599)
+        with freeze_time(frozen_time):
+            refresh_token(self.user)
+
+        token.refresh_from_db()
+        self.assertEqual(token.created, original_created)
+
+    def test_token_refreshed_after_default_interval_when_no_lifetime(self):
+        """When user has no token_lifetime, the debounce interval falls back
+        to DEFAULT_TOKEN_UPDATE_INTERVAL (600s). Token created timestamp
+        SHOULD be updated if more than 600 seconds have elapsed."""
+        self.user.token_lifetime = None
+        self.user.save()
+        token = Token.objects.get(user=self.user)
+        original_created = token.created
+
+        # 601 seconds is more than the 600s default interval
+        frozen_time = original_created + timezone.timedelta(
+            seconds=DEFAULT_TOKEN_UPDATE_INTERVAL.total_seconds() + 1
+        )
+        with freeze_time(frozen_time):
+            refresh_token(self.user)
+
+        token.refresh_from_db()
+        self.assertGreater(token.created, original_created)
+
     def test_token_never_expires_if_token_lifetime_is_none(self):
         user = User.objects.get(username=self.username)
         user.token_lifetime = None
@@ -202,7 +300,7 @@ VALID_JWT_TOKEN = jwt.encode(VALID_JWT_PAYLOAD, "test_secret")
     OIDC_CLIENT_SECRET="test-secret",
     OIDC_USER_FIELD="username",
 )
-class OIDCAuthenticationTest(test.APITransactionTestCase):
+class OIDCAuthenticationTest(test.APITestCase):
     def tearDown(self):
         cache.clear()
 
@@ -251,6 +349,32 @@ class OIDCAuthenticationTest(test.APITransactionTestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
         self.assertEqual(response.data["detail"], "Token has expired.")
+
+    @respx.mock
+    def test_existing_inactive_user_is_rejected(self):
+        """An existing deactivated user must be rejected, not crash on re-creation.
+
+        The default User.objects manager filters out inactive users, so a naive
+        get_or_create would miss the existing row and then collide on the unique
+        username constraint, producing a 500. Authentication must return 401.
+        """
+        username = "deactivated_user"
+        User.objects.create_user(username=username, is_active=False)
+
+        respx.post("http://oidc.example.com/introspect").mock(
+            return_value=httpx.Response(
+                200, json={"active": True, "username": username}
+            )
+        )
+
+        response = self.client.get(
+            "/api/users/me/",
+            HTTP_AUTHORIZATION=f"Bearer {VALID_JWT_TOKEN}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        # No duplicate row was created.
+        self.assertEqual(User.all_objects.filter(username=username).count(), 1)
 
     @respx.mock
     def test_user_created_if_not_exists(self):

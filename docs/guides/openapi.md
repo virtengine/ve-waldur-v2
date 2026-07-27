@@ -17,6 +17,7 @@ We heavily customize `drf-spectacular`'s default behavior to produce a schema th
 | Filter which endpoints appear in schema | `disabled_actions` on ViewSet or modify `openapi_generators.py` |
 | Schema-wide transformations | Hook in `schema_hooks.py` |
 | Document authentication schemes | Authentication extension in `openapi_extensions.py` |
+| Expose a `count` (`*Count` SDK method) for a detail list action | `@count_action` decorator on the `@action` (see §2) |
 
 **Validation command:**
 
@@ -52,7 +53,7 @@ This class, located in `openapi_inspector.py`, is our custom subclass of `AutoSc
 
 - **Purpose**: To enrich the generated "operation" object with Waldur-specific metadata and logic.
 - **Edge Cases Handled**:
-    1. **HEAD method for Lists**: We map the `HEAD` HTTP method to a "count" operation for list views. The inspector provides a custom description and a simple `200` response. Crucially, it returns `None` for detail views (`/api/users/{uuid}/`), effectively hiding this non-sensical operation.
+    1. **HEAD method → `count` operations**: We map `HEAD` to a `_count` operation so clients can read the total via the `x-result-count` header without downloading a body (the generated SDKs expose these as `*Count` methods). This is on by default for **collections** — top-level *and* nested, since `NestedSimpleRouter` mirrors the `head`→`get` mapping of `SortedDefaultRouter`. For **detail views** the inspector returns `None` (a count of a single object is meaningless), *except* for detail-scoped list actions that opt in via the `@count_action` decorator (e.g. `UserRoleMixin.list_users` → `/api/projects/{uuid}/list_users/`). If a list route sets an explicit `@extend_schema(operation_id=…)`, its auto-added HEAD companion would inherit an id ending in `_list` and collide with the GET, so the inspector renames it to a distinct `_count` id. See [Count endpoints](#count-endpoints-count_action-and-head-efficiency) below.
     2. **Custom Permissions Metadata**: This is a powerful feature for our frontend developers. If a view action has a `_permissions` attribute (e.g., `create_permissions`), the inspector extracts this data and injects it into the schema under a custom `x-permissions` vendor extension. This allows the frontend to understand the permissions required for an action without hardcoding them.
 
     ```yaml
@@ -64,6 +65,42 @@ This class, located in `openapi_inspector.py`, is our custom subclass of `AutoSc
           - permission: "project.create"
             scopes: ["customer"]
     ```
+
+#### Count endpoints (`@count_action`) and HEAD efficiency
+
+Every collection exposes a `_count` HEAD operation automatically. To add one to
+a **detail-scoped list action**, stack `@count_action` (from
+`waldur_core.core.views`) on top of `@action`:
+
+```python
+from waldur_core.core.views import count_action
+
+@count_action
+@action(detail=True, methods=["GET"])
+def list_users(self, request, uuid=None):
+    ...
+```
+
+The count must be **cheap**: the `x-result-count` header comes from the
+paginator's `COUNT(*)`, so a HEAD request must not serialise rows. Standard
+`ListModelMixin.list` is already optimised for this (the `optimized_head_list`
+monkey-patch in `core/views.py`). A **custom action** that serialises its own
+page must short-circuit HEAD itself, *after* applying all filters:
+
+```python
+page = self.paginate_queryset(queryset)   # filters already applied above
+if request.method == "HEAD":
+    return self.get_paginated_response([])  # count only — no serialisation
+serializer = MySerializer(page, many=True)
+return self.get_paginated_response(serializer.data)
+```
+
+Because both GET and HEAD run through the same `filter_queryset` / action-body
+filtering before pagination, the count always reflects the same query filters as
+the list: `count(filter) == len(list(filter))`. Runtime `HEAD` works even for
+routes not documented in the schema because `ViewSetMixin.as_view` aliases
+`HEAD`→`GET`; the schema plumbing above is only what makes the SDK `*Count`
+method exist.
 
 #### `get_description()`
 
@@ -256,7 +293,31 @@ def filter_invoice_items(items, ordering=None):
 
 ---
 
-## 7. Best Practices and Conventions
+## 7. Nullable Fields and SDK Client Generation
+
+When a model ForeignKey is nullable (`null=True`), the corresponding serializer field **must** declare `allow_null=True`. Without this, the OpenAPI schema will not mark the field as nullable, and auto-generated SDK clients (Python, TypeScript, Go) will crash when parsing a `null` value from the API response.
+
+**Example bug**: A nullable FK serialized without `allow_null=True` causes the generated Python client to call `UUID(None)`, raising a `TypeError`.
+
+```python
+# Model
+class AgentIdentity(models.Model):
+    created_by = models.ForeignKey(User, null=True, on_delete=models.SET_NULL)
+
+# WRONG - missing allow_null=True
+created_by = serializers.SlugRelatedField(slug_field="uuid", read_only=True)
+
+# CORRECT - matches the model's nullable nature
+created_by = serializers.SlugRelatedField(slug_field="uuid", read_only=True, allow_null=True)
+```
+
+**Rule**: Any time a serializer field maps to a nullable model field (FK with `null=True`, or `CharField(null=True)`, etc.), add `allow_null=True` to the serializer field. This applies to `SlugRelatedField`, `HyperlinkedRelatedField`, `PrimaryKeyRelatedField`, and plain fields alike.
+
+**How to verify**: After making changes, run `uv run waldur spectacular --validate` and inspect the generated schema to confirm the field shows `nullable: true`.
+
+---
+
+## 8. Best Practices and Conventions
 
 1. **Docstrings are the Source of Truth**: Write clear docstrings on viewset *action methods*. They become the official API descriptions.
 2. **Use the Right Tool for the Job**:
@@ -271,7 +332,7 @@ def filter_invoice_items(items, ordering=None):
 7. **Handle Polymorphism with Hooks**: For complex conditional schemas (`oneOf`, `anyOf`), post-processing hooks are the most flexible and powerful tool available, as demonstrated by `add_polymorphic_attributes_schema`.
 8. **Simplify for the Consumer**: Use extensions (`OpenStackNestedSecurityGroupSerializerExtension`) and hooks (`transform_paginated_arrays`) to simplify complex or deeply nested objects where the full detail is unnecessary for the API consumer. The goal is a schema that is not just accurate, but also usable.
 
-## 8. The OpenAPI Schema in the Broader Workflow
+## 9. The OpenAPI Schema in the Broader Workflow
 
 The OpenAPI schema is not merely a documentation artifact; it is a critical, machine-readable contract that drives a significant portion of our development, testing, and release workflows. Our CI/CD pipelines are built around the schema as the single source of truth for the API's structure.
 

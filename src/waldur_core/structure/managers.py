@@ -25,7 +25,9 @@ def build_filter(path, ids):
 T = TypeVar("T", bound=Model)
 
 
-def filter_queryset_for_user(queryset: QuerySet[T], user: User) -> QuerySet[T]:
+def filter_queryset_for_user[T: Model](
+    queryset: QuerySet[T], user: User
+) -> QuerySet[T]:
     def get_customer_subquery(path):
         if list_permission:
             connected_customers = get_connected_customers_by_permission(
@@ -89,10 +91,50 @@ def filter_queryset_for_user(queryset: QuerySet[T], user: User) -> QuerySet[T]:
         content_type = ContentType.objects.get_for_model(queryset.model)
         subquery |= models.Q(id__in=get_scope_ids(user, content_type))
 
+    # Resource and ResourceProject UserRoles confer read-only visibility of
+    # the parent project / customer so role-holders can render the UI. The
+    # helpers return lazy QuerySets — the lookup folds into the outer SQL
+    # as a subquery without an extra round-trip.
+    if queryset.model is structure_models.Project:
+        rp_project_qs = _get_resource_role_project_ids_qs(user)
+        if rp_project_qs is not None:
+            subquery |= models.Q(id__in=rp_project_qs)
+    elif queryset.model is structure_models.Customer:
+        rp_customer_qs = _get_resource_role_customer_ids_qs(user)
+        if rp_customer_qs is not None:
+            subquery |= models.Q(id__in=rp_customer_qs)
+
     if not subquery:
         return queryset
 
     return queryset.filter(subquery).distinct()
+
+
+def _get_resource_role_project_ids_qs(user):
+    """Lazy QuerySet of structure Project IDs reachable via the user's
+    Resource / ResourceProject UserRoles.
+
+    Returns ``None`` when the marketplace module is not installed.
+    """
+    try:
+        from waldur_mastermind.marketplace.managers import (
+            get_user_resource_descended_project_ids,
+        )
+    except ImportError:
+        return None
+    return get_user_resource_descended_project_ids(user)
+
+
+def _get_resource_role_customer_ids_qs(user):
+    """Lazy QuerySet of Customer IDs reachable via the user's Resource /
+    ResourceProject UserRoles. See ``_get_resource_role_project_ids_qs``."""
+    try:
+        from waldur_mastermind.marketplace.managers import (
+            get_user_resource_descended_customer_ids,
+        )
+    except ImportError:
+        return None
+    return get_user_resource_descended_customer_ids(user)
 
 
 def filter_customer_by_ip_address(ip_address):
@@ -232,7 +274,7 @@ def count_customer_users(customer):
 def get_visible_customers(user):
     direct_projects = get_connected_projects(user)
     direct_customers = get_connected_customers(user)
-    indirect_customers = structure_models.Project.objects.filter(
+    indirect_customers = structure_models.Project.available_objects.filter(
         id__in=direct_projects
     ).values_list("customer_id", flat=True)
 
@@ -258,7 +300,7 @@ def get_visible_customers(user):
 def get_visible_projects(user):
     direct_customers = get_connected_customers(user)
     direct_projects = get_connected_projects(user)
-    indirect_projects = structure_models.Project.objects.filter(
+    indirect_projects = structure_models.Project.available_objects.filter(
         customer_id__in=direct_customers
     ).values_list("id", flat=True)
     return direct_projects.union(indirect_projects)

@@ -11,24 +11,29 @@ from waldur_core.core.models import NAME_LENGTH
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CustomerRole, OfferingRole, ProjectRole
 from waldur_core.structure.tests import factories as structure_factories
-from waldur_core.structure.tests import fixtures
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.marketplace import models, plugins
 from waldur_mastermind.marketplace.enums import (
+    BASIC_OFFERING,
     SUPPORT_OFFERING,
     BillingTypes,
     LimitPeriods,
     OfferingStates,
 )
-from waldur_mastermind.marketplace.tests import factories
+from waldur_mastermind.marketplace.tests import factories, fixtures
 from waldur_mastermind.marketplace.tests.factories import OFFERING_OPTIONS
 from waldur_mastermind.marketplace.tests.utils import TestCreateProcessor
 
 
 class BaseOrderCreateTest(test.APITransactionTestCase):
     def setUp(self):
-        self.fixture = fixtures.ProjectFixture()
+        self.fixture = structure_fixtures.ProjectFixture()
         self.project = self.fixture.project
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_ORDER)
+        CustomerRole.READER.add_permission(PermissionEnum.LIST_PROJECTS)
+        ProjectRole.ADMIN.add_permission(PermissionEnum.CREATE_ORDER)
+        ProjectRole.MANAGER.add_permission(PermissionEnum.CREATE_ORDER)
+        ProjectRole.MEMBER.add_permission(PermissionEnum.CREATE_ORDER)
 
     def create_order(self, user, offering=None, add_payload=None, skip_auto_plan=False):
         if offering is None:
@@ -513,6 +518,40 @@ class OrderCreateTest(BaseOrderCreateTest):
 
 
 @ddt
+class OrderCreatePermissionTest(BaseOrderCreateTest):
+    """Tests that CREATE_ORDER permission gates order creation correctly."""
+
+    def test_customer_reader_cannot_create_order(self):
+        user = structure_factories.UserFactory()
+        self.fixture.customer.add_user(user, CustomerRole.READER)
+        response = self.create_order(user)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_customer_reader_with_create_order_permission_can_create_order(self):
+        CustomerRole.READER.add_permission(PermissionEnum.CREATE_ORDER)
+        user = structure_factories.UserFactory()
+        self.fixture.customer.add_user(user, CustomerRole.READER)
+        response = self.create_order(user)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    @data("owner", "admin", "manager", "member")
+    def test_authorized_user_can_create_order(self, user_role):
+        user = getattr(self.fixture, user_role)
+        response = self.create_order(user)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_staff_can_create_order_bypassing_permission_check(self):
+        response = self.create_order(self.fixture.staff)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_unrelated_user_without_project_access_cannot_create_order(self):
+        user = structure_factories.UserFactory()
+        response = self.create_order(user)
+        # Rejected at serializer project validation (400), before permission check
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+@ddt
 @mock.patch(
     "waldur_mastermind.marketplace.tasks.notify_consumer_about_pending_order.delay"
 )
@@ -531,8 +570,8 @@ class OrderNotificationCreateTest(BaseOrderCreateTest):
         return super().setUp()
 
     def submit_public(self, role):
-        provider_fixture = fixtures.ProjectFixture()
-        consumer_fixture = fixtures.ProjectFixture()
+        provider_fixture = structure_fixtures.ProjectFixture()
+        consumer_fixture = structure_fixtures.ProjectFixture()
         public_offering = factories.OfferingFactory(
             state=OfferingStates.ACTIVE,
             shared=True,
@@ -624,7 +663,7 @@ class OrderNotificationCreateTest(BaseOrderCreateTest):
     def test_public_offering_is_approved_in_the_same_organization(
         self, auto_approve_in_service_provider_projects, mocked_task
     ):
-        consumer_fixture = provider_fixture = fixtures.ProjectFixture()
+        consumer_fixture = provider_fixture = structure_fixtures.ProjectFixture()
         public_offering = factories.OfferingFactory(
             state=OfferingStates.ACTIVE,
             shared=True,
@@ -682,7 +721,7 @@ class OrderNotificationCreateTest(BaseOrderCreateTest):
         self, auto_approve, disable_autoapprove, expected_state, mocked_task
     ):
         """Test that disable_autoapprove flag correctly overrides auto-approval logic."""
-        consumer_fixture = provider_fixture = fixtures.ProjectFixture()
+        consumer_fixture = provider_fixture = structure_fixtures.ProjectFixture()
         public_offering = factories.OfferingFactory(
             state=OfferingStates.ACTIVE,
             shared=True,
@@ -847,6 +886,188 @@ class OrderLimitsCreateTest(BaseOrderCreateTest):
             "offering": factories.OfferingFactory.get_public_url(offering),
             "plan": factories.PlanFactory.get_public_url(plan),
             "limits": {"cpu_count": 5},
+            "attributes": {},
+        }
+
+        response = self.create_order(
+            self.fixture.staff, offering, add_payload=add_payload
+        )
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
+
+    def _create_child_offering_with_parent_limits(self):
+        """Create a child offering (like OpenStack Instance) whose parent has
+        LIMIT components (cores, ram, storage). Uses BASIC_OFFERING type which
+        doesn't have can_update_limits=True, matching the OpenStack.Instance scenario.
+        """
+        parent_offering = factories.OfferingFactory(
+            state=OfferingStates.ACTIVE,
+            type=SUPPORT_OFFERING,
+        )
+        for comp_type in ("cores", "ram", "storage"):
+            models.OfferingComponent.objects.create(
+                offering=parent_offering,
+                type=comp_type,
+                billing_type=BillingTypes.LIMIT,
+            )
+        child_offering = factories.OfferingFactory(
+            state=OfferingStates.ACTIVE,
+            type=BASIC_OFFERING,
+            parent=parent_offering,
+        )
+        plan = factories.PlanFactory(offering=child_offering)
+        return child_offering, plan
+
+    def test_instance_order_with_only_parent_limits_succeeds(self):
+        """When the frontend sends parent (tenant) component limits for an instance
+        order, they should be stripped and the order should succeed.
+        """
+        instance_offering, plan = self._create_child_offering_with_parent_limits()
+
+        add_payload = {
+            "offering": factories.OfferingFactory.get_public_url(instance_offering),
+            "plan": factories.PlanFactory.get_public_url(plan),
+            "limits": {"cores": 4, "ram": 8192, "storage": 102400},
+            "attributes": {},
+        }
+
+        response = self.create_order(
+            self.fixture.staff, instance_offering, add_payload=add_payload
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        order = models.Order.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(order.limits, {})
+
+    def test_instance_order_with_parent_and_own_limit_components(self):
+        """When a child offering has its own LIMIT component alongside parent
+        components, parent limits are stripped and child limits are validated.
+        """
+        instance_offering, plan = self._create_child_offering_with_parent_limits()
+        models.OfferingComponent.objects.create(
+            offering=instance_offering,
+            type="consultancy",
+            billing_type=BillingTypes.LIMIT,
+        )
+
+        add_payload = {
+            "offering": factories.OfferingFactory.get_public_url(instance_offering),
+            "plan": factories.PlanFactory.get_public_url(plan),
+            "limits": {"cores": 4, "ram": 8192, "consultancy": 5},
+            "attributes": {},
+        }
+
+        response = self.create_order(
+            self.fixture.staff, instance_offering, add_payload=add_payload
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        order = models.Order.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(order.limits, {"consultancy": 5})
+
+    def test_instance_order_with_unknown_limit_key_rejected(self):
+        """Limit keys that belong to neither parent nor child components
+        are rejected by component validation.
+        """
+        instance_offering, plan = self._create_child_offering_with_parent_limits()
+
+        add_payload = {
+            "offering": factories.OfferingFactory.get_public_url(instance_offering),
+            "plan": factories.PlanFactory.get_public_url(plan),
+            "limits": {"unknown_component": 10},
+            "attributes": {},
+        }
+
+        response = self.create_order(
+            self.fixture.staff, instance_offering, add_payload=add_payload
+        )
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
+
+    def test_creation_with_limits_succeeds_for_offering_without_can_update_limits(self):
+        """Creating an order with valid LIMIT components should succeed even
+        if the offering type does not support limit updates (can_update_limits=False).
+        The can_update_limits check only applies to update orders.
+        """
+        offering = factories.OfferingFactory(
+            state=OfferingStates.ACTIVE,
+            type=BASIC_OFFERING,
+        )
+        plan = factories.PlanFactory(offering=offering)
+        models.OfferingComponent.objects.create(
+            offering=offering,
+            type="consultancy",
+            billing_type=BillingTypes.LIMIT,
+        )
+
+        add_payload = {
+            "offering": factories.OfferingFactory.get_public_url(offering),
+            "plan": factories.PlanFactory.get_public_url(plan),
+            "limits": {"consultancy": 5},
+            "attributes": {},
+        }
+
+        response = self.create_order(
+            self.fixture.staff, offering, add_payload=add_payload
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_empty_limits_dict_for_child_offering_passes(self):
+        """An empty limits dict should not trigger validation."""
+        instance_offering, plan = self._create_child_offering_with_parent_limits()
+
+        add_payload = {
+            "offering": factories.OfferingFactory.get_public_url(instance_offering),
+            "plan": factories.PlanFactory.get_public_url(plan),
+            "limits": {},
+            "attributes": {},
+        }
+
+        response = self.create_order(
+            self.fixture.staff, instance_offering, add_payload=add_payload
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_parent_limits_stripped_from_stored_order(self):
+        """Parent component limits must not be stored on the order."""
+        instance_offering, plan = self._create_child_offering_with_parent_limits()
+
+        add_payload = {
+            "offering": factories.OfferingFactory.get_public_url(instance_offering),
+            "plan": factories.PlanFactory.get_public_url(plan),
+            "limits": {"cores": 4, "ram": 8192},
+            "attributes": {},
+        }
+
+        response = self.create_order(
+            self.fixture.staff, instance_offering, add_payload=add_payload
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        order = models.Order.objects.get(uuid=response.data["uuid"])
+        self.assertNotIn("cores", order.limits)
+        self.assertNotIn("ram", order.limits)
+
+    def test_top_level_offering_still_validates_limits_on_creation(self):
+        """Orders for top-level offerings still go through component-level
+        validation — invalid limit types are rejected.
+        """
+        offering = factories.OfferingFactory(
+            state=OfferingStates.ACTIVE, type=SUPPORT_OFFERING
+        )
+        plan = factories.PlanFactory(offering=offering)
+        models.OfferingComponent.objects.create(
+            offering=offering,
+            type="cpu_count",
+            billing_type=BillingTypes.FIXED,
+        )
+
+        add_payload = {
+            "offering": factories.OfferingFactory.get_public_url(offering),
+            "plan": factories.PlanFactory.get_public_url(plan),
+            "limits": {"cpu_count": 4},
             "attributes": {},
         }
 
@@ -1087,9 +1308,9 @@ class OrderStartDateCreateTest(BaseOrderCreateTest):
 
 
 @ddt
-class OrderDeleteTest(test.APITransactionTestCase):
+class OrderDeleteTest(test.APITestCase):
     def setUp(self):
-        self.fixture = fixtures.ProjectFixture()
+        self.fixture = structure_fixtures.ProjectFixture()
         self.project = self.fixture.project
         self.manager = self.fixture.manager
         self.order = factories.OrderFactory(
@@ -1132,8 +1353,30 @@ class OrderDeleteTest(test.APITransactionTestCase):
         return response
 
 
+class OrderUnlinkTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = structure_fixtures.ProjectFixture()
+        self.order = factories.OrderFactory(
+            project=self.fixture.project,
+            created_by=self.fixture.manager,
+        )
+
+    def test_staff_can_unlink_order(self):
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OrderFactory.get_url(self.order, action="unlink")
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(models.Order.objects.filter(pk=self.order.pk).exists())
+
+    def test_non_staff_cannot_unlink_order(self):
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.OrderFactory.get_url(self.order, action="unlink")
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
 @ddt
-class OrderFilterTest(test.APITransactionTestCase):
+class OrderFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
         self.project = self.fixture.project
@@ -1195,9 +1438,105 @@ class OrderFilterTest(test.APITransactionTestCase):
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]["uuid"], self.order.uuid.hex)
 
+    def test_output_updated_at_is_visible_in_list_response(self):
+        self.order.output = "Provisioning output"
+        self.order.save(update_fields=["output"])
+
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertIn("output_updated_at", response.data[0])
+        self.assertIsNotNone(response.data[0]["output_updated_at"])
+
+
+class OrderListNoDuplicatesTest(test.APITestCase):
+    """Test that orders are not duplicated when a user has access
+    through multiple permission paths (Fixes PUHURI-PORTALS-ETK)."""
+
+    def setUp(self):
+        self.fixture = structure_fixtures.ProjectFixture()
+        self.project = self.fixture.project
+        CustomerRole.OWNER.add_permission(PermissionEnum.LIST_ORDERS)
+        ProjectRole.MANAGER.add_permission(PermissionEnum.LIST_ORDERS)
+
+    def test_order_not_duplicated_when_user_is_both_consumer_and_provider(self):
+        # Arrange: offering belongs to the same customer as the project,
+        # so the owner matches both project__customer and offering__customer filters.
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+        )
+        factories.OrderFactory(
+            project=self.project,
+            offering=offering,
+            created_by=self.fixture.manager,
+        )
+
+        # Act
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.OrderFactory.get_list_url()
+        response = self.client.get(url)
+
+        # Assert: order should appear exactly once, not duplicated
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+
+    def test_order_not_duplicated_when_user_has_project_and_customer_roles(self):
+        # Arrange: user is both project manager and customer owner,
+        # matching both project__in and project__customer__in filters.
+        offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
+        factories.OrderFactory(
+            project=self.project,
+            offering=offering,
+            created_by=self.fixture.manager,
+        )
+
+        # The owner has access via project__customer (as customer owner)
+        # The manager has access via project (as project manager)
+        # But the owner also has access via project__customer, so just one path.
+        # Let's make a user who is both manager and customer owner.
+        user = self.fixture.manager
+        self.fixture.customer.add_user(user, CustomerRole.OWNER)
+
+        # Act
+        self.client.force_authenticate(user)
+        url = factories.OrderFactory.get_list_url()
+        response = self.client.get(url)
+
+        # Assert: order should appear exactly once
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+
+    def test_order_not_duplicated_when_user_has_offering_role_and_customer_role(self):
+        # Arrange: user is offering manager and also offering's customer owner,
+        # matching both offering__in and offering__customer__in filters.
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+        )
+        OfferingRole.MANAGER.add_permission(PermissionEnum.LIST_ORDERS)
+        offering.add_user(self.fixture.owner, OfferingRole.MANAGER)
+
+        factories.OrderFactory(
+            project=structure_factories.ProjectFactory(),
+            offering=offering,
+            created_by=structure_factories.UserFactory(),
+        )
+
+        # Act: owner matches via offering__customer__in AND offering__in
+        self.client.force_authenticate(self.fixture.owner)
+        url = factories.OrderFactory.get_list_url()
+        response = self.client.get(url)
+
+        # Assert: order should appear exactly once
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+
 
 @ddt
-class OrderSetBackendIdTest(test.APITransactionTestCase):
+class OrderSetBackendIdTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
         self.offering = factories.OfferingFactory(
@@ -1328,3 +1667,47 @@ class OrderSetBackendIdTest(test.APITransactionTestCase):
         response = self.make_request(self.fixture.owner)
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+@ddt
+class OrderResourceActionTest(test.APITestCase):
+    """Tests for the resource action that fetches connected resource via order."""
+
+    def setUp(self):
+        """Set up test fixtures."""
+        self.fixture = fixtures.MarketplaceFixture()
+        self.order = self.fixture.order
+        self.resource = self.fixture.resource
+
+    @data("staff", "offering_owner", "manager", "admin")
+    def test_authorized_user_can_fetch_connected_resource(self, user):
+        """Test that authorized users can fetch connected resource via resource action."""
+        user_obj = getattr(self.fixture, user)
+        self.client.force_authenticate(user_obj)
+        url = factories.OrderFactory.get_url(self.order, "resource")
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["uuid"], str(self.resource.uuid))
+
+    def test_unrelated_user_cannot_fetch_connected_resource(self):
+        """Test that unrelated user cannot fetch connected resource."""
+        other_fixture = structure_fixtures.ProjectFixture()
+        self.client.force_authenticate(other_fixture.user)
+        url = factories.OrderFactory.get_url(self.order, "resource")
+        response = self.client.get(url)
+
+        # User should not have access to this order
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_resource_serializer_returns_all_fields(self):
+        """Test that resource action returns properly serialized resource with all fields."""
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OrderFactory.get_url(self.order, "resource")
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # Verify key fields are present
+        self.assertIn("uuid", response.data)
+        self.assertIn("name", response.data)
+        self.assertIn("state", response.data)

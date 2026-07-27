@@ -5,6 +5,7 @@ from unittest import mock
 from ddt import data, ddt
 from django.core import mail
 from django.test import override_settings
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from freezegun import freeze_time
 from rest_framework import status, test
@@ -24,7 +25,7 @@ from waldur_mastermind.marketplace.tests import factories as marketplace_factori
 
 
 @ddt
-class InvoiceRetrieveTest(test.APITransactionTestCase):
+class InvoiceRetrieveTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.InvoiceFixture()
 
@@ -65,7 +66,7 @@ class InvoiceRetrieveTest(test.APITransactionTestCase):
 
 
 @ddt
-class InvoiceSendNotificationTest(test.APITransactionTestCase):
+class InvoiceSendNotificationTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.InvoiceFixture()
         self.url = factories.InvoiceFactory.get_url(
@@ -115,7 +116,7 @@ class InvoiceSendNotificationTest(test.APITransactionTestCase):
         )
 
 
-class UpdateInvoiceItemProjectTest(test.APITransactionTestCase):
+class UpdateInvoiceItemProjectTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.InvoiceFixture()
         self.invoice = self.fixture.invoice
@@ -155,11 +156,11 @@ class UpdateInvoiceItemProjectTest(test.APITransactionTestCase):
         self.assertEqual(item["project_uuid"], self.fixture.project.uuid.hex)
 
 
-class MeasuredUnitTest(test.APITransactionTestCase):
+class MeasuredUnitTest(test.APITestCase):
     def get_invoice_item(self, unit, measured_unit=""):
         return factories.InvoiceItemFactory(
-            start=datetime.date(year=2020, month=12, day=1),
-            end=datetime.date(year=2020, month=12, day=10),
+            start=timezone.make_aware(datetime.datetime(year=2020, month=12, day=1)),
+            end=timezone.make_aware(datetime.datetime(year=2020, month=12, day=10)),
             quantity=2,
             unit=unit,
             measured_unit=measured_unit,
@@ -197,7 +198,7 @@ class MeasuredUnitTest(test.APITransactionTestCase):
         self.assertEqual(item.get_measured_unit(), _("allocations"))
 
 
-class InvoiceStatsTest(test.APITransactionTestCase):
+class InvoiceStatsTest(test.APITestCase):
     def setUp(self):
         self.provider = marketplace_factories.ServiceProviderFactory()
         self.provider_2 = marketplace_factories.ServiceProviderFactory()
@@ -372,7 +373,7 @@ class InvoiceStatsTest(test.APITransactionTestCase):
         )
 
 
-class DeleteCustomerWithInvoiceTest(test.APITransactionTestCase):
+class DeleteCustomerWithInvoiceTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
         self.invoice = factories.InvoiceFactory(customer=self.fixture.customer)
@@ -402,7 +403,7 @@ class DeleteCustomerWithInvoiceTest(test.APITransactionTestCase):
 
 
 @ddt
-class InvoicePaidTest(test.APITransactionTestCase):
+class InvoicePaidTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.InvoiceFixture()
         self.invoice = self.fixture.invoice
@@ -470,7 +471,7 @@ class InvoicePaidTest(test.APITransactionTestCase):
 
 
 @ddt
-class UpdateBackendIdTest(test.APITransactionTestCase):
+class UpdateBackendIdTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.InvoiceFixture()
         self.url = factories.InvoiceFactory.get_url(
@@ -497,7 +498,7 @@ class UpdateBackendIdTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
 
-class InvoiceUpdateCacheTest(test.APITransactionTestCase):
+class InvoiceUpdateCacheTest(test.APITestCase):
     def setUp(self):
         self.customer = structure_factories.CustomerFactory()
         self.invoice = factories.InvoiceFactory(customer=self.customer)

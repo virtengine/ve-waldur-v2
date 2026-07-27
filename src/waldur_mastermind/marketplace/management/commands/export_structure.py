@@ -15,8 +15,15 @@ from waldur_core.checklist.models import (
     QuestionOption,
 )
 from waldur_core.core.models import User
+from waldur_core.logging.enums import EVENT_GROUP_MAPPING, EventGroup, EventType
+from waldur_core.logging.models import Event
 from waldur_core.permissions.models import Role, RolePermission, UserRole
-from waldur_core.structure.models import Customer, Project, UserAgreement
+from waldur_core.structure.models import (
+    Customer,
+    Project,
+    ServiceSettings,
+    UserAgreement,
+)
 from waldur_core.users.models import GroupInvitation, Invitation, PermissionRequest
 from waldur_mastermind.invoices.models import (
     CustomerCredit,
@@ -34,14 +41,24 @@ from waldur_mastermind.marketplace.models import (
     MaintenanceAnnouncementOffering,
     Offering,
     OfferingComponent,
+    OfferingPartition,
+    OfferingSoftwareCatalog,
     OfferingUser,
+    OfferingUserGroup,
     Order,
     Plan,
     PlanComponent,
     ProjectServiceAccount,
     Resource,
     ResourcePlanPeriod,
+    RobotAccount,
     ServiceProvider,
+    SoftwareCatalog,
+)
+from waldur_mastermind.policy.models import (
+    CustomerEstimatedCostPolicy,
+    ProjectEstimatedCostPolicy,
+    SlurmPeriodicUsagePolicy,
 )
 from waldur_mastermind.proposal.models import (
     AssignmentBatch,
@@ -50,11 +67,14 @@ from waldur_mastermind.proposal.models import (
     CallManagingOrganisation,
     CallResourceTemplate,
     Proposal,
+    ProposalProjectRoleMapping,
     RequestedOffering,
     RequestedResource,
     Review,
+    ReviewerSuggestion,
     Round,
 )
+from waldur_openstack.models import Flavor, Image, Instance, Tenant, Volume
 
 
 class Command(BaseCommand):
@@ -98,6 +118,11 @@ class Command(BaseCommand):
             action="store_true",
             help="Enable verbose logging output",
         )
+        parser.add_argument(
+            "--include-events",
+            action="store_true",
+            help="Include audit log events related to invoicing, credits and policies.",
+        )
 
     def log_export_step(self, step_name, export_function):
         """Helper method to log and time export steps."""
@@ -125,6 +150,7 @@ class Command(BaseCommand):
     def handle(self, **options):
         output_path = options["output"]
         verbose = options.get("verbose", False)
+        include_events = options.get("include_events", False)
 
         # Setup logging level
         if verbose:
@@ -195,6 +221,12 @@ class Command(BaseCommand):
             "offering_users": self.log_export_step(
                 "offering_users", self.export_offering_users
             ),
+            "robot_accounts": self.log_export_step(
+                "robot_accounts", self.export_robot_accounts
+            ),
+            "offering_user_groups": self.log_export_step(
+                "offering_user_groups", self.export_offering_user_groups
+            ),
             # Checklist exports
             "checklists": self.log_export_step("checklists", self.export_checklists),
             "questions": self.log_export_step("questions", self.export_questions),
@@ -250,6 +282,12 @@ class Command(BaseCommand):
             "assignment_items": self.log_export_step(
                 "assignment_items", self.export_assignment_items
             ),
+            "reviewer_suggestions": self.log_export_step(
+                "reviewer_suggestions", self.export_reviewer_suggestions
+            ),
+            "role_mappings": self.log_export_step(
+                "role_mappings", self.export_role_mappings
+            ),
             # Maintenance announcement exports
             "maintenance_announcements": self.log_export_step(
                 "maintenance_announcements", self.export_maintenance_announcements
@@ -258,7 +296,52 @@ class Command(BaseCommand):
                 "maintenance_announcement_offerings",
                 self.export_maintenance_announcement_offerings,
             ),
+            # Software catalog exports
+            "software_catalogs": self.log_export_step(
+                "software_catalogs", self.export_software_catalogs
+            ),
+            "offering_partitions": self.log_export_step(
+                "offering_partitions", self.export_offering_partitions
+            ),
+            "offering_software_catalogs": self.log_export_step(
+                "offering_software_catalogs", self.export_offering_software_catalogs
+            ),
+            # Policy exports
+            "project_estimated_cost_policies": self.log_export_step(
+                "project_estimated_cost_policies",
+                self.export_project_estimated_cost_policies,
+            ),
+            "customer_estimated_cost_policies": self.log_export_step(
+                "customer_estimated_cost_policies",
+                self.export_customer_estimated_cost_policies,
+            ),
+            "slurm_periodic_policies": self.log_export_step(
+                "slurm_periodic_policies",
+                self.export_slurm_periodic_policies,
+            ),
+            # OpenStack backend model exports
+            "openstack_service_settings": self.log_export_step(
+                "openstack_service_settings", self.export_openstack_service_settings
+            ),
+            "openstack_flavors": self.log_export_step(
+                "openstack_flavors", self.export_openstack_flavors
+            ),
+            "openstack_images": self.log_export_step(
+                "openstack_images", self.export_openstack_images
+            ),
+            "openstack_tenants": self.log_export_step(
+                "openstack_tenants", self.export_openstack_tenants
+            ),
+            "openstack_instances": self.log_export_step(
+                "openstack_instances", self.export_openstack_instances
+            ),
+            "openstack_volumes": self.log_export_step(
+                "openstack_volumes", self.export_openstack_volumes
+            ),
         }
+
+        if include_events:
+            data["events"] = self.log_export_step("events", self.export_events)
 
         export_elapsed = time.time() - export_start_time
         self.logger.info(f"Data export completed in {export_elapsed:.2f}s")
@@ -351,6 +434,7 @@ class Command(BaseCommand):
                     "is_staff": user.is_staff,
                     "is_support": user.is_support,
                     "is_active": user.is_active,
+                    "deactivation_reason": user.deactivation_reason,
                     "native_name": user.native_name,
                     "phone_number": user.phone_number,
                     "organization": user.organization,
@@ -361,7 +445,9 @@ class Command(BaseCommand):
                     if user.date_joined
                     else None,
                     # Additional fields identified in analysis
-                    "token_lifetime": user.token_lifetime,
+                    "token_lifetime": user.token_lifetime
+                    if user.token_lifetime is not None
+                    else -1,
                     "details": user.details,
                     "notifications_enabled": user.notifications_enabled,
                     "is_identity_manager": user.is_identity_manager,
@@ -385,6 +471,9 @@ class Command(BaseCommand):
                     "nationalities": user.nationalities,
                     "organization_country": user.organization_country,
                     "organization_type": user.organization_type,
+                    "organization_registry_code": user.organization_registry_code,
+                    "organization_vat_code": user.organization_vat_code,
+                    "organization_address": user.organization_address,
                     "eduperson_assurance": user.eduperson_assurance,
                     "modified": user.modified.isoformat() if user.modified else None,
                     "slug": user.slug,
@@ -592,6 +681,8 @@ class Command(BaseCommand):
                 "getting_started": offering.getting_started,
                 "integration_guide": offering.integration_guide,
                 "privacy_policy_link": offering.privacy_policy_link,
+                "helpdesk_url": offering.helpdesk_url,
+                "documentation_url": offering.documentation_url,
                 "access_url": offering.access_url,
                 "country": offering.country,
                 "paused_reason": offering.paused_reason,
@@ -615,6 +706,14 @@ class Command(BaseCommand):
                 offering_data["compliance_checklist_uuid"] = (
                     offering.compliance_checklist.uuid.hex
                 )
+
+            # Add scope reference if it exists
+            if offering.content_type and offering.object_id:
+                offering_data["scope_type"] = (
+                    f"{offering.content_type.app_label}.{offering.content_type.model}"
+                )
+                if hasattr(offering.scope, "uuid"):
+                    offering_data["scope_uuid"] = offering.scope.uuid.hex
 
             offerings.append(offering_data)
         return offerings
@@ -831,7 +930,7 @@ class Command(BaseCommand):
         """Export marketplace resource data."""
         resources = []
         for resource in Resource.objects.select_related(
-            "offering", "plan", "project", "project__customer"
+            "offering", "plan", "project", "project__customer", "content_type"
         ).order_by("created"):
             resources.append(
                 {
@@ -871,6 +970,12 @@ class Command(BaseCommand):
                     "current_usages": resource.current_usages,
                     "error_message": resource.error_message,
                     "error_traceback": resource.error_traceback,
+                    "scope_type": f"{resource.content_type.app_label}.{resource.content_type.model}"
+                    if resource.content_type
+                    else None,
+                    "scope_uuid": resource.scope.uuid.hex
+                    if resource.content_type and resource.scope
+                    else None,
                 }
             )
         return resources
@@ -1150,6 +1255,7 @@ class Command(BaseCommand):
                     "username": offering_user.username,
                     "is_restricted": offering_user.is_restricted,
                     "state": offering_user.state,
+                    "backend_metadata": offering_user.backend_metadata,
                     "service_provider_comment": offering_user.service_provider_comment,
                     "service_provider_comment_url": offering_user.service_provider_comment_url,
                     "created": offering_user.created.isoformat()
@@ -1161,6 +1267,66 @@ class Command(BaseCommand):
                 }
             )
         return offering_users
+
+    def export_robot_accounts(self):
+        """Export robot account data."""
+        robot_accounts = []
+        for robot_account in (
+            RobotAccount.objects.select_related("resource", "responsible_user")
+            .prefetch_related("users")
+            .order_by("created")
+        ):
+            robot_accounts.append(
+                {
+                    "uuid": robot_account.uuid.hex,
+                    "resource_uuid": robot_account.resource.uuid.hex,
+                    "resource_name": robot_account.resource.name,
+                    "username": robot_account.username,
+                    "description": robot_account.description,
+                    "type": robot_account.type,
+                    "keys": robot_account.keys,
+                    "state": robot_account.state,
+                    "backend_metadata": robot_account.backend_metadata,
+                    "backend_id": robot_account.backend_id,
+                    "responsible_user_uuid": robot_account.responsible_user.uuid.hex
+                    if robot_account.responsible_user
+                    else None,
+                    "user_uuids": [user.uuid.hex for user in robot_account.users.all()],
+                    "created": robot_account.created.isoformat()
+                    if robot_account.created
+                    else None,
+                    "modified": robot_account.modified.isoformat()
+                    if robot_account.modified
+                    else None,
+                }
+            )
+        return robot_accounts
+
+    def export_offering_user_groups(self):
+        """Export offering user group data.
+
+        OfferingUserGroup has no UUID field; the import side matches groups
+        by the natural key (offering, backend_metadata.gid).
+        """
+        offering_user_groups = []
+        for group in (
+            OfferingUserGroup.objects.select_related("offering")
+            .prefetch_related("projects")
+            .order_by("created")
+        ):
+            offering_user_groups.append(
+                {
+                    "offering_uuid": group.offering.uuid.hex,
+                    "offering_name": group.offering.name,
+                    "backend_metadata": group.backend_metadata,
+                    "project_uuids": [
+                        project.uuid.hex for project in group.projects.all()
+                    ],
+                    "created": group.created.isoformat() if group.created else None,
+                    "modified": group.modified.isoformat() if group.modified else None,
+                }
+            )
+        return offering_user_groups
 
     def export_checklists(self):
         """Export checklist data."""
@@ -1640,14 +1806,7 @@ class Command(BaseCommand):
                     "cutoff_time": round_obj.cutoff_time.isoformat()
                     if round_obj.cutoff_time
                     else None,
-                    "review_strategy": round_obj.review_strategy,
-                    "deciding_entity": round_obj.deciding_entity,
-                    "allocation_time": round_obj.allocation_time,
                     "review_duration_in_days": round_obj.review_duration_in_days,
-                    "minimum_number_of_reviewers": round_obj.minimum_number_of_reviewers,
-                    "minimal_average_scoring": str(round_obj.minimal_average_scoring)
-                    if round_obj.minimal_average_scoring is not None
-                    else None,
                     "allocation_date": round_obj.allocation_date.isoformat()
                     if round_obj.allocation_date
                     else None,
@@ -1836,6 +1995,51 @@ class Command(BaseCommand):
             )
         return items
 
+    def export_reviewer_suggestions(self):
+        """Export reviewer suggestion data (algorithm-generated matches)."""
+        suggestions = []
+        for s in ReviewerSuggestion.objects.select_related(
+            "call", "reviewer", "reviewer__user", "reviewed_by"
+        ).order_by("call__name", "-affinity_score"):
+            suggestions.append(
+                {
+                    "uuid": s.uuid.hex,
+                    "call_uuid": s.call.uuid.hex,
+                    "call_name": s.call.name,
+                    "reviewer_uuid": s.reviewer.uuid.hex,
+                    "reviewer_name": s.reviewer.user.full_name,
+                    "affinity_score": s.affinity_score,
+                    "keyword_score": s.keyword_score,
+                    "text_score": s.text_score,
+                    "status": s.status,
+                    "reviewed_by_uuid": s.reviewed_by.uuid.hex
+                    if s.reviewed_by
+                    else None,
+                    "reviewed_at": s.reviewed_at.isoformat() if s.reviewed_at else None,
+                    "rejection_reason": s.rejection_reason,
+                    "matched_keywords": s.matched_keywords,
+                    "top_matching_proposals": s.top_matching_proposals,
+                }
+            )
+        return suggestions
+
+    def export_role_mappings(self):
+        """Export proposal-to-project role mapping data."""
+        mappings = []
+        for m in ProposalProjectRoleMapping.objects.select_related(
+            "call", "proposal_role", "project_role"
+        ).order_by("call__name", "proposal_role__name"):
+            mappings.append(
+                {
+                    "uuid": m.uuid.hex,
+                    "call_uuid": m.call.uuid.hex,
+                    "call_name": m.call.name,
+                    "proposal_role": m.proposal_role.name,
+                    "project_role": m.project_role.name if m.project_role else None,
+                }
+            )
+        return mappings
+
     def export_maintenance_announcements(self):
         """Export maintenance announcement data."""
         announcements = []
@@ -1899,3 +2103,365 @@ class Command(BaseCommand):
                 }
             )
         return offerings
+
+    def export_software_catalogs(self):
+        """Export software catalog definitions (not package content)."""
+        catalogs = []
+        for catalog in SoftwareCatalog.objects.all().order_by("name", "catalog_type"):
+            catalogs.append(
+                {
+                    "uuid": catalog.uuid.hex,
+                    "name": catalog.name,
+                    "version": catalog.version,
+                    "catalog_type": catalog.catalog_type,
+                    "source_url": catalog.source_url,
+                    "description": catalog.description,
+                    "metadata": catalog.metadata,
+                    "auto_update_enabled": catalog.auto_update_enabled,
+                    "last_update_attempt": catalog.last_update_attempt.isoformat()
+                    if catalog.last_update_attempt
+                    else None,
+                    "last_successful_update": catalog.last_successful_update.isoformat()
+                    if catalog.last_successful_update
+                    else None,
+                    "update_errors": catalog.update_errors,
+                    "created": catalog.created.isoformat() if catalog.created else None,
+                    "modified": catalog.modified.isoformat()
+                    if catalog.modified
+                    else None,
+                }
+            )
+        return catalogs
+
+    def export_offering_partitions(self):
+        """Export offering partition data (SLURM partitions)."""
+        partitions = []
+        for partition in OfferingPartition.objects.select_related("offering").order_by(
+            "offering__name", "partition_name"
+        ):
+            partitions.append(
+                {
+                    "uuid": partition.uuid.hex,
+                    "offering_uuid": partition.offering.uuid.hex,
+                    "offering_name": partition.offering.name,
+                    "partition_name": partition.partition_name,
+                    "cpu_arch": partition.cpu_arch,
+                    "gpu_arch": partition.gpu_arch,
+                    "cpu_bind": partition.cpu_bind,
+                    "def_cpu_per_gpu": partition.def_cpu_per_gpu,
+                    "max_cpus_per_node": partition.max_cpus_per_node,
+                    "created": partition.created.isoformat()
+                    if partition.created
+                    else None,
+                    "modified": partition.modified.isoformat()
+                    if partition.modified
+                    else None,
+                }
+            )
+        return partitions
+
+    def export_offering_software_catalogs(self):
+        """Export offering-to-software-catalog links."""
+        links = []
+        for link in OfferingSoftwareCatalog.objects.select_related(
+            "offering", "catalog", "partition"
+        ).order_by("offering__name", "catalog__name"):
+            link_data = {
+                "uuid": link.uuid.hex,
+                "offering_uuid": link.offering.uuid.hex,
+                "offering_name": link.offering.name,
+                "catalog_uuid": link.catalog.uuid.hex,
+                "catalog_name": link.catalog.name,
+                "enabled_cpu_family": link.enabled_cpu_family,
+                "enabled_cpu_microarchitectures": link.enabled_cpu_microarchitectures,
+                "created": link.created.isoformat() if link.created else None,
+                "modified": link.modified.isoformat() if link.modified else None,
+            }
+            if link.partition:
+                link_data["partition_uuid"] = link.partition.uuid.hex
+            links.append(link_data)
+        return links
+
+    def export_openstack_service_settings(self):
+        """Export OpenStack service settings."""
+        settings_list = []
+        for ss in ServiceSettings.objects.filter(type="OpenStack").select_related(
+            "customer"
+        ):
+            settings_list.append(
+                {
+                    "uuid": ss.uuid.hex,
+                    "name": ss.name,
+                    "type": ss.type,
+                    "backend_url": ss.backend_url or "",
+                    "username": ss.username or "",
+                    "password": ss.password or "",
+                    "domain": ss.domain or "",
+                    "token": ss.token or "",
+                    "shared": ss.shared,
+                    "options": ss.options,
+                    "is_active": ss.is_active,
+                    "state": ss.state,
+                    "customer_uuid": ss.customer.uuid.hex if ss.customer else None,
+                    "customer_name": ss.customer.name if ss.customer else None,
+                }
+            )
+        return settings_list
+
+    def export_openstack_flavors(self):
+        """Export OpenStack flavors."""
+        flavors = []
+        for flavor in Flavor.objects.select_related("settings"):
+            flavors.append(
+                {
+                    "uuid": flavor.uuid.hex,
+                    "name": flavor.name,
+                    "backend_id": flavor.backend_id,
+                    "cores": flavor.cores,
+                    "ram": flavor.ram,
+                    "disk": flavor.disk,
+                    "settings_uuid": flavor.settings.uuid.hex,
+                    "settings_name": flavor.settings.name,
+                }
+            )
+        return flavors
+
+    def export_openstack_images(self):
+        """Export OpenStack images."""
+        images = []
+        for image in Image.all_objects.select_related("settings"):
+            images.append(
+                {
+                    "uuid": image.uuid.hex,
+                    "name": image.name,
+                    "backend_id": image.backend_id,
+                    "min_disk": image.min_disk,
+                    "min_ram": image.min_ram,
+                    "settings_uuid": image.settings.uuid.hex,
+                    "settings_name": image.settings.name,
+                }
+            )
+        return images
+
+    def export_openstack_tenants(self):
+        """Export OpenStack tenants."""
+        tenants = []
+        for tenant in Tenant.objects.select_related("service_settings", "project"):
+            tenants.append(
+                {
+                    "uuid": tenant.uuid.hex,
+                    "name": tenant.name,
+                    "description": tenant.description,
+                    "backend_id": tenant.backend_id,
+                    "state": tenant.state,
+                    "runtime_state": tenant.runtime_state,
+                    "service_settings_uuid": tenant.service_settings.uuid.hex,
+                    "project_uuid": tenant.project.uuid.hex,
+                    "project_name": tenant.project.name,
+                    "internal_network_id": tenant.internal_network_id,
+                    "external_network_id": tenant.external_network_id,
+                    "availability_zone": tenant.availability_zone,
+                    "user_username": tenant.user_username,
+                    "user_password": tenant.user_password,
+                }
+            )
+        return tenants
+
+    def export_openstack_instances(self):
+        """Export OpenStack instances."""
+        instances = []
+        for instance in Instance.objects.select_related(
+            "tenant", "service_settings", "project"
+        ):
+            instances.append(
+                {
+                    "uuid": instance.uuid.hex,
+                    "name": instance.name,
+                    "description": instance.description,
+                    "backend_id": instance.backend_id,
+                    "state": instance.state,
+                    "runtime_state": instance.runtime_state,
+                    "tenant_uuid": instance.tenant.uuid.hex,
+                    "cores": instance.cores,
+                    "ram": instance.ram,
+                    "disk": instance.disk,
+                    "image_name": instance.image_name,
+                    "flavor_name": instance.flavor_name,
+                    "flavor_disk": instance.flavor_disk,
+                    "hypervisor_hostname": instance.hypervisor_hostname,
+                    "key_name": instance.key_name,
+                    "key_fingerprint": instance.key_fingerprint,
+                    "directly_connected_ips": instance.directly_connected_ips,
+                }
+            )
+        return instances
+
+    def export_openstack_volumes(self):
+        """Export OpenStack volumes."""
+        volumes = []
+        for volume in Volume.objects.select_related(
+            "tenant", "instance", "service_settings", "project"
+        ):
+            volumes.append(
+                {
+                    "uuid": volume.uuid.hex,
+                    "name": volume.name,
+                    "description": volume.description,
+                    "backend_id": volume.backend_id,
+                    "state": volume.state,
+                    "runtime_state": volume.runtime_state,
+                    "tenant_uuid": volume.tenant.uuid.hex,
+                    "instance_uuid": volume.instance.uuid.hex
+                    if volume.instance
+                    else None,
+                    "size": volume.size,
+                    "bootable": volume.bootable,
+                    "device": volume.device,
+                    "image_name": volume.image_name,
+                }
+            )
+        return volumes
+
+    def export_project_estimated_cost_policies(self):
+        """Export project estimated cost policies."""
+        policies = []
+        for policy in ProjectEstimatedCostPolicy.objects.select_related(
+            "scope", "created_by"
+        ).order_by("scope__name"):
+            policies.append(
+                {
+                    "uuid": policy.uuid.hex,
+                    "project_uuid": policy.scope.uuid.hex,
+                    "project_name": policy.scope.name,
+                    "limit_cost": policy.limit_cost,
+                    "period": policy.period,
+                    "actions": policy.actions,
+                    "options": policy.options,
+                    "has_fired": policy.has_fired,
+                    "fired_datetime": policy.fired_datetime.isoformat()
+                    if policy.fired_datetime
+                    else None,
+                    "created_by_uuid": policy.created_by.uuid.hex
+                    if policy.created_by
+                    else None,
+                    "created": policy.created.isoformat() if policy.created else None,
+                    "modified": policy.modified.isoformat()
+                    if policy.modified
+                    else None,
+                }
+            )
+        return policies
+
+    def export_customer_estimated_cost_policies(self):
+        """Export customer estimated cost policies."""
+        policies = []
+        for policy in CustomerEstimatedCostPolicy.objects.select_related(
+            "scope", "created_by"
+        ).order_by("scope__name"):
+            policies.append(
+                {
+                    "uuid": policy.uuid.hex,
+                    "customer_uuid": policy.scope.uuid.hex,
+                    "customer_name": policy.scope.name,
+                    "limit_cost": policy.limit_cost,
+                    "period": policy.period,
+                    "actions": policy.actions,
+                    "options": policy.options,
+                    "has_fired": policy.has_fired,
+                    "fired_datetime": policy.fired_datetime.isoformat()
+                    if policy.fired_datetime
+                    else None,
+                    "created_by_uuid": policy.created_by.uuid.hex
+                    if policy.created_by
+                    else None,
+                    "created": policy.created.isoformat() if policy.created else None,
+                    "modified": policy.modified.isoformat()
+                    if policy.modified
+                    else None,
+                }
+            )
+        return policies
+
+    def export_slurm_periodic_policies(self):
+        """Export SLURM periodic usage policies with component limits."""
+        policies = []
+        for policy in (
+            SlurmPeriodicUsagePolicy.objects.select_related("scope", "created_by")
+            .prefetch_related(
+                "component_limits_set__component",
+                "organization_groups",
+            )
+            .order_by("scope__name")
+        ):
+            component_limits = []
+            for cl in policy.component_limits_set.all():
+                component_limits.append(
+                    {
+                        "type": cl.component.type,
+                        "limit": cl.limit,
+                    }
+                )
+            policies.append(
+                {
+                    "uuid": policy.uuid.hex,
+                    "offering_uuid": policy.scope.uuid.hex,
+                    "offering_name": policy.scope.name,
+                    "apply_to_all": policy.apply_to_all,
+                    "actions": policy.actions,
+                    "options": policy.options,
+                    "limit_type": policy.limit_type,
+                    "tres_billing_enabled": policy.tres_billing_enabled,
+                    "tres_billing_weights": policy.tres_billing_weights,
+                    "carryover_factor": policy.carryover_factor,
+                    "grace_ratio": policy.grace_ratio,
+                    "carryover_enabled": policy.carryover_enabled,
+                    "raw_usage_reset": policy.raw_usage_reset,
+                    "qos_strategy": policy.qos_strategy,
+                    "has_fired": policy.has_fired,
+                    "fired_datetime": policy.fired_datetime.isoformat()
+                    if policy.fired_datetime
+                    else None,
+                    "created_by_uuid": policy.created_by.uuid.hex
+                    if policy.created_by
+                    else None,
+                    "organization_group_uuids": [
+                        og.uuid.hex for og in policy.organization_groups.all()
+                    ],
+                    "component_limits": component_limits,
+                    "created": policy.created.isoformat() if policy.created else None,
+                    "modified": policy.modified.isoformat()
+                    if policy.modified
+                    else None,
+                }
+            )
+        return policies
+
+    def export_events(self):
+        """Export audit log events related to invoicing, credits and policies."""
+        event_types = set()
+        for group in [EventGroup.INVOICES, EventGroup.CREDITS]:
+            event_types.update(
+                item.value for item in EVENT_GROUP_MAPPING.get(group, [])
+            )
+        event_types.update(
+            [
+                EventType.POLICY_NOTIFICATION.value,
+                EventType.SLURM_POLICY_EVALUATION.value,
+                EventType.REQUEST_SLURM_RESOURCE_DOWNSCALING.value,
+                EventType.REQUEST_SLURM_RESOURCE_PAUSING.value,
+            ]
+        )
+        events = []
+        for event in Event.objects.filter(event_type__in=sorted(event_types)).order_by(
+            "created"
+        ):
+            events.append(
+                {
+                    "uuid": event.uuid.hex,
+                    "event_type": event.event_type,
+                    "message": event.message,
+                    "context": event.context,
+                    "created": event.created.isoformat(),
+                }
+            )
+        return events

@@ -8,6 +8,7 @@ from collections.abc import Iterable, Mapping
 from constance import LazyConfig, settings
 from django import forms
 from django.conf import settings as django_settings
+from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import (
     ImproperlyConfigured,
     MultipleObjectsReturned,
@@ -16,7 +17,9 @@ from django.core.exceptions import (
 from django.core.files.storage import default_storage
 from django.core.validators import RegexValidator, URLValidator
 from django.urls import Resolver404, reverse
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
+from drf_spectacular.utils import extend_schema_field
 from modeltranslation.manager import get_translatable_fields_for_model
 from rest_framework import serializers
 from rest_framework import serializers as rf_serializers
@@ -25,8 +28,10 @@ from rest_framework.serializers import ListSerializer
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core.clean_html import clean_html
-from waldur_core.core.models import generate_slug
+from waldur_core.core.models import PersonalAccessToken, UserDetailsMatchMixin
 from waldur_core.core.signals import pre_serializer_fields
+from waldur_core.permissions.enums import TYPE_KEY_BY_CT, TYPE_MAP, PermissionEnum
+from waldur_core.permissions.utils import get_scope_ancestors, has_any_permission
 from waldur_mastermind.common.serializers import StringListSerializer
 
 from . import fields as core_fields
@@ -157,6 +162,17 @@ class JsonListSerializerField(serializers.ListField):
         return value
 
 
+class ClearableImageField(serializers.ImageField):
+    """
+    ImageField that accepts empty string or null to clear the value.
+    """
+
+    def to_internal_value(self, data):
+        if data is None or data == "":
+            return None
+        return super().to_internal_value(data)
+
+
 class MultilingualImageSerializerField(serializers.DictField):
     """
     A field for handling language-specific image uploads.
@@ -231,6 +247,10 @@ class CoreAuthTokenSerializer(serializers.Serializer):
     token = serializers.CharField(
         read_only=True, help_text="Authentication token for API access"
     )
+
+
+class TokenExchangeSerializer(serializers.Serializer):
+    code = serializers.UUIDField()
 
 
 class Base64Field(serializers.CharField):
@@ -357,6 +377,14 @@ class GenericRelatedField(Field):
             raise serializers.ValidationError(message)
 
         return obj
+
+
+class UserEmailPatternsValidatorMixin:
+    """Provides validate_user_email_patterns for serializers with a user_email_patterns field."""
+
+    def validate_user_email_patterns(self, value):
+        UserDetailsMatchMixin.validate_user_email_patterns(value)
+        return value
 
 
 class AugmentedSerializerMixin:
@@ -605,10 +633,10 @@ class ConstanceSettingsSerializer(serializers.Serializer):
         fields = OrderedDict()
         for name, options in settings.CONFIG.items():
             default = options[0]
-            if len(options) == 3:
+            if len(options) >= 3:
                 config_type = options[2]
                 if config_type not in settings.ADDITIONAL_FIELDS and not isinstance(
-                    default, config_type
+                    default, config_type if isinstance(config_type, type) else str
                 ):
                     raise ImproperlyConfigured(
                         _(
@@ -626,7 +654,7 @@ class ConstanceSettingsSerializer(serializers.Serializer):
             if config_type is str:
                 field_class = serializers.CharField
             if config_type == "image_field":
-                field_class = serializers.ImageField
+                field_class = ClearableImageField
             if config_type == "email_field":
                 field_class = serializers.EmailField
             if config_type is int:
@@ -641,6 +669,10 @@ class ConstanceSettingsSerializer(serializers.Serializer):
                 field_class = StringListSerializer
             if config_type == "json_list_field":
                 field_class = JsonListSerializerField
+            if config_type == "choice_field":
+                field_class = serializers.ChoiceField
+            if config_type == "multiple_choice_field":
+                field_class = serializers.MultipleChoiceField
             if config_type == "country_list_field":
                 field_class = StringListSerializer
             if config_type in (
@@ -665,6 +697,15 @@ class ConstanceSettingsSerializer(serializers.Serializer):
                 kwargs["allow_blank"] = True
             if config_type == "url_field":
                 kwargs["validators"] = [URLValidator()]
+                kwargs["allow_blank"] = True
+            if config_type == "choice_field":
+                kwargs["choices"] = getattr(
+                    django_settings, "CONSTANCE_CONFIG_CHOICES", {}
+                ).get(name, [])
+            if config_type == "multiple_choice_field":
+                kwargs["choices"] = getattr(
+                    django_settings, "CONSTANCE_CONFIG_CHOICES", {}
+                ).get(name, [])
                 kwargs["allow_blank"] = True
             fields[name] = field_class(**kwargs)
         return fields
@@ -691,6 +732,8 @@ class ConstanceSettingsSerializer(serializers.Serializer):
                             # It's already a path string
                             processed[key] = value
                     new = processed
+                if isinstance(new, set):
+                    new = list(new)
                 setattr(config, name, new)
 
 
@@ -770,14 +813,11 @@ class SlugSerializerMixin(serializers.Serializer):
 
         return value
 
-    def generate_slug(self, validated_data):
-        klass = self.Meta.model
-        slug_source = validated_data[klass.get_slug_source_field()]
-        return generate_slug(slug_source, klass)
-
     def create(self, validated_data):
-        if "slug" not in validated_data:
-            validated_data["slug"] = self.generate_slug(validated_data)
+        # Strip empty slug so the model's generate_slug() is used on save.
+        # This ensures model-level slug templates (e.g. project_slug_template) are respected.
+        if "slug" in validated_data and not validated_data["slug"]:
+            validated_data.pop("slug")
         return super().create(validated_data)
 
 
@@ -1024,11 +1064,15 @@ class HTMLCleanField(serializers.CharField):
     def to_internal_value(self, data):
         # First, let the parent CharField handle basic validation
         value = super().to_internal_value(data)
-
+        if not value:
+            return value
         # Then clean the HTML content if it's not empty
-        if value:
-            return clean_html(value.strip())
-
+        value = clean_html(value.strip())
+        if self.max_length is not None and len(value) > self.max_length:
+            raise serializers.ValidationError(
+                _("Value is too long (maximum %(max_length)s characters).")
+                % {"max_length": self.max_length}
+            )
         return value
 
 
@@ -1375,3 +1419,299 @@ class TableGrowthStatsResponseSerializer(serializers.Serializer):
         many=True,
         help_text="List of tables that exceeded configured growth thresholds",
     )
+
+
+class TableGrowthTriggerResponseSerializer(serializers.Serializer):
+    """Response serializer for triggering table size sampling."""
+
+    detail = serializers.CharField(help_text="Status message about the triggered task")
+
+
+# --- Personal Access Token serializers ---
+
+
+class AllowedScopeInputSerializer(serializers.Serializer):
+    """Single PAT binding entry on create.
+
+    `type` is a key of :data:`waldur_core.permissions.enums.TYPE_MAP`;
+    `uuid` is the target entity's UUID.
+    """
+
+    type = serializers.CharField()
+    uuid = serializers.UUIDField()
+
+    def validate_type(self, value):
+        if value not in TYPE_MAP:
+            raise serializers.ValidationError(
+                f"Unknown scope type '{value}'. Expected one of: {sorted(TYPE_MAP)}."
+            )
+        return value
+
+
+class AllowedScopeOutputSerializer(serializers.Serializer):
+    """Single PAT binding entry on read.
+
+    `name` falls back to ``"(deleted)"`` if the bound entity no longer exists.
+    """
+
+    type = serializers.CharField()
+    uuid = serializers.UUIDField(allow_null=True)
+    name = serializers.CharField(allow_null=True)
+
+
+def _serialize_allowed_scopes(stored):
+    """Turn the stored list of {content_type_id, object_id} into output dicts.
+
+    Resolves each binding to ``{type, uuid, name}``; surfaces deleted
+    entities with ``uuid=None`` and ``name="(deleted)"`` rather than
+    dropping them. Issues one query per distinct ContentType (not per
+    binding) — important when the PAT list endpoint renders many tokens.
+    """
+    bindings = list(stored or [])
+    if not bindings:
+        return []
+
+    # Group object_ids by content_type to do one query per type.
+    ids_by_ct: dict[int, set[int]] = {}
+    for entry in bindings:
+        ids_by_ct.setdefault(entry["content_type_id"], set()).add(entry["object_id"])
+
+    # Bulk-fetch each batch.
+    instances_by_ct: dict[int, dict[int, object]] = {}
+    type_key_by_ct: dict[int, str | None] = {}
+    for ct_id, ids in ids_by_ct.items():
+        try:
+            ct = ContentType.objects.get_for_id(ct_id)
+        except ContentType.DoesNotExist:
+            type_key_by_ct[ct_id] = None
+            continue
+        type_key_by_ct[ct_id] = TYPE_KEY_BY_CT.get((ct.app_label, ct.model))
+        model = ct.model_class()
+        instances_by_ct[ct_id] = {
+            obj.pk: obj for obj in model.objects.filter(pk__in=ids)
+        }
+
+    out = []
+    for entry in bindings:
+        ct_id = entry["content_type_id"]
+        type_key = type_key_by_ct.get(ct_id)
+        if not type_key:
+            continue
+        instance = instances_by_ct.get(ct_id, {}).get(entry["object_id"])
+        if instance is None:
+            out.append({"type": type_key, "uuid": None, "name": "(deleted)"})
+        else:
+            out.append(
+                {
+                    "type": type_key,
+                    "uuid": getattr(instance, "uuid", None),
+                    "name": getattr(instance, "name", None) or str(instance),
+                }
+            )
+    return out
+
+
+class PersonalAccessTokenCreateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=150)
+    scopes = serializers.ListField(child=serializers.CharField())
+    # Use ``Serializer(many=True)`` (a ListSerializer under the hood) rather
+    # than ``ListField(child=Serializer())`` — the latter reports per-item
+    # validation errors as ``OrderedDict[int, ...]`` (index keys), which the
+    # orjson renderer rejects with ``TypeError: Dict key must be str``.
+    allowed_scopes = AllowedScopeInputSerializer(
+        many=True,
+        required=False,
+        default=list,
+        help_text=(
+            "Optional list of entity bindings restricting where this token "
+            "can act. Empty list = no entity restriction."
+        ),
+    )
+    expires_at = serializers.DateTimeField()
+
+    def validate_scopes(self, value):
+        valid_values = {e.value for e in PermissionEnum}
+        invalid = [s for s in value if s not in valid_values]
+        if invalid:
+            raise serializers.ValidationError(f"Invalid scope(s): {invalid}")
+        if not value:
+            raise serializers.ValidationError("At least one scope is required.")
+
+        user = self.context["request"].user
+        if PermissionEnum.STAFF_ACCESS.value in value and not user.is_staff:
+            raise serializers.ValidationError(
+                "Only staff users can request the STAFF.ACCESS scope."
+            )
+        if PermissionEnum.SUPPORT_ACCESS.value in value and not (
+            user.is_staff or user.is_support
+        ):
+            raise serializers.ValidationError(
+                "Only staff or support users can request the SUPPORT.ACCESS scope."
+            )
+
+        return value
+
+    def validate_expires_at(self, value):
+        if value <= timezone.now():
+            raise serializers.ValidationError("Expiration must be in the future.")
+        max_days = config.PAT_MAX_LIFETIME_DAYS
+        max_expiry = timezone.now() + timezone.timedelta(days=max_days)
+        if value > max_expiry:
+            raise serializers.ValidationError(
+                f"Expiration cannot exceed {max_days} days from now."
+            )
+        return value
+
+    def validate(self, attrs):
+        user = self.context["request"].user
+
+        if not user.can_use_personal_access_tokens:
+            raise serializers.ValidationError(
+                "You are not allowed to create personal access tokens."
+            )
+
+        # Check token count limit
+        active_count = PersonalAccessToken.objects.filter(
+            user=user, is_active=True
+        ).count()
+        if active_count >= config.PAT_MAX_TOKENS_PER_USER:
+            raise serializers.ValidationError(
+                f"Maximum number of active tokens ({config.PAT_MAX_TOKENS_PER_USER}) reached."
+            )
+
+        bindings_input = attrs.get("allowed_scopes") or []
+        scopes = attrs.get("scopes") or []
+
+        # STAFF.ACCESS / SUPPORT.ACCESS are global by design — entity binding
+        # would be meaningless. Reject the combination.
+        global_scopes = {
+            PermissionEnum.STAFF_ACCESS.value,
+            PermissionEnum.SUPPORT_ACCESS.value,
+        }
+        if bindings_input and any(s in global_scopes for s in scopes):
+            raise serializers.ValidationError(
+                {
+                    "allowed_scopes": (
+                        "Entity bindings cannot be combined with STAFF.ACCESS "
+                        "or SUPPORT.ACCESS — those scopes are global."
+                    )
+                }
+            )
+
+        # Resolve each binding to a concrete entity and verify the caller has
+        # at least one of the requested permissions on it (or an ancestor).
+        # Storage form: list of {content_type_id, object_id}.
+        permission_enums = [PermissionEnum(s) for s in scopes if s not in global_scopes]
+        request = self.context["request"]
+        resolved = []
+        errors = []
+        for idx, entry in enumerate(bindings_input):
+            type_key = entry["type"]
+            uuid_value = entry["uuid"]
+            app_label, model_name = TYPE_MAP[type_key]
+            try:
+                ct = ContentType.objects.get_by_natural_key(app_label, model_name)
+            except ContentType.DoesNotExist:
+                errors.append(
+                    {
+                        "type": f"Unknown scope type '{type_key}'.",
+                    }
+                )
+                continue
+            model = ct.model_class()
+            instance = model.objects.filter(uuid=uuid_value).first()
+            if instance is None:
+                errors.append(f"{type_key} with uuid {uuid_value} does not exist.")
+                continue
+            # Staff already passes has_any_permission unconditionally — the
+            # PAT scope-check kicks in at request time, not here. For non-
+            # staff users we ensure they cannot bind to entities they have
+            # no relevant authority on (privilege escalation guard).
+            if not user.is_staff and permission_enums:
+                allowed_here = any(
+                    has_any_permission(request, permission_enums, ancestor)
+                    for ancestor in get_scope_ancestors(instance)
+                )
+                if not allowed_here:
+                    errors.append(
+                        f"You do not hold any of the requested permissions "
+                        f"on {type_key} {uuid_value}."
+                    )
+                    continue
+            resolved.append({"content_type_id": ct.id, "object_id": instance.id})
+
+        if errors:
+            raise serializers.ValidationError({"allowed_scopes": errors})
+
+        attrs["allowed_scopes"] = resolved
+        return attrs
+
+    def create(self, validated_data):
+        user = self.context["request"].user
+        expires_at = validated_data["expires_at"]
+        full_token, prefix, token_hash = PersonalAccessToken.generate_token(expires_at)
+
+        pat = PersonalAccessToken.objects.create(
+            user=user,
+            name=validated_data["name"],
+            token_prefix=prefix,
+            token_hash=token_hash,
+            scopes=validated_data["scopes"],
+            allowed_scopes=validated_data.get("allowed_scopes", []),
+            expires_at=expires_at,
+        )
+        # Attach plaintext for one-time response
+        pat._plaintext_token = full_token
+        return pat
+
+
+class PersonalAccessTokenCreatedSerializer(serializers.Serializer):
+    """Returned once at creation — includes the plaintext token."""
+
+    uuid = serializers.UUIDField()
+    name = serializers.CharField()
+    token = serializers.CharField(help_text="Plaintext token — shown only once.")
+    scopes = serializers.ListField(child=serializers.CharField())
+    allowed_scopes = AllowedScopeOutputSerializer(many=True)
+    expires_at = serializers.DateTimeField()
+    created = serializers.DateTimeField()
+
+
+class PersonalAccessTokenSerializer(serializers.Serializer):
+    """List / retrieve — never exposes the token or hash."""
+
+    uuid = serializers.UUIDField()
+    name = serializers.CharField()
+    token_prefix = serializers.CharField()
+    scopes = serializers.ListField(child=serializers.CharField())
+    allowed_scopes = serializers.SerializerMethodField()
+    expires_at = serializers.DateTimeField()
+    is_active = serializers.BooleanField()
+    last_used_at = serializers.DateTimeField()
+    last_used_ip = serializers.IPAddressField()
+    use_count = serializers.IntegerField()
+    created = serializers.DateTimeField()
+
+    @extend_schema_field(AllowedScopeOutputSerializer(many=True))
+    def get_allowed_scopes(self, obj):
+        return _serialize_allowed_scopes(getattr(obj, "allowed_scopes", []) or [])
+
+
+class AvailableScopeSerializer(serializers.Serializer):
+    permission = serializers.CharField()
+    description = serializers.CharField()
+
+
+class AvailableBindingTargetSerializer(serializers.Serializer):
+    """Which entity types the caller could bind a given permission to."""
+
+    permission = serializers.CharField()
+    types = serializers.ListField(child=serializers.CharField())
+
+
+class DetailSerializer(serializers.Serializer):
+    detail = serializers.CharField()
+
+
+class StatusSerializer(serializers.Serializer):
+    status = serializers.CharField()

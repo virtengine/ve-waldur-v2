@@ -2,6 +2,8 @@ import functools
 import ipaddress
 import logging
 import re
+import uuid
+from datetime import UTC
 from urllib.parse import urlparse, urlunparse
 
 import httpx
@@ -26,6 +28,7 @@ from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates
 from waldur_core.core.utils import create_batch_fetcher, pwgen
 from waldur_core.logging import event_logger
+from waldur_core.logging.diff import compute_collection_diff
 from waldur_core.logging.enums import EventType
 from waldur_core.structure.backend import ServiceBackend, log_backend_action
 from waldur_core.structure.models import ServiceSettings
@@ -46,6 +49,7 @@ from waldur_openstack.exceptions import (
     OpenStackBackendError,
     OpenStackTenantNotFound,
 )
+from waldur_openstack.octavia import get_octavia_client
 from waldur_openstack.session import (
     get_cinder_client,
     get_glance_client,
@@ -53,10 +57,11 @@ from waldur_openstack.session import (
     get_keystone_session,
     get_neutron_client,
     get_nova_client,
+    get_placement_client,
 )
 from waldur_openstack.utils import get_external_network_id, is_valid_volume_type_name
 
-from . import models, signals
+from . import audit, models, signals
 
 logger = logging.getLogger(__name__)
 
@@ -285,6 +290,9 @@ class OpenStackBackend(ServiceBackend):
         self.pull_service_settings_quotas()
         self.pull_global_volume_types()
         self.pull_global_flavors()
+        self.pull_global_images()
+        self.pull_external_networks()
+        self.pull_hypervisors()
 
     def pull_resources(self):
         self.pull_tenants()
@@ -437,7 +445,7 @@ class OpenStackBackend(ServiceBackend):
                 return None
             parsed = dateparse.parse_datetime(value)
             if parsed and timezone.is_naive(parsed):
-                parsed = timezone.make_aware(parsed, timezone=timezone.utc)
+                parsed = timezone.make_aware(parsed, timezone=UTC)
             return parsed
 
         local_image_mapping = self._tenant_mappings(tenant.images.all())
@@ -454,7 +462,7 @@ class OpenStackBackend(ServiceBackend):
         new_image_ids = remote_image_ids - local_image_ids
         for image_backend_id in new_image_ids:
             remote_image = remote_image_mapping[image_backend_id]
-            local_image, _ = models.Image.objects.update_or_create(
+            local_image, _ = models.Image.all_objects.update_or_create(
                 settings=self.settings,
                 backend_id=remote_image["id"],
                 defaults={
@@ -464,6 +472,10 @@ class OpenStackBackend(ServiceBackend):
                     "min_ram": remote_image["min_ram"],
                     "min_disk": self.gb2mb(remote_image["min_disk"]),
                     "backend_created_at": get_backend_created_at(remote_image),
+                    # Glance v2 returns custom properties as flat top-level
+                    # keys (verified empirically against the lab cloud).
+                    "hw_rescue_device": remote_image.get("hw_rescue_device") or "",
+                    "hw_rescue_bus": remote_image.get("hw_rescue_bus") or "",
                 },
             )
             tenant.images.add(local_image)
@@ -471,7 +483,7 @@ class OpenStackBackend(ServiceBackend):
         existing_image_ids = remote_image_ids & local_image_ids
         for image_backend_id in existing_image_ids:
             remote_image = remote_image_mapping[image_backend_id]
-            local_image, _ = models.Image.objects.update_or_create(
+            local_image, _ = models.Image.all_objects.update_or_create(
                 settings=self.settings,
                 backend_id=remote_image["id"],
                 defaults={
@@ -481,6 +493,8 @@ class OpenStackBackend(ServiceBackend):
                     "min_ram": remote_image["min_ram"],
                     "min_disk": self.gb2mb(remote_image["min_disk"]),
                     "backend_created_at": get_backend_created_at(remote_image),
+                    "hw_rescue_device": remote_image.get("hw_rescue_device") or "",
+                    "hw_rescue_bus": remote_image.get("hw_rescue_bus") or "",
                 },
             )
 
@@ -570,6 +584,216 @@ class OpenStackBackend(ServiceBackend):
                 },
             )
 
+    # Mapping from Placement resource_class → legacy Hypervisor field names.
+    # Used to populate the backward-compatible vcpus / memory_mb / local_gb
+    # columns on Hypervisor from the per-class HypervisorInventory rows. Other
+    # classes (VGPU, PCI_DEVICE, NUMA_CORE, CUSTOM_*) are stored in
+    # HypervisorInventory but have no legacy column.
+    _LEGACY_HYPERVISOR_CAPACITY_FIELDS = {
+        "VCPU": ("vcpus", "vcpus_used"),
+        "MEMORY_MB": ("memory_mb", "memory_mb_used"),
+        "DISK_GB": ("local_gb", "local_gb_used"),
+    }
+
+    @staticmethod
+    def _effective_total(inv):
+        """Capacity the Nova scheduler treats as available."""
+        total = max(inv.get("total", 0) - inv.get("reserved", 0), 0)
+        return int(total * (inv.get("allocation_ratio", 1.0) or 1.0))
+
+    def _collect_placement_data(self):
+        """Return per-resource-provider capacity and traits, keyed by RP name.
+
+        Returns a ``(capacity, traits)`` tuple.
+
+        ``capacity`` maps resource-provider name → per-class inventory::
+
+            {
+              "compute01": {
+                "VCPU":      {"total": 72, "reserved": 0, "allocation_ratio": 16.0, "used": 5},
+                "MEMORY_MB": {...},
+                "DISK_GB":   {...},
+                "VGPU":      {...},   # only when present on this RP
+                ...
+              },
+              ...
+            }
+
+        Raw values are preserved (not pre-multiplied) so admins can answer
+        "why is the effective vCPU count what it is?" from `HypervisorInventory`
+        rows. Compute the effective total via `_effective_total(inv)` when
+        needed.
+
+        ``traits`` maps resource-provider name → list of trait names::
+
+            {"compute01": ["HW_CPU_X86_AVX2", "STORAGE_DISK_SSD", "CUSTOM_GOLD"]}
+
+        For compute-node resource providers, the provider name equals
+        hypervisor_hostname, which is how we link Placement back to the Nova
+        Hypervisor records below.
+        """
+        placement = get_placement_client(self.admin_session)
+        rps = placement.list_resource_providers()
+        capacity = {}
+        traits = {}
+        for rp in rps:
+            rp_uuid = rp.get("uuid")
+            if not rp_uuid:
+                continue
+            try:
+                inventories = placement.get_inventories(rp_uuid)
+                usages = placement.get_usages(rp_uuid)
+                rp_traits = placement.get_traits(rp_uuid)
+            except OpenStackBackendError as e:
+                logger.warning(
+                    "Skipping Placement resource provider %s due to error: %s",
+                    rp.get("name"),
+                    e,
+                )
+                continue
+            per_class = {}
+            for resource_class, inv in inventories.items():
+                if not isinstance(inv, dict):
+                    continue
+                per_class[resource_class] = {
+                    "total": int(inv.get("total", 0)),
+                    "reserved": int(inv.get("reserved", 0)),
+                    "allocation_ratio": float(inv.get("allocation_ratio", 1.0) or 1.0),
+                    "used": int(usages.get(resource_class, 0)),
+                }
+            capacity[rp.get("name")] = per_class
+            traits[rp.get("name")] = list(rp_traits)
+        return capacity, traits
+
+    def pull_hypervisors(self):
+        nova = get_nova_client(self.admin_session)
+        try:
+            remote_hypervisors = nova.hypervisors.list()
+        except nova_exceptions.ClientException as e:
+            raise OpenStackBackendError(e)
+
+        # Capacity now comes from Placement; Nova's hypervisor_stats fields are
+        # documented as misleading (ignored CPU pinning, file-backed memory,
+        # shared storage) and removed at microversion 2.88. running_vms, state
+        # and status remain Nova-sourced for now (still present at 2.87).
+        placement_capacity, placement_traits = self._collect_placement_data()
+
+        remote_ids = [str(h.id) for h in remote_hypervisors]
+        stale_qs = models.Hypervisor.objects.filter(settings=self.settings).exclude(
+            backend_id__in=remote_ids
+        )
+        for stale in stale_qs:
+            logger.info(
+                "Deleting stale hypervisor %s (backend_id=%s) for settings %s.",
+                stale.name,
+                stale.backend_id,
+                self.settings,
+            )
+        stale_qs.delete()
+
+        for remote in remote_hypervisors:
+            per_class = placement_capacity.get(remote.hypervisor_hostname, {})
+            # Maintain the legacy three columns on Hypervisor for backward-
+            # compat with the existing summary endpoint and the homeport chart.
+            legacy_fields = {}
+            for resource_class, (
+                cap_field,
+                used_field,
+            ) in self._LEGACY_HYPERVISOR_CAPACITY_FIELDS.items():
+                inv = per_class.get(resource_class)
+                if inv is None:
+                    legacy_fields[cap_field] = 0
+                    legacy_fields[used_field] = 0
+                else:
+                    legacy_fields[cap_field] = self._effective_total(inv)
+                    legacy_fields[used_field] = inv.get("used", 0)
+
+            hypervisor, created = models.Hypervisor.objects.update_or_create(
+                settings=self.settings,
+                backend_id=str(remote.id),
+                defaults={
+                    "name": remote.hypervisor_hostname,
+                    "hypervisor_type": getattr(remote, "hypervisor_type", ""),
+                    "running_vms": getattr(remote, "running_vms", 0),
+                    "state": getattr(remote, "state", ""),
+                    "status": getattr(remote, "status", ""),
+                    **legacy_fields,
+                },
+            )
+            if created:
+                logger.info(
+                    "Created new hypervisor %s (backend_id=%s) for settings %s.",
+                    remote.hypervisor_hostname,
+                    remote.id,
+                    self.settings,
+                )
+
+            # Mirror Placement's view: the per-class inventory becomes the
+            # source of truth for capacity. Drop classes that the host no
+            # longer reports (e.g. VGPU pool removed).
+            seen_classes = set()
+            for resource_class, inv in per_class.items():
+                models.HypervisorInventory.objects.update_or_create(
+                    hypervisor=hypervisor,
+                    resource_class=resource_class,
+                    defaults={
+                        "total": inv["total"],
+                        "reserved": inv["reserved"],
+                        "allocation_ratio": inv["allocation_ratio"],
+                        "used": inv["used"],
+                    },
+                )
+                seen_classes.add(resource_class)
+            hypervisor.inventories.exclude(resource_class__in=seen_classes).delete()
+
+            # Sync Placement traits (capability flags) as an M2M. Trait rows
+            # form a global catalog shared across hosts; .set() replaces the
+            # host's links, so traits dropped from the resource provider are
+            # detached on the next pull. Orphan Trait rows are left in place —
+            # they are a harmless name catalog.
+            trait_objs = [
+                models.Trait.objects.get_or_create(name=name)[0]
+                for name in placement_traits.get(remote.hypervisor_hostname, [])
+            ]
+            hypervisor.traits.set(trait_objs)
+
+    def pull_global_images(self):
+        glance = get_glance_client(self.admin_session)
+        try:
+            remote_images = list(glance.images.list())
+        except glance_exceptions.ClientException as e:
+            raise OpenStackBackendError(e)
+
+        remote_images = [
+            image for image in remote_images if image["status"] != "deleted"
+        ]
+
+        def get_backend_created_at(image):
+            value = image.get("created_at")
+            if not value:
+                return None
+            parsed = dateparse.parse_datetime(value)
+            if parsed and timezone.is_naive(parsed):
+                parsed = timezone.make_aware(parsed, timezone=UTC)
+            return parsed
+
+        models.Image.all_objects.filter(settings=self.settings).exclude(
+            backend_id__in=[image["id"] for image in remote_images]
+        ).delete()
+        for remote_image in remote_images:
+            models.Image.all_objects.update_or_create(
+                settings=self.settings,
+                backend_id=remote_image["id"],
+                defaults={
+                    "name": remote_image["name"]
+                    or remote_image.get("description")
+                    or remote_image["id"],
+                    "min_ram": remote_image["min_ram"],
+                    "min_disk": self.gb2mb(remote_image["min_disk"]),
+                    "backend_created_at": get_backend_created_at(remote_image),
+                },
+            )
+
     def pull_global_volume_types(self):
         cinder = get_cinder_client(self.admin_session)
         try:
@@ -592,6 +816,67 @@ class OpenStackBackend(ServiceBackend):
                     "disabled": volume_type.name in volume_type_blacklist,
                 },
             )
+
+    def pull_external_networks(self):
+        neutron = get_neutron_client(self.admin_session)
+        try:
+            remote_networks = neutron.list_networks(**{"router:external": True})[
+                "networks"
+            ]
+        except neutron_exceptions.NeutronClientException as e:
+            raise OpenStackBackendError(e)
+
+        remote_network_ids = [n["id"] for n in remote_networks]
+
+        # Delete stale external networks
+        models.ExternalNetwork.objects.filter(settings=self.settings).exclude(
+            backend_id__in=remote_network_ids
+        ).delete()
+
+        for net in remote_networks:
+            ext_net, _ = models.ExternalNetwork.objects.update_or_create(
+                settings=self.settings,
+                backend_id=net["id"],
+                defaults={
+                    "name": net.get("name", ""),
+                    "is_shared": net.get("shared", False),
+                    "is_default": net.get("is_default", False),
+                    "status": net.get("status", ""),
+                    "description": net.get("description", ""),
+                },
+            )
+
+            # Sync subnets for this external network
+            try:
+                remote_subnets = neutron.list_subnets(network_id=net["id"])["subnets"]
+            except neutron_exceptions.NeutronClientException as e:
+                logger.warning(
+                    "Failed to list subnets for external network %s: %s",
+                    net["id"],
+                    e,
+                )
+                continue
+
+            remote_subnet_ids = [s["id"] for s in remote_subnets]
+            models.ExternalSubnet.objects.filter(network=ext_net).exclude(
+                backend_id__in=remote_subnet_ids
+            ).delete()
+
+            for subnet in remote_subnets:
+                models.ExternalSubnet.objects.update_or_create(
+                    network=ext_net,
+                    backend_id=subnet["id"],
+                    defaults={
+                        "name": subnet.get("name", ""),
+                        "cidr": subnet.get("cidr", ""),
+                        "gateway_ip": subnet.get("gateway_ip"),
+                        "ip_version": subnet.get("ip_version", 4),
+                        "enable_dhcp": subnet.get("enable_dhcp", True),
+                        "allocation_pools": subnet.get("allocation_pools", []),
+                        "dns_nameservers": subnet.get("dns_nameservers", []),
+                        "description": subnet.get("description", ""),
+                    },
+                )
 
     def pull_tenant_volume_types(self, tenant: models.Tenant):
         session = get_tenant_session(tenant)
@@ -677,6 +962,10 @@ class OpenStackBackend(ServiceBackend):
         neutron_quotas = {
             "security_group": quotas.get("security_group_count"),
             "security_group_rule": quotas.get("security_group_rule_count"),
+            "floatingip": quotas.get("floating_ip_count"),
+            "network": quotas.get("network_count"),
+            "subnet": quotas.get("subnet_count"),
+            "port": quotas.get("port_count"),
         }
         neutron_quotas = {k: v for k, v in neutron_quotas.items() if v is not None}
 
@@ -701,6 +990,10 @@ class OpenStackBackend(ServiceBackend):
             tenant.set_quota_limit(quota_name, limit)
         for quota_name, usage in self.get_tenant_quotas_usage(tenant).items():
             tenant.set_quota_usage(quota_name, usage)
+        # Notify downstream integrations that a fresh pull completed, even when
+        # set_quota_usage produced no deltas. Without this, stable workloads
+        # never refresh marketplace-side snapshots that key off QuotaUsage saves.
+        signals.tenant_quotas_pulled.send(models.Tenant, instance=tenant)
 
     @log_backend_action("pull floating IPs for tenant")
     def pull_tenant_floating_ips(self, tenant: models.Tenant):
@@ -945,23 +1238,15 @@ class OpenStackBackend(ServiceBackend):
         )
 
     def _log_security_group_rule_imported(self, rule: models.SecurityGroupRule):
-        event_logger.emit(
-            "Security group rule %s has been imported from backend." % str(rule),
-            event_type=EventType.OPENSTACK_SECURITY_GROUP_RULE_IMPORTED,
-            event_context={"security_group_rule": rule},
-            scopes=[rule, rule.security_group],
-        )
+        # Per-rule events are intentionally not emitted; the aggregate
+        # openstack_security_group_rules_changed event covers the whole pull.
+        logger.debug("Security group rule %s has been imported from backend.", rule)
 
     def _log_security_group_rule_pulled(self, rule):
-        logger.debug("Security group rule %s has been pulled from backend.", str(rule))
+        logger.debug("Security group rule %s has been pulled from backend.", rule)
 
     def _log_security_group_rule_cleaned(self, rule):
-        event_logger.emit(
-            "Security group rule %s has been cleaned from cache." % str(rule),
-            event_type=EventType.OPENSTACK_SECURITY_GROUP_RULE_CLEANED,
-            event_context={"security_group_rule": rule},
-            scopes=[rule, rule.security_group],
-        )
+        logger.debug("Security group rule %s has been cleaned from cache.", rule)
 
     def _update_remote_security_groups(
         self, tenant: models.Tenant, backend_security_groups
@@ -1036,15 +1321,45 @@ class OpenStackBackend(ServiceBackend):
             except neutron_exceptions.NeutronClientException as e:
                 raise OpenStackBackendError(e)
 
+            # Sync external gateway fields
+            gateway_info = backend_router.get("external_gateway_info")
+            if gateway_info:
+                ext_net_id = gateway_info.get("network_id", "")
+                ext_net_ref = models.ExternalNetwork.objects.filter(
+                    settings=tenant.service_settings, backend_id=ext_net_id
+                ).first()
+                ext_enable_snat = gateway_info.get("enable_snat")
+                ext_fixed_ips = gateway_info.get("external_fixed_ips", [])
+            else:
+                ext_net_id = ""
+                ext_net_ref = None
+                ext_enable_snat = None
+                ext_fixed_ips = []
+
             defaults = {
                 "name": backend_router["name"],
                 "description": backend_router["description"],
                 "routes": backend_router["routes"],
                 "fixed_ips": fixed_ips,
+                "external_network_id": ext_net_id,
+                "external_network_ref": ext_net_ref,
+                "enable_snat": ext_enable_snat,
+                "external_fixed_ips": ext_fixed_ips,
                 "service_settings": tenant.service_settings,
                 "project": tenant.project,
-                "state": CoreStates.OK,
             }
+            # Only assign state when the row is new or recovering from ERRED;
+            # never overwrite a transitional state (DELETION_SCHEDULED,
+            # DELETING, UPDATE_SCHEDULED, UPDATING, CREATION_SCHEDULED,
+            # CREATING) because the worker that issued the transition is
+            # racing with this pull and a stale OK write breaks the FSM.
+            existing_state = (
+                models.Router.objects.filter(tenant=tenant, backend_id=backend_id)
+                .values_list("state", flat=True)
+                .first()
+            )
+            if existing_state in (None, CoreStates.ERRED):
+                defaults["state"] = CoreStates.OK
             try:
                 router_obj, _ = models.Router.objects.update_or_create(
                     tenant=tenant, backend_id=backend_id, defaults=defaults
@@ -1075,6 +1390,117 @@ class OpenStackBackend(ServiceBackend):
     def _tenant_mappings(self, queryset):
         rows = queryset.exclude(backend_id="").values("id", "backend_id")
         return {row["backend_id"]: row["id"] for row in rows}
+
+    def _port_pull_mappings(self, tenant: models.Tenant):
+        return (
+            self._tenant_mappings(tenant.available_networks),
+            self._tenant_mappings(tenant.available_subnets),
+            self._tenant_mappings(models.SecurityGroup.objects.filter(tenant=tenant)),
+            self._tenant_mappings(models.Instance.objects.filter(tenant=tenant)),
+        )
+
+    def _upsert_port_from_neutron_dict(
+        self,
+        tenant: models.Tenant,
+        backend_port: dict,
+        network_mapping: dict,
+        subnet_mapping: dict,
+        security_group_mapping: dict,
+        instance_mapping: dict,
+    ):
+        """Create or update a Waldur Port from a Neutron port dict (same as pull_tenant_ports)."""
+        backend_id = backend_port["id"]
+
+        subnet_id = None
+        try:
+            subnet_backend_id = backend_port["fixed_ips"][0]["subnet_id"]
+            subnet_id = subnet_mapping.get(subnet_backend_id)
+        except (AttributeError, KeyError, IndexError):
+            pass
+
+        device_id = backend_port.get("device_id")
+        instance_id = instance_mapping.get(device_id)
+
+        defaults = {
+            "name": backend_port["name"],
+            "description": backend_port["description"],
+            "service_settings": tenant.service_settings,
+            "project": tenant.project,
+            "instance_id": instance_id,
+            "subnet_id": subnet_id,
+            "state": CoreStates.OK,
+            "mac_address": backend_port["mac_address"],
+            "fixed_ips": backend_port["fixed_ips"],
+            "allowed_address_pairs": backend_port.get("allowed_address_pairs", []),
+            "network_id": network_mapping.get(backend_port["network_id"]),
+            "device_id": device_id,
+            "status": backend_port["status"],
+            "admin_state_up": backend_port["admin_state_up"],
+            "device_owner": backend_port.get("device_owner"),
+            "port_security_enabled": backend_port.get("port_security_enabled", True),
+        }
+        try:
+            port, _ = models.Port.objects.update_or_create(
+                tenant=tenant, backend_id=backend_id, defaults=defaults
+            )
+            local_groups = set(
+                port.security_groups.values_list("backend_id", flat=True)
+            )
+            remote_groups = set(backend_port["security_groups"])
+
+            new_groups = remote_groups - local_groups
+            for group_id in new_groups:
+                local_group_id = security_group_mapping.get(group_id)
+                if local_group_id:
+                    port.security_groups.add(local_group_id)
+
+            stale_groups = local_groups - remote_groups
+            for group in port.security_groups.filter(backend_id__in=stale_groups):
+                port.security_groups.remove(group)
+            return port
+        except IntegrityError:
+            logger.warning(
+                "Could not create or update port with backend ID %s "
+                "and tenant %s due to concurrent update.",
+                backend_id,
+                tenant,
+            )
+            return None
+
+    def import_port_from_neutron_by_id(
+        self, tenant: models.Tenant, neutron_port_id: str
+    ):
+        """Fetch one port from Neutron and upsert local Port (same mapping as pull_tenant_ports)."""
+        session = get_tenant_session(tenant)
+        neutron = get_neutron_client(session)
+        candidates = [neutron_port_id]
+        try:
+            normalized = str(uuid.UUID(str(neutron_port_id).strip()))
+            if normalized not in candidates:
+                candidates.append(normalized)
+        except (ValueError, TypeError):
+            pass
+
+        backend_port = None
+        last_error = None
+        for pid in candidates:
+            try:
+                backend_port = neutron.show_port(pid)["port"]
+                break
+            except neutron_exceptions.NeutronClientException as e:
+                last_error = e
+                continue
+        if backend_port is None:
+            logger.warning(
+                "Could not fetch Neutron port %s for tenant %s: %s",
+                neutron_port_id,
+                tenant,
+                last_error,
+            )
+            return None
+
+        mappings = self._port_pull_mappings(tenant)
+        return self._upsert_port_from_neutron_dict(tenant, backend_port, *mappings)
 
     def update_instance_port_status(self, instance: models.Instance):
         neutron = get_neutron_client(self.admin_session)
@@ -1109,77 +1535,25 @@ class OpenStackBackend(ServiceBackend):
         except neutron_exceptions.NeutronClientException as e:
             raise OpenStackBackendError(e)
 
-        network_mapping = self._tenant_mappings(tenant.available_networks)
-        subnet_mapping = self._tenant_mappings(tenant.available_subnets)
-        security_group_mapping = self._tenant_mappings(
-            models.SecurityGroup.objects.filter(tenant=tenant)
-        )
-        instance_mapping = self._tenant_mappings(
-            models.Instance.objects.filter(tenant=tenant)
-        )
+        mappings = self._port_pull_mappings(tenant)
 
         for backend_port in backend_ports:
-            backend_id = backend_port["id"]
-
-            subnet_id = None
-            try:
-                subnet_backend_id = backend_port["fixed_ips"][0]["subnet_id"]
-                subnet_id = subnet_mapping.get(subnet_backend_id)
-            except (AttributeError, KeyError, IndexError):
-                pass
-
-            device_id = backend_port.get("device_id")
-            instance_id = instance_mapping.get(device_id)
-
-            defaults = {
-                "name": backend_port["name"],
-                "description": backend_port["description"],
-                "service_settings": tenant.service_settings,
-                "project": tenant.project,
-                "instance_id": instance_id,
-                "subnet_id": subnet_id,
-                "state": CoreStates.OK,
-                "mac_address": backend_port["mac_address"],
-                "fixed_ips": backend_port["fixed_ips"],
-                "allowed_address_pairs": backend_port.get("allowed_address_pairs", []),
-                "network_id": network_mapping.get(backend_port["network_id"]),
-                "device_id": device_id,
-                "status": backend_port["status"],
-                "admin_state_up": backend_port["admin_state_up"],
-                "device_owner": backend_port.get("device_owner"),
-                "port_security_enabled": backend_port.get(
-                    "port_security_enabled", True
-                ),
-            }
-            try:
-                port, _ = models.Port.objects.update_or_create(
-                    tenant=tenant, backend_id=backend_id, defaults=defaults
-                )
-                local_groups = set(
-                    port.security_groups.values_list("backend_id", flat=True)
-                )
-                remote_groups = set(backend_port["security_groups"])
-
-                new_groups = remote_groups - local_groups
-                for group_id in new_groups:
-                    local_group_id = security_group_mapping.get(group_id)
-                    if local_group_id:
-                        port.security_groups.add(local_group_id)
-
-                stale_groups = local_groups - remote_groups
-                for group in port.security_groups.filter(backend_id__in=stale_groups):
-                    port.security_groups.remove(group)
-            except IntegrityError:
-                logger.warning(
-                    "Could not create or update port with backend ID %s "
-                    "and tenant %s due to concurrent update.",
-                    backend_id,
-                    tenant,
-                )
+            self._upsert_port_from_neutron_dict(tenant, backend_port, *mappings)
 
         remote_ids = {ip["id"] for ip in backend_ports}
+        # Only consider ports in a stable state. Ports in CREATION_SCHEDULED /
+        # CREATING (saved by OpenStackInstanceSerializer and waiting for
+        # create_instance_ports to push them to Neutron) and ports being torn
+        # down (DELETION_SCHEDULED / DELETING) must survive this sweep —
+        # otherwise the periodic pull races with the executor chain and
+        # silently deletes in-flight rows. Same idiom as
+        # _remove_stale_floating_ips / _remove_stale_security_groups /
+        # stale_networks / stale_subnets / _remove_stale_server_groups.
         stale_ports = (
-            models.Port.objects.filter(tenant=tenant)
+            models.Port.objects.filter(
+                tenant=tenant,
+                state__in=[CoreStates.OK, CoreStates.ERRED],
+            )
             .exclude(backend_id="")
             .exclude(backend_id__in=remote_ids)
         )
@@ -1305,6 +1679,7 @@ class OpenStackBackend(ServiceBackend):
             is_external=backend_network["router:external"],
             runtime_state=backend_network["status"],
             mtu=backend_network.get("mtu"),
+            port_security_enabled=backend_network.get("port_security_enabled", True),
             backend_id=backend_network["id"],
             state=CoreStates.OK,
         )
@@ -2026,6 +2401,9 @@ class OpenStackBackend(ServiceBackend):
 
     def _extract_security_group_rules(self, security_group, backend_security_group):
         backend_rules = backend_security_group["security_group_rules"]
+        # Snapshot local state before pull, for the aggregate diff event.
+        old_snapshot = audit.snapshot_security_group_rules(security_group)
+
         cur_rules = {rule.backend_id: rule for rule in security_group.rules.all()}
         for backend_rule in backend_rules:
             cur_rules.pop(backend_rule["id"], None)
@@ -2042,6 +2420,19 @@ class OpenStackBackend(ServiceBackend):
         for rule in stale_rules:
             self._log_security_group_rule_cleaned(rule)
         stale_rules.delete()
+
+        # Emit one aggregate event covering the entire pull reconciliation.
+        new_snapshot = audit.snapshot_security_group_rules(security_group)
+        diff = compute_collection_diff(
+            old_snapshot,
+            new_snapshot,
+            identity_key=lambda r: r["_pk"],
+            compare_fields=audit.SECURITY_GROUP_RULE_COMPARE_FIELDS,
+            serialize=lambda r: {k: v for k, v in r.items() if k != "_pk"},
+        )
+        audit.emit_security_group_rules_changed(
+            security_group, diff, trigger="backend_sync"
+        )
 
     def _import_security_group_rule(self, backend_rule):
         return {
@@ -2106,20 +2497,9 @@ class OpenStackBackend(ServiceBackend):
                     "Security group rule with id %s successfully deleted in backend",
                     backend_rule_id,
                 )
-                backend_rule = backend_rules[backend_rule_id]
-                security_group_rule = models.SecurityGroupRule(
-                    security_group=security_group,
-                    backend_id=backend_rule_id,
-                    **self._import_security_group_rule(backend_rule),
-                )
-                event_logger.emit(
-                    "Extra security group rule %s has been deleted in "
-                    "backend because it is not defined in Waldur."
-                    % str(security_group_rule),
-                    event_type=EventType.OPENSTACK_SECURITY_GROUP_RULE_DELETED,
-                    event_context={"security_group_rule": security_group_rule},
-                    scopes=[security_group_rule, security_group_rule.security_group],
-                )
+                # Per-rule events intentionally omitted — the aggregate
+                # openstack_security_group_rules_changed event (emitted at
+                # the API or pull layer) covers the change.
 
         # deleting unsynchronized rules
         for local_rule in unsynchronized_rules:
@@ -2139,13 +2519,7 @@ class OpenStackBackend(ServiceBackend):
                     "Security group rule with id %s successfully deleted in backend",
                     local_rule.backend_id,
                 )
-                event_logger.emit(
-                    "Security group rule %s has been deleted "
-                    "from backend because it has different params." % str(local_rule),
-                    event_type=EventType.OPENSTACK_SECURITY_GROUP_RULE_DELETED,
-                    event_context={"security_group_rule": local_rule},
-                    scopes=[local_rule, local_rule.security_group],
-                )
+                # Per-rule events intentionally omitted (see above).
 
         # creating nonexistent and unsynchronized rules
         for local_rule in unsynchronized_rules + nonexistent_rules:
@@ -2198,13 +2572,7 @@ class OpenStackBackend(ServiceBackend):
                     "Security group rule with id %s successfully created in backend",
                     local_rule.id,
                 )
-                event_logger.emit(
-                    "Security group rule %s has been created in backend."
-                    % str(local_rule),
-                    event_type=EventType.OPENSTACK_SECURITY_GROUP_RULE_CREATED,
-                    event_context={"security_group_rule": local_rule},
-                    scopes=[local_rule, local_rule.security_group],
-                )
+                # Per-rule events intentionally omitted (see above).
 
     @log_backend_action()
     def create_security_group(self, security_group: models.SecurityGroup):
@@ -2426,7 +2794,7 @@ class OpenStackBackend(ServiceBackend):
         nova = get_nova_client(session)
         try:
             backend_server_group = nova.server_groups.create(
-                name=server_group.name, policies=server_group.policy
+                name=server_group.name, policy=server_group.policy
             )
             server_group.backend_id = backend_server_group.id
             server_group.save(update_fields=["backend_id"])
@@ -2471,6 +2839,46 @@ class OpenStackBackend(ServiceBackend):
             raise OpenStackBackendError(e.message)
 
     @log_backend_action()
+    def set_external_gateway(self, router: models.Router):
+        neutron = get_neutron_client(self.admin_session)
+        body = {"network_id": router.external_network_id}
+        if router.enable_snat is not None:
+            body["enable_snat"] = router.enable_snat
+        if router.external_fixed_ips:
+            body["external_fixed_ips"] = router.external_fixed_ips
+        try:
+            neutron.update_router(
+                router.backend_id,
+                {"router": {"external_gateway_info": body}},
+            )
+        except neutron_exceptions.NeutronClientException as e:
+            raise OpenStackBackendError(e)
+        self.pull_tenant_routers(router.tenant, router.backend_id)
+
+    @log_backend_action()
+    def remove_external_gateway(self, router: models.Router):
+        neutron = get_neutron_client(self.admin_session)
+        try:
+            neutron.update_router(
+                router.backend_id,
+                {"router": {"external_gateway_info": None}},
+            )
+        except neutron_exceptions.NeutronClientException as e:
+            raise OpenStackBackendError(e)
+        router.external_network_id = ""
+        router.external_network_ref = None
+        router.enable_snat = None
+        router.external_fixed_ips = []
+        router.save(
+            update_fields=[
+                "external_network_id",
+                "external_network_ref",
+                "enable_snat",
+                "external_fixed_ips",
+            ]
+        )
+
+    @log_backend_action()
     def detect_external_network(
         self, tenant: models.Tenant, router: models.Router | None = None
     ):
@@ -2510,6 +2918,13 @@ class OpenStackBackend(ServiceBackend):
             ext_gw = selected_router.get("external_gateway_info", {})
             if ext_gw and "network_id" in ext_gw:
                 tenant.external_network_id = ext_gw["network_id"]
+                # Also set the FK if an ExternalNetwork record exists
+                ext_net = models.ExternalNetwork.objects.filter(
+                    settings=tenant.service_settings,
+                    backend_id=ext_gw["network_id"],
+                ).first()
+                if ext_net:
+                    tenant.external_network_ref = ext_net
                 tenant.save()
                 logger.info(
                     "Found and set external network with id %s for tenant %s (PK: %s) "
@@ -2567,11 +2982,11 @@ class OpenStackBackend(ServiceBackend):
             data["mtu"] = network.mtu
 
         try:
-            response = neutron.create_network({"networks": [data]})
+            response = neutron.create_network({"network": data})
         except neutron_exceptions.NeutronException as e:
             raise OpenStackBackendError(e)
         else:
-            backend_network = response["networks"][0]
+            backend_network = response["network"]
             network.backend_id = backend_network["id"]
             network.runtime_state = backend_network["status"]
             if backend_network.get("provider:network_type"):
@@ -2709,8 +3124,8 @@ class OpenStackBackend(ServiceBackend):
         elif subnet.gateway_ip:
             data["gateway_ip"] = subnet.gateway_ip
         try:
-            response = neutron.create_subnet({"subnets": [data]})
-            backend_subnet = response["subnets"][0]
+            response = neutron.create_subnet({"subnet": data})
+            backend_subnet = response["subnet"]
             subnet.backend_id = backend_subnet["id"]
             if backend_subnet.get("gateway_ip"):
                 subnet.gateway_ip = backend_subnet["gateway_ip"]
@@ -2969,6 +3384,19 @@ class OpenStackBackend(ServiceBackend):
                 scopes=[floating_ip, floating_ip.tenant],
             )
 
+    def _lookup_external_network_name(self, backend_id: str) -> str | None:
+        """Best-effort cache lookup for the human-readable external-network name."""
+        if not backend_id:
+            return None
+        net = (
+            models.ExternalNetwork.objects.filter(
+                settings=self.settings, backend_id=backend_id
+            )
+            .values_list("name", flat=True)
+            .first()
+        )
+        return net or None
+
     @log_backend_action("create floating ip")
     def create_floating_ip(
         self, floating_ip: models.FloatingIP, serialized_router=None, **kwargs
@@ -3013,6 +3441,33 @@ class OpenStackBackend(ServiceBackend):
                     }
                 }
             )["floatingip"]
+        except (
+            neutron_exceptions.IpAddressGenerationFailureClient,
+            neutron_exceptions.ExternalIpAddressExhaustedClient,
+        ) as e:
+            # The external network's allocation pool is exhausted. Bare
+            # 'IpAddressGenerationFailureClient: No more IP addresses
+            # available' is unactionable; tell the caller exactly which
+            # pool is full and who to escalate to.
+            external_network_name = self._lookup_external_network_name(
+                external_network_id
+            )
+            logger.warning(
+                "Floating IP allocation failed for tenant %s on external "
+                "network %s (%s): pool exhausted. Original error: %s",
+                floating_ip.tenant.backend_id,
+                external_network_name or "?",
+                external_network_id,
+                e,
+            )
+            floating_ip.runtime_state = "ERRED"
+            floating_ip.save()
+            raise OpenStackBackendError(
+                f"Cannot allocate floating IP: the external network "
+                f"'{external_network_name or external_network_id}' has no "
+                f"free addresses in its allocation pool. Contact your "
+                f"cloud administrator to extend the pool."
+            ) from e
         except neutron_exceptions.NeutronClientException as e:
             floating_ip.runtime_state = "ERRED"
             floating_ip.save()
@@ -3072,6 +3527,13 @@ class OpenStackBackend(ServiceBackend):
         )
 
         tenant.external_network_id = external_network_id
+        # Also set the FK if an ExternalNetwork record exists
+        ext_net = models.ExternalNetwork.objects.filter(
+            settings=tenant.service_settings,
+            backend_id=external_network_id,
+        ).first()
+        if ext_net:
+            tenant.external_network_ref = ext_net
         tenant.save()
 
         logger.info(
@@ -3210,18 +3672,81 @@ class OpenStackBackend(ServiceBackend):
             logger.error("Tenant with id %s does not exist", tenant.backend_id)
             raise OpenStackBackendError(e)
 
+    def get_allocation_candidates(self, resources, required=None, limit=None):
+        """Pre-flight scheduler check via Placement.
+
+        Returns the raw Placement `/allocation_candidates` response so the
+        caller can decide what to project (count, per-RP summaries, etc.).
+        See PlacementClient.list_allocation_candidates for the parameter
+        contract.
+        """
+        placement = get_placement_client(self.admin_session)
+        return placement.list_allocation_candidates(
+            resources=resources, required=required, limit=limit
+        )
+
+    def get_instance_placement_allocations(self, instance):
+        """Return Placement allocations for a specific instance, broken down
+        by resource provider with names resolved.
+
+        Each Nova server's UUID is its Placement consumer UUID, so the join
+        is trivial. Useful for "what is this instance actually consuming?" —
+        especially for VGPU/PCI/specialty resources that the flavor alone
+        does not describe.
+
+        Returns a list shaped like::
+
+            [{
+              "resource_provider_uuid": "...",
+              "resource_provider_name": "compute01",
+              "resources": {"VCPU": 1, "MEMORY_MB": 1024, "DISK_GB": 10},
+            }, ...]
+
+        Empty list when Placement has no record (transient state right after
+        create, or instance never scheduled).
+        """
+        placement = get_placement_client(self.admin_session)
+        allocations = placement.get_allocations(instance.backend_id)
+        if not allocations:
+            return []
+        rp_names = {
+            rp.get("uuid"): rp.get("name", "")
+            for rp in placement.list_resource_providers()
+        }
+        return [
+            {
+                "resource_provider_uuid": rp_uuid,
+                "resource_provider_name": rp_names.get(rp_uuid, ""),
+                "resources": (record or {}).get("resources", {}),
+            }
+            for rp_uuid, record in allocations.items()
+        ]
+
     def pull_service_settings_quotas(self):
-        nova = get_nova_client(self.admin_session)
-        try:
-            stats = nova.hypervisor_stats.statistics()
-        except nova_exceptions.ClientException as e:
-            raise OpenStackBackendError(e)
+        # Aggregate cluster-wide capacity from Placement, summing the same
+        # effective totals (allocation_ratio applied, reserved subtracted) used
+        # by pull_hypervisors. This replaces nova.hypervisor_stats.statistics()
+        # which is removed at microversion 2.88.
+        placement_capacity, _ = self._collect_placement_data()
 
-        self.settings.set_quota_limit("openstack_vcpu", stats.vcpus)
-        self.settings.set_quota_usage("openstack_vcpu", stats.vcpus_used)
+        def aggregate(resource_class):
+            total = used = 0
+            for per_class in placement_capacity.values():
+                inv = per_class.get(resource_class)
+                if not inv:
+                    continue
+                total += self._effective_total(inv)
+                used += inv.get("used", 0)
+            return total, used
 
-        self.settings.set_quota_limit("openstack_ram", stats.memory_mb)
-        self.settings.set_quota_usage("openstack_ram", stats.memory_mb_used)
+        total_vcpu, used_vcpu = aggregate("VCPU")
+        total_ram, used_ram = aggregate("MEMORY_MB")
+
+        self.settings.set_quota_limit("openstack_vcpu", total_vcpu)
+        self.settings.set_quota_usage("openstack_vcpu", used_vcpu)
+
+        self.settings.set_quota_limit("openstack_ram", total_ram)
+        self.settings.set_quota_usage("openstack_ram", used_ram)
 
         self.settings.set_quota_usage("openstack_storage", self.get_storage_usage())
 
@@ -3250,6 +3775,7 @@ class OpenStackBackend(ServiceBackend):
             "description": port.description,
             "network_id": network.backend_id,
             "tenant_id": port.tenant.backend_id,
+            "port_security_enabled": port.port_security_enabled,
         }
 
         logger.info(
@@ -3401,9 +3927,12 @@ class OpenStackBackend(ServiceBackend):
         )
 
     def _backend_server_group_to_server_group(self, backend_server_group, **kwargs):
+        # Nova microversion 2.64 replaced the `policies` list with a single
+        # `policy` string on server-group responses; we pin to 2.87 in
+        # get_nova_client, so only `policy` is present.
         server_group = models.ServerGroup(
             name=backend_server_group.name,
-            policy=backend_server_group.policies[0],
+            policy=backend_server_group.policy,
             backend_id=backend_server_group.id,
             state=CoreStates.OK,
         )
@@ -3716,7 +4245,12 @@ class OpenStackBackend(ServiceBackend):
         volume.backend_id = backend_volume.id
         if hasattr(backend_volume, "volume_image_metadata"):
             volume.image_metadata = backend_volume.volume_image_metadata
-        volume.bootable = backend_volume.bootable == "true"
+        # Cinder reports bootable="false" right after create for image-backed
+        # volumes until the image copy finishes, so only ever upgrade the flag
+        # here. Downgrading would clear the bootable flag that the serializer
+        # set on a system volume, making create_instance fail its
+        # `volumes.get(bootable=True)` guard (PUHURI-PORTALS-T2B).
+        volume.bootable = volume.bootable or backend_volume.bootable == "true"
         volume.runtime_state = backend_volume.status
         volume.save()
         return volume
@@ -4150,7 +4684,15 @@ class OpenStackBackend(ServiceBackend):
         nova = get_nova_client(session)
 
         try:
-            backend_flavor = nova.flavors.get(backend_flavor_id)
+            try:
+                backend_flavor = nova.flavors.get(backend_flavor_id)
+            except nova_exceptions.NotFound:
+                raise OpenStackBackendError(
+                    "Flavor with backend ID '%s' was not found in OpenStack. "
+                    "It may have been removed or recreated; refresh the "
+                    "offering's flavors to update the cached references."
+                    % backend_flavor_id
+                )
 
             # instance key name and fingerprint_md5 are optional
             # it is assumed that if public_key is specified, then
@@ -4180,7 +4722,11 @@ class OpenStackBackend(ServiceBackend):
                 instance.name,
             )
 
+            ports_without_backend_id = []
             for port in instance.ports.all():
+                if not port.backend_id:
+                    ports_without_backend_id.append(port)
+                    continue
                 nics.append({"port-id": port.backend_id})
 
             if (
@@ -4195,8 +4741,28 @@ class OpenStackBackend(ServiceBackend):
                 )
                 nics.append({"port-id": external_port_id["id"]})
 
+            # Nova microversion >= 2.36 rejects an empty nics list with a bare
+            # ValueError that escapes the nova_exceptions.ClientException handler
+            # below. Surface a clear backend error instead so the task is marked
+            # as ERRED with an actionable message.
+            if not nics:
+                if ports_without_backend_id:
+                    raise OpenStackBackendError(
+                        "Cannot create instance %s: %d port(s) have no backend_id "
+                        "(port creation likely failed earlier). Port UUIDs: %s"
+                        % (
+                            instance.name,
+                            len(ports_without_backend_id),
+                            [str(p.uuid) for p in ports_without_backend_id],
+                        )
+                    )
+                raise OpenStackBackendError(
+                    "Cannot create instance %s: at least one network port is required."
+                    % instance.name
+                )
+
             block_device_mapping_v2 = []
-            for volume in instance.volumes.iterator():
+            for volume in instance.volumes.all():
                 device_mapping = {
                     "destination_type": "volume",
                     "device_type": "disk",
@@ -4233,18 +4799,26 @@ class OpenStackBackend(ServiceBackend):
             if instance.user_data:
                 server_create_parameters["userdata"] = instance.user_data
 
-            if (
-                instance.tenant.service_settings.options.get("config_drive", False)
-                is True
-            ):
+            if instance.config_drive is None:
+                config_drive = instance.tenant.service_settings.options.get(
+                    "config_drive", False
+                )
+            else:
+                config_drive = instance.config_drive
+            if config_drive:
                 server_create_parameters["config_drive"] = True
 
-            if server_group is not None:
+            if server_group:
                 server_create_parameters["scheduler_hints"] = {"group": server_group}
 
-            logger.info(
-                "Creating instance with parameters: %s", server_create_parameters
-            )
+            # user_data may contain sensitive cloud-init payloads, so redact it
+            # from the log to avoid leaking secrets into log aggregation.
+            loggable_parameters = dict(server_create_parameters)
+            if "userdata" in loggable_parameters:
+                loggable_parameters["userdata"] = (
+                    f"<redacted, {len(server_create_parameters['userdata'])} bytes>"
+                )
+            logger.info("Creating instance with parameters: %s", loggable_parameters)
             server = nova.servers.create(**server_create_parameters)
             instance.backend_id = server.id
             instance.save()
@@ -4257,7 +4831,11 @@ class OpenStackBackend(ServiceBackend):
             )
         except nova_exceptions.ClientException as e:
             logger.exception("Failed to provision instance %s", instance.uuid)
-            raise OpenStackBackendError(e)
+            message = str(e).strip() or repr(e) or type(e).__name__
+            raise OpenStackBackendError(
+                "Failed to provision instance '%s' in OpenStack: %s"
+                % (instance.name, message)
+            )
         else:
             logger.info("Successfully provisioned instance %s", instance.uuid)
 
@@ -4324,9 +4902,34 @@ class OpenStackBackend(ServiceBackend):
 
     @log_backend_action()
     def push_instance_floating_ips(self, instance: models.Instance):
+        instance_floating_ips = list(instance.floating_ips)
+
+        # Defensive guard: update_floatingip(port_id="") silently disassociates
+        # the FIP on Neutron, leaving its status stuck at DOWN. The
+        # PollRuntimeStateTask scheduled after this step then retries for
+        # max_retries × default_retry_delay = 1200 × 5s = 100 minutes before
+        # erring out with no actionable message. Fail fast instead.
+        missing = []
+        for floating_ip in instance_floating_ips:
+            if not floating_ip.backend_id:
+                missing.append(
+                    f"floating IP {floating_ip.address or floating_ip.uuid.hex} has "
+                    "no backend_id (create_floating_ip did not run or failed)"
+                )
+            elif not floating_ip.port.backend_id:
+                missing.append(
+                    f"floating IP {floating_ip.address or floating_ip.uuid.hex} "
+                    f"references port {floating_ip.port.uuid.hex} with empty "
+                    "backend_id (port not pushed to Neutron)"
+                )
+        if missing:
+            raise OpenStackBackendError(
+                f"Cannot push floating IPs for instance {instance.name}: "
+                + "; ".join(missing)
+            )
+
         session = get_tenant_session(instance.tenant)
         neutron = get_neutron_client(session)
-        instance_floating_ips = instance.floating_ips
         try:
             backend_floating_ips = neutron.list_floatingips(
                 port_id=instance.ports.values_list("backend_id", flat=True)
@@ -4375,6 +4978,28 @@ class OpenStackBackend(ServiceBackend):
                         floating_ip.backend_id,
                         body={"floatingip": {"port_id": floating_ip.port.backend_id}},
                     )
+                except neutron_exceptions.NotFound as e:
+                    # Neutron returns 404 here when *either* the floating IP or
+                    # the port_id we passed in is not visible to the current
+                    # session (deleted out-of-band, stale Waldur backend_id,
+                    # cross-tenant/RBAC mismatch, OVN driver edge case, …).
+                    # Silently skipping leaves the FIP unassociated while the
+                    # downstream PollRuntimeStateTask spins on runtime_state
+                    # `DOWN` for ~100 minutes before failing with no actionable
+                    # error — fail fast with a clear diagnostic instead, naming
+                    # both sides so the operator can see which one is missing.
+                    raise OpenStackBackendError(
+                        f"Failed to attach floating IP "
+                        f"{floating_ip.address or floating_ip.uuid.hex} "
+                        f"(backend_id={floating_ip.backend_id}) to port "
+                        f"{floating_ip.port.uuid.hex} "
+                        f"(backend_id={floating_ip.port.backend_id}) on "
+                        f"instance {instance.name}: Neutron returned NotFound. "
+                        f"The floating IP or the target port is not visible in "
+                        f"the tenant session (deleted out-of-band, stale "
+                        f"Waldur backend_id, or cross-tenant/RBAC mismatch). "
+                        f"Original error: {e}"
+                    ) from e
                 except neutron_exceptions.NeutronClientException as e:
                     raise OpenStackBackendError(e)
                 else:
@@ -4452,7 +5077,7 @@ class OpenStackBackend(ServiceBackend):
             attached_volume_ids = [
                 v.volumeId for v in nova.volumes.get_server_volumes(backend_id)
             ]
-            flavor_id = backend_instance.flavor["id"]
+            backend_flavor = backend_instance.flavor
             image_id = backend_instance.image and backend_instance.image.get("id")
 
             # If no image_id from instance metadata, try to get it from bootable volumes
@@ -4486,7 +5111,7 @@ class OpenStackBackend(ServiceBackend):
         instance: models.Instance = self._backend_instance_to_instance(
             tenant,
             backend_instance,
-            flavor_id,
+            backend_flavor,
             connected_internal_network_names,
             image_id,
             detected_image_name,
@@ -4582,10 +5207,19 @@ class OpenStackBackend(ServiceBackend):
                     tenant=tenant, backend_id=backend_volume_id
                 )
 
-                # Check if volume is bootable and has image_metadata
-                if volume.bootable and volume.image_metadata:
-                    image_id = volume.image_metadata.get("image_id")
-                    image_name = volume.image_metadata.get("image_name")
+                # Check if volume is bootable and has image info
+                if volume.bootable:
+                    image_id = None
+                    image_name = None
+
+                    if volume.image_metadata:
+                        image_id = volume.image_metadata.get("image_id")
+                        image_name = volume.image_metadata.get("image_name")
+
+                    # Fall back to volume.image FK if image_metadata is empty
+                    if not image_id and volume.image_id:
+                        image_id = volume.image.backend_id
+                        image_name = volume.image.name
 
                     # Include volume if it has either image_id or image_name
                     if image_id or image_name:
@@ -4634,11 +5268,12 @@ class OpenStackBackend(ServiceBackend):
         self,
         tenant: models.Tenant,
         backend_instance,
-        backend_flavor_id=None,
+        backend_flavor=None,
         connected_internal_network_names=None,
         backend_image_id=None,
         backend_image_name=None,
     ):
+        launch_time = None
         # parse launch time
         try:
             d = dateparse.parse_datetime(
@@ -4650,7 +5285,7 @@ class OpenStackBackend(ServiceBackend):
             # At the moment OpenStack does not provide any timezone info,
             # but in future it might do.
             if timezone.is_naive(d):
-                launch_time = timezone.make_aware(d, timezone.utc)
+                launch_time = timezone.make_aware(d, UTC)
 
         availability_zone = None
         try:
@@ -4675,7 +5310,7 @@ class OpenStackBackend(ServiceBackend):
             pass
         if connected_internal_network_names is None:
             connected_internal_network_names = set()
-        backend_networks = backend_instance.networks
+        backend_networks = getattr(backend_instance, "networks", None) or {}
         external_backend_networks = (
             set(backend_networks.keys()) - connected_internal_network_names
         )
@@ -4683,36 +5318,34 @@ class OpenStackBackend(ServiceBackend):
             ",".join(backend_networks[ext_net]) for ext_net in external_backend_networks
         ]
 
+        # Microversion 2.69 partial-cells responses can return `created=None`,
+        # so guard against TypeError from dateparse.parse_datetime(None).
+        created_raw = getattr(backend_instance, "created", None)
+        try:
+            created = dateparse.parse_datetime(created_raw) if created_raw else None
+        except (ValueError, TypeError):
+            created = None
+
         instance = models.Instance(
             name=backend_instance.name or backend_instance.id,
             key_name=backend_instance.key_name or "",
             start_time=launch_time,
             state=CoreStates.OK,
             runtime_state=backend_instance.status,
-            created=dateparse.parse_datetime(backend_instance.created),
+            created=created,
             backend_id=backend_instance.id,
             availability_zone=availability_zone,
             hypervisor_hostname=hypervisor_hostname,
             directly_connected_ips=",".join(external_backend_ips),
         )
 
-        if backend_flavor_id:
-            try:
-                flavor = models.Flavor.objects.get(
-                    settings=tenant.service_settings, backend_id=backend_flavor_id
-                )
-                instance.flavor_name = flavor.name
-                instance.flavor_disk = flavor.disk
-                instance.cores = flavor.cores
-                instance.ram = flavor.ram
-            except models.Flavor.DoesNotExist:
-                backend_flavor = self._get_flavor(tenant, backend_flavor_id)
-                # If flavor has been removed in OpenStack cloud, we should skip update
-                if backend_flavor:
-                    instance.flavor_name = backend_flavor.name
-                    instance.flavor_disk = self.gb2mb(backend_flavor.disk)
-                    instance.cores = backend_flavor.vcpus
-                    instance.ram = backend_flavor.ram
+        # With Nova microversion 2.47+, flavor details are embedded in the
+        # server response (vcpus, ram, disk, original_name) even for deleted flavors.
+        if backend_flavor:
+            instance.flavor_name = backend_flavor.get("original_name", "")
+            instance.flavor_disk = self.gb2mb(backend_flavor.get("disk", 0))
+            instance.cores = backend_flavor.get("vcpus", 0)
+            instance.ram = backend_flavor.get("ram", 0)
 
         if backend_image_id:
             try:
@@ -4728,10 +5361,10 @@ class OpenStackBackend(ServiceBackend):
                         backend_image.name
                     )  # Ensure string conversion
                 else:
-                    # Don't clear image_name if image is not found in backend
-                    # This preserves the original image name that was set during creation
-                    # Only leave unchanged if we have no existing value
-                    pass  # Leave instance.image_name unchanged (will remain empty for new instances)
+                    # Image not found in backend — leave image_name empty on this
+                    # transient object. pull_instance() will skip overwriting
+                    # the DB instance's image_name if it already has a value.
+                    pass
         elif backend_image_name:
             # Use the provided image name directly (from volume metadata fallback)
             instance.image_name = str(backend_image_name)  # Ensure string conversion
@@ -4746,17 +5379,6 @@ class OpenStackBackend(ServiceBackend):
         instance.disk = sum(volume.size for volume in volumes)
 
         return instance
-
-    def _get_flavor(self, tenant: models.Tenant, flavor_id):
-        session = get_tenant_session(tenant)
-        nova = get_nova_client(session)
-        try:
-            return nova.flavors.get(flavor_id)
-        except nova_exceptions.NotFound:
-            logger.info("OpenStack flavor %s is gone.", flavor_id)
-            return None
-        except nova_exceptions.ClientException as e:
-            raise OpenStackBackendError(e)
 
     def _get_image(self, tenant: models.Tenant, image_id):
         session = get_tenant_session(tenant)
@@ -4784,11 +5406,11 @@ class OpenStackBackend(ServiceBackend):
 
         instances = []
         for backend_instance in backend_instances:
-            flavor_id = backend_instance.flavor["id"]
+            backend_flavor = backend_instance.flavor
             image_id = backend_instance.image and backend_instance.image.get("id")
             instances.append(
                 self._backend_instance_to_instance(
-                    tenant, backend_instance, flavor_id, None, image_id, None
+                    tenant, backend_instance, backend_flavor, None, image_id, None
                 )
             )
         return instances
@@ -4925,6 +5547,21 @@ class OpenStackBackend(ServiceBackend):
         if instance.modified < import_time:
             if update_fields is None:
                 update_fields = models.Instance.get_backend_fields()
+            # Don't overwrite image_name with empty value if instance already has one
+            if (
+                not imported_instance.image_name
+                and instance.image_name
+                and "image_name" in update_fields
+            ):
+                update_fields = tuple(f for f in update_fields if f != "image_name")
+            # Don't overwrite flavor fields with zeros if instance already has values
+            for field in ("cores", "ram", "flavor_name", "flavor_disk"):
+                if (
+                    not getattr(imported_instance, field)
+                    and getattr(instance, field)
+                    and field in update_fields
+                ):
+                    update_fields = tuple(f for f in update_fields if f != field)
             update_pulled_fields(instance, imported_instance, update_fields)
 
     @log_backend_action()
@@ -5148,6 +5785,12 @@ class OpenStackBackend(ServiceBackend):
         # we assume that port subnet cannot be changed
         neutron = get_neutron_client(session)
         nova = get_nova_client(session)
+        # Port creation is done through the admin session, consistent with
+        # create_port() and create_instance_port(). A stored port carries the
+        # concrete fixed IP pulled from the backend, and specifying an explicit
+        # ip_address on create is admin-only in Neutron
+        # (create_port:fixed_ips:ip_address), so the tenant session is refused.
+        admin_neutron = get_neutron_client(self.admin_session)
 
         try:
             backend_ports = neutron.list_ports(device_id=instance.backend_id)["ports"]
@@ -5167,44 +5810,58 @@ class OpenStackBackend(ServiceBackend):
                 except neutron_exceptions.NeutronClientException as e:
                     raise OpenStackBackendError(e)
 
-        # create new ports
+        # create or attach ports not yet on the instance
         new_ports = instance.ports.exclude(
             backend_id__in=[ip["id"] for ip in backend_ports]
         )
         for new_port in new_ports:
-            port_payload = {
-                "network_id": new_port.subnet.network.backend_id,
-                # If you specify only a subnet ID, OpenStack Networking
-                # allocates an available IP from that subnet to the port.
-                "fixed_ips": [
-                    {
-                        "subnet_id": new_port.subnet.backend_id,
-                    }
-                ],
-                "security_groups": list(
-                    instance.security_groups.exclude(backend_id="").values_list(
-                        "backend_id", flat=True
-                    )
-                ),
-            }
             try:
-                logger.debug(
-                    "About to create network port for instance %s in subnet %s.",
-                    instance.backend_id,
-                    new_port.subnet.backend_id,
-                )
-                backend_port = neutron.create_port({"port": port_payload})["port"]
-                nova.servers.interface_attach(
-                    instance.backend_id, backend_port["id"], None, None
-                )
+                if new_port.backend_id:
+                    # Existing port — attach it to the instance directly
+                    logger.debug(
+                        "About to attach existing port %s to instance %s.",
+                        new_port.backend_id,
+                        instance.backend_id,
+                    )
+                    nova.servers.interface_attach(
+                        instance.backend_id, new_port.backend_id, None, None
+                    )
+                else:
+                    # New port — create in OpenStack and attach
+                    port_payload = {
+                        "network_id": new_port.subnet.network.backend_id,
+                        "fixed_ips": new_port.fixed_ips
+                        if new_port.fixed_ips
+                        else [
+                            {
+                                "subnet_id": new_port.subnet.backend_id,
+                            }
+                        ],
+                        "security_groups": list(
+                            instance.security_groups.exclude(backend_id="").values_list(
+                                "backend_id", flat=True
+                            )
+                        ),
+                    }
+                    logger.debug(
+                        "About to create network port for instance %s in subnet %s.",
+                        instance.backend_id,
+                        new_port.subnet.backend_id,
+                    )
+                    created_port = admin_neutron.create_port({"port": port_payload})[
+                        "port"
+                    ]
+                    nova.servers.interface_attach(
+                        instance.backend_id, created_port["id"], None, None
+                    )
+                    new_port.mac_address = created_port["mac_address"]
+                    new_port.fixed_ips = created_port["fixed_ips"]
+                    new_port.backend_id = created_port["id"]
+                    new_port.save()
             except neutron_exceptions.NeutronClientException as e:
                 raise OpenStackBackendError(e)
             except nova_exceptions.ClientException as e:
                 raise OpenStackBackendError(e)
-            new_port.mac_address = backend_port["mac_address"]
-            new_port.fixed_ips = backend_port["fixed_ips"]
-            new_port.backend_id = backend_port["id"]
-            new_port.save()
 
     @log_backend_action()
     def create_instance_ports(self, instance: models.Instance):
@@ -5283,8 +5940,11 @@ class OpenStackBackend(ServiceBackend):
                     "subnet_id": port.subnet.backend_id,
                 }
             ],
-            "security_groups": security_groups,
+            "port_security_enabled": port.port_security_enabled,
         }
+
+        if port.port_security_enabled:
+            port_payload["security_groups"] = security_groups
 
         logger.debug(
             "Final port payload security_groups: %s (count: %d)",
@@ -5320,6 +5980,35 @@ class OpenStackBackend(ServiceBackend):
 
         try:
             backend_port = neutron.create_port({"port": port_payload})["port"]
+        except neutron_exceptions.IpAddressAlreadyAllocatedClient as e:
+            # Neutron refused the requested fixed IP — already in use on the
+            # subnet. This is a recoverable user/race condition rather than an
+            # internal failure, so:
+            #   - log at WARNING (no traceback) in backend.py;
+            #   - raise OpenStackBackendError with a human-readable message so
+            #     it surfaces clearly in instance.error_message instead of the
+            #     default cryptic "An unknown exception occurred." that the
+            #     bare exception repr produces.
+            requested_ips = ", ".join(
+                f.get("ip_address")
+                for f in (port_payload.get("fixed_ips") or [])
+                if f.get("ip_address")
+            )
+            if requested_ips:
+                detail = f"requested fixed IP {requested_ips} is already allocated"
+            else:
+                detail = "the IP allocated for this port is already in use"
+            user_message = (
+                f"Failed to create port on subnet {port.subnet.backend_id}: "
+                f"{detail}. Choose a different IP address or omit fixed_ips "
+                "to let OpenStack auto-assign one."
+            )
+            logger.warning(
+                "%s Network: %s",
+                user_message,
+                port_payload.get("network_id"),
+            )
+            raise OpenStackBackendError(user_message) from e
         except neutron_exceptions.NeutronClientException as e:
             logger.error(
                 "Failed to create port. Payload was: %s. Error: %s",
@@ -5424,6 +6113,26 @@ class OpenStackBackend(ServiceBackend):
         try:
             neutron.update_port(
                 backend_id, {"port": {"allowed_address_pairs": allowed_address_pairs}}
+            )
+        except neutron_exceptions.NeutronClientException as e:
+            raise OpenStackBackendError(e)
+
+    @log_backend_action()
+    def set_port_allowed_address_pairs(
+        self, port: models.Port, allowed_address_pairs: list[dict]
+    ):
+        """Replace a Port's allowed_address_pairs in Neutron and re-pull.
+
+        Used by ``PortViewSet.set_allowed_address_pairs`` so cluster-VIP
+        workloads (keepalived, MetalLB, OpenShift ingress, OVN router-as-VM)
+        can permit additional IP/MAC pairs on their ports.
+        """
+        session = get_tenant_session(port.tenant)
+        neutron = get_neutron_client(session)
+        try:
+            neutron.update_port(
+                port.backend_id,
+                {"port": {"allowed_address_pairs": allowed_address_pairs}},
             )
         except neutron_exceptions.NeutronClientException as e:
             raise OpenStackBackendError(e)
@@ -5645,6 +6354,50 @@ class OpenStackBackend(ServiceBackend):
             raise OpenStackBackendError(e)
 
     @log_backend_action()
+    def rescue_instance(self, instance: models.Instance, rescue_image_ref: str = None):
+        """Put instance into Nova rescue mode.
+
+        Volume-backed instances require a "stable device rescue" image
+        (Glance hw_rescue_device or hw_rescue_bus property set) and an
+        explicit rescue_image_ref — the legacy rescue path does not support
+        BFV instances and Nova will leave the instance in unrecoverable
+        ERROR state without one. Validation lives in the serializer; this
+        method just calls the API.
+
+        Note: novaclient's ``servers.rescue()`` takes ``image=`` (mapped to
+        ``rescue_image_ref`` in the wire request body), not ``image_ref=``.
+        Lab-validated.
+        """
+        session = get_tenant_session(instance.tenant)
+        nova = get_nova_client(session)
+        try:
+            nova.servers.rescue(instance.backend_id, image=rescue_image_ref)
+        except nova_exceptions.ClientException as e:
+            if e.code == 409 and "vm_state rescued" in e.message:
+                logger.info(
+                    "OpenStack instance %s is already in rescue mode",
+                    instance.backend_id,
+                )
+                return
+            raise OpenStackBackendError(e)
+
+    @log_backend_action()
+    def unrescue_instance(self, instance: models.Instance):
+        """Restore an instance from rescue mode."""
+        session = get_tenant_session(instance.tenant)
+        nova = get_nova_client(session)
+        try:
+            nova.servers.unrescue(instance.backend_id)
+        except nova_exceptions.ClientException as e:
+            if e.code == 409 and "vm_state active" in e.message:
+                logger.info(
+                    "OpenStack instance %s is already out of rescue mode",
+                    instance.backend_id,
+                )
+                return
+            raise OpenStackBackendError(e)
+
+    @log_backend_action()
     def resize_instance(self, instance: models.Instance, flavor_id: str):
         session = get_tenant_session(instance.tenant)
         nova = get_nova_client(session)
@@ -5703,7 +6456,10 @@ class OpenStackBackend(ServiceBackend):
         console_domain_override = service_settings.get_option("console_domain_override")
         if console_domain_override:
             parsed_url = urlparse(result_url)
-            if parsed_url.port:
+            if ":" in console_domain_override:
+                # Override includes port (e.g. "lb.example.com:443")
+                parsed_url = parsed_url._replace(netloc=console_domain_override)
+            elif parsed_url.port:
                 parsed_url = parsed_url._replace(
                     netloc=f"{console_domain_override}:{parsed_url.port}"
                 )
@@ -5752,8 +6508,30 @@ class OpenStackBackend(ServiceBackend):
         incoming_policies = [
             p for p in backend_policies if p["target_tenant"] == tenant.backend_id
         ]
+        incoming_backend_ids = [p["id"] for p in incoming_policies]
 
-        processed_incoming_policy_ids = []
+        # Delete stale incoming policies BEFORE inserting fresh ones. When
+        # OpenStack recreates an RBAC policy, the new entry has a new
+        # ``backend_id`` but reuses the ``(network, target_tenant, policy_type)``
+        # trio — which is the database's unique constraint. Cleaning up first
+        # frees the trio so the subsequent insert does not violate the
+        # constraint.
+        stale_incoming_policies = models.NetworkRBACPolicy.objects.filter(
+            target_tenant=tenant
+        ).exclude(backend_id__in=incoming_backend_ids)
+        stale_incoming_count = stale_incoming_policies.count()
+        for policy in stale_incoming_policies:
+            logger.info(
+                "Deleting stale NetworkRBACPolicy: %s (network: %s, target: %s)",
+                policy.backend_id,
+                policy.network.name,
+                policy.target_tenant.name,
+            )
+        stale_incoming_policies.delete()
+        if stale_incoming_count:
+            logger.info(
+                "Deleted %d stale NetworkRBACPolicy objects", stale_incoming_count
+            )
 
         for backend_policy in incoming_policies:
             network = models.Network.objects.filter(
@@ -5782,7 +6560,10 @@ class OpenStackBackend(ServiceBackend):
                 )
                 continue
 
-            # Create or update the RBAC policy
+            # Create or update the RBAC policy by its backend_id (stable
+            # identifier for a given OpenStack policy object). Stale rows that
+            # would otherwise collide on the unique trio have already been
+            # removed above.
             policy, created = models.NetworkRBACPolicy.objects.update_or_create(
                 backend_id=backend_policy["id"],
                 defaults={
@@ -5800,31 +6581,8 @@ class OpenStackBackend(ServiceBackend):
                     network.tenant.name,
                 )
 
-            processed_incoming_policy_ids.append(backend_policy["id"])
-
-        # Clean up stale policies
-        stale_incoming_policies = models.NetworkRBACPolicy.objects.filter(
-            target_tenant=tenant
-        ).exclude(backend_id__in=processed_incoming_policy_ids)
-
-        # Log and delete stale policies
-        for policy in stale_incoming_policies:
-            logger.info(
-                "Deleting stale NetworkRBACPolicy: %s (network: %s, target: %s)",
-                policy.backend_id,
-                policy.network.name,
-                policy.target_tenant.name,
-            )
-
-        stale_count = stale_incoming_policies.count()
-        stale_incoming_policies.delete()
-
-        if stale_count:
-            logger.info("Deleted %d stale NetworkRBACPolicy objects", stale_count)
-
         # Process OUTGOING policies only if tenant has networks
         tenant_networks = tenant.networks.all()
-        processed_policy_ids = []
 
         if not tenant_networks.exists():
             return
@@ -5836,6 +6594,26 @@ class OpenStackBackend(ServiceBackend):
         outgoing_policies = [
             p for p in backend_policies if p["object_id"] in network_backend_ids
         ]
+        outgoing_backend_ids = [p["id"] for p in outgoing_policies]
+
+        # Delete stale outgoing policies BEFORE inserting fresh ones, for the
+        # same reason as the incoming branch above.
+        stale_outgoing_policies = models.NetworkRBACPolicy.objects.filter(
+            network__in=tenant_networks
+        ).exclude(backend_id__in=outgoing_backend_ids)
+        stale_outgoing_count = stale_outgoing_policies.count()
+        for policy in stale_outgoing_policies:
+            logger.info(
+                "Deleting stale NetworkRBACPolicy: %s (network: %s, target: %s)",
+                policy.backend_id,
+                policy.network.name,
+                policy.target_tenant.name,
+            )
+        stale_outgoing_policies.delete()
+        if stale_outgoing_count:
+            logger.info(
+                "Deleted %d stale NetworkRBACPolicy objects", stale_outgoing_count
+            )
 
         # Process each outgoing policy
         for backend_policy in outgoing_policies:
@@ -5860,7 +6638,8 @@ class OpenStackBackend(ServiceBackend):
                 )
                 continue
 
-            # Create or update the RBAC policy
+            # Create or update the RBAC policy (stale rows that would collide
+            # on the unique trio have already been removed above).
             policy, created = models.NetworkRBACPolicy.objects.update_or_create(
                 backend_id=backend_policy["id"],
                 defaults={
@@ -5877,28 +6656,6 @@ class OpenStackBackend(ServiceBackend):
                     network.name,
                     target_tenant.name,
                 )
-
-            processed_policy_ids.append(backend_policy["id"])
-
-        # Clean up stale outgoing policies
-        stale_policies = models.NetworkRBACPolicy.objects.filter(
-            network__in=tenant_networks
-        ).exclude(backend_id__in=processed_policy_ids)
-
-        # Log and delete stale policies
-        for policy in stale_policies:
-            logger.info(
-                "Deleting stale NetworkRBACPolicy: %s (network: %s, target: %s)",
-                policy.backend_id,
-                policy.network.name,
-                policy.target_tenant.name,
-            )
-
-        stale_count = stale_policies.count()
-        stale_policies.delete()
-
-        if stale_count:
-            logger.info("Deleted %d stale NetworkRBACPolicy objects", stale_count)
 
     @reraise_exceptions
     def create_network_rbac_policy(
@@ -6094,6 +6851,591 @@ class OpenStackBackend(ServiceBackend):
             neutron.delete_router(router.backend_id)
         except neutron_exceptions.NeutronClientException as e:
             raise OpenStackBackendError(e)
+
+    @log_backend_action()
+    def create_load_balancer(self, load_balancer: models.LoadBalancer):
+        get_octavia_client(load_balancer.tenant).create_load_balancer(load_balancer)
+        logger.info(
+            "Load balancer %s has been created in the backend.",
+            load_balancer.name,
+        )
+
+    @log_backend_action()
+    def delete_load_balancer(self, load_balancer: models.LoadBalancer):
+        if not load_balancer.backend_id:
+            logger.warning(
+                "Cannot remove load balancer without backend_id: %s",
+                load_balancer,
+            )
+            return
+
+        get_octavia_client(load_balancer.tenant).delete_load_balancer(load_balancer)
+        logger.info(
+            "Load balancer %s has been deleted from the backend.",
+            load_balancer.name,
+        )
+
+    @log_backend_action()
+    def update_load_balancer(self, load_balancer: models.LoadBalancer):
+        if not load_balancer.backend_id:
+            logger.warning(
+                "Cannot update load balancer without backend_id: %s",
+                load_balancer,
+            )
+            return
+
+        get_octavia_client(load_balancer.tenant).update_load_balancer(
+            load_balancer, name=load_balancer.name
+        )
+        logger.info(
+            "Load balancer %s has been updated in the backend.",
+            load_balancer,
+        )
+
+    @log_backend_action()
+    def pull_load_balancer(self, load_balancer: models.LoadBalancer):
+        if not load_balancer.backend_id:
+            return
+
+        get_octavia_client(load_balancer.tenant).pull_load_balancer(load_balancer)
+
+        logger.info(
+            "Load balancer %s has been pulled in the backend.",
+            load_balancer,
+        )
+
+    @log_backend_action()
+    def attach_floating_ip_to_load_balancer_vip(
+        self, load_balancer: models.LoadBalancer, serialized_floating_ip=None
+    ):
+        floating_ip: models.FloatingIP = core_utils.deserialize_instance(
+            serialized_floating_ip
+        )
+        """Attach a floating IP to the load balancer VIP port."""
+
+        if not load_balancer.vip_port or not load_balancer.vip_port.backend_id:
+            raise OpenStackBackendError(
+                "Load balancer VIP port is not available yet. "
+                "Wait for the load balancer to become ACTIVE."
+            )
+        if load_balancer.tenant != floating_ip.tenant:
+            raise OpenStackBackendError(
+                "Floating IP must belong to the same tenant as the load balancer."
+            )
+        session = get_tenant_session(load_balancer.tenant)
+        neutron = get_neutron_client(session)
+        try:
+            neutron.update_floatingip(
+                floating_ip.backend_id,
+                {"floatingip": {"port_id": load_balancer.vip_port.backend_id}},
+            )
+        except neutron_exceptions.NeutronClientException as e:
+            raise OpenStackBackendError(str(e))
+        # Clear previous LB attachment if this FIP was attached elsewhere
+        models.LoadBalancer.objects.filter(attached_floating_ip=floating_ip).update(
+            attached_floating_ip=None
+        )
+        # Clear FIP port (VIP port is not in our Port model)
+        floating_ip.port = None
+        floating_ip.save(update_fields=["port"])
+        load_balancer.attached_floating_ip = floating_ip
+        load_balancer.save(update_fields=["attached_floating_ip"])
+        logger.info(
+            "Floating IP %s attached to load balancer %s VIP.",
+            floating_ip.address,
+            load_balancer.name,
+        )
+
+    @log_backend_action()
+    def detach_floating_ip_from_load_balancer_vip(
+        self, load_balancer: models.LoadBalancer
+    ):
+        """Detach floating IP from the load balancer VIP port."""
+        if not load_balancer.attached_floating_ip:
+            raise OpenStackBackendError("Load balancer has no floating IP attached.")
+        floating_ip = load_balancer.attached_floating_ip
+        session = get_tenant_session(load_balancer.tenant)
+        neutron = get_neutron_client(session)
+        try:
+            neutron.update_floatingip(
+                floating_ip.backend_id,
+                {"floatingip": {"port_id": None}},
+            )
+        except neutron_exceptions.NeutronClientException as e:
+            raise OpenStackBackendError(str(e))
+        load_balancer.attached_floating_ip = None
+        load_balancer.save(update_fields=["attached_floating_ip"])
+        logger.info(
+            "Floating IP %s detached from load balancer %s VIP.",
+            floating_ip.address,
+            load_balancer.name,
+        )
+
+    @log_backend_action()
+    def set_load_balancer_vip_security_groups(
+        self, load_balancer: models.LoadBalancer, serialized_security_groups=None
+    ):
+        """Set security groups on the load balancer VIP port."""
+        security_groups = [
+            core_utils.deserialize_instance(sg) for sg in serialized_security_groups
+        ]
+        if not load_balancer.vip_port or not load_balancer.vip_port.backend_id:
+            raise OpenStackBackendError("Load balancer VIP port is not available yet.")
+        session = get_tenant_session(load_balancer.tenant)
+        neutron = get_neutron_client(session)
+        sg_backend_ids = [sg.backend_id for sg in security_groups if sg.backend_id]
+        try:
+            neutron.update_port(
+                load_balancer.vip_port.backend_id,
+                {"port": {"security_groups": sg_backend_ids}},
+            )
+        except neutron_exceptions.NeutronClientException as e:
+            raise OpenStackBackendError(str(e))
+        # Sync the local Port M2M with the new security groups
+        load_balancer.vip_port.security_groups.set(security_groups)
+        logger.info(
+            "Security groups %s set on load balancer %s VIP port.",
+            [sg.name for sg in security_groups],
+            load_balancer.name,
+        )
+
+    def pull_tenant_load_balancers(self, tenant: models.Tenant):
+        """Sync load balancers from Octavia for the tenant."""
+        octavia_client = get_octavia_client(tenant)
+        if not octavia_client.is_available():
+            logger.info(
+                "Octavia service is not available for tenant %s, skipping load balancer sync.",
+                tenant,
+            )
+            return
+        try:
+            backend_load_balancers = octavia_client.get_tenant_load_balancers()
+        except OpenStackBackendError as e:
+            logger.warning("Failed to pull load balancers for tenant %s: %s", tenant, e)
+            return
+        for backend_load_balancer in backend_load_balancers:
+            load_balancer = models.LoadBalancer.objects.filter(
+                tenant=tenant,
+                backend_id=backend_load_balancer.id,
+            ).first()
+
+            if load_balancer is not None:
+                octavia_client._backend_load_balancer_to_load_balancer(
+                    backend_load_balancer, load_balancer
+                )
+                continue
+
+            vip_subnet_backend_id = backend_load_balancer.vip_subnet_id
+            vip_subnet = models.SubNet.objects.filter(
+                tenant=tenant, backend_id=vip_subnet_backend_id
+            ).first()
+            if vip_subnet is None:
+                logger.warning(
+                    "Skipping load balancer %r (backend_id=%s): VIP subnet %r "
+                    "is not registered in Waldur for tenant %s.",
+                    backend_load_balancer.name,
+                    backend_load_balancer.id,
+                    vip_subnet_backend_id,
+                    tenant,
+                )
+                continue
+            new_load_balancer = models.LoadBalancer.objects.create(
+                tenant=tenant,
+                name=backend_load_balancer.name,
+                backend_id=backend_load_balancer.id,
+                vip_subnet=vip_subnet,
+                service_settings=tenant.service_settings,
+                project=tenant.project,
+                state=CoreStates.OK,
+            )
+            octavia_client._backend_load_balancer_to_load_balancer(
+                backend_load_balancer, new_load_balancer
+            )
+        remote_ids = {str(lb.id) for lb in backend_load_balancers}
+        stale = models.LoadBalancer.objects.filter(tenant=tenant).exclude(
+            backend_id__in=remote_ids
+        )
+        stale.delete()
+
+    @log_backend_action()
+    def create_pool(self, pool: models.Pool):
+        if not pool.load_balancer.backend_id:
+            raise OpenStackBackendError(
+                "Load balancer must be created in the backend before creating a pool."
+            )
+        get_octavia_client(pool.load_balancer.tenant).create_pool(pool)
+        logger.info("Pool %s has been created in the backend.", pool.name)
+
+    @log_backend_action()
+    def delete_pool(self, pool: models.Pool):
+        if not pool.backend_id:
+            logger.warning("Cannot remove pool without backend_id: %s", pool)
+            return
+        get_octavia_client(pool.load_balancer.tenant).delete_pool(pool)
+        logger.info("Pool %s has been deleted from the backend.", pool.name)
+
+    @log_backend_action()
+    def pull_pool(self, pool: models.Pool):
+        if not pool.backend_id:
+            return
+        get_octavia_client(pool.load_balancer.tenant).pull_pool(pool)
+
+    @log_backend_action()
+    def update_pool(self, pool: models.Pool):
+        if not pool.backend_id:
+            return
+        get_octavia_client(pool.load_balancer.tenant).update_pool(pool)
+        logger.info("Pool %s has been updated in the backend.", pool.name)
+
+    def pull_tenant_pools(self, tenant: models.Tenant):
+        """Sync pools from Octavia for the tenant."""
+        load_balancers = (
+            models.LoadBalancer.objects.filter(tenant=tenant)
+            .exclude(backend_id__isnull=True)
+            .exclude(backend_id="")
+        )
+        if not load_balancers.exists():
+            return
+        octavia_client = get_octavia_client(tenant)
+        if not octavia_client.is_available():
+            return
+        for lb in load_balancers:
+            try:
+                backend_pools = octavia_client.list_pools_for_load_balancer(
+                    lb.backend_id
+                )
+            except OpenStackBackendError as e:
+                logger.warning("Failed to pull pools for load balancer %s: %s", lb, e)
+                continue
+            for backend_pool in backend_pools:
+                backend_id = str(backend_pool.id)
+                defaults = {
+                    "name": backend_pool.name or "",
+                    "protocol": backend_pool.protocol or "TCP",
+                    "lb_algorithm": backend_pool.lb_algorithm or "SOURCE_IP_PORT",
+                    "provisioning_status": backend_pool.provisioning_status or "",
+                    "operating_status": backend_pool.operating_status or "",
+                    "service_settings": tenant.service_settings,
+                    "project": tenant.project,
+                    "state": CoreStates.OK,
+                    "error_message": "",
+                }
+                try:
+                    models.Pool.objects.update_or_create(
+                        load_balancer=lb,
+                        backend_id=backend_id,
+                        defaults=defaults,
+                    )
+                except IntegrityError:
+                    logger.warning(
+                        "Could not create pool with backend ID %s "
+                        "and load balancer %s due to concurrent update.",
+                        backend_id,
+                        lb,
+                    )
+            remote_ids = {str(p.id) for p in backend_pools}
+            stale = models.Pool.objects.filter(load_balancer=lb).exclude(
+                backend_id__in=remote_ids
+            )
+            stale.delete()
+
+    @log_backend_action()
+    def create_pool_member(self, member: models.PoolMember):
+        if not member.pool.backend_id:
+            raise OpenStackBackendError(
+                "Pool must be created in the backend before creating a member."
+            )
+        if not member.subnet.backend_id:
+            raise OpenStackBackendError(
+                "Subnet must be created in the backend before creating a member."
+            )
+        get_octavia_client(member.pool.load_balancer.tenant).create_pool_member(member)
+        logger.info("Pool member %s has been created in the backend.", member.name)
+
+    @log_backend_action()
+    def delete_pool_member(self, member: models.PoolMember):
+        if not member.backend_id:
+            logger.warning("Cannot remove pool member without backend_id: %s", member)
+            return
+        get_octavia_client(member.pool.load_balancer.tenant).delete_pool_member(member)
+        logger.info("Pool member %s has been deleted from the backend.", member.name)
+
+    @log_backend_action()
+    def pull_pool_member(self, member: models.PoolMember):
+        if not member.backend_id:
+            return
+        get_octavia_client(member.pool.load_balancer.tenant).pull_pool_member(member)
+
+    @log_backend_action()
+    def update_pool_member(self, member: models.PoolMember):
+        if not member.backend_id:
+            return
+        get_octavia_client(member.pool.load_balancer.tenant).update_pool_member(member)
+        logger.info("Pool member %s has been updated in the backend.", member.name)
+
+    def pull_tenant_pool_members(self, tenant: models.Tenant):
+        """Sync pool members from Octavia for the tenant."""
+        pools = (
+            models.Pool.objects.filter(
+                load_balancer__tenant=tenant,
+            )
+            .exclude(backend_id__isnull=True)
+            .exclude(backend_id="")
+        )
+        if not pools.exists():
+            return
+        octavia_client = get_octavia_client(tenant)
+        if not octavia_client.is_available():
+            return
+        for pool in pools:
+            try:
+                backend_members = octavia_client.list_members_for_pool(pool.backend_id)
+            except OpenStackBackendError as e:
+                logger.warning("Failed to pull members for pool %s: %s", pool, e)
+                continue
+            for backend_member in backend_members:
+                backend_id = str(backend_member.id)
+                subnet_obj = None
+                if getattr(backend_member, "subnet_id", None):
+                    subnet_obj = models.SubNet.objects.filter(
+                        tenant=tenant,
+                        backend_id=backend_member.subnet_id,
+                    ).first()
+                defaults = {
+                    "name": backend_member.name or "",
+                    "address": backend_member.address or "0.0.0.0",
+                    "protocol_port": backend_member.protocol_port or 80,
+                    "subnet": subnet_obj,
+                    "weight": backend_member.weight
+                    if backend_member.weight is not None
+                    else 1,
+                    "provisioning_status": backend_member.provisioning_status or "",
+                    "operating_status": backend_member.operating_status or "",
+                    "service_settings": tenant.service_settings,
+                    "project": tenant.project,
+                    "state": CoreStates.OK,
+                    "error_message": "",
+                }
+                try:
+                    models.PoolMember.objects.update_or_create(
+                        pool=pool,
+                        backend_id=backend_id,
+                        defaults=defaults,
+                    )
+                except IntegrityError:
+                    logger.warning(
+                        "Could not create pool member with backend ID %s "
+                        "and pool %s due to concurrent update.",
+                        backend_id,
+                        pool,
+                    )
+            remote_ids = {str(m.id) for m in backend_members}
+            stale = models.PoolMember.objects.filter(pool=pool).exclude(
+                backend_id__in=remote_ids
+            )
+            stale.delete()
+
+    @log_backend_action()
+    def create_health_monitor(self, health_monitor: models.HealthMonitor):
+        if not health_monitor.pool.backend_id:
+            raise OpenStackBackendError(
+                "Pool must be created in the backend before creating a health monitor."
+            )
+        get_octavia_client(
+            health_monitor.pool.load_balancer.tenant
+        ).create_health_monitor(health_monitor)
+        logger.info(
+            "Health monitor %s has been created in the backend.",
+            health_monitor.name,
+        )
+
+    @log_backend_action()
+    def delete_health_monitor(self, health_monitor: models.HealthMonitor):
+        if not health_monitor.backend_id:
+            logger.warning(
+                "Cannot remove health monitor without backend_id: %s",
+                health_monitor,
+            )
+            return
+        get_octavia_client(
+            health_monitor.pool.load_balancer.tenant
+        ).delete_health_monitor(health_monitor)
+        logger.info(
+            "Health monitor %s has been deleted from the backend.",
+            health_monitor.name,
+        )
+
+    @log_backend_action()
+    def pull_health_monitor(self, health_monitor: models.HealthMonitor):
+        if not health_monitor.backend_id:
+            return
+        get_octavia_client(
+            health_monitor.pool.load_balancer.tenant
+        ).pull_health_monitor(health_monitor)
+
+    @log_backend_action()
+    def update_health_monitor(self, health_monitor: models.HealthMonitor):
+        if not health_monitor.backend_id:
+            return
+        get_octavia_client(
+            health_monitor.pool.load_balancer.tenant
+        ).update_health_monitor(health_monitor)
+        logger.info(
+            "Health monitor %s has been updated in the backend.",
+            health_monitor.name,
+        )
+
+    def pull_tenant_healthmonitors(self, tenant: models.Tenant):
+        """Sync health monitors from Octavia for the tenant."""
+        pools = (
+            models.Pool.objects.filter(
+                load_balancer__tenant=tenant,
+            )
+            .exclude(backend_id__isnull=True)
+            .exclude(backend_id="")
+        )
+        if not pools.exists():
+            return
+        octavia_client = get_octavia_client(tenant)
+        if not octavia_client.is_available():
+            return
+        for pool in pools:
+            try:
+                backend_hms = octavia_client.list_health_monitors_for_pool(
+                    pool.backend_id
+                )
+            except OpenStackBackendError as e:
+                logger.warning(
+                    "Failed to pull health monitors for pool %s: %s", pool, e
+                )
+                continue
+            for backend_hm in backend_hms:
+                backend_id = str(backend_hm.id)
+                defaults = {
+                    "name": backend_hm.name or "",
+                    "monitor_type": backend_hm.type or "TCP",
+                    "delay": backend_hm.delay if backend_hm.delay is not None else 10,
+                    "timeout": backend_hm.timeout
+                    if backend_hm.timeout is not None
+                    else 5,
+                    "max_retries": backend_hm.max_retries
+                    if backend_hm.max_retries is not None
+                    else 3,
+                    "provisioning_status": backend_hm.provisioning_status or "",
+                    "operating_status": backend_hm.operating_status or "",
+                    "service_settings": tenant.service_settings,
+                    "project": tenant.project,
+                    "state": CoreStates.OK,
+                    "error_message": "",
+                }
+                try:
+                    models.HealthMonitor.objects.update_or_create(
+                        pool=pool,
+                        defaults={**defaults, "backend_id": backend_id},
+                    )
+                except IntegrityError:
+                    logger.warning(
+                        "Could not create health monitor with backend ID %s "
+                        "and pool %s due to concurrent update.",
+                        backend_id,
+                        pool,
+                    )
+            remote_ids = {str(hm.id) for hm in backend_hms}
+            stale = models.HealthMonitor.objects.filter(pool=pool).exclude(
+                backend_id__in=remote_ids
+            )
+            stale.delete()
+
+    @log_backend_action()
+    def create_listener(self, listener: models.Listener):
+        if not listener.load_balancer.backend_id:
+            raise OpenStackBackendError(
+                "Load balancer must be created in the backend before creating a listener."
+            )
+        get_octavia_client(listener.load_balancer.tenant).create_listener(listener)
+        logger.info("Listener %s has been created in the backend.", listener.name)
+
+    @log_backend_action()
+    def delete_listener(self, listener: models.Listener):
+        if not listener.backend_id:
+            logger.warning("Cannot remove listener without backend_id: %s", listener)
+            return
+        get_octavia_client(listener.load_balancer.tenant).delete_listener(listener)
+        logger.info("Listener %s has been deleted from the backend.", listener.name)
+
+    @log_backend_action()
+    def pull_listener(self, listener: models.Listener):
+        if not listener.backend_id:
+            return
+        get_octavia_client(listener.load_balancer.tenant).pull_listener(listener)
+
+    @log_backend_action()
+    def update_listener(self, listener: models.Listener):
+        if not listener.backend_id:
+            return
+        get_octavia_client(listener.load_balancer.tenant).update_listener(listener)
+        logger.info("Listener %s has been updated in the backend.", listener.name)
+
+    def pull_tenant_listeners(self, tenant: models.Tenant):
+        """Sync listeners from Octavia for the tenant."""
+        load_balancers = (
+            models.LoadBalancer.objects.filter(tenant=tenant)
+            .exclude(backend_id__isnull=True)
+            .exclude(backend_id="")
+        )
+        if not load_balancers.exists():
+            return
+        octavia_client = get_octavia_client(tenant)
+        if not octavia_client.is_available():
+            return
+        for lb in load_balancers:
+            try:
+                backend_listeners = octavia_client.list_listeners_for_load_balancer(
+                    lb.backend_id
+                )
+            except OpenStackBackendError as e:
+                logger.warning(
+                    "Failed to pull listeners for load balancer %s: %s", lb, e
+                )
+                continue
+            for backend_listener in backend_listeners:
+                backend_id = str(backend_listener.id)
+                default_pool_id = backend_listener.default_pool_id
+                default_pool = None
+                if default_pool_id:
+                    default_pool = models.Pool.objects.filter(
+                        load_balancer=lb, backend_id=default_pool_id
+                    ).first()
+                defaults = {
+                    "name": backend_listener.name or "",
+                    "protocol": backend_listener.protocol or "TCP",
+                    "protocol_port": backend_listener.protocol_port or 80,
+                    "default_pool": default_pool,
+                    "provisioning_status": backend_listener.provisioning_status or "",
+                    "operating_status": backend_listener.operating_status or "",
+                    "service_settings": tenant.service_settings,
+                    "project": tenant.project,
+                    "state": CoreStates.OK,
+                    "error_message": "",
+                }
+                try:
+                    models.Listener.objects.update_or_create(
+                        load_balancer=lb,
+                        backend_id=backend_id,
+                        defaults=defaults,
+                    )
+                except IntegrityError:
+                    logger.warning(
+                        "Could not create listener with backend ID %s "
+                        "and load balancer %s due to concurrent update.",
+                        backend_id,
+                        lb,
+                    )
+            remote_ids = {str(lst.id) for lst in backend_listeners}
+            stale = models.Listener.objects.filter(load_balancer=lb).exclude(
+                backend_id__in=remote_ids
+            )
+            stale.delete()
 
     @log_backend_action()
     def push_port_security_groups(self, port: models.Port):

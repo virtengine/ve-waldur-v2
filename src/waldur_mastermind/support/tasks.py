@@ -1,17 +1,20 @@
 import copy
 import logging
+from datetime import timedelta
 from smtplib import SMTPException
 
 import html2text
 from celery import shared_task
 from constance import config
 from django.core import signing
+from django.db.models import Q
 from django.template import Context, Template
 from django.template.loader import get_template
+from django.utils import timezone
 
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
-from waldur_core.core.utils import text2html
+from waldur_core.core.utils import broadcast_mail, text2html
 
 from . import backend, models
 from .utils import get_feedback_link
@@ -139,8 +142,8 @@ def _send_email(
             notification = core_models.Notification.objects.get(key=notification_key)
             if not notification.enabled:
                 message = (
-                    "Notification %s is disabled. ",
-                    "Please enable it to send notifications." % notification_key,
+                    "Notification %s is disabled. Please enable it to send notifications."
+                    % notification_key
                 )
                 logger.info(message)
                 return
@@ -291,3 +294,453 @@ def sync_request_types():
 @shared_task(name="waldur_mastermind.support.sync_issues")
 def sync_issues():
     backend.get_active_backend().sync_issues()
+
+
+@shared_task(
+    name="waldur_mastermind.support.route_issue_to_provider",
+    bind=True,
+    max_retries=3,
+    default_retry_delay=60,
+)
+def route_issue_to_provider(self, issue_id):
+    """Route an issue to the appropriate provider helpdesk by creating a child issue."""
+    try:
+        issue = models.Issue.objects.get(id=issue_id)
+    except models.Issue.DoesNotExist:
+        logger.error("Issue %s not found for routing.", issue_id)
+        return
+
+    # Skip if already routed
+    if issue.child_issues.exists():
+        logger.info("Issue %s already routed, skipping.", issue.key)
+        return
+
+    # Resolve: Issue -> resource -> Offering -> ServiceProvider -> ProviderHelpdesk
+    resource = issue.resource
+    if not resource:
+        logger.info("Issue %s has no resource, stays with operator.", issue.key)
+        return
+
+    from waldur_mastermind.marketplace import models as marketplace_models
+
+    # Find the marketplace resource and its offering
+    marketplace_resource = None
+    if isinstance(resource, marketplace_models.Resource):
+        marketplace_resource = resource
+    else:
+        marketplace_resource = marketplace_models.Resource.objects.filter(
+            scope=resource
+        ).first()
+
+    if not marketplace_resource:
+        logger.info("No marketplace resource found for issue %s.", issue.key)
+        return
+
+    offering = marketplace_resource.offering
+    if not offering or not offering.customer:
+        logger.info("No offering/customer found for issue %s.", issue.key)
+        return
+
+    try:
+        service_provider = marketplace_models.ServiceProvider.objects.get(
+            customer=offering.customer
+        )
+    except marketplace_models.ServiceProvider.DoesNotExist:
+        logger.info("No service provider for offering customer of issue %s.", issue.key)
+        return
+
+    try:
+        provider_helpdesk = models.ProviderHelpdesk.objects.get(
+            service_provider=service_provider, is_active=True
+        )
+    except models.ProviderHelpdesk.DoesNotExist:
+        logger.info("No active provider helpdesk for issue %s.", issue.key)
+        return
+
+    try:
+        child_issue = create_provider_child_issue(issue, provider_helpdesk, resource)
+        logger.info(
+            "Successfully routed issue %s to provider %s (child: %s).",
+            issue.key,
+            service_provider,
+            child_issue.key,
+        )
+        notify_provider_new_ticket.delay(child_issue.id)
+    except Exception as exc:
+        provider_helpdesk.failed_routing_count += 1
+        provider_helpdesk.save(update_fields=["failed_routing_count"])
+        logger.exception("Failed to route issue %s to provider.", issue.key)
+        raise self.retry(exc=exc)
+
+
+def create_provider_child_issue(issue, provider_helpdesk, resource=None):
+    """Create a child issue routed to the given provider helpdesk and push it to the provider backend.
+
+    Shared by automatic routing (route_issue_to_provider) and manual routing
+    (IssueViewSet.route_to_provider). Raises on backend failure; the caller decides
+    how to handle it (retry vs. surfacing an error).
+    """
+    from .utils import build_provider_context
+
+    context = build_provider_context(issue, resource)
+    enriched_description = (
+        f"Routed from operator ticket {issue.key}\n\n"
+        f"Customer: {context.get('customer_name', 'N/A')}\n"
+        f"Project: {context.get('project_name', 'N/A')}\n"
+        f"Resource: {context.get('resource_name', 'N/A')}\n\n"
+        f"{issue.description}"
+    )
+
+    child_issue = models.Issue.objects.create(
+        summary=issue.summary,
+        description=enriched_description,
+        type=issue.type,
+        priority=issue.priority,
+        status=issue.status,
+        caller=issue.caller,
+        customer=issue.customer,
+        project=issue.project,
+        parent_issue=issue,
+        provider_helpdesk=provider_helpdesk,
+    )
+
+    # Call provider backend to create the issue
+    from .backend import get_backend_for_provider
+
+    provider_backend = get_backend_for_provider(provider_helpdesk)
+    provider_backend.create_issue(child_issue)
+
+    issue.append_processing_log(
+        "routed_to_provider",
+        {
+            "child_issue_uuid": child_issue.uuid.hex,
+            "provider": str(provider_helpdesk.service_provider),
+        },
+    )
+    issue.save(update_fields=["processing_log"])
+
+    return child_issue
+
+
+def reroute_issue_to_provider(issue, new_helpdesk):
+    """Move an already-routed issue from its current provider helpdesk to a new one.
+
+    Tears down the existing child issue(s) through the ORIGINAL provider's backend
+    (a real delete for jira/zammad; a no-op for the basic backend, where the child
+    row is the whole ticket), then creates a fresh child for ``new_helpdesk``.
+    Returns ``(new_child_issue, old_helpdesks)``. The caller runs this inside a
+    transaction and dispatches notifications on commit.
+    """
+    from .backend import get_backend_for_provider
+
+    # Create the new child FIRST. An already-deleted external ticket
+    # (jira/zammad) cannot be restored by an ORM rollback, so tearing the old
+    # one down before the new routing succeeds would risk losing it when
+    # create_provider_child_issue fails. Creating first leaves the original
+    # ticket intact on failure.
+    new_child = create_provider_child_issue(issue, new_helpdesk, issue.resource)
+
+    old_helpdesks = []
+    for child in (
+        issue.child_issues.select_related("provider_helpdesk")
+        .exclude(id=new_child.id)
+        .all()
+    ):
+        old_helpdesk = child.provider_helpdesk
+        if old_helpdesk:
+            old_helpdesks.append(old_helpdesk)
+            try:
+                get_backend_for_provider(old_helpdesk).delete_issue(child)
+            except Exception:
+                # Best-effort teardown: a backend that cannot retract the ticket
+                # (email/smax) leaves an external artifact; the withdrawal
+                # notification tells the old provider to drop it.
+                logger.exception(
+                    "Failed to remove child issue %s from provider %s during "
+                    "reroute; the external ticket may be orphaned.",
+                    child.key,
+                    old_helpdesk,
+                )
+        child.delete()
+
+    issue.append_processing_log(
+        "rerouted_to_provider",
+        {
+            "child_issue_uuid": new_child.uuid.hex,
+            "from": [str(h.service_provider) for h in old_helpdesks],
+            "to": str(new_helpdesk.service_provider),
+        },
+    )
+    issue.save(update_fields=["processing_log"])
+
+    return new_child, old_helpdesks
+
+
+@shared_task(name="waldur_mastermind.support.notify_provider_new_ticket")
+def notify_provider_new_ticket(issue_id):
+    """Notify provider about a new ticket routed to their helpdesk."""
+    try:
+        issue = models.Issue.objects.select_related("provider_helpdesk").get(
+            id=issue_id
+        )
+    except models.Issue.DoesNotExist:
+        return
+
+    helpdesk = issue.provider_helpdesk
+    if not helpdesk or not helpdesk.notify_on_new_ticket:
+        return
+
+    recipients = helpdesk.get_notification_emails()
+    if recipients:
+        try:
+            broadcast_mail(
+                "support",
+                "provider_new_ticket",
+                {"issue": issue, "provider_helpdesk": helpdesk},
+                recipients,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to send new ticket notification for issue %s", issue.key
+            )
+
+
+@shared_task(name="waldur_mastermind.support.notify_provider_ticket_withdrawn")
+def notify_provider_ticket_withdrawn(issue_id, helpdesk_id):
+    """Notify a provider that a ticket previously routed to them was rerouted away.
+
+    Sent to the OLD helpdesk after a reroute, so backends that cannot retract the
+    external ticket (email/smax) know to drop it. The child issue has already been
+    removed, so this references the operator (parent) issue.
+    """
+    try:
+        issue = models.Issue.objects.get(id=issue_id)
+        helpdesk = models.ProviderHelpdesk.objects.get(id=helpdesk_id)
+    except (models.Issue.DoesNotExist, models.ProviderHelpdesk.DoesNotExist):
+        return
+
+    if not helpdesk.notify_on_new_ticket:
+        return
+
+    recipients = helpdesk.get_notification_emails()
+    if recipients:
+        try:
+            broadcast_mail(
+                "support",
+                "provider_ticket_withdrawn",
+                {"issue": issue, "provider_helpdesk": helpdesk},
+                recipients,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to send ticket withdrawn notification for issue %s", issue.key
+            )
+
+
+@shared_task(name="waldur_mastermind.support.notify_provider_customer_comment")
+def notify_provider_customer_comment(comment_id):
+    """Notify provider when customer adds a comment."""
+    try:
+        comment = models.Comment.objects.select_related(
+            "issue", "issue__provider_helpdesk"
+        ).get(id=comment_id)
+    except models.Comment.DoesNotExist:
+        return
+
+    issue = comment.issue
+    helpdesk = issue.provider_helpdesk
+    if not helpdesk or not helpdesk.notify_on_comment:
+        return
+
+    recipients = helpdesk.get_notification_emails()
+    if recipients:
+        try:
+            broadcast_mail(
+                "support",
+                "provider_customer_comment",
+                {"issue": issue, "comment": comment, "provider_helpdesk": helpdesk},
+                recipients,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to send comment notification for issue %s", issue.key
+            )
+
+
+@shared_task(name="waldur_mastermind.support.notify_provider_sla_warning")
+def notify_provider_sla_warning(issue_id):
+    """Notify provider about SLA approaching deadline."""
+    try:
+        issue = models.Issue.objects.select_related("provider_helpdesk").get(
+            id=issue_id
+        )
+    except models.Issue.DoesNotExist:
+        return
+
+    helpdesk = issue.provider_helpdesk
+    if not helpdesk or not helpdesk.notify_on_sla_warning:
+        return
+
+    recipients = helpdesk.get_notification_emails()
+    if recipients:
+        try:
+            broadcast_mail(
+                "support",
+                "provider_sla_warning",
+                {"issue": issue, "provider_helpdesk": helpdesk},
+                recipients,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to send SLA warning notification for issue %s", issue.key
+            )
+
+
+@shared_task(name="waldur_mastermind.support.notify_ticket_escalated")
+def notify_ticket_escalated(issue_id, reason):
+    """Notify operator staff that a ticket has been escalated."""
+    try:
+        issue = models.Issue.objects.get(id=issue_id)
+    except models.Issue.DoesNotExist:
+        return
+
+    logger.info("Issue %s has been escalated. Reason: %s", issue.key, reason)
+
+
+@shared_task(name="waldur_mastermind.support.notify_provider_escalation")
+def notify_provider_escalation(issue_id, reason):
+    """Notify provider that a ticket has been escalated."""
+    try:
+        issue = models.Issue.objects.get(id=issue_id)
+    except models.Issue.DoesNotExist:
+        return
+
+    # Notify provider via their helpdesk
+    for child in issue.child_issues.select_related("provider_helpdesk").all():
+        if child.provider_helpdesk:
+            recipients = child.provider_helpdesk.get_notification_emails()
+            if recipients and child.provider_helpdesk.notify_on_escalation:
+                try:
+                    broadcast_mail(
+                        "support",
+                        "provider_escalation",
+                        {
+                            "issue": issue,
+                            "child_issue": child,
+                            "reason": reason,
+                        },
+                        recipients,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to send escalation notification for issue %s",
+                        issue.key,
+                    )
+
+
+@shared_task(name="waldur_mastermind.support.forward_comment_to_child")
+def forward_comment_to_child(comment_id):
+    """Forward a comment from parent issue to its child issues."""
+    try:
+        comment = models.Comment.objects.select_related("issue", "author").get(
+            id=comment_id
+        )
+    except models.Comment.DoesNotExist:
+        logger.error("Comment %s not found for forwarding.", comment_id)
+        return
+
+    parent_issue = comment.issue
+    child_issues = parent_issue.child_issues.all()
+
+    for child_issue in child_issues:
+        models.Comment.objects.create(
+            issue=child_issue,
+            author=comment.author,
+            description=comment.description,
+            is_public=comment.is_public,
+            is_forwarded=True,
+        )
+        logger.info(
+            "Forwarded comment from %s to child issue %s.",
+            parent_issue.key,
+            child_issue.key,
+        )
+
+
+@shared_task(name="waldur_mastermind.support.propagate_comment_to_parent")
+def propagate_comment_to_parent(comment_id):
+    """Propagate a comment from child issue back to its parent issue."""
+    try:
+        comment = models.Comment.objects.select_related("issue", "author").get(
+            id=comment_id
+        )
+    except models.Comment.DoesNotExist:
+        logger.error("Comment %s not found for propagation.", comment_id)
+        return
+
+    child_issue = comment.issue
+    parent_issue = child_issue.parent_issue
+
+    if not parent_issue:
+        return
+
+    models.Comment.objects.create(
+        issue=parent_issue,
+        author=comment.author,
+        description=comment.description,
+        is_public=comment.is_public,
+        is_forwarded=True,
+    )
+    logger.info(
+        "Propagated comment from child %s to parent %s.",
+        child_issue.key,
+        parent_issue.key,
+    )
+
+
+@shared_task(name="waldur_mastermind.support.check_sla_breaches")
+def check_sla_breaches():
+    """Mark issues as SLA-breached if deadlines have passed."""
+    if not config.WALDUR_SUPPORT_ENABLED:
+        return
+
+    now = timezone.now()
+    breached_issues = models.Issue.objects.filter(
+        sla_breached=False,
+        resolution_date__isnull=True,
+    ).filter(
+        Q(first_response_deadline__lt=now, first_response_at__isnull=True)
+        | Q(resolution_deadline__lt=now)
+    )
+
+    count = breached_issues.update(sla_breached=True)
+    if count:
+        logger.info("Marked %d issues as SLA-breached.", count)
+
+
+@shared_task(name="waldur_mastermind.support.check_sla_warnings")
+def check_sla_warnings():
+    """Log warnings for issues approaching SLA deadlines."""
+    if not config.WALDUR_SUPPORT_ENABLED:
+        return
+
+    now = timezone.now()
+    warning_window = timedelta(hours=1)
+
+    approaching = models.Issue.objects.filter(
+        sla_breached=False,
+        resolution_date__isnull=True,
+    ).filter(
+        Q(
+            first_response_deadline__lt=now + warning_window,
+            first_response_deadline__gt=now,
+            first_response_at__isnull=True,
+        )
+        | Q(
+            resolution_deadline__lt=now + warning_window,
+            resolution_deadline__gt=now,
+        )
+    )
+
+    for issue in approaching:
+        logger.warning("Issue %s is approaching SLA deadline.", issue.key or issue.uuid)

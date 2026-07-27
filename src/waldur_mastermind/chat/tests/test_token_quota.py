@@ -79,7 +79,7 @@ class TokenQuotaCreationTest(test.APITransactionTestCase):
         self.assertEqual(len(errors), 0, f"Unexpected errors: {errors}")
 
 
-class TokenQuotaResetAtSerializerTest(test.APITransactionTestCase):
+class TokenQuotaResetAtSerializerTest(test.APITestCase):
     """Test that serializer calculates next reset times correctly."""
 
     def setUp(self):
@@ -142,7 +142,7 @@ class TokenQuotaResetAtSerializerTest(test.APITransactionTestCase):
         self.assertEqual(reset_at.day, 1)
 
 
-class TokenQuotaLimitsTest(test.APITransactionTestCase):
+class TokenQuotaLimitsTest(test.APITestCase):
     """Test effective limit calculation with user overrides and system defaults."""
 
     def setUp(self):
@@ -150,9 +150,9 @@ class TokenQuotaLimitsTest(test.APITransactionTestCase):
         self.quota = TokenQuota.for_user(self.user)
 
     @override_constance_config(
-        LLM_TOKEN_LIMIT_DAILY=10000,
-        LLM_TOKEN_LIMIT_WEEKLY=50000,
-        LLM_TOKEN_LIMIT_MONTHLY=100000,
+        AI_ASSISTANT_TOKEN_LIMIT_DAILY=10000,
+        AI_ASSISTANT_TOKEN_LIMIT_WEEKLY=50000,
+        AI_ASSISTANT_TOKEN_LIMIT_MONTHLY=100000,
     )
     def test_uses_system_defaults_when_user_limits_null(self):
         """Effective limits fall back to constance config when user limits are null."""
@@ -161,9 +161,9 @@ class TokenQuotaLimitsTest(test.APITransactionTestCase):
         self.assertEqual(self.quota.get_effective_limit("monthly"), 100000)
 
     @override_constance_config(
-        LLM_TOKEN_LIMIT_DAILY=10000,
-        LLM_TOKEN_LIMIT_WEEKLY=50000,
-        LLM_TOKEN_LIMIT_MONTHLY=100000,
+        AI_ASSISTANT_TOKEN_LIMIT_DAILY=10000,
+        AI_ASSISTANT_TOKEN_LIMIT_WEEKLY=50000,
+        AI_ASSISTANT_TOKEN_LIMIT_MONTHLY=100000,
     )
     def test_uses_user_limits_when_set(self):
         """User-specific limits override system defaults."""
@@ -177,16 +177,16 @@ class TokenQuotaLimitsTest(test.APITransactionTestCase):
         self.assertEqual(self.quota.get_effective_limit("monthly"), 60000)
 
     @override_constance_config(
-        LLM_TOKEN_LIMIT_DAILY=-1,
-        LLM_TOKEN_LIMIT_WEEKLY=-1,
-        LLM_TOKEN_LIMIT_MONTHLY=-1,
+        AI_ASSISTANT_TOKEN_LIMIT_DAILY=-1,
+        AI_ASSISTANT_TOKEN_LIMIT_WEEKLY=-1,
+        AI_ASSISTANT_TOKEN_LIMIT_MONTHLY=-1,
     )
     def test_unlimited_when_system_default_is_none(self):
         self.assertEqual(-1, self.quota.get_effective_limit("daily"))
         self.assertEqual(-1, self.quota.get_effective_limit("weekly"))
         self.assertEqual(-1, self.quota.get_effective_limit("monthly"))
 
-    @override_constance_config(LLM_TOKEN_LIMIT_DAILY=10000)
+    @override_constance_config(AI_ASSISTANT_TOKEN_LIMIT_DAILY=10000)
     def test_user_can_set_unlimited_with_zero(self):
         """User limit of -1 means unlimited (overrides system default)."""
         self.quota.daily_limit = -1
@@ -228,29 +228,29 @@ class TokenQuotaLimitsTest(test.APITransactionTestCase):
         self.assertEqual(TokenQuota._coerce_limit(999999), 999999)
 
 
-class TokenQuotaInvalidConfigTest(test.APITransactionTestCase):
+class TokenQuotaInvalidConfigTest(test.APITestCase):
     """Test handling of invalid constance configuration values."""
 
     def setUp(self):
         self.user = structure_factories.UserFactory()
         self.quota = TokenQuota.for_user(self.user)
 
-    @override_constance_config(LLM_TOKEN_LIMIT_DAILY="not_a_number")
+    @override_constance_config(AI_ASSISTANT_TOKEN_LIMIT_DAILY="not_a_number")
     def test_invalid_string_config_raises_error(self):
         """get_effective_limit raises ValueError when system default is invalid string."""
         with self.assertRaises(ValueError) as ctx:
             self.quota.get_effective_limit("daily")
         self.assertIn("must be an integer", str(ctx.exception))
-        self.assertIn("LLM_TOKEN_LIMIT_DAILY", str(ctx.exception))
+        self.assertIn("AI_ASSISTANT_TOKEN_LIMIT_DAILY", str(ctx.exception))
 
-    @override_constance_config(LLM_TOKEN_LIMIT_WEEKLY=-5)
+    @override_constance_config(AI_ASSISTANT_TOKEN_LIMIT_WEEKLY=-5)
     def test_config_below_negative_one_raises_error(self):
         """get_effective_limit raises ValueError when system default is < -1."""
         with self.assertRaises(ValueError) as ctx:
             self.quota.get_effective_limit("weekly")
         self.assertIn("must be >= -1", str(ctx.exception))
 
-    @override_constance_config(LLM_TOKEN_LIMIT_DAILY=1000)
+    @override_constance_config(AI_ASSISTANT_TOKEN_LIMIT_DAILY=1000)
     def test_user_invalid_limit_raises_error_on_save(self):
         """Setting invalid user limit should be caught by model validation."""
         # Setting limit below -1 should fail validation
@@ -258,7 +258,7 @@ class TokenQuotaInvalidConfigTest(test.APITransactionTestCase):
         with self.assertRaises(Exception):  # Django ValidationError
             self.quota.full_clean()
 
-    @override_constance_config(LLM_TOKEN_LIMIT_WEEKLY="invalid")
+    @override_constance_config(AI_ASSISTANT_TOKEN_LIMIT_WEEKLY="invalid")
     def test_invalid_config_prevents_quota_check(self):
         """Invalid system config prevents quota validation."""
         # This should raise when trying to check effective limits
@@ -266,7 +266,7 @@ class TokenQuotaInvalidConfigTest(test.APITransactionTestCase):
             self.quota.get_effective_limit("weekly")
 
 
-class CalendarBasedResetTasksTest(test.APITransactionTestCase):
+class CalendarBasedResetTasksTest(test.APITestCase):
     """Test calendar-based reset tasks."""
 
     def setUp(self):
@@ -371,14 +371,14 @@ class TokenQuotaUsageTest(test.APITransactionTestCase):
         self.assertEqual(self.quota.monthly_usage, 1000)
 
 
-class TokenQuotaRemainingTest(test.APITransactionTestCase):
+class TokenQuotaRemainingTest(test.APITestCase):
     """Test remaining token calculations."""
 
     def setUp(self):
         self.user = structure_factories.UserFactory()
         self.quota = TokenQuota.for_user(self.user)
 
-    @override_constance_config(LLM_TOKEN_LIMIT_DAILY=10000)
+    @override_constance_config(AI_ASSISTANT_TOKEN_LIMIT_DAILY=10000)
     def test_get_remaining_returns_correct_value(self):
         """get_remaining calculates remaining tokens correctly."""
         self.quota.daily_usage = 3000
@@ -388,7 +388,7 @@ class TokenQuotaRemainingTest(test.APITransactionTestCase):
 
         self.assertEqual(remaining, 7000)
 
-    @override_constance_config(LLM_TOKEN_LIMIT_MONTHLY=100000)
+    @override_constance_config(AI_ASSISTANT_TOKEN_LIMIT_MONTHLY=100000)
     def test_get_remaining_returns_zero_when_exhausted(self):
         """get_remaining returns 0 when quota is exhausted."""
         self.quota.monthly_usage = 100000
@@ -398,7 +398,7 @@ class TokenQuotaRemainingTest(test.APITransactionTestCase):
 
         self.assertEqual(remaining, 0)
 
-    @override_constance_config(LLM_TOKEN_LIMIT_DAILY=10000)
+    @override_constance_config(AI_ASSISTANT_TOKEN_LIMIT_DAILY=10000)
     def test_get_remaining_never_negative(self):
         """get_remaining returns 0, not negative, when over limit."""
         self.quota.daily_usage = 15000  # Over limit
@@ -408,7 +408,7 @@ class TokenQuotaRemainingTest(test.APITransactionTestCase):
 
         self.assertEqual(remaining, 0)
 
-    @override_constance_config(LLM_TOKEN_LIMIT_WEEKLY=-1)
+    @override_constance_config(AI_ASSISTANT_TOKEN_LIMIT_WEEKLY=-1)
     def test_get_remaining_returns_none_when_unlimited(self):
         """get_remaining returns None for unlimited quotas."""
         remaining = self.quota.get_remaining("weekly")
@@ -444,7 +444,7 @@ class TokenQuotaConcurrencyTest(test.APITransactionTestCase):
             self.assertIn("non-negative", str(ctx.exception))
 
 
-class QuotaUsageAPITest(test.APITransactionTestCase):
+class QuotaUsageAPITest(test.APITestCase):
     """Test quota usage API endpoint."""
 
     def setUp(self):
@@ -453,10 +453,11 @@ class QuotaUsageAPITest(test.APITransactionTestCase):
         self.usage_url = reverse("chatquota-usage")
 
     @override_constance_config(
-        LLM_CHAT_ENABLED=True,
-        LLM_INFERENCES_API_URL="https://example.com/stream",
-        LLM_INFERENCES_API_TOKEN="dummy-token",
-        LLM_TOKEN_LIMIT_MONTHLY=1000,
+        AI_ASSISTANT_ENABLED=True,
+        AI_ASSISTANT_ENABLED_ROLES="all",
+        AI_ASSISTANT_API_URL="https://example.com/stream",
+        AI_ASSISTANT_API_TOKEN="dummy-token",
+        AI_ASSISTANT_TOKEN_LIMIT_MONTHLY=1000,
     )
     def test_get_own_usage(self):
         """User can view their own usage."""
@@ -469,10 +470,11 @@ class QuotaUsageAPITest(test.APITransactionTestCase):
         self.assertEqual(response.data["monthly_limit"], 1000)
 
     @override_constance_config(
-        LLM_CHAT_ENABLED=True,
-        LLM_INFERENCES_API_URL="https://example.com/stream",
-        LLM_INFERENCES_API_TOKEN="dummy-token",
-        LLM_TOKEN_LIMIT_MONTHLY=1000,
+        AI_ASSISTANT_ENABLED=True,
+        AI_ASSISTANT_ENABLED_ROLES="all",
+        AI_ASSISTANT_API_URL="https://example.com/stream",
+        AI_ASSISTANT_API_TOKEN="dummy-token",
+        AI_ASSISTANT_TOKEN_LIMIT_MONTHLY=1000,
     )
     def test_get_usage_with_user_specific_limit(self):
         """Usage respects user-specific quota limit."""
@@ -488,10 +490,11 @@ class QuotaUsageAPITest(test.APITransactionTestCase):
         self.assertEqual(response.data["monthly_limit"], 2000)
 
     @override_constance_config(
-        LLM_CHAT_ENABLED=True,
-        LLM_INFERENCES_API_URL="https://example.com/stream",
-        LLM_INFERENCES_API_TOKEN="dummy-token",
-        LLM_TOKEN_LIMIT_MONTHLY=-1,
+        AI_ASSISTANT_ENABLED=True,
+        AI_ASSISTANT_ENABLED_ROLES="all",
+        AI_ASSISTANT_API_URL="https://example.com/stream",
+        AI_ASSISTANT_API_TOKEN="dummy-token",
+        AI_ASSISTANT_TOKEN_LIMIT_MONTHLY=-1,
     )
     def test_get_usage_unlimited(self):
         """Usage shows unlimited when limit is None."""
@@ -507,10 +510,11 @@ class QuotaUsageAPITest(test.APITransactionTestCase):
         self.assertIsNone(response.data["monthly_limit"])
 
     @override_constance_config(
-        LLM_CHAT_ENABLED=True,
-        LLM_INFERENCES_API_URL="https://example.com/stream",
-        LLM_INFERENCES_API_TOKEN="dummy-token",
-        LLM_TOKEN_LIMIT_MONTHLY=1000,
+        AI_ASSISTANT_ENABLED=True,
+        AI_ASSISTANT_ENABLED_ROLES="all",
+        AI_ASSISTANT_API_URL="https://example.com/stream",
+        AI_ASSISTANT_API_TOKEN="dummy-token",
+        AI_ASSISTANT_TOKEN_LIMIT_MONTHLY=1000,
     )
     def test_staff_can_view_other_user_usage(self):
         """Staff user can view usage for any user."""
@@ -528,9 +532,10 @@ class QuotaUsageAPITest(test.APITransactionTestCase):
         self.assertEqual(response.data["monthly_usage"], 300)
 
     @override_constance_config(
-        LLM_CHAT_ENABLED=True,
-        LLM_INFERENCES_API_URL="https://example.com/stream",
-        LLM_INFERENCES_API_TOKEN="dummy-token",
+        AI_ASSISTANT_ENABLED=True,
+        AI_ASSISTANT_ENABLED_ROLES="all",
+        AI_ASSISTANT_API_URL="https://example.com/stream",
+        AI_ASSISTANT_API_TOKEN="dummy-token",
     )
     def test_user_cannot_view_other_user_usage(self):
         """User cannot view usage for other users."""
@@ -541,12 +546,13 @@ class QuotaUsageAPITest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, 403)
 
     @override_constance_config(
-        LLM_CHAT_ENABLED=True,
-        LLM_INFERENCES_API_URL="https://example.com/stream",
-        LLM_INFERENCES_API_TOKEN="dummy-token",
-        LLM_TOKEN_LIMIT_DAILY=5000,
-        LLM_TOKEN_LIMIT_WEEKLY=25000,
-        LLM_TOKEN_LIMIT_MONTHLY=100000,
+        AI_ASSISTANT_ENABLED=True,
+        AI_ASSISTANT_ENABLED_ROLES="all",
+        AI_ASSISTANT_API_URL="https://example.com/stream",
+        AI_ASSISTANT_API_TOKEN="dummy-token",
+        AI_ASSISTANT_TOKEN_LIMIT_DAILY=5000,
+        AI_ASSISTANT_TOKEN_LIMIT_WEEKLY=25000,
+        AI_ASSISTANT_TOKEN_LIMIT_MONTHLY=100000,
     )
     def test_response_includes_system_defaults(self):
         """Response includes system default limits from constance config."""
@@ -561,12 +567,13 @@ class QuotaUsageAPITest(test.APITransactionTestCase):
         self.assertEqual(response.data["monthly_system_default"], 100000)
 
     @override_constance_config(
-        LLM_CHAT_ENABLED=True,
-        LLM_INFERENCES_API_URL="https://example.com/stream",
-        LLM_INFERENCES_API_TOKEN="dummy-token",
-        LLM_TOKEN_LIMIT_DAILY=-1,
-        LLM_TOKEN_LIMIT_WEEKLY=-1,
-        LLM_TOKEN_LIMIT_MONTHLY=-1,
+        AI_ASSISTANT_ENABLED=True,
+        AI_ASSISTANT_ENABLED_ROLES="all",
+        AI_ASSISTANT_API_URL="https://example.com/stream",
+        AI_ASSISTANT_API_TOKEN="dummy-token",
+        AI_ASSISTANT_TOKEN_LIMIT_DAILY=-1,
+        AI_ASSISTANT_TOKEN_LIMIT_WEEKLY=-1,
+        AI_ASSISTANT_TOKEN_LIMIT_MONTHLY=-1,
     )
     def test_system_defaults_show_unlimited(self):
         """System defaults show -1 when configured as unlimited."""
@@ -580,12 +587,13 @@ class QuotaUsageAPITest(test.APITransactionTestCase):
         self.assertEqual(response.data["monthly_system_default"], -1)
 
     @override_constance_config(
-        LLM_CHAT_ENABLED=True,
-        LLM_INFERENCES_API_URL="https://example.com/stream",
-        LLM_INFERENCES_API_TOKEN="dummy-token",
-        LLM_TOKEN_LIMIT_DAILY=10000,
-        LLM_TOKEN_LIMIT_WEEKLY=50000,
-        LLM_TOKEN_LIMIT_MONTHLY=200000,
+        AI_ASSISTANT_ENABLED=True,
+        AI_ASSISTANT_ENABLED_ROLES="all",
+        AI_ASSISTANT_API_URL="https://example.com/stream",
+        AI_ASSISTANT_API_TOKEN="dummy-token",
+        AI_ASSISTANT_TOKEN_LIMIT_DAILY=10000,
+        AI_ASSISTANT_TOKEN_LIMIT_WEEKLY=50000,
+        AI_ASSISTANT_TOKEN_LIMIT_MONTHLY=200000,
     )
     def test_system_defaults_visible_even_with_custom_limits(self):
         """System defaults are shown even when user has custom limits."""
@@ -608,7 +616,7 @@ class QuotaUsageAPITest(test.APITransactionTestCase):
         self.assertEqual(response.data["monthly_system_default"], 200000)
 
 
-class SetTokenQuotaAPITest(test.APITransactionTestCase):
+class SetTokenQuotaAPITest(test.APITestCase):
     """Tests for staff setting user AI token quotas via set_quota endpoint."""
 
     def setUp(self):

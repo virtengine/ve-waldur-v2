@@ -8,6 +8,41 @@ from waldur_core.logging.event_logger import get_valid_events
 from waldur_core.structure.tests import factories as structure_factories
 
 
+class EventConsumerFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.EventConsumer],
+):
+    class Meta:
+        model = models.EventConsumer
+
+    user = factory.SubFactory(structure_factories.UserFactory)
+
+    @classmethod
+    def with_scopes(cls, *instances, user=None, **kwargs):
+        """Create an EventConsumer bound to the given entities.
+
+        No instances = a global (unrestricted) consumer.
+        """
+        params = dict(kwargs)
+        if user is not None:
+            params["user"] = user
+        consumer = cls.create(**params)
+        for instance in instances:
+            models.EventConsumerScope.objects.create(
+                consumer=consumer,
+                content_type=ct_models.ContentType.objects.get_for_model(
+                    instance.__class__
+                ),
+                object_id=instance.id,
+            )
+        return consumer
+
+    @classmethod
+    def for_offering(cls, offering, user=None, **kwargs):
+        """Create an EventConsumer bound to a single offering."""
+        return cls.with_scopes(offering, user=user, **kwargs)
+
+
 class EventFactory(
     factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Event]
 ):
@@ -71,6 +106,28 @@ class WebHookFactory(
             hook = WebHookFactory()
         return "http://testserver" + reverse(
             "webhook-detail", kwargs={"uuid": hook.uuid.hex}
+        )
+
+
+class EmailHookFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.EmailHook]
+):
+    class Meta:
+        model = models.EmailHook
+
+    event_types = get_valid_events()[:3]
+    email = "hook@example.com"
+
+    @classmethod
+    def get_list_url(cls):
+        return "http://testserver" + reverse("emailhook-list")
+
+    @classmethod
+    def get_url(cls, hook=None):
+        if hook is None:
+            hook = EmailHookFactory()
+        return "http://testserver" + reverse(
+            "emailhook-detail", kwargs={"uuid": hook.uuid.hex}
         )
 
 
@@ -141,6 +198,39 @@ class EmailLogFactory(
         return "http://testserver" + reverse(
             "email-log-detail", kwargs={"uuid": email_log.uuid.hex}
         )
+
+
+class SystemLogFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.SystemLog]
+):
+    class Meta:
+        model = models.SystemLog
+
+    source = "api"
+    instance = "test-pod-1"
+    level = "INFO"
+    level_number = 20
+    logger_name = "waldur_core.test"
+    message = factory.Sequence(lambda i: "test log message #%s" % i)
+    context = factory.LazyFunction(dict)
+
+    @classmethod
+    def get_list_url(cls):
+        return "http://testserver" + reverse("system-log-list")
+
+    @classmethod
+    def get_url(cls, log=None):
+        if log is None:
+            log = SystemLogFactory()
+        return "http://testserver" + reverse("system-log-detail", kwargs={"pk": log.pk})
+
+    @classmethod
+    def get_stats_url(cls):
+        return "http://testserver" + reverse("system-log-stats")
+
+    @classmethod
+    def get_instances_url(cls):
+        return "http://testserver" + reverse("system-log-instances")
 
 
 class EventSubscriptionQueueFactory(

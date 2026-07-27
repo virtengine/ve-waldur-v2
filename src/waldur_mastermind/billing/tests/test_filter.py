@@ -14,7 +14,7 @@ from waldur_mastermind.invoices.tests import factories as invoice_factories
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 
 
-class CustomerEstimatedCostFilterTest(test.APITransactionTestCase):
+class CustomerEstimatedCostFilterTest(test.APITestCase):
     def setUp(self):
         models.PriceEstimate.objects.filter(
             scope=structure_factories.CustomerFactory()
@@ -38,7 +38,7 @@ class CustomerEstimatedCostFilterTest(test.APITransactionTestCase):
         response = self.client.get(url, params)
 
         return [
-            int(customer["billing_price_estimate"]["total"])
+            int(float(customer["billing_price_estimate"]["total"]))
             for customer in response.data
         ]
 
@@ -84,7 +84,7 @@ class CustomerTotalCostFilterTest(test.APITransactionTestCase):
         response = self.client.get(url, params)
 
         return [
-            int(customer["billing_price_estimate"]["current"])
+            int(float(customer["billing_price_estimate"]["current"]))
             for customer in response.data
         ]
 
@@ -103,7 +103,7 @@ class CustomerTotalCostFilterTest(test.APITransactionTestCase):
 
 
 @override_waldur_core_settings(ENABLE_ACCOUNTING_START_DATE=True)
-class FinancialReportFilterTest(test.APITransactionTestCase):
+class FinancialReportFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.CustomerFixture()
         self.url = "/api/financial-reports/"
@@ -126,7 +126,7 @@ class FinancialReportFilterTest(test.APITransactionTestCase):
         self.assertEqual(len(response.data), 0)
 
 
-class FinancialReportProviderFilterTest(test.APITransactionTestCase):
+class FinancialReportProviderFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.CustomerFixture()
         self.url = "/api/financial-reports/"
@@ -183,10 +183,10 @@ class FinancialReportProviderFilterTest(test.APITransactionTestCase):
 
     def test_filter_by_provider_uuid(self):
         result = self.get_billing_price_estimate(self.provider.uuid.hex)
-        self.assertEqual(result["current"], 350)  # 100*2 + 50*3
-        self.assertEqual(result["total"], 350)
+        self.assertEqual(result["current"], "350.00")  # 100*2 + 50*3
+        self.assertEqual(result["total"], "350.00")
 
     def test_filter_by_another_provider_uuid(self):
         result = self.get_billing_price_estimate(self.another_provider.uuid.hex)
-        self.assertEqual(result["current"], 120)  # 30*4
-        self.assertEqual(result["total"], 120)
+        self.assertEqual(result["current"], "120.00")  # 30*4
+        self.assertEqual(result["total"], "120.00")

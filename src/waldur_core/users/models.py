@@ -16,7 +16,11 @@ from waldur_core.core import mixins as core_mixins
 from waldur_core.core import models as core_models
 from waldur_core.core.mixins import ProjectNameTemplateMixin
 from waldur_core.permissions.models import Role
-from waldur_core.permissions.utils import add_user, validate_user_restrictions
+from waldur_core.permissions.utils import (
+    add_user,
+    has_user,
+    validate_role_grant,
+)
 from waldur_core.structure.models import Customer, Project
 from waldur_core.structure.signals import permissions_request_approved
 from waldur_core.users.enums import InvitationState
@@ -34,6 +38,13 @@ class BaseInvitation(core_models.UuidMixin, core_mixins.ScopeMixin, TimeStampedM
         null=True,
     )
 
+
+class ScopeInvitationMixin(models.Model):
+    """Mixin for invitations scoped to a Customer with a system Role."""
+
+    class Meta:
+        abstract = True
+
     customer = models.ForeignKey(
         on_delete=models.CASCADE,
         to=Customer,
@@ -45,7 +56,10 @@ class BaseInvitation(core_models.UuidMixin, core_mixins.ScopeMixin, TimeStampedM
 
 
 class GroupInvitation(
-    BaseInvitation, ProjectNameTemplateMixin, core_models.UserDetailsMatchMixin
+    BaseInvitation,
+    ScopeInvitationMixin,
+    ProjectNameTemplateMixin,
+    core_models.UserDetailsMatchMixin,
 ):
     is_active = models.BooleanField(default=True)
     is_public = models.BooleanField(
@@ -69,6 +83,21 @@ class GroupInvitation(
     auto_approve = models.BooleanField(
         default=False,
         help_text="Automatically approve permission requests from users matching email patterns or affiliations",
+    )
+    custom_text = models.TextField(
+        blank=True,
+        default="",
+        max_length=500,
+        help_text="Custom description text displayed to users viewing this invitation.",
+    )
+    allow_multiple_requests = models.BooleanField(
+        default=False,
+        help_text="Allow users to submit multiple permission requests for this invitation.",
+    )
+    allow_custom_project_details = models.BooleanField(
+        default=False,
+        help_text="Allow users to provide custom project name and description when accepting the invitation. "
+        "If disabled, the project name is auto-generated from the template.",
     )
 
     class Permissions:
@@ -106,6 +135,7 @@ class GroupInvitation(
 
 class Invitation(
     BaseInvitation,
+    ScopeInvitationMixin,
     core_models.ErrorMessageMixin,
     core_models.UserDetailsMixin,
 ):
@@ -153,7 +183,7 @@ class Invitation(
         ),
     )
     full_name = models.CharField(_("full name"), max_length=100, blank=True)
-    extra_invitation_text = models.TextField(blank=True, max_length=250)
+    extra_invitation_text = models.TextField(blank=True, max_length=2000)
 
     def get_expiration_base_datetime(self):
         if not self.scope:
@@ -176,6 +206,7 @@ class Invitation(
         )
 
     def accept(self, user):
+        validate_role_grant(self.scope, user, self.role)
         add_user(self.scope, user, self.role, self.created_by)
 
         self.state = InvitationState.ACCEPTED
@@ -234,33 +265,46 @@ class PermissionRequest(core_mixins.ReviewMixin, core_models.UuidMixin):
         to=settings.AUTH_USER_MODEL,
         related_name="+",
     )
+    project_name = models.CharField(
+        max_length=500,
+        blank=True,
+        default="",
+        help_text="Custom project name provided by user during invitation acceptance.",
+    )
+    project_description = models.CharField(
+        max_length=2000,
+        blank=True,
+        default="",
+        help_text="Custom project description provided by user during invitation acceptance.",
+    )
 
     @transaction.atomic
     def approve(self, user: core_models.User, comment: str = None):
         super().approve(user, comment)
 
-        # Validate the requesting user against scope's email/affiliation restrictions
-        validate_user_restrictions(self.invitation.scope, self.created_by)
-
+        created_project = None
+        project_created = False
         if self.invitation.auto_create_project:
             # Create project and grant project permission instead of customer permission
-            project = self._create_project_for_user(user)
-            permission = add_user(
-                project,
-                self.created_by,
-                self.invitation.project_role or self.invitation.role,
-                created_by=user,
-            )
-            scope = project
+            created_project, project_created = self._create_project_for_user(user)
+            role = self.invitation.project_role or self.invitation.role
+            scope = created_project
         else:
-            # Original behavior - grant customer/scope permission
-            permission = add_user(
-                self.invitation.scope,
-                self.created_by,
-                self.invitation.role,
-                created_by=user,
-            )
             scope = self.invitation.scope
+            role = self.invitation.role
+
+        # Defense-in-depth: skip if user already has the role
+        if has_user(scope, self.created_by, role):
+            return {"project": created_project, "project_created": project_created}
+
+        validate_role_grant(scope, self.created_by, role)
+
+        permission = add_user(
+            scope,
+            self.created_by,
+            role,
+            created_by=user,
+        )
 
         permissions_request_approved.send(
             sender=self.__class__,
@@ -268,18 +312,21 @@ class PermissionRequest(core_mixins.ReviewMixin, core_models.UuidMixin):
             structure=scope,
         )
 
+        return {"project": created_project, "project_created": project_created}
+
     def _create_project_for_user(self, approving_user):
         from waldur_core.structure.models import Project
 
-        project_name = self._resolve_project_name()
+        project_name = self.project_name or self._resolve_project_name()
 
-        # Use get_or_create to ensure only one project per user per customer
-        project, created = Project.objects.get_or_create(
+        # Use get_or_create with available_objects to exclude soft-deleted projects
+        project, created = Project.available_objects.get_or_create(
             name=project_name,
             customer=self.invitation.customer,
+            defaults={"description": self.project_description},
         )
 
-        return project
+        return project, created
 
     def _resolve_project_name(self):
         return self.invitation.resolve_project_name(self.created_by)

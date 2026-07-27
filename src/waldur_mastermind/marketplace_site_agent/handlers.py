@@ -1,5 +1,7 @@
 import logging
 
+from django.contrib.contenttypes.models import ContentType
+
 from waldur_core.core.middleware import get_skip_side_effects
 from waldur_core.logging import enums as logging_enums
 from waldur_core.logging import tasks as logging_tasks
@@ -92,12 +94,30 @@ def send_offering_user_username_message(
     if not offering_user.username:
         return
 
+    project_ct = ContentType.objects.get_for_model(structure_models.Project)
+    user_project_ids = permission_models.UserRole.objects.filter(
+        user=offering_user.user,
+        is_active=True,
+        content_type=project_ct,
+    ).values_list("object_id", flat=True)
+
+    resource_backend_ids = list(
+        marketplace_models.Resource.objects.filter(
+            offering=offering_user.offering,
+            project_id__in=user_project_ids,
+        )
+        .exclude(state=ResourceStates.TERMINATED)
+        .exclude(backend_id="")
+        .values_list("backend_id", flat=True)
+    )
+
     payload = {
         "username": offering_user.username,
         "offering_user_uuid": offering_user.uuid.hex,
         "user_uuid": offering_user.user.uuid.hex,
         "state": offering_user.state,
         "action": "username_set",
+        "resource_backend_ids": resource_backend_ids,
     }
     messages = marketplace_utils.prepare_messages(
         offering_user.offering,
@@ -117,9 +137,10 @@ def process_role_changed(permission: permission_models.UserRole, granted: bool):
     project = permission.scope
     offering_ids = set(
         project.resource_set.filter(
-            state=ResourceStates.OK,
             offering__type=SITE_AGENT_OFFERING,
-        ).values_list("offering", flat=True)
+        )
+        .exclude(state=ResourceStates.TERMINATED)
+        .values_list("offering", flat=True)
     )
 
     if not offering_ids:
@@ -184,7 +205,7 @@ def send_resource_update_message_to_queue(
     ):
         return
 
-    utils.push_resource_update_message(instance)
+    utils.push_resource_update_message(instance, force=True)
 
 
 def send_account_message(
@@ -205,7 +226,7 @@ def send_account_message(
             username = service_account.username
             observable_object_type = logging_enums.ObservableObjectType.SERVICE_ACCOUNT
         case course_account if isinstance(account, marketplace_models.CourseAccount):
-            username = course_account.user.username
+            username = course_account.user.username if course_account.user else ""
             observable_object_type = logging_enums.ObservableObjectType.COURSE_ACCOUNT
     payload = {
         "account_uuid": account.uuid.hex,
@@ -284,3 +305,58 @@ def send_course_account_deletion_info(
         return
 
     send_account_message(instance, created=False)
+
+
+def cleanup_agent_identity_queue(sender, instance, **kwargs):
+    """Delete the linked EventConsumer when an AgentIdentity is deleted.
+
+    Deleting the row (rather than only tearing down RabbitMQ) matters: the FK is
+    SET_NULL, so a surviving consumer keeps `queue_created=True` and an intact
+    offering binding, and the dispatcher goes on publishing every event for that
+    offering into a queue that no longer exists — until the hourly
+    `cleanup_dangling_agent_queues` sweep notices. Re-registering meanwhile
+    would stack a second consumer alongside the dangling one.
+
+    The RabbitMQ teardown itself is done by `cleanup_event_consumer_queue`, the
+    pre_delete handler on EventConsumer, so there is exactly one implementation
+    of it.
+    """
+    consumer = instance.event_consumer
+    if consumer is None:
+        return
+    # Clear the in-memory reference so the about-to-be-deleted AgentIdentity
+    # object doesn't hold a stale pointer to a deleted consumer. (consumer.delete()
+    # still issues its own SET_NULL UPDATE against the DB row, which is harmless
+    # here since the row is deleted moments later.)
+    instance.event_consumer = None
+    consumer.delete()
+
+
+def send_resource_messages_on_project_move(
+    sender, project, old_customer, new_customer, **kwargs
+):
+    """Push a RESOURCE message for every active site-agent resource in a moved project.
+
+    Waldur does not emit a RESOURCE event when a project changes its customer,
+    so STOMP-mode agents would never learn about the new account hierarchy.
+    force=True bypasses the idempotency guard because the resource's own fields
+    (downscaled, paused, …) haven't changed, but the hierarchy has.
+    """
+    if get_skip_side_effects():
+        return
+
+    resources = marketplace_models.Resource.objects.filter(
+        project=project,
+        offering__type=SITE_AGENT_OFFERING,
+        state=ResourceStates.OK,
+    )
+
+    for resource in resources:
+        utils.push_resource_update_message(resource, force=True)
+        logger.info(
+            "Pushed resource message for %s after project %s moved from %s to %s",
+            resource,
+            project,
+            old_customer,
+            new_customer,
+        )

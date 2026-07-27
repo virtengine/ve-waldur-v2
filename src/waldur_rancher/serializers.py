@@ -7,14 +7,16 @@ from django.db import transaction
 from django.db.models import QuerySet
 from django.utils.translation import gettext_lazy as _
 from drf_spectacular.utils import extend_schema_field
-from iptools.ipv4 import validate_cidr as is_valid_ipv4_cidr
-from iptools.ipv6 import validate_cidr as is_valid_ipv6_cidr
 from rest_framework import exceptions, serializers
 
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core import signals as core_signals
 from waldur_core.core.enums import CoreStates
-from waldur_core.core.validators import BackendURLValidator
+from waldur_core.core.validators import (
+    BackendURLValidator,
+    is_valid_ipv4_cidr,
+    is_valid_ipv6_cidr,
+)
 from waldur_core.structure import serializers as structure_serializers
 from waldur_core.structure.managers import filter_queryset_for_user
 from waldur_core.structure.models import Project, ServiceSettings, VirtualMachine
@@ -382,6 +384,11 @@ class RancherNestedPublicIPSerializer(serializers.HyperlinkedModelSerializer):
         )
 
 
+@extend_schema_field(serializers.DictField(child=serializers.IntegerField()))
+class RancherClusterRequestedField(serializers.JSONField):
+    pass
+
+
 class RancherClusterSerializer(
     structure_serializers.SshPublicKeySerializerMixin,
     structure_serializers.BaseResourceSerializer,
@@ -422,6 +429,9 @@ class RancherClusterSerializer(
     public_ips = RancherNestedPublicIPSerializer(many=True, read_only=True)
 
     router_ips = serializers.SerializerMethodField()
+
+    requested = RancherClusterRequestedField(read_only=True)
+    capacity = RancherClusterRequestedField(read_only=True)
 
     class Meta(structure_serializers.BaseResourceSerializer.Meta):
         model = models.Cluster
@@ -1002,6 +1012,18 @@ class RancherWorkloadSerializer(serializers.HyperlinkedModelSerializer):
         return super().create(validated_data)
 
 
+class RancherHPAMetricTargetSerializer(serializers.Serializer):
+    type = serializers.CharField()
+    utilization = serializers.IntegerField(required=False, allow_null=True)
+    averageValue = serializers.CharField(required=False, allow_null=True)
+
+
+class RancherHPAMetricSerializer(serializers.Serializer):
+    name = serializers.CharField()
+    type = serializers.CharField()
+    target = RancherHPAMetricTargetSerializer()
+
+
 class RancherHPASerializer(serializers.HyperlinkedModelSerializer):
     cluster_uuid = serializers.UUIDField(read_only=True, source="cluster.uuid")
     cluster_name = serializers.ReadOnlyField(source="cluster.name")
@@ -1011,6 +1033,7 @@ class RancherHPASerializer(serializers.HyperlinkedModelSerializer):
     namespace_name = serializers.ReadOnlyField(source="namespace.name")
     workload_uuid = serializers.UUIDField(read_only=True, source="workload.uuid")
     workload_name = serializers.ReadOnlyField(source="workload.name")
+    metrics = RancherHPAMetricSerializer(many=True)
 
     class Meta:
         model = models.HPA
@@ -1669,3 +1692,8 @@ class ClusterSecurityGroupSerializer(serializers.ModelSerializer):
         for rule in rules:
             rule.save()
         return group
+
+
+class SecretSerializer(serializers.Serializer):
+    name = serializers.CharField()
+    id = serializers.CharField()

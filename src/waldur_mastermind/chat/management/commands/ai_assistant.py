@@ -1,10 +1,19 @@
+import time
+from pathlib import Path
+
+from constance import config
 from django.core.management.base import BaseCommand, CommandError
 
+from waldur_mastermind.chat.block_schemas import blocks_to_text
+from waldur_mastermind.chat.context_assembler import build_context
 from waldur_mastermind.chat.health_checks import (
     LLMConfigurationHealthCheck,
     LLMConnectivityHealthCheck,
     LLMResponseHealthCheck,
 )
+from waldur_mastermind.chat.llm_streamer import LLMStreamer
+from waldur_mastermind.chat.validation.evaluators import get_evaluator
+from waldur_mastermind.chat.validation.scenarios import load_all_scenarios
 
 
 class Command(BaseCommand):
@@ -12,9 +21,9 @@ class Command(BaseCommand):
     AI Assistant management commands.
 
     Available subcommands:
-        health              - Check LLM infrastructure health
+        health              - Check AI Assistant infrastructure health
         validate_scenarios  - Validate scenario YAML files
-        test_evaluation     - Test evaluation with real LLM responses
+        test_evaluation     - Test evaluation with real AI Assistant responses
         run_all             - Run all checks (health, validate, test)
 
     Examples:
@@ -34,7 +43,7 @@ class Command(BaseCommand):
         # Health subcommand
         subparsers.add_parser(
             "health",
-            help="Check LLM infrastructure health",
+            help="Check AI Assistant infrastructure health",
         )
 
         # Validate scenarios subcommand
@@ -46,7 +55,7 @@ class Command(BaseCommand):
         # Test evaluation subcommand
         test_eval_parser = subparsers.add_parser(
             "test_evaluation",
-            help="Test evaluation with real LLM responses",
+            help="Test evaluation with real AI Assistant responses",
         )
         test_eval_parser.add_argument(
             "--scenario",
@@ -83,42 +92,36 @@ class Command(BaseCommand):
             raise CommandError(f"Unknown subcommand: {subcommand}")
 
     def handle_health(self, **_options):
-        """Run health checks on LLM infrastructure."""
-        from constance import config
-
+        """Run health checks on AI Assistant infrastructure."""
         self.stdout.write("=" * 60)
-        self.stdout.write(self.style.SUCCESS("LLM Configuration & Health"))
+        self.stdout.write(self.style.SUCCESS("AI Assistant Configuration & Health"))
         self.stdout.write("=" * 60)
         self.stdout.write("")
 
         # Display configuration
         self.stdout.write(self.style.SUCCESS("Configuration:"))
-        self.stdout.write(f"  LLM_CHAT_ENABLED: {config.LLM_CHAT_ENABLED}")
+        self.stdout.write(f"  AI_ASSISTANT_ENABLED: {config.AI_ASSISTANT_ENABLED}")
         self.stdout.write(
-            f"  LLM_INFERENCES_BACKEND_TYPE: {config.LLM_INFERENCES_BACKEND_TYPE}"
+            f"  AI_ASSISTANT_BACKEND_TYPE: {config.AI_ASSISTANT_BACKEND_TYPE}"
         )
-        self.stdout.write(f"  LLM_INFERENCES_MODEL: {config.LLM_INFERENCES_MODEL}")
+        self.stdout.write(f"  AI_ASSISTANT_MODEL: {config.AI_ASSISTANT_MODEL}")
 
         # Mask the token for security
-        if config.LLM_INFERENCES_API_URL:
-            self.stdout.write(
-                f"  LLM_INFERENCES_API_URL: {config.LLM_INFERENCES_API_URL}"
-            )
+        if config.AI_ASSISTANT_API_URL:
+            self.stdout.write(f"  AI_ASSISTANT_API_URL: {config.AI_ASSISTANT_API_URL}")
         else:
-            self.stdout.write(self.style.WARNING("  LLM_INFERENCES_API_URL: [not set]"))
+            self.stdout.write(self.style.WARNING("  AI_ASSISTANT_API_URL: [not set]"))
 
-        if config.LLM_INFERENCES_API_TOKEN:
+        if config.AI_ASSISTANT_API_TOKEN:
             # Show first 8 chars and mask the rest
             token_preview = (
-                config.LLM_INFERENCES_API_TOKEN[:8]
+                config.AI_ASSISTANT_API_TOKEN[:8]
                 + "..."
-                + config.LLM_INFERENCES_API_TOKEN[-4:]
+                + config.AI_ASSISTANT_API_TOKEN[-4:]
             )
-            self.stdout.write(f"  LLM_INFERENCES_API_TOKEN: {token_preview}")
+            self.stdout.write(f"  AI_ASSISTANT_API_TOKEN: {token_preview}")
         else:
-            self.stdout.write(
-                self.style.WARNING("  LLM_INFERENCES_API_TOKEN: [not set]")
-            )
+            self.stdout.write(self.style.WARNING("  AI_ASSISTANT_API_TOKEN: [not set]"))
 
         self.stdout.write("")
 
@@ -162,10 +165,6 @@ class Command(BaseCommand):
 
     def handle_validate_scenarios(self, **_options):
         """Validate scenario YAML files."""
-        from pathlib import Path
-
-        from waldur_mastermind.chat.validation.scenarios import load_all_scenarios
-
         self.stdout.write("=" * 60)
         self.stdout.write(self.style.SUCCESS("Validation Scenarios Check"))
         self.stdout.write("=" * 60)
@@ -234,15 +233,6 @@ class Command(BaseCommand):
 
     def handle_test_evaluation(self, **options):
         """Test evaluation with real LLM responses."""
-        import time
-        from pathlib import Path
-
-        from constance import config
-
-        from waldur_mastermind.chat.validation.evaluators import get_evaluator
-        from waldur_mastermind.chat.validation.scenarios import load_all_scenarios
-        from waldur_mastermind.chat.views import LLMStreamer
-
         self.stdout.write("=" * 60)
         self.stdout.write(self.style.SUCCESS("LLM Validation Testing"))
         self.stdout.write("=" * 60)
@@ -297,12 +287,17 @@ class Command(BaseCommand):
                     try:
                         start_time = time.time()
 
+                        messages = build_context(
+                            user=None, user_input=input_text, thread=None
+                        )
+
                         # Use LLMStreamer to get response
                         streamer = LLMStreamer(
-                            input_text,
-                            config.LLM_INFERENCES_API_URL,
-                            config.LLM_INFERENCES_API_TOKEN,
+                            messages,
+                            config.AI_ASSISTANT_API_URL,
+                            config.AI_ASSISTANT_API_TOKEN,
                             user=None,  # No tool execution for validation
+                            preload_all_tools=True,  # Validation tests all tools
                         )
 
                         # Iterate through stream to complete the request
@@ -310,7 +305,9 @@ class Command(BaseCommand):
                             pass
 
                         # Get the accumulated response
-                        llm_response = streamer.accumulated_content.strip()
+                        llm_response = blocks_to_text(
+                            streamer.accumulated_blocks
+                        ).strip()
 
                         duration_ms = int((time.time() - start_time) * 1000)
                         total_duration_ms += duration_ms
@@ -328,13 +325,21 @@ class Command(BaseCommand):
                     test_passed = True
                     failure_messages = []
 
+                    # Build tool_calls list from streamer for tool_usage evaluators
+                    api_tool_calls = [
+                        {"name": entry["name"]}
+                        for entry in streamer.tool_calls.values()
+                        if entry.get("name")
+                    ]
+
                     for evaluation in scenario.evaluations:
                         evaluator = get_evaluator(evaluation.type)
 
-                        # For language evaluator, add input_text to config
                         eval_config = dict(evaluation.config)
                         if evaluation.type == "language":
                             eval_config["input_text"] = input_text
+                        elif evaluation.type == "tool_usage":
+                            eval_config["tool_calls"] = api_tool_calls
 
                         result = evaluator.evaluate(llm_response, eval_config)
 

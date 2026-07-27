@@ -58,6 +58,13 @@ class CoreConfig(AppConfig):
             dispatch_uid="waldur_core.core.handlers.log_ssh_key_save",
         )
 
+        for model in (User, SshPublicKey):
+            signals.post_save.connect(
+                handlers.create_initial_revision,
+                sender=model,
+                dispatch_uid=f"waldur_core.core.create_initial_revision_{model.__name__}",
+            )
+
         signals.post_delete.connect(
             handlers.log_ssh_key_delete,
             sender=SshPublicKey,
@@ -68,6 +75,12 @@ class CoreConfig(AppConfig):
             handlers.log_token_create,
             sender=Token,
             dispatch_uid="waldur_core.core.handlers.log_token_create",
+        )
+
+        signals.pre_save.connect(
+            handlers.revoke_user_pats_on_deactivation,
+            sender=User,
+            dispatch_uid="waldur_core.core.handlers.revoke_user_pats_on_deactivation",
         )
 
         constance_signals.config_updated.connect(handlers.constance_updated)

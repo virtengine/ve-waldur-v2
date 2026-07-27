@@ -23,8 +23,6 @@ from django.template.defaultfilters import slugify
 from django.utils.translation import gettext
 from django.utils.translation import gettext_lazy as _
 from drf_spectacular.utils import extend_schema_field
-from iptools.ipv4 import validate_cidr as is_valid_ipv4_cidr
-from iptools.ipv6 import validate_cidr as is_valid_ipv6_cidr
 from netaddr import AddrFormatError, IPNetwork, all_matching_cidrs
 from rest_framework import serializers
 from rest_framework.reverse import reverse
@@ -36,18 +34,22 @@ from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates
 from waldur_core.core.validators import (
     BackendURLValidator,
+    is_valid_ipv4_cidr,
+    is_valid_ipv6_cidr,
     validate_x509_certificate,
 )
 from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
 from waldur_core.quotas.models import SharedQuotaMixin
 from waldur_core.quotas.serializers import QuotaSerializer
 from waldur_core.structure import models as structure_models
-from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure import serializers as structure_serializers
 from waldur_openstack.utils import (
+    get_tenant_external_networks,
     get_valid_availability_zones,
     is_flavor_valid_for_tenant,
     is_image_valid_for_tenant,
+    is_openstack_service_provider,
+    is_valid_volume_type_name,
     is_volume_type_valid_for_tenant,
     volume_type_name_to_quota_name,
 )
@@ -86,6 +88,17 @@ class OpenStackServiceSerializer(structure_serializers.ServiceOptionsSerializer)
         help_text=_("Domain name. If not defined default domain will be used."),
         required=False,
         allow_null=True,
+    )
+
+    auth_type = serializers.ChoiceField(
+        source="options.auth_type",
+        choices=[
+            ("password", "Password"),
+            ("v3applicationcredential", "Application Credential"),
+        ],
+        default="password",
+        required=False,
+        help_text=_("Authentication method: password or v3applicationcredential"),
     )
 
     availability_zone = serializers.CharField(
@@ -194,7 +207,9 @@ class OpenStackServiceSerializer(structure_serializers.ServiceOptionsSerializer)
     console_domain_override = serializers.CharField(
         source="options.console_domain_override",
         label=_("Console domain override"),
-        help_text=_("Override of the console URL domain"),
+        help_text=_(
+            "Override of the console URL domain. Supports hostname (e.g. lb.example.com) or hostname:port (e.g. lb.example.com:443)."
+        ),
         required=False,
     )
 
@@ -268,6 +283,8 @@ class OpenStackFlavorSerializer(
 
 
 class OpenStackImageSerializer(structure_serializers.BasePropertySerializer):
+    is_rescue_image = serializers.ReadOnlyField()
+
     class Meta:
         model = models.Image
         fields = (
@@ -279,6 +296,9 @@ class OpenStackImageSerializer(structure_serializers.BasePropertySerializer):
             "settings",
             "backend_id",
             "backend_created_at",
+            "hw_rescue_device",
+            "hw_rescue_bus",
+            "is_rescue_image",
         )
         extra_kwargs = {
             "url": {"lookup_field": "uuid"},
@@ -299,6 +319,217 @@ class OpenStackVolumeTypeSerializer(structure_serializers.BasePropertySerializer
         }
 
 
+class ExternalSubnetSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.ExternalSubnet
+        fields = (
+            "uuid",
+            "name",
+            "backend_id",
+            "cidr",
+            "gateway_ip",
+            "ip_version",
+            "enable_dhcp",
+            "allocation_pools",
+            "dns_nameservers",
+            "public_ip_range",
+            "description",
+        )
+
+
+class ExternalNetworkSerializer(
+    core_serializers.RestrictedSerializerMixin,
+    structure_serializers.BasePropertySerializer,
+):
+    subnets = ExternalSubnetSerializer(many=True, read_only=True)
+
+    class Meta(structure_serializers.BasePropertySerializer.Meta):
+        model = models.ExternalNetwork
+        fields = (
+            "url",
+            "uuid",
+            "name",
+            "settings",
+            "backend_id",
+            "is_shared",
+            "is_default",
+            "status",
+            "description",
+            "subnets",
+        )
+        extra_kwargs = {
+            "url": {"lookup_field": "uuid"},
+            "settings": {"lookup_field": "uuid"},
+        }
+
+
+class HypervisorSummarySerializer(serializers.Serializer):
+    total_vcpus = serializers.IntegerField()
+    used_vcpus = serializers.IntegerField()
+    total_memory_mb = serializers.IntegerField()
+    used_memory_mb = serializers.IntegerField()
+    total_local_gb = serializers.IntegerField()
+    used_local_gb = serializers.IntegerField()
+    total_running_vms = serializers.IntegerField()
+
+
+class AllocationCandidatesQuerySerializer(serializers.Serializer):
+    """Query params for the Placement allocation-candidates endpoint."""
+
+    settings_uuid = serializers.UUIDField(
+        help_text="UUID of the OpenStack ServiceSettings to query."
+    )
+    resources = serializers.CharField(
+        help_text=(
+            "Comma-separated resource:amount pairs, e.g. "
+            "'VCPU:4,MEMORY_MB:8192,DISK_GB:10'."
+        ),
+    )
+    required = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text=(
+            "Optional comma-separated list of required traits, e.g. "
+            "'HW_CPU_X86_AVX2,STORAGE_DISK_SSD'."
+        ),
+    )
+    limit = serializers.IntegerField(
+        required=False, min_value=1, max_value=100, default=10
+    )
+
+    @staticmethod
+    def parse_resources(spec: str) -> dict:
+        """Parse 'VCPU:4,MEMORY_MB:8192' → {'VCPU': 4, 'MEMORY_MB': 8192}."""
+        result = {}
+        for pair in (s.strip() for s in spec.split(",") if s.strip()):
+            if ":" not in pair:
+                raise serializers.ValidationError(
+                    f"resources entry '{pair}' must be of form CLASS:N"
+                )
+            cls, raw = pair.split(":", 1)
+            try:
+                result[cls.strip().upper()] = int(raw)
+            except ValueError as e:
+                raise serializers.ValidationError(
+                    f"resources entry '{pair}' has non-integer amount"
+                ) from e
+        if not result:
+            raise serializers.ValidationError(
+                "resources must contain at least one CLASS:N pair"
+            )
+        return result
+
+
+class ResourceClassSummarySerializer(serializers.Serializer):
+    used = serializers.IntegerField()
+    capacity = serializers.IntegerField()
+
+
+class ProviderSummarySerializer(serializers.Serializer):
+    resources = serializers.DictField(child=ResourceClassSummarySerializer())
+    traits = serializers.ListField(child=serializers.CharField())
+
+
+class AllocationCandidatesResponseSerializer(serializers.Serializer):
+    """Response shape for the allocation-candidates endpoint."""
+
+    candidate_count = serializers.IntegerField(
+        help_text="Total number of allocation candidates Placement returned."
+    )
+    provider_summaries = serializers.DictField(
+        child=ProviderSummarySerializer(),
+        help_text=(
+            "Placement's per-provider summary: maps resource_provider_uuid → "
+            "{resources: {CLASS: {used, capacity}, ...}, traits: [...]}."
+        ),
+    )
+
+
+class InstancePlacementAllocationSerializer(serializers.Serializer):
+    """One Placement allocation record for an instance, scoped to a single
+    resource provider. Returned as a list (one entry per RP the instance
+    consumes from). Audience is restricted at the view layer
+    (``can_diagnose_openstack_instance``) — staff, support and service-
+    provider owners only — so all fields including the resource provider
+    UUID and name are unconditionally exposed here.
+    """
+
+    resource_provider_uuid = serializers.CharField()
+    resource_provider_name = serializers.CharField()
+    resources = serializers.DictField(child=serializers.IntegerField())
+
+
+class HypervisorSerializer(structure_serializers.BasePropertySerializer):
+    traits = serializers.SlugRelatedField(slug_field="name", many=True, read_only=True)
+
+    class Meta(structure_serializers.BasePropertySerializer.Meta):
+        model = models.Hypervisor
+        fields = (
+            "url",
+            "uuid",
+            "name",
+            "settings",
+            "backend_id",
+            "hypervisor_type",
+            "vcpus",
+            "vcpus_used",
+            "memory_mb",
+            "memory_mb_used",
+            "local_gb",
+            "local_gb_used",
+            "running_vms",
+            "state",
+            "status",
+            "traits",
+        )
+        extra_kwargs = {
+            "url": {"lookup_field": "uuid"},
+            "settings": {"lookup_field": "uuid"},
+        }
+
+
+class HypervisorInventorySerializer(serializers.HyperlinkedModelSerializer):
+    hypervisor = serializers.HyperlinkedRelatedField(
+        view_name="openstack-hypervisor-detail",
+        lookup_field="uuid",
+        read_only=True,
+    )
+    hypervisor_uuid = serializers.ReadOnlyField(source="hypervisor.uuid")
+    hypervisor_name = serializers.ReadOnlyField(source="hypervisor.name")
+    settings = serializers.HyperlinkedRelatedField(
+        source="hypervisor.settings",
+        view_name="servicesettings-detail",
+        lookup_field="uuid",
+        read_only=True,
+    )
+    settings_uuid = serializers.ReadOnlyField(source="hypervisor.settings.uuid")
+    effective_total = serializers.ReadOnlyField()
+
+    class Meta:
+        model = models.HypervisorInventory
+        fields = (
+            "url",
+            "uuid",
+            "hypervisor",
+            "hypervisor_uuid",
+            "hypervisor_name",
+            "settings",
+            "settings_uuid",
+            "resource_class",
+            "total",
+            "reserved",
+            "allocation_ratio",
+            "used",
+            "effective_total",
+        )
+        extra_kwargs = {
+            "url": {
+                "lookup_field": "uuid",
+                "view_name": "openstack-hypervisor-inventory-detail",
+            },
+        }
+
+
 class OpenStackTenantQuotaSerializer(serializers.Serializer):
     instances = serializers.IntegerField(min_value=1, required=False)
     volumes = serializers.IntegerField(min_value=1, required=False)
@@ -308,6 +539,41 @@ class OpenStackTenantQuotaSerializer(serializers.Serializer):
     storage = serializers.IntegerField(min_value=1, required=False)
     security_group_count = serializers.IntegerField(min_value=1, required=False)
     security_group_rule_count = serializers.IntegerField(min_value=1, required=False)
+    # Neutron quotas: 0 means "deny all", -1 means "unlimited"
+    floating_ip_count = serializers.IntegerField(min_value=-1, required=False)
+    network_count = serializers.IntegerField(min_value=-1, required=False)
+    subnet_count = serializers.IntegerField(min_value=-1, required=False)
+    port_count = serializers.IntegerField(min_value=-1, required=False)
+
+    def to_internal_value(self, data):
+        # Accept declared fields via default path.
+        result = super().to_internal_value(data)
+
+        # Accept dynamic per-volume-type storage quota keys of the form
+        # gigabytes_<volume_type_name> (e.g. gigabytes_ssd, gigabytes___DEFAULT__).
+        # Cinder stores and returns these in GB (not MiB), so values are passed
+        # through unchanged; no unit conversion is applied here or in push_tenant_quotas.
+        errors = {}
+        for key, value in data.items():
+            if not is_valid_volume_type_name(key):
+                continue
+            if key in result:
+                # Already handled by a declared field — should not happen, but guard anyway.
+                continue
+            try:
+                coerced = int(value)
+            except (TypeError, ValueError):
+                errors[key] = [_("A valid integer is required.")]
+                continue
+            if coerced < -1:
+                errors[key] = [_("Ensure this value is greater than or equal to -1.")]
+                continue
+            result[key] = coerced
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        return result
 
 
 class OpenStackFixedIpSerializer(serializers.Serializer):
@@ -415,10 +681,38 @@ class OpenStackFloatingIPSerializer(structure_serializers.BaseResourceActionSeri
         attrs["project"] = tenant.project
 
         router = attrs.get("router")
-        if router and router.tenant != tenant:
-            raise serializers.ValidationError(
-                {"router": _("Router must belong to the same tenant.")}
-            )
+        if router:
+            if router.tenant != tenant:
+                raise serializers.ValidationError(
+                    {"router": _("Router must belong to the same tenant.")}
+                )
+            # When supplied, the router determines which network the FIP is
+            # allocated from (via detect_external_network). Apply the same
+            # is_shared / RBAC predicate as set_external_gateway so a consumer
+            # cannot indirectly target a provider-internal pool by picking a
+            # router whose gateway was set before WAL-9987 closed that hole.
+            ext_id = router.external_network_id
+            if ext_id:
+                user = self.context["request"].user
+                visible_global = (
+                    get_tenant_external_networks(tenant, user)
+                    .filter(backend_id=ext_id)
+                    .exists()
+                )
+                visible_rbac = models.Network.objects.filter(
+                    backend_id=ext_id,
+                    rbac_policies__target_tenant=tenant,
+                    rbac_policies__policy_type=models.NetworkRBACPolicy.NetworkShareType.EXTERNAL,
+                ).exists()
+                if not (visible_global or visible_rbac):
+                    raise serializers.ValidationError(
+                        {
+                            "router": _(
+                                "Router's external network is not available to you "
+                                "for floating IP allocation."
+                            )
+                        }
+                    )
 
         return super().validate(attrs)
 
@@ -544,14 +838,16 @@ def validate_security_group_rule(rule: dict):
                 }
             )
 
-    elif protocol == "":
+    elif protocol == "" or _is_numeric_ip_protocol(protocol):
         # See also: https://github.com/openstack/neutron/blob/af130e79cbe5d12b7c9f9f4dcbcdc8d972bfcfd4/neutron/db/securitygroups_db.py#L500
+        # Neutron rejects port_range_min/max for protocols other than tcp/udp/icmp.
 
         if from_port != -1:
             raise serializers.ValidationError(
                 {
                     "from_port": _(
-                        "Port range is not supported if protocol is not specified."
+                        "Port range is not supported if protocol is not specified "
+                        "or is not tcp/udp/icmp."
                     )
                 }
             )
@@ -560,7 +856,8 @@ def validate_security_group_rule(rule: dict):
             raise serializers.ValidationError(
                 {
                     "to_port": _(
-                        "Port range is not supported if protocol is not specified."
+                        "Port range is not supported if protocol is not specified "
+                        "or is not tcp/udp/icmp."
                     )
                 }
             )
@@ -568,10 +865,17 @@ def validate_security_group_rule(rule: dict):
     else:
         raise serializers.ValidationError(
             {
-                "protocol": _("Value should be one of (tcp, udp, icmp), found %s")
+                "protocol": _(
+                    "Value should be one of (tcp, udp, icmp) or an IANA protocol "
+                    "number 0-255, found %s"
+                )
                 % protocol
             }
         )
+
+
+def _is_numeric_ip_protocol(value) -> bool:
+    return isinstance(value, str) and value.isdigit() and 0 <= int(value) <= 255
 
 
 class OpenStackSecurityGroupRuleSerializer(
@@ -624,7 +928,7 @@ class OpenStackSecurityGroupRuleUpdateSerializer(OpenStackSecurityGroupRuleSeria
             )
         rule_id = data.pop("id")
         try:
-            rule = security_group.rules.get(id=rule_id)
+            rule = security_group.rules.select_related("remote_group").get(id=rule_id)
         except models.SecurityGroupRule.DoesNotExist:
             raise serializers.ValidationError(
                 {"id": _("Security group does not have rule with id %s.") % rule_id}
@@ -919,6 +1223,14 @@ class OpenStackServerGroupSerializer(
                 "view_name": "openstack-tenant-detail",
                 "read_only": True,
             },
+            "policy": {
+                "help_text": _(
+                    "affinity — all instances are placed on the same hypervisor. "
+                    "anti-affinity — all instances are placed on different hypervisors. "
+                    "soft-affinity — instances are placed on the same hypervisor if possible, but not enforced. "
+                    "soft-anti-affinity — instances are placed on different hypervisors if possible, but not enforced."
+                ),
+            },
         }
 
     display_name = serializers.SerializerMethodField()
@@ -929,9 +1241,13 @@ class OpenStackServerGroupSerializer(
 
     @extend_schema_field(OpenStackNestedInstanceSerializer(many=True))
     def get_instances(self, server_group):
-        filtered_instances = models.Instance.objects.filter(
-            server_group__backend_id=server_group.backend_id
-        ).values("backend_id", "name", "uuid")
+        filtered_instances = (
+            models.Instance.objects.filter(
+                server_group__backend_id=server_group.backend_id
+            )
+            .values("backend_id", "name", "uuid")
+            .order_by("name")
+        )
         return filtered_instances
 
     def validate(self, attrs):
@@ -983,16 +1299,6 @@ def validate_private_subnet_cidr(value):
     return validate_private_cidr(value, 24)
 
 
-def can_create_tenant(
-    user: core_models.User,
-    project: structure_models.Project,
-):
-    if not structure_permissions._has_admin_access(user, project):
-        raise serializers.ValidationError(
-            _("You do not have permissions to create tenant.")
-        )
-
-
 class OpenStackTenantSecurityGroupSerializer(serializers.Serializer):
     name = serializers.CharField()
     description = serializers.CharField(required=False, allow_blank=True)
@@ -1026,12 +1332,23 @@ class OpenStackTenantSerializer(structure_serializers.BaseResourceSerializer):
         default=False,
     )
 
+    external_network_ref_uuid = serializers.ReadOnlyField(
+        source="external_network_ref.uuid",
+        default=None,
+    )
+    external_network_ref_name = serializers.ReadOnlyField(
+        source="external_network_ref.name",
+        default="",
+    )
+
     class Meta(structure_serializers.BaseResourceSerializer.Meta):
         model = models.Tenant
         fields = structure_serializers.BaseResourceSerializer.Meta.fields + (
             "availability_zone",
             "internal_network_id",
             "external_network_id",
+            "external_network_ref_uuid",
+            "external_network_ref_name",
             "user_username",
             "user_password",
             "quotas",
@@ -1046,6 +1363,8 @@ class OpenStackTenantSerializer(structure_serializers.BaseResourceSerializer):
             + (
                 "internal_network_id",
                 "external_network_id",
+                "external_network_ref_uuid",
+                "external_network_ref_name",
             )
         )
         protected_fields = (
@@ -1171,11 +1490,6 @@ class OpenStackTenantSerializer(structure_serializers.BaseResourceSerializer):
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
-
-        if not self.instance:
-            user = self.context["request"].user
-            project = attrs["project"]
-            can_create_tenant(user, project)
 
         self.validate_security_groups_configuration(attrs)
 
@@ -1315,6 +1629,10 @@ class OpenStackSubNetAllocationPoolField(serializers.JSONField):
 
 class OpenStackNestedSubNetSerializer(serializers.ModelSerializer):
     allocation_pools = OpenStackSubNetAllocationPoolField(read_only=True)
+    # Projected from the parent Network; Neutron owns this flag at the network level.
+    port_security_enabled = serializers.BooleanField(
+        source="network.port_security_enabled", read_only=True
+    )
 
     class Meta:
         model = models.SubNet
@@ -1327,6 +1645,7 @@ class OpenStackNestedSubNetSerializer(serializers.ModelSerializer):
             "allocation_pools",
             "ip_version",
             "enable_dhcp",
+            "port_security_enabled",
         )
 
 
@@ -1355,16 +1674,359 @@ class OpenStackRouterSetRoutesSerializer(serializers.Serializer):
         return attrs
 
 
+class SetExternalGatewayFixedIPSerializer(serializers.Serializer):
+    ip_address = serializers.CharField(
+        help_text=_("IP address specification for the gateway port.")
+    )
+    subnet_id = serializers.CharField(
+        required=False, help_text=_("Backend ID of the subnet.")
+    )
+
+
+class SetExternalGatewaySerializer(serializers.Serializer):
+    external_network_id = serializers.CharField(
+        help_text=_("Backend ID (OpenStack UUID) of the external network."),
+    )
+    enable_snat = serializers.BooleanField(
+        required=False,
+        default=None,
+        allow_null=True,
+        help_text=_(
+            "Whether to enable SNAT on the gateway. "
+            "None means use OpenStack default (True). "
+            "Requires advanced permissions."
+        ),
+    )
+    external_fixed_ips = SetExternalGatewayFixedIPSerializer(
+        many=True,
+        required=False,
+        default=list,
+        help_text=_(
+            "List of fixed IP specifications for the gateway port. "
+            "Each entry should have 'ip_address' and optionally 'subnet_id'. "
+            "Requires advanced permissions."
+        ),
+    )
+
+    def _resolve_network_source(self, external_network_id, router, user):
+        """Resolve the external network and determine its source type.
+
+        The global path is gated by ``get_tenant_external_networks`` so that
+        non-provider users cannot attach a router to a provider-internal
+        (non-shared) external network they don't have RBAC access to.
+        """
+        ext_net = (
+            get_tenant_external_networks(router.tenant, user)
+            .filter(backend_id=external_network_id)
+            .first()
+        )
+        if ext_net:
+            return "global", ext_net
+
+        rbac_network = models.Network.objects.filter(
+            backend_id=external_network_id,
+            rbac_policies__target_tenant=router.tenant,
+            rbac_policies__policy_type=models.NetworkRBACPolicy.NetworkShareType.EXTERNAL,
+        ).first()
+        if rbac_network:
+            return "rbac", rbac_network
+
+        return None, None
+
+    def _can_set_advanced_gateway_options(
+        self, user, router, network_source, network_obj
+    ):
+        """Check if user can set enable_snat=False or external_fixed_ips."""
+        if network_source == "global":
+            return is_openstack_service_provider(user, router.tenant.service_settings)
+
+        if network_source == "rbac":
+            if user.is_staff:
+                return True
+            source_project = network_obj.tenant.project
+            return source_project.has_user(
+                user, ProjectRole.ADMIN
+            ) or source_project.has_user(user, ProjectRole.MANAGER)
+
+        return False
+
+    def validate(self, attrs):
+        view = self.context.get("view")
+        if not view:
+            return attrs
+
+        router = view.get_object()
+        request = self.context["request"]
+        user = request.user
+        external_network_id = attrs["external_network_id"]
+
+        network_source, network_obj = self._resolve_network_source(
+            external_network_id, router, user
+        )
+        if network_source is None:
+            raise serializers.ValidationError(
+                {
+                    "external_network_id": _(
+                        "Network with backend ID '%s' is not available as an external "
+                        "network for this router's tenant."
+                    )
+                    % external_network_id,
+                }
+            )
+
+        # Check advanced options (SNAT control, fixed IPs)
+        enable_snat = attrs.get("enable_snat")
+        external_fixed_ips = attrs.get("external_fixed_ips", [])
+        needs_advanced = enable_snat is not None or bool(external_fixed_ips)
+
+        if needs_advanced:
+            if not self._can_set_advanced_gateway_options(
+                user, router, network_source, network_obj
+            ):
+                raise serializers.ValidationError(
+                    _(
+                        "You do not have permission to set advanced gateway options "
+                        "(SNAT control or fixed IPs) for this network."
+                    )
+                )
+
+        # Validate external_fixed_ips entries against the chosen network's subnets.
+        # A subnet_id pinned to a different external network would let a caller
+        # bind the gateway to a subnet they should never reach (e.g. provider
+        # admin pool), so the per-entry subnet_id must belong to network_obj.
+        subnets_by_backend_id = {
+            s.backend_id: s.cidr for s in network_obj.subnets.all()
+        }
+        for entry in external_fixed_ips:
+            if "ip_address" not in entry:
+                raise serializers.ValidationError(
+                    {
+                        "external_fixed_ips": _(
+                            "Each entry must contain an 'ip_address' field."
+                        )
+                    }
+                )
+            subnet_id = entry.get("subnet_id")
+            if subnet_id is not None:
+                if subnet_id not in subnets_by_backend_id:
+                    raise serializers.ValidationError(
+                        {
+                            "external_fixed_ips": _(
+                                "subnet_id '%s' does not belong to the chosen "
+                                "external network."
+                            )
+                            % subnet_id
+                        }
+                    )
+                cidr = subnets_by_backend_id[subnet_id]
+                if cidr:
+                    try:
+                        addr_in_net = ip_address(entry["ip_address"]) in ip_network(
+                            cidr, strict=False
+                        )
+                    except ValueError:
+                        raise serializers.ValidationError(
+                            {
+                                "external_fixed_ips": _("Invalid ip_address '%s'.")
+                                % entry["ip_address"]
+                            }
+                        )
+                    if not addr_in_net:
+                        raise serializers.ValidationError(
+                            {
+                                "external_fixed_ips": _(
+                                    "ip_address '%(ip)s' is not inside subnet "
+                                    "'%(subnet)s' (%(cidr)s)."
+                                )
+                                % {
+                                    "ip": entry["ip_address"],
+                                    "subnet": subnet_id,
+                                    "cidr": cidr,
+                                }
+                            }
+                        )
+
+        # Store resolved data for the view
+        attrs["network_source"] = network_source
+        attrs["network_obj"] = network_obj
+        if network_source == "global":
+            attrs["external_network_ref"] = network_obj
+        else:
+            attrs["external_network_ref"] = None
+
+        return attrs
+
+
+class AvailableExternalNetworkSubnetSerializer(serializers.Serializer):
+    backend_id = serializers.CharField()
+    name = serializers.CharField()
+    cidr = serializers.CharField()
+
+
+class AvailableExternalNetworkSerializer(serializers.Serializer):
+    backend_id = serializers.CharField()
+    name = serializers.CharField()
+    description = serializers.CharField()
+    source = serializers.ChoiceField(choices=["global", "rbac"])
+    subnets = AvailableExternalNetworkSubnetSerializer(many=True)
+
+
+class TopologyNodeSerializer(serializers.Serializer):
+    id = serializers.CharField()
+    type = serializers.ChoiceField(
+        choices=[
+            "tenant",
+            "router",
+            "network",
+            "subnet",
+            "port",
+            "instance",
+            "floating_ip",
+            "external_network",
+            "rbac_share",
+        ]
+    )
+    name = serializers.CharField(allow_blank=True)
+    uuid = serializers.CharField(allow_null=True, required=False)
+    attrs = serializers.DictField(child=serializers.JSONField())
+
+
+class TopologyEdgeSerializer(serializers.Serializer):
+    source = serializers.CharField()
+    target = serializers.CharField()
+    kind = serializers.ChoiceField(
+        choices=[
+            "contains",
+            "has_subnet",
+            "has_port",
+            "has_interface",
+            "attached_to",
+            "gateway",
+            "floating_for",
+            "shared_with",
+        ]
+    )
+
+
+class TenantTopologySerializer(serializers.Serializer):
+    nodes = TopologyNodeSerializer(many=True)
+    edges = TopologyEdgeSerializer(many=True)
+
+
+class EffectiveRouteSerializer(serializers.Serializer):
+    destination = serializers.CharField()
+    nexthop = serializers.IPAddressField(allow_null=True)
+    source = serializers.ChoiceField(choices=["default", "connected", "static"])
+    subnet_uuid = serializers.CharField(allow_null=True, required=False)
+    subnet_name = serializers.CharField(allow_blank=True, required=False)
+    subnet_cidr = serializers.CharField(allow_blank=True, required=False)
+    port_uuid = serializers.CharField(allow_null=True, required=False)
+    port_backend_id = serializers.CharField(allow_blank=True, required=False)
+    ip_on_router = serializers.IPAddressField(allow_null=True, required=False)
+    gateway_ip_on_router = serializers.IPAddressField(allow_null=True, required=False)
+    external_network_uuid = serializers.CharField(allow_null=True, required=False)
+    external_network_name = serializers.CharField(allow_blank=True, required=False)
+
+
+class EffectiveRoutesResponseSerializer(serializers.Serializer):
+    snat = serializers.BooleanField(allow_null=True)
+    has_external_gateway = serializers.BooleanField()
+    routes = EffectiveRouteSerializer(many=True)
+
+
+class DiagnoseCheckSerializer(serializers.Serializer):
+    check = serializers.CharField()
+    status = serializers.ChoiceField(choices=("ok", "warn", "fail", "skip"))
+    detail = serializers.CharField()
+    fix_hint = serializers.CharField(allow_blank=True)
+
+
+class DiagnoseConnectivityRequestSerializer(serializers.Serializer):
+    target = serializers.CharField(
+        default="external",
+        required=False,
+        help_text=_(
+            "Connectivity target. 'external' (default) checks outbound "
+            "internet; 'internal:<ip>' checks east-west to another IP; "
+            "'fip:<address>' verifies a specific floating-IP mapping."
+        ),
+    )
+
+
+class DiagnoseConnectivityResponseSerializer(serializers.Serializer):
+    target = serializers.CharField()
+    target_address = serializers.CharField(allow_null=True)
+    checks = DiagnoseCheckSerializer(many=True)
+    root_cause = serializers.CharField(allow_null=True)
+
+
 class OpenStackAllowedAddressPairSerializer(serializers.Serializer):
     ip_address = serializers.CharField(
         default="192.168.42.0/24",
         initial="192.168.42.0/24",
-        write_only=True,
     )
     mac_address = serializers.CharField(required=False)
 
     def validate_ip_address(self, value):
         return validate_private_cidr(value)
+
+
+# Neutron MAC format: six 2-character hex groups separated by colons.
+_MAC_ADDRESS_RE = re.compile(r"^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$")
+# Neutron's typical per-port cap on allowed_address_pairs entries.
+_AAP_MAX_ENTRIES = 64
+
+
+class AllowedAddressPairEntrySerializer(serializers.Serializer):
+    """One {ip_address, mac_address?} entry. Used by the set action.
+
+    Reuses ``validate_private_cidr`` to enforce that the spoofable range
+    is bounded to RFC1918 — accepting ``0.0.0.0/0``, the port's subnet
+    gateway, link-local, multicast, or public IPs would let a port
+    impersonate the upstream router, metadata service, or other
+    tenants' fixed IPs (the textbook AAP-escalation attack the
+    instance-level path explicitly guards against).
+    """
+
+    ip_address = serializers.CharField()
+    mac_address = serializers.CharField(required=False, allow_blank=True)
+
+    def validate_ip_address(self, value):
+        return validate_private_cidr(value)
+
+    def validate_mac_address(self, value):
+        if not value:
+            return value
+        if not _MAC_ADDRESS_RE.match(value):
+            raise serializers.ValidationError(
+                _("MAC address must match aa:bb:cc:dd:ee:ff.")
+            )
+        return value.lower()
+
+
+class SetAllowedAddressPairsSerializer(serializers.Serializer):
+    """Body shape for ``POST .../ports/{uuid}/set_allowed_address_pairs/``."""
+
+    allowed_address_pairs = AllowedAddressPairEntrySerializer(
+        many=True, allow_empty=True
+    )
+
+    def validate_allowed_address_pairs(self, value):
+        if len(value) > _AAP_MAX_ENTRIES:
+            raise serializers.ValidationError(
+                _("At most {limit} address pairs are supported per port.").format(
+                    limit=_AAP_MAX_ENTRIES
+                )
+            )
+        seen = set()
+        for entry in value:
+            key = (entry.get("ip_address"), entry.get("mac_address") or "")
+            if key in seen:
+                raise serializers.ValidationError(
+                    _("Duplicate address pair entries are not allowed.")
+                )
+            seen.add(key)
+        return value
 
 
 @extend_schema_field(OpenStackAllowedAddressPairSerializer(many=True))
@@ -1553,6 +2215,9 @@ class OpenStackPortSerializer(structure_serializers.BaseResourceActionSerializer
 class NetworkRBACPolicySerializer(
     core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer
 ):
+    DIRECTION_OUTBOUND = "outbound"
+    DIRECTION_INBOUND = "inbound"
+
     network = serializers.HyperlinkedRelatedField(
         view_name="openstack-network-detail",
         lookup_field="uuid",
@@ -1568,9 +2233,17 @@ class NetworkRBACPolicySerializer(
         view_name="openstack-network-rbac-policy-detail", lookup_field="uuid"
     )
     network_name = serializers.CharField(source="network.name", read_only=True)
+    source_tenant_uuid = serializers.UUIDField(
+        source="network.tenant.uuid", read_only=True
+    )
+    source_tenant_name = serializers.CharField(
+        source="network.tenant.name", read_only=True
+    )
     target_tenant_name = serializers.CharField(
         source="target_tenant.name", read_only=True
     )
+    target_label = serializers.SerializerMethodField()
+    direction = serializers.SerializerMethodField()
 
     class Meta:
         model = models.NetworkRBACPolicy
@@ -1579,13 +2252,47 @@ class NetworkRBACPolicySerializer(
             "uuid",
             "network",
             "network_name",
+            "source_tenant_uuid",
+            "source_tenant_name",
             "target_tenant",
             "target_tenant_name",
+            "target_label",
+            "direction",
             "backend_id",
             "policy_type",
             "created",
         )
         read_only_fields = ("uuid", "created", "backend_id")
+
+    @extend_schema_field(serializers.CharField())
+    def get_target_label(self, obj: models.NetworkRBACPolicy) -> str:
+        return obj.target_tenant.name if obj.target_tenant_id else _("All projects")
+
+    @extend_schema_field(
+        serializers.ChoiceField(choices=[DIRECTION_OUTBOUND, DIRECTION_INBOUND])
+    )
+    def get_direction(self, obj: models.NetworkRBACPolicy) -> str:
+        """Direction relative to the requesting user.
+
+        ``outbound`` if the user can manage the source network's project
+        (they are the sharer); ``inbound`` otherwise (they are the
+        consumer). Staff/support default to ``outbound`` for parity with
+        the legacy view; the explicit filter handles their case.
+        """
+        request = self.context.get("request") if self.context else None
+        user = getattr(request, "user", None) if request else None
+        if user is None or not user.is_authenticated:
+            return self.DIRECTION_OUTBOUND
+        if user.is_staff or user.is_support:
+            return self.DIRECTION_OUTBOUND
+        source_project = obj.network.tenant.project
+        if (
+            source_project.has_user(user, ProjectRole.ADMIN)
+            or source_project.has_user(user, ProjectRole.MANAGER)
+            or source_project.customer.has_user(user, CustomerRole.OWNER)
+        ):
+            return self.DIRECTION_OUTBOUND
+        return self.DIRECTION_INBOUND
 
     def validate_target_tenant(self, target_tenant):
         network = self.context.get("network")
@@ -1649,6 +2356,7 @@ class OpenStackNetworkSerializer(
             "subnets",
             "mtu",
             "rbac_policies",
+            "port_security_enabled",
         )
         read_only_fields = (
             structure_serializers.BaseResourceSerializer.Meta.read_only_fields
@@ -1661,6 +2369,7 @@ class OpenStackNetworkSerializer(
                 "service_settings",
                 "project",
                 "rbac_policies",
+                "port_security_enabled",
             )
         )
         extra_kwargs = dict(
@@ -1682,8 +2391,9 @@ class OpenStackNetworkSerializer(
         return [
             (
                 "segmentation_id",
-                lambda user: user.is_authenticated
-                and (user.is_staff or user.is_support),
+                lambda user: (
+                    user.is_authenticated and (user.is_staff or user.is_support)
+                ),
             ),
         ]
 
@@ -1719,6 +2429,10 @@ class OpenStackSubNetSerializer(structure_serializers.BaseResourceActionSerializ
     tenant_name = serializers.CharField(source="network.tenant.name", read_only=True)
     dns_nameservers = DnsNameserversField(required=False)
     host_routes = OpenStackStaticRouteSerializer(many=True, required=False)
+    # Projected from the parent Network; Neutron owns this flag at the network level.
+    port_security_enabled = serializers.BooleanField(
+        source="network.port_security_enabled", read_only=True
+    )
 
     class Meta(structure_serializers.BaseResourceSerializer.Meta):
         model = models.SubNet
@@ -1736,6 +2450,7 @@ class OpenStackSubNetSerializer(structure_serializers.BaseResourceActionSerializ
             "dns_nameservers",
             "host_routes",
             "is_connected",
+            "port_security_enabled",
         )
         read_only_fields = (
             structure_serializers.BaseResourceSerializer.Meta.read_only_fields
@@ -1989,7 +2704,7 @@ class OpenStackCreatePortSerializer(serializers.HyperlinkedModelSerializer):
     port = serializers.HyperlinkedRelatedField(
         view_name="openstack-port-detail",
         lookup_field="uuid",
-        queryset=models.Port.objects.filter(status="DOWN"),
+        queryset=models.Port.objects.all(),
         required=False,
     )
     tenant = serializers.HyperlinkedRelatedField(
@@ -2064,7 +2779,7 @@ class OpenStackCreateInstancePortSerializer(serializers.HyperlinkedModelSerializ
     port = serializers.HyperlinkedRelatedField(
         view_name="openstack-port-detail",
         lookup_field="uuid",
-        queryset=models.Port.objects.filter(status="DOWN"),
+        queryset=models.Port.objects.all(),
         required=False,
     )
 
@@ -2074,6 +2789,7 @@ class OpenStackCreateInstancePortSerializer(serializers.HyperlinkedModelSerializ
             "fixed_ips",
             "subnet",
             "port",
+            "port_security_enabled",
         )
         extra_kwargs = {
             "subnet": {
@@ -2095,6 +2811,7 @@ class OpenStackCreateInstancePortSerializer(serializers.HyperlinkedModelSerializ
 
         subnet: models.SubNet = internal_value.get("subnet")
         fixed_ips = internal_value.get("fixed_ips")
+        port_security_enabled = internal_value.get("port_security_enabled", True)
 
         # For instance creation, initially set to subnet's tenant
         # This will be corrected to instance's tenant during instance creation
@@ -2105,6 +2822,7 @@ class OpenStackCreateInstancePortSerializer(serializers.HyperlinkedModelSerializ
             project=subnet.project,  # Initially use subnet's project (will be corrected later)
             service_settings=subnet.service_settings,
             fixed_ips=fixed_ips,
+            port_security_enabled=port_security_enabled,
         )
 
 
@@ -2114,6 +2832,14 @@ class OpenStackRouterSerializer(structure_serializers.BaseResourceSerializer):
     tenant_uuid = serializers.UUIDField(source="tenant.uuid", read_only=True)
     fixed_ips = OpenStackFixedIpField(read_only=True)
     ports = OpenStackNestedPortSerializer(many=True, read_only=True)
+    has_external_gateway = serializers.BooleanField(read_only=True)
+    external_network_uuid = serializers.UUIDField(
+        source="external_network_ref.uuid", read_only=True, allow_null=True
+    )
+    external_network_name = serializers.CharField(
+        source="external_network_ref.name", read_only=True, allow_null=True
+    )
+    external_fixed_ips = serializers.JSONField(read_only=True)
 
     class Meta:
         model = models.Router
@@ -2124,11 +2850,717 @@ class OpenStackRouterSerializer(structure_serializers.BaseResourceSerializer):
             "routes",
             "fixed_ips",
             "ports",
+            "external_network_id",
+            "external_network_uuid",
+            "external_network_name",
+            "has_external_gateway",
+            "enable_snat",
+            "external_fixed_ips",
         )
         extra_kwargs = dict(
             url={"lookup_field": "uuid", "view_name": "openstack-router-detail"},
             tenant={"lookup_field": "uuid", "view_name": "openstack-tenant-detail"},
         )
+
+
+class OpenStackLoadBalancerVIPSecurityGroupSerializer(serializers.Serializer):
+    uuid = serializers.CharField()
+    name = serializers.CharField()
+    url = serializers.URLField()
+
+
+class OpenStackLoadBalancerSerializer(structure_serializers.BaseResourceSerializer):
+    tenant_name = serializers.CharField(source="tenant.name", read_only=True)
+    tenant_uuid = serializers.UUIDField(source="tenant.uuid", read_only=True)
+    vip_address = serializers.IPAddressField(read_only=True)
+    vip_subnet = serializers.HyperlinkedRelatedField(
+        view_name="openstack-subnet-detail",
+        lookup_field="uuid",
+        read_only=True,
+        allow_null=True,
+    )
+    vip_port = serializers.HyperlinkedRelatedField(
+        view_name="openstack-port-detail",
+        lookup_field="uuid",
+        read_only=True,
+        allow_null=True,
+    )
+    provider = serializers.CharField(read_only=True)
+    provisioning_status = serializers.CharField(read_only=True)
+    operating_status = serializers.CharField(read_only=True)
+    vip_security_groups = serializers.SerializerMethodField()
+
+    @extend_schema_field(
+        OpenStackLoadBalancerVIPSecurityGroupSerializer(
+            many=True,
+            help_text="Security groups assigned to the VIP port.",
+        )
+    )
+    def get_vip_security_groups(self, obj):
+        if not obj.vip_port:
+            return []
+        return [
+            {
+                "uuid": str(sg.uuid),
+                "name": sg.name,
+                "url": reverse(
+                    "openstack-sgp-detail",
+                    kwargs={"uuid": sg.uuid},
+                    request=self.context.get("request"),
+                ),
+            }
+            for sg in obj.vip_port.security_groups.all()
+        ]
+
+    class Meta:
+        model = models.LoadBalancer
+        fields = structure_serializers.BaseResourceSerializer.Meta.fields + (
+            "tenant",
+            "tenant_name",
+            "tenant_uuid",
+            "vip_address",
+            "vip_subnet",
+            "vip_port",
+            "attached_floating_ip",
+            "provider",
+            "provisioning_status",
+            "operating_status",
+            "vip_security_groups",
+        )
+        extra_kwargs = dict(
+            url={"lookup_field": "uuid", "view_name": "openstack-loadbalancer-detail"},
+            tenant={"lookup_field": "uuid", "view_name": "openstack-tenant-detail"},
+            attached_floating_ip={
+                "lookup_field": "uuid",
+                "view_name": "openstack-fip-detail",
+            },
+        )
+
+
+class LoadBalancerAttachFloatingIPSerializer(serializers.Serializer):
+    floating_ip = serializers.HyperlinkedRelatedField(
+        view_name="openstack-fip-detail",
+        lookup_field="uuid",
+        queryset=models.FloatingIP.objects.all(),
+    )
+
+
+class LoadBalancerSetSecurityGroupsSerializer(serializers.Serializer):
+    security_groups = serializers.ListField(
+        child=serializers.HyperlinkedRelatedField(
+            view_name="openstack-sgp-detail",
+            lookup_field="uuid",
+            queryset=models.SecurityGroup.objects.all(),
+        ),
+    )
+
+
+class LoadBalancerWritableSerializer(serializers.HyperlinkedModelSerializer):
+    name = serializers.CharField()
+    uuid = serializers.UUIDField(read_only=True)
+    url = serializers.HyperlinkedIdentityField(
+        view_name="openstack-loadbalancer-detail", lookup_field="uuid"
+    )
+
+    class Meta:
+        model = models.LoadBalancer
+        fields = (
+            "url",
+            "uuid",
+            "name",
+        )
+
+
+class UpdateLoadBalancerSerializer(LoadBalancerWritableSerializer):
+    pass
+
+
+class CreateLoadBalancerSerializer(LoadBalancerWritableSerializer):
+    name = serializers.CharField()
+    vip_subnet = serializers.HyperlinkedRelatedField(
+        view_name="openstack-subnet-detail",
+        lookup_field="uuid",
+        queryset=models.SubNet.objects.all(),
+        required=True,
+    )
+
+    class Meta(LoadBalancerWritableSerializer.Meta):
+        fields = LoadBalancerWritableSerializer.Meta.fields + (
+            "tenant",
+            "vip_subnet",
+        )
+        extra_kwargs = dict(
+            tenant={"lookup_field": "uuid", "view_name": "openstack-tenant-detail"},
+        )
+
+    def validate_tenant(self, tenant):
+        user = self.context["request"].user
+        if not (
+            user.is_staff
+            or tenant.project.customer.has_user(user, CustomerRole.OWNER)
+            or tenant.project.has_user(user, ProjectRole.ADMIN)
+            or tenant.project.has_user(user, ProjectRole.MANAGER)
+        ):
+            raise serializers.ValidationError(
+                "You do not have permission to create load balancer for this tenant."
+            )
+
+        if tenant.state != CoreStates.OK:
+            raise serializers.ValidationError(
+                "Load balancer can be created only for tenant in OK state."
+            )
+
+        return tenant
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        tenant = attrs.get("tenant")
+        subnet = attrs["vip_subnet"]
+        if subnet.tenant_id != tenant.id:
+            raise serializers.ValidationError(
+                {"vip_subnet": _("Subnet must belong to the selected tenant.")}
+            )
+        if not subnet.backend_id:
+            raise serializers.ValidationError(
+                {
+                    "vip_subnet": _(
+                        "Subnet must be provisioned in the backend before creating a load balancer."
+                    )
+                }
+            )
+        attrs["project"] = tenant.project
+        attrs["service_settings"] = tenant.service_settings
+        return attrs
+
+
+class OpenStackPoolSerializer(structure_serializers.BaseResourceSerializer):
+    load_balancer_name = serializers.CharField(
+        source="load_balancer.name", read_only=True
+    )
+    load_balancer_uuid = serializers.UUIDField(
+        source="load_balancer.uuid", read_only=True
+    )
+    protocol = serializers.CharField(read_only=True)
+    lb_algorithm = serializers.CharField(read_only=True)
+    provisioning_status = serializers.CharField(read_only=True)
+    operating_status = serializers.CharField(read_only=True)
+
+    class Meta:
+        model = models.Pool
+        fields = structure_serializers.BaseResourceSerializer.Meta.fields + (
+            "load_balancer",
+            "load_balancer_name",
+            "load_balancer_uuid",
+            "protocol",
+            "lb_algorithm",
+            "provisioning_status",
+            "operating_status",
+        )
+        extra_kwargs = dict(
+            url={"lookup_field": "uuid", "view_name": "openstack-pool-detail"},
+            load_balancer={
+                "lookup_field": "uuid",
+                "view_name": "openstack-loadbalancer-detail",
+            },
+        )
+
+
+def _validate_load_balancer(load_balancer, user):
+    if not (
+        user.is_staff
+        or load_balancer.project.customer.has_user(user, CustomerRole.OWNER)
+        or load_balancer.project.has_user(user, ProjectRole.ADMIN)
+        or load_balancer.project.has_user(user, ProjectRole.MANAGER)
+    ):
+        raise serializers.ValidationError(
+            "You do not have permission to create pool for this load balancer."
+        )
+
+    if load_balancer.state != CoreStates.OK:
+        raise serializers.ValidationError(
+            "Pool can be created only for load balancer in OK state."
+        )
+
+    if not load_balancer.backend_id:
+        raise serializers.ValidationError(
+            "Load balancer must be provisioned in the backend before creating a pool."
+        )
+
+
+class PoolWritableSerializer(serializers.HyperlinkedModelSerializer):
+    name = serializers.CharField()
+    uuid = serializers.UUIDField(read_only=True)
+    url = serializers.HyperlinkedIdentityField(
+        view_name="openstack-pool-detail", lookup_field="uuid"
+    )
+
+    class Meta:
+        model = models.Pool
+        fields = (
+            "url",
+            "uuid",
+            "name",
+        )
+
+
+class UpdatePoolSerializer(PoolWritableSerializer):
+    pass
+
+
+class CreatePoolSerializer(PoolWritableSerializer):
+    protocol = serializers.ChoiceField(choices=models.PROTOCOL_CHOICES)
+    lb_algorithm = serializers.ChoiceField(
+        choices=models.LB_ALGORITHM_CHOICES,
+        default="SOURCE_IP_PORT",
+        required=False,
+    )
+
+    class Meta(PoolWritableSerializer.Meta):
+        fields = PoolWritableSerializer.Meta.fields + (
+            "load_balancer",
+            "protocol",
+            "lb_algorithm",
+        )
+        extra_kwargs = dict(
+            load_balancer={
+                "lookup_field": "uuid",
+                "view_name": "openstack-loadbalancer-detail",
+            },
+        )
+
+    def validate_load_balancer(self, load_balancer):
+        user = self.context["request"].user
+        _validate_load_balancer(load_balancer, user)
+        return load_balancer
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        load_balancer = attrs["load_balancer"]
+        lb_algorithm = attrs.get("lb_algorithm", "SOURCE_IP_PORT")
+        if (
+            load_balancer.provider == "ovn"
+            and lb_algorithm not in models.OVN_SUPPORTED_LB_ALGORITHMS
+        ):
+            raise serializers.ValidationError(
+                {
+                    "lb_algorithm": _(
+                        "OVN provider only supports the following algorithms: %s."
+                    )
+                    % ", ".join(models.OVN_SUPPORTED_LB_ALGORITHMS)
+                }
+            )
+        attrs["project"] = load_balancer.project
+        attrs["service_settings"] = load_balancer.service_settings
+        return attrs
+
+
+class OpenStackListenerSerializer(structure_serializers.BaseResourceSerializer):
+    load_balancer_name = serializers.CharField(
+        source="load_balancer.name", read_only=True
+    )
+    load_balancer_uuid = serializers.UUIDField(
+        source="load_balancer.uuid", read_only=True
+    )
+    protocol = serializers.CharField(read_only=True)
+    protocol_port = serializers.IntegerField(read_only=True)
+    provisioning_status = serializers.CharField(read_only=True)
+    operating_status = serializers.CharField(read_only=True)
+
+    class Meta:
+        model = models.Listener
+        fields = structure_serializers.BaseResourceSerializer.Meta.fields + (
+            "load_balancer",
+            "load_balancer_name",
+            "load_balancer_uuid",
+            "protocol",
+            "protocol_port",
+            "default_pool",
+            "provisioning_status",
+            "operating_status",
+        )
+        extra_kwargs = dict(
+            url={"lookup_field": "uuid", "view_name": "openstack-listener-detail"},
+            load_balancer={
+                "lookup_field": "uuid",
+                "view_name": "openstack-loadbalancer-detail",
+            },
+            default_pool={
+                "lookup_field": "uuid",
+                "view_name": "openstack-pool-detail",
+            },
+        )
+
+
+class ListenerWritableSerializer(serializers.HyperlinkedModelSerializer):
+    name = serializers.CharField(required=False)
+    default_pool = serializers.HyperlinkedRelatedField(
+        view_name="openstack-pool-detail",
+        lookup_field="uuid",
+        queryset=models.Pool.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+
+    class Meta:
+        model = models.Listener
+        fields = ("name", "default_pool")
+        extra_kwargs = dict(
+            default_pool={
+                "lookup_field": "uuid",
+                "view_name": "openstack-pool-detail",
+            },
+        )
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if "default_pool" not in attrs:
+            return attrs
+        default_pool = attrs["default_pool"]
+
+        if default_pool is None:
+            return attrs
+
+        if self.instance is not None:
+            load_balancer = self.instance.load_balancer
+        else:
+            load_balancer = attrs.get("load_balancer")
+
+        if default_pool.load_balancer_id != load_balancer.id:
+            raise serializers.ValidationError(
+                {
+                    "default_pool": _(
+                        "Default pool must belong to the same load balancer."
+                    )
+                }
+            )
+
+        if not default_pool.backend_id:
+            raise serializers.ValidationError(
+                {"default_pool": _("Default pool must be provisioned in the backend.")}
+            )
+
+        return attrs
+
+
+class UpdateListenerSerializer(ListenerWritableSerializer):
+    pass
+
+
+class CreateListenerSerializer(ListenerWritableSerializer):
+    protocol = serializers.ChoiceField(choices=models.PROTOCOL_CHOICES)
+    protocol_port = serializers.IntegerField(
+        min_value=1, max_value=65535, help_text="Port on which the listener listens"
+    )
+    uuid = serializers.UUIDField(read_only=True)
+    url = serializers.HyperlinkedIdentityField(
+        view_name="openstack-listener-detail", lookup_field="uuid"
+    )
+
+    class Meta(ListenerWritableSerializer.Meta):
+        fields = ListenerWritableSerializer.Meta.fields + (
+            "url",
+            "uuid",
+            "load_balancer",
+            "protocol",
+            "protocol_port",
+        )
+
+        extra_kwargs = {
+            **ListenerWritableSerializer.Meta.extra_kwargs,
+            "load_balancer": {
+                "lookup_field": "uuid",
+                "view_name": "openstack-loadbalancer-detail",
+            },
+        }
+
+    def validate_load_balancer(self, load_balancer):
+        user = self.context["request"].user
+        _validate_load_balancer(load_balancer, user)
+        return load_balancer
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        load_balancer = attrs["load_balancer"]
+        attrs["project"] = load_balancer.project
+        attrs["service_settings"] = load_balancer.service_settings
+        return attrs
+
+
+class OpenStackPoolMemberSerializer(structure_serializers.BaseResourceSerializer):
+    pool_name = serializers.CharField(source="pool.name", read_only=True)
+    pool_uuid = serializers.UUIDField(source="pool.uuid", read_only=True)
+    load_balancer_uuid = serializers.UUIDField(
+        source="pool.load_balancer.uuid", read_only=True
+    )
+    address = serializers.IPAddressField(read_only=True)
+    protocol_port = serializers.IntegerField(read_only=True)
+    subnet = serializers.HyperlinkedRelatedField(
+        view_name="openstack-subnet-detail",
+        lookup_field="uuid",
+        read_only=True,
+        allow_null=True,
+    )
+    weight = serializers.IntegerField(read_only=True)
+    provisioning_status = serializers.CharField(read_only=True)
+    operating_status = serializers.CharField(read_only=True)
+
+    class Meta:
+        model = models.PoolMember
+        fields = structure_serializers.BaseResourceSerializer.Meta.fields + (
+            "pool",
+            "pool_name",
+            "pool_uuid",
+            "load_balancer_uuid",
+            "address",
+            "protocol_port",
+            "subnet",
+            "weight",
+            "provisioning_status",
+            "operating_status",
+        )
+        extra_kwargs = dict(
+            url={
+                "lookup_field": "uuid",
+                "view_name": "openstack-poolmember-detail",
+            },
+            pool={
+                "lookup_field": "uuid",
+                "view_name": "openstack-pool-detail",
+            },
+        )
+
+
+class PoolMemberWritingSerializer(serializers.HyperlinkedModelSerializer):
+    name = serializers.CharField(required=False, allow_blank=True)
+    weight = serializers.IntegerField(
+        min_value=1, max_value=256, default=1, required=False
+    )
+    uuid = serializers.UUIDField(read_only=True)
+    url = serializers.HyperlinkedIdentityField(
+        view_name="openstack-poolmember-detail", lookup_field="uuid"
+    )
+
+    class Meta:
+        model = models.PoolMember
+        fields = (
+            "url",
+            "uuid",
+            "name",
+            "weight",
+        )
+
+
+class UpdatePoolMemberSerializer(PoolMemberWritingSerializer):
+    pass
+
+
+class CreatePoolMemberSerializer(PoolMemberWritingSerializer):
+    address = serializers.IPAddressField()
+    protocol_port = serializers.IntegerField(
+        min_value=1,
+        max_value=65535,
+        help_text="Port on the backend server",
+    )
+    subnet = serializers.HyperlinkedRelatedField(
+        view_name="openstack-subnet-detail",
+        lookup_field="uuid",
+        queryset=models.SubNet.objects.all(),
+        required=True,
+    )
+
+    class Meta(PoolMemberWritingSerializer.Meta):
+        fields = PoolMemberWritingSerializer.Meta.fields + (
+            "pool",
+            "address",
+            "protocol_port",
+            "subnet",
+        )
+        extra_kwargs = dict(
+            pool={
+                "lookup_field": "uuid",
+                "view_name": "openstack-pool-detail",
+            },
+        )
+
+    def validate_pool(self, pool):
+        user = self.context["request"].user
+        if not (
+            user.is_staff
+            or pool.project.customer.has_user(user, CustomerRole.OWNER)
+            or pool.project.has_user(user, ProjectRole.ADMIN)
+            or pool.project.has_user(user, ProjectRole.MANAGER)
+        ):
+            raise serializers.ValidationError(
+                "You do not have permission to create member for this pool."
+            )
+
+        if pool.state != CoreStates.OK:
+            raise serializers.ValidationError(
+                "Member can be created only for pool in OK state."
+            )
+
+        if not pool.backend_id:
+            raise serializers.ValidationError(
+                "Pool must be provisioned in the backend before creating a member."
+            )
+
+        return pool
+
+    def validate_subnet(self, subnet):
+        if not subnet.backend_id:
+            raise serializers.ValidationError(
+                _("Subnet must be provisioned in the backend before creating a member.")
+            )
+        return subnet
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        pool = attrs["pool"]
+        subnet = attrs["subnet"]
+        if subnet.tenant_id != pool.load_balancer.tenant_id:
+            raise serializers.ValidationError(
+                {
+                    "subnet": _(
+                        "Subnet must belong to the same tenant as the load balancer."
+                    )
+                }
+            )
+        attrs["project"] = pool.project
+        attrs["service_settings"] = pool.service_settings
+        return attrs
+
+
+class OpenStackHealthMonitorSerializer(structure_serializers.BaseResourceSerializer):
+    pool_name = serializers.CharField(source="pool.name", read_only=True)
+    pool_uuid = serializers.UUIDField(source="pool.uuid", read_only=True)
+    load_balancer_uuid = serializers.UUIDField(
+        source="pool.load_balancer.uuid", read_only=True
+    )
+    type = serializers.CharField(source="monitor_type", read_only=True)
+    delay = serializers.IntegerField(read_only=True)
+    timeout = serializers.IntegerField(read_only=True)
+    max_retries = serializers.IntegerField(read_only=True)
+    provisioning_status = serializers.CharField(read_only=True)
+    operating_status = serializers.CharField(read_only=True)
+
+    class Meta:
+        model = models.HealthMonitor
+        fields = structure_serializers.BaseResourceSerializer.Meta.fields + (
+            "pool",
+            "pool_name",
+            "pool_uuid",
+            "load_balancer_uuid",
+            "type",
+            "delay",
+            "timeout",
+            "max_retries",
+            "provisioning_status",
+            "operating_status",
+        )
+        extra_kwargs = dict(
+            url={
+                "lookup_field": "uuid",
+                "view_name": "openstack-healthmonitor-detail",
+            },
+            pool={
+                "lookup_field": "uuid",
+                "view_name": "openstack-pool-detail",
+            },
+        )
+
+
+class HealthMonitorWritableSerializer(serializers.HyperlinkedModelSerializer):
+    uuid = serializers.UUIDField(read_only=True)
+    url = serializers.HyperlinkedIdentityField(
+        view_name="openstack-healthmonitor-detail", lookup_field="uuid"
+    )
+    name = serializers.CharField(required=False, allow_blank=True)
+    delay = serializers.IntegerField(
+        min_value=1,
+        help_text="Interval between health checks in seconds",
+        default=5,
+    )
+    timeout = serializers.IntegerField(
+        min_value=1, help_text="Time in seconds to timeout a health check", default=5
+    )
+    max_retries = serializers.IntegerField(
+        min_value=1,
+        max_value=10,
+        default=3,
+    )
+    max_retries_down = serializers.IntegerField(
+        min_value=1,
+        max_value=10,
+        default=3,
+    )
+
+    class Meta:
+        model = models.HealthMonitor
+        fields = (
+            "url",
+            "uuid",
+            "name",
+            "delay",
+            "timeout",
+            "max_retries",
+            "max_retries_down",
+        )
+
+
+class UpdateHealthMonitorSerializer(HealthMonitorWritableSerializer):
+    pass
+
+
+class CreateHealthMonitorSerializer(HealthMonitorWritableSerializer):
+    type = serializers.ChoiceField(
+        choices=models.HEALTHMONITOR_TYPE_CHOICES, source="monitor_type"
+    )
+
+    class Meta(HealthMonitorWritableSerializer.Meta):
+        fields = HealthMonitorWritableSerializer.Meta.fields + (
+            "pool",
+            "type",
+        )
+        extra_kwargs = dict(
+            pool={
+                "lookup_field": "uuid",
+                "view_name": "openstack-pool-detail",
+            },
+        )
+
+    def validate_pool(self, pool):
+        user = self.context["request"].user
+        if not (
+            user.is_staff
+            or pool.project.customer.has_user(user, CustomerRole.OWNER)
+            or pool.project.has_user(user, ProjectRole.ADMIN)
+            or pool.project.has_user(user, ProjectRole.MANAGER)
+        ):
+            raise serializers.ValidationError(
+                "You do not have permission to create health monitor for this pool."
+            )
+
+        if pool.state != CoreStates.OK:
+            raise serializers.ValidationError(
+                "Health monitor can be created only for pool in OK state."
+            )
+
+        if not pool.backend_id:
+            raise serializers.ValidationError(
+                "Pool must be provisioned in the backend before creating a health monitor."
+            )
+
+        if models.HealthMonitor.objects.filter(pool=pool).exists():
+            raise serializers.ValidationError("Pool already has a health monitor.")
+
+        return pool
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        pool = attrs["pool"]
+        attrs["project"] = pool.project
+        attrs["service_settings"] = pool.service_settings
+        return attrs
 
 
 class CreateRouterSerializer(serializers.HyperlinkedModelSerializer):
@@ -2285,6 +3717,12 @@ class OpenStackCreateFloatingIPSerializer(serializers.Serializer):
 class OpenStackUsageStatsSerializer(serializers.Serializer):
     shared = serializers.BooleanField()
     service_provider = serializers.ListField(child=serializers.CharField())
+
+
+class OpenStackUsageStatsResponseSerializer(serializers.Serializer):
+    name = serializers.CharField(read_only=True)
+    running_instances_count = serializers.IntegerField(read_only=True)
+    created_instances_count = serializers.IntegerField(read_only=True)
 
 
 class BaseAvailabilityZoneSerializer(structure_serializers.BasePropertySerializer):
@@ -2608,7 +4046,9 @@ class OpenStackSnapshotRestorationSerializer(
     description = serializers.CharField(
         required=False, help_text=_("New volume description.")
     )
-    volume_state = serializers.ReadOnlyField(source="volume.get_state_display")
+    volume_state = serializers.CharField(
+        read_only=True, source="volume.get_state_display"
+    )
 
     class Meta:
         model = models.SnapshotRestoration
@@ -2662,6 +4102,11 @@ class OpenStackSnapshotRestorationSerializer(
         return super().create(validated_data)
 
 
+class OpenStackSnapshotBackupSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField(read_only=True)
+    name = serializers.CharField(read_only=True)
+
+
 class OpenStackSnapshotSerializer(structure_serializers.BaseResourceActionSerializer):
     source_volume_name = serializers.ReadOnlyField(source="source_volume.name")
     source_volume_marketplace_uuid = serializers.UUIDField(
@@ -2670,6 +4115,7 @@ class OpenStackSnapshotSerializer(structure_serializers.BaseResourceActionSerial
     action_details = serializers.JSONField(read_only=True)
     metadata = serializers.JSONField(required=False)
     restorations = OpenStackSnapshotRestorationSerializer(many=True, read_only=True)
+    backups = OpenStackSnapshotBackupSerializer(many=True, read_only=True)
 
     class Meta(structure_serializers.BaseResourceSerializer.Meta):
         model = models.Snapshot
@@ -2683,6 +4129,7 @@ class OpenStackSnapshotSerializer(structure_serializers.BaseResourceActionSerial
             "action",
             "action_details",
             "restorations",
+            "backups",
             "kept_until",
         )
         read_only_fields = (
@@ -2723,7 +4170,7 @@ class OpenStackNestedVolumeSerializer(
     serializers.HyperlinkedModelSerializer,
     structure_serializers.BasicResourceSerializer,
 ):
-    state = serializers.ReadOnlyField(source="get_state_display")
+    state = serializers.CharField(read_only=True, source="get_state_display")
     type_name = serializers.CharField(source="type.name", read_only=True)
 
     class Meta:
@@ -2777,7 +4224,7 @@ class OpenStackNestedSecurityGroupSerializer(
         many=True,
         read_only=True,
     )
-    state = serializers.ReadOnlyField(source="get_state_display")
+    state = serializers.CharField(read_only=True, source="get_state_display")
 
     class Meta:
         model = models.SecurityGroup
@@ -2812,7 +4259,7 @@ class OpenStackNestedServerGroupSerializer(
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
 ):
-    state = serializers.ReadOnlyField(source="get_state_display")
+    state = serializers.CharField(read_only=True, source="get_state_display")
 
     class Meta:
         model = models.ServerGroup
@@ -2821,9 +4268,10 @@ class OpenStackNestedServerGroupSerializer(
         extra_kwargs = {"url": {"lookup_field": "uuid"}}
 
 
-def _validate_instance_ports(ports, tenant):
+def _validate_instance_ports(ports, tenant, instance=None):
     """- make sure that ports belong to specified setting;
     - make sure that ports does not connect to the same subnet twice;
+    - make sure that referenced existing ports are attachable to the instance.
     """
     if not ports:
         return
@@ -2841,6 +4289,38 @@ def _validate_instance_ports(ports, tenant):
                 _("Subnet %s does not belong to the same tenant as instance.") % subnet
             )
             raise serializers.ValidationError({"ports": message})
+
+    instance_pk = instance.pk if instance is not None else None
+    for port in ports:
+        if not port.pk:
+            continue
+        if port.tenant_id not in tenants_ids:
+            raise serializers.ValidationError(
+                {
+                    "ports": _(
+                        "Port %s does not belong to the same tenant as instance."
+                    )
+                    % port
+                }
+            )
+        same_instance = instance_pk is not None and port.instance_id == instance_pk
+        if port.instance_id and not same_instance:
+            raise serializers.ValidationError(
+                {"ports": _("Port %s is already attached to another instance.") % port}
+            )
+        # Skip device_owner check for ports already attached to the same instance —
+        # OpenStack assigns device_owner="compute:nova" to attached VM ports, and we
+        # want to allow re-referencing them in update_ports.
+        if port.device_owner and not same_instance:
+            raise serializers.ValidationError(
+                {
+                    "ports": _(
+                        "Port %(port)s cannot be attached because it is owned by %(owner)s."
+                    )
+                    % {"port": port, "owner": port.device_owner}
+                }
+            )
+
     pairs = [(port.subnet, port.backend_id) for port in ports]
     duplicates = [
         subnet for subnet, count in collections.Counter(pairs).items() if count > 1
@@ -3036,6 +4516,20 @@ class OpenStackInstanceSerializer(structure_serializers.VirtualMachineSerializer
     ports = OpenStackNestedPortSerializer(many=True, required=True)
     floating_ips = OpenStackNestedFloatingIPSerializer(many=True)
 
+    user_data = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text=_(
+            "Cloud-init user data passed to the instance on provisioning. "
+            "SECURITY: this value is stored and transmitted in plain text — "
+            "it is kept unencrypted in Waldur's database, forwarded to OpenStack "
+            "where any process on the instance can read it via the metadata "
+            "service, and it may appear in logs. Do NOT put unencrypted secrets "
+            "(passwords, private keys, API tokens) here; reference a secrets "
+            "manager or inject them through an encrypted channel instead."
+        ),
+    )
+
     volumes = OpenStackNestedVolumeSerializer(
         many=True,
         required=False,
@@ -3070,6 +4564,7 @@ class OpenStackInstanceSerializer(structure_serializers.VirtualMachineSerializer
             "availability_zone",
             "availability_zone_name",
             "connect_directly_to_external_network",
+            "config_drive",
             "runtime_state",
             "action",
             "action_details",
@@ -3087,6 +4582,7 @@ class OpenStackInstanceSerializer(structure_serializers.VirtualMachineSerializer
                 "ports",
                 "availability_zone",
                 "connect_directly_to_external_network",
+                "config_drive",
                 "tenant",
             )
         )
@@ -3187,7 +4683,13 @@ class OpenStackInstanceCreateSerializer(OpenStackInstanceSerializer):
     image = serializers.HyperlinkedRelatedField(
         view_name="openstack-image-detail",
         lookup_field="uuid",
-        queryset=models.Image.objects.all().select_related("settings"),
+        # Exclude rescue-tagged images: an image with hw_rescue_device or
+        # hw_rescue_bus is meant for Nova rescue mode and is typically an
+        # ISO that won't boot a usable system disk. The HyperlinkedRelatedField
+        # will report it as not-found if a client tries to pass one.
+        queryset=models.Image.objects.filter(
+            hw_rescue_device="", hw_rescue_bus=""
+        ).select_related("settings"),
         write_only=True,
         help_text=_("The OS image to use for the instance"),
     )
@@ -3295,7 +4797,16 @@ class OpenStackInstanceCreateSerializer(OpenStackInstanceSerializer):
                 gettext("Please specify at least one network.")
             )
 
-        _validate_instance_security_groups(attrs.get("security_groups", []), tenant)
+        security_groups = attrs.get("security_groups", [])
+        has_port_security_disabled = any(
+            not port.port_security_enabled for port in ports
+        )
+        if has_port_security_disabled and security_groups:
+            raise serializers.ValidationError(
+                _("Security groups cannot be assigned when port security is disabled.")
+            )
+
+        _validate_instance_security_groups(security_groups, tenant)
         _validate_instance_server_group(attrs.get("server_group"), tenant)
         _validate_instance_ports(ports, tenant)
         subnets = [port.subnet for port in ports]
@@ -3507,6 +5018,71 @@ class OpenStackInstanceCreateSerializer(OpenStackInstanceSerializer):
         return instance
 
 
+class InstanceRescueSerializer(serializers.Serializer):
+    """Input serializer for the rescue action.
+
+    For volume-backed instances, both an explicit `rescue_image` and the
+    "stable device rescue" Glance properties are required — Nova will leave
+    a BFV instance in an unrecoverable ERROR state otherwise (per
+    https://specs.openstack.org/openstack/nova-specs/specs/ussuri/implemented/virt-bfv-instance-rescue.html).
+    """
+
+    rescue_image = serializers.HyperlinkedRelatedField(
+        view_name="openstack-image-detail",
+        lookup_field="uuid",
+        queryset=models.Image.objects.all(),
+        required=False,
+        allow_null=True,
+        help_text=_(
+            "Optional rescue image. Required for volume-backed instances; "
+            "must be a Glance image with hw_rescue_device or hw_rescue_bus "
+            "set (a 'stable device rescue' image)."
+        ),
+    )
+
+    def validate(self, attrs):
+        instance: models.Instance = self.instance
+        rescue_image: models.Image | None = attrs.get("rescue_image")
+
+        # Cross-tenant: rescue image must be visible to the instance's tenant.
+        if rescue_image is not None:
+            tenant: models.Tenant = instance.tenant
+            if not rescue_image.tenants.filter(pk=tenant.pk).exists():
+                raise serializers.ValidationError(
+                    {
+                        "rescue_image": _(
+                            "Rescue image is not visible to the instance's tenant."
+                        )
+                    }
+                )
+
+        # Volume-backed instance safety: BFV rescue requires an explicit
+        # stable-device rescue image.
+        is_volume_backed = instance.volumes.filter(bootable=True).exists()
+        if is_volume_backed:
+            if rescue_image is None:
+                raise serializers.ValidationError(
+                    {
+                        "rescue_image": _(
+                            "Volume-backed instances require an explicit rescue image."
+                        )
+                    }
+                )
+            if not rescue_image.is_rescue_image:
+                raise serializers.ValidationError(
+                    {
+                        "rescue_image": _(
+                            "Selected image is not a stable-device rescue image. "
+                            "Volume-backed instances require an image tagged with "
+                            "hw_rescue_device or hw_rescue_bus, otherwise the rescue "
+                            "will fail and leave the instance in an unrecoverable state."
+                        )
+                    }
+                )
+
+        return attrs
+
+
 class InstanceFlavorChangeSerializer(serializers.Serializer):
     flavor = serializers.HyperlinkedRelatedField(
         view_name="openstack-flavor-detail",
@@ -3620,7 +5196,7 @@ class OpenStackInstancePortsUpdateSerializer(serializers.Serializer):
     ports = OpenStackCreatePortSerializer(many=True)
 
     def validate_ports(self, ports):
-        _validate_instance_ports(ports, self.instance.tenant)
+        _validate_instance_ports(ports, self.instance.tenant, instance=self.instance)
         return ports
 
     @transaction.atomic
@@ -3631,20 +5207,26 @@ class OpenStackInstancePortsUpdateSerializer(serializers.Serializer):
         models.Port.objects.filter(instance=instance, network__isnull=False).exclude(
             subnet__in=new_subnets
         ).delete()
-        # create new ports
+        # create or attach ports
         for port in ports:
-            match = models.Port.objects.filter(
-                instance=instance, subnet=port.subnet
-            ).first()
-            if not match:
-                models.Port.objects.create(
-                    instance=instance,
-                    subnet=port.subnet,
-                    network=port.subnet.network,
-                    tenant=port.subnet.tenant,
-                    project=port.subnet.project,
-                    service_settings=port.subnet.service_settings,
-                )
+            if port.pk:
+                # Existing port returned by serializer — attach it to the instance
+                port.instance = instance
+                port.save(update_fields=["instance"])
+            else:
+                match = models.Port.objects.filter(
+                    instance=instance, subnet=port.subnet
+                ).first()
+                if not match:
+                    models.Port.objects.create(
+                        instance=instance,
+                        subnet=port.subnet,
+                        network=port.subnet.network,
+                        tenant=port.subnet.tenant,
+                        project=port.subnet.project,
+                        service_settings=port.subnet.service_settings,
+                        fixed_ips=port.fixed_ips or [],
+                    )
 
         return instance
 
@@ -4001,7 +5583,7 @@ class OpenStackConsoleLogSerializer(serializers.Serializer):
 
 class OpenStackBackendInstanceSerializer(serializers.ModelSerializer):
     availability_zone = serializers.ReadOnlyField(source="availability_zone.name")
-    state = serializers.ReadOnlyField(source="get_state_display")
+    state = serializers.CharField(read_only=True, source="get_state_display")
 
     class Meta:
         model = models.Instance
@@ -4020,7 +5602,7 @@ class OpenStackBackendInstanceSerializer(serializers.ModelSerializer):
 
 class OpenStackBackendVolumesSerializer(serializers.ModelSerializer):
     availability_zone = serializers.ReadOnlyField(source="availability_zone.name")
-    state = serializers.ReadOnlyField(source="get_state_display")
+    state = serializers.CharField(read_only=True, source="get_state_display")
     type = serializers.ReadOnlyField(source="type.name")
 
     class Meta:

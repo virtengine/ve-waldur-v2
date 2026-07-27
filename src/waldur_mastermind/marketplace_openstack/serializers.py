@@ -1,9 +1,12 @@
 from django.db import transaction
 from django.utils.translation import gettext_lazy as _
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from waldur_core.core import signals as core_signals
+from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace import serializers as marketplace_serializers
 from waldur_mastermind.marketplace_openstack.utils import _apply_quotas
 from waldur_openstack import models as openstack_models
 from waldur_openstack import serializers as openstack_serializers
@@ -90,6 +93,35 @@ core_signals.pre_serializer_fields.connect(
 )
 
 
+@extend_schema_field(serializers.BooleanField())
+def get_config_drive_default(serializer, offering: marketplace_models.Offering) -> bool:
+    try:
+        service = offering.scope
+    except AttributeError:
+        return False
+    if isinstance(service, structure_models.BaseResource):
+        service = service.service_settings
+    if not isinstance(service, structure_models.ServiceSettings):
+        return False
+    return bool(service.options.get("config_drive", False))
+
+
+def add_openstack_config_drive_default(sender, fields, **kwargs):
+    """Expose the OpenStack-wide config_drive default on public offering details.
+
+    Kept here (not in marketplace core) so that OpenStack-specific concerns
+    do not leak into the generic marketplace offering serializer.
+    """
+    fields["config_drive_default"] = serializers.SerializerMethodField()
+    setattr(sender, "get_config_drive_default", get_config_drive_default)
+
+
+core_signals.pre_serializer_fields.connect(
+    sender=marketplace_serializers.PublicOfferingDetailsSerializer,
+    receiver=add_openstack_config_drive_default,
+)
+
+
 class TenantSerializer(serializers.HyperlinkedModelSerializer):
     class Meta:
         model = openstack_models.Tenant
@@ -160,3 +192,81 @@ class ImageCreateResponseSerializer(serializers.Serializer):
 class ImageUploadResponseSerializer(serializers.Serializer):
     status = serializers.CharField()
     message = serializers.CharField()
+
+
+class DuplicateOfferingCandidateSerializer(serializers.Serializer):
+    """One offering in a duplicate per-tenant group (read-only diagnostics)."""
+
+    id = serializers.IntegerField()
+    uuid = serializers.UUIDField()
+    name = serializers.CharField()
+    state = serializers.CharField()
+    active_resources = serializers.IntegerField()
+    total_resources = serializers.IntegerField()
+    is_recommended_keeper = serializers.BooleanField()
+
+
+class DuplicateOfferingGroupSerializer(serializers.Serializer):
+    """A tenant + offering type that has more than one per-tenant offering.
+
+    Shape produced by ``utils.build_duplicate_offering_report``; surfaces the
+    duplicate offerings, the recommended keeper and the count of orphaned
+    resources so a staff user can see the problem without reading logs.
+    """
+
+    tenant_id = serializers.IntegerField()
+    tenant_uuid = serializers.UUIDField(allow_null=True)
+    tenant_name = serializers.CharField(allow_null=True)
+    customer_name = serializers.CharField(allow_null=True)
+    customer_uuid = serializers.UUIDField(allow_null=True)
+    offering_type = serializers.CharField()
+    recommended_keeper_id = serializers.IntegerField()
+    orphan_count = serializers.IntegerField()
+    candidates = DuplicateOfferingCandidateSerializer(many=True)
+
+
+class DuplicateOfferingRemediateSerializer(serializers.Serializer):
+    """Request to collapse one duplicate group onto its keeper.
+
+    The keeper is deliberately not accepted from the client: it is resolved
+    server-side from the same helpers that build the report.
+    """
+
+    tenant_id = serializers.IntegerField()
+    offering_type = serializers.CharField()
+    dry_run = serializers.BooleanField(
+        default=True,
+        help_text="Preview the changes without applying them. Mirrors the "
+        "dry-run-by-default behaviour of the dedupe_tenant_offerings command.",
+    )
+
+
+class DuplicateOfferingMergePlanSerializer(serializers.Serializer):
+    """What resolving a single duplicate would move onto the keeper."""
+
+    duplicate_id = serializers.IntegerField()
+    duplicate_name = serializers.CharField()
+    keeper_id = serializers.IntegerField()
+    keeper_name = serializers.CharField()
+    action = serializers.CharField(
+        help_text="delete (nothing attached), merge, or skip."
+    )
+    is_empty = serializers.BooleanField()
+    resource_count = serializers.IntegerField()
+    order_count = serializers.IntegerField()
+    plan_period_count = serializers.IntegerField()
+    component_usage_count = serializers.IntegerField()
+    component_quota_count = serializers.IntegerField()
+    blockers = serializers.ListField(child=serializers.CharField())
+
+
+class DuplicateOfferingRemediationSerializer(serializers.Serializer):
+    """Result of a remediation, whether previewed or applied."""
+
+    tenant_id = serializers.IntegerField()
+    offering_type = serializers.CharField()
+    keeper_id = serializers.IntegerField()
+    keeper_name = serializers.CharField()
+    dry_run = serializers.BooleanField()
+    duplicates = DuplicateOfferingMergePlanSerializer(many=True)
+    blockers = serializers.ListField(child=serializers.CharField())

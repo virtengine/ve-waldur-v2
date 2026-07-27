@@ -8,6 +8,7 @@ class ChecklistTypes:
     PROJECT_METADATA = "project_metadata"
     ONBOARDING_CUSTOMER_DATA = "onboarding_customer"
     ONBOARDING_INTENT_DATA = "onboarding_intent"
+    WORKFLOW_STEP = "workflow_step"
 
     CHOICES = [
         (PROJECT_COMPLIANCE, _("Project compliance")),
@@ -16,6 +17,7 @@ class ChecklistTypes:
         (PROJECT_METADATA, _("Project metadata")),
         (ONBOARDING_CUSTOMER_DATA, _("Onboarding customer data")),
         (ONBOARDING_INTENT_DATA, _("Onboarding intent/purpose data")),
+        (WORKFLOW_STEP, _("Workflow step evaluation")),
     ]
 
 
@@ -36,6 +38,8 @@ class QuestionTypes:
     COUNTRY = "country"
     RATING = "rating"
     DATETIME = "datetime"
+    LIKERT = "likert"
+    RICH_TEXT = "rich_text"
 
     CHOICES = [
         (BOOLEAN, _("Yes/No/N/A")),
@@ -54,6 +58,32 @@ class QuestionTypes:
         (COUNTRY, _("Country")),
         (RATING, _("Rating")),
         (DATETIME, _("Date and time")),
+        (LIKERT, _("Likert scale")),
+        (RICH_TEXT, _("Rich text")),
+    ]
+
+
+class LikertScaleLengths:
+    THREE = 3
+    FIVE = 5
+    SEVEN = 7
+
+    CHOICES = [
+        (THREE, _("3 point")),
+        (FIVE, _("5 point")),
+        (SEVEN, _("7 point")),
+    ]
+
+
+class RichTextToolbarLevels:
+    MINIMAL = "minimal"
+    STANDARD = "standard"
+    EXTENDED = "extended"
+
+    CHOICES = [
+        (MINIMAL, _("Minimal")),
+        (STANDARD, _("Standard")),
+        (EXTENDED, _("Extended")),
     ]
 
 

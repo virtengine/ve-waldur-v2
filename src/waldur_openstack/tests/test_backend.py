@@ -7,12 +7,15 @@ from cinderclient.v2.volumes import Volume
 from ddt import data, ddt
 from django.test import TestCase
 from django.utils import timezone
+from neutronclient.common import exceptions as neutron_exceptions
+from novaclient import exceptions as nova_exceptions
 from novaclient.v2.flavors import Flavor
 from novaclient.v2.servers import Server
 
 from waldur_core.core.models import CoreStates
 from waldur_openstack import models
 from waldur_openstack.backend import OpenStackBackend
+from waldur_openstack.exceptions import OpenStackBackendError
 from waldur_openstack.models import Port
 from waldur_openstack.tests.factories import (
     FloatingIPFactory,
@@ -66,7 +69,14 @@ class BaseBackendTest(TestCase):
                 "key_name": "",
                 "created": "2012-04-23T08:10:00Z",
                 "OS-SRV-USG:launched_at": "2012-04-23T09:15",
-                "flavor": {"id": backend_id},
+                "flavor": {
+                    "vcpus": 2,
+                    "ram": 4096,
+                    "disk": 10,
+                    "ephemeral": 0,
+                    "swap": 0,
+                    "original_name": "m1.small",
+                },
                 "image": {"id": backend_id},
                 "networks": {
                     "test-int-net": ["192.168.42.60"],
@@ -173,15 +183,41 @@ class CreateVolumesTest(VolumesBaseTest):
         self.assertEqual(volume.availability_zone, None)
         mock_logger.error.assert_called_once()
 
-    def _get_volume(self):
+    def test_intended_bootable_flag_survives_cinder_reporting_false_at_create(self):
+        # Cinder reports bootable="false" right after create for an image-backed
+        # volume until the image copy completes. The flag the serializer set on
+        # a system volume must survive so create_instance can find it via
+        # `volumes.get(bootable=True)` (regression for PUHURI-PORTALS-T2B).
+        backend_volume = self._get_valid_volume("new-backend-id")
+        backend_volume.bootable = "false"
+        self.mocked_cinder.volumes.create.return_value = backend_volume
+
+        volume = self._get_volume(bootable=True)
+
+        self.assertTrue(volume.bootable)
+
+    def test_bootable_flag_is_set_when_cinder_reports_true(self):
+        # A volume created from an image that Cinder already reports as bootable
+        # gets the flag even if it was not pre-set in the DB.
+        backend_volume = self._get_valid_volume("new-backend-id")
+        backend_volume.bootable = "true"
+        self.mocked_cinder.volumes.create.return_value = backend_volume
+
+        volume = self._get_volume(bootable=False)
+
+        self.assertTrue(volume.bootable)
+
+    def _get_volume(self, bootable=False):
         volume = factories.VolumeFactory(
             tenant=self.fixture.tenant,
             project=self.fixture.project,
             backend_id=None,
+            bootable=bootable,
         )
 
         backend = OpenStackBackend(self.openstack_settings)
         backend.create_volume(volume)
+        volume.refresh_from_db()
         return volume
 
 
@@ -476,18 +512,19 @@ class PullInstanceTest(BaseBackendTest):
     def setUp(self):
         super().setUp()
 
-        class MockFlavor:
-            name = "flavor_name"
-            disk = 102400
-            ram = 10240
-            vcpus = 1
-
         class MockInstance:
             name = "instance_name"
             id = "instance_id"
             created = "2017-08-10"
             key_name = "key_name"
-            flavor = {"id": "flavor_id"}
+            flavor = {
+                "vcpus": 1,
+                "ram": 10240,
+                "disk": 100,
+                "ephemeral": 0,
+                "swap": 0,
+                "original_name": "flavor_name",
+            }
             image = {"id": "image_id"}
             status = "ERRED"
             fault = {"message": "OpenStack Nova error."}
@@ -505,7 +542,6 @@ class PullInstanceTest(BaseBackendTest):
 
         self.mocked_nova.servers.get.return_value = MockInstance
         self.mocked_nova.volumes.get_server_volumes.return_value = []
-        self.mocked_nova.flavors.get.return_value = MockFlavor
 
     def test_availability_zone_is_pulled(self):
         zone = self.fixture.instance_availability_zone
@@ -553,6 +589,56 @@ class PullInstanceTest(BaseBackendTest):
         instance.refresh_from_db()
 
         self.assertEqual(instance.hypervisor_hostname, "aio1.openstack.local")
+
+
+class BackendInstanceToInstancePartialCellTest(BaseBackendTest):
+    """Microversion 2.69 may return partial server entries when a cell is
+    down: `created` becomes None and `status` becomes "UNKNOWN". The pull must
+    not crash on these — produce a sane Instance instead so the rest of the
+    sync continues."""
+
+    def test_partial_cell_server_does_not_crash(self):
+        partial_server = Server(
+            manager=None,
+            info={
+                "id": "partial-id",
+                "name": "partial",
+                "status": "UNKNOWN",
+                "key_name": "",
+                "created": None,
+                "OS-SRV-USG:launched_at": None,
+                "flavor": None,
+                "image": "",
+                "networks": {},
+            },
+        )
+
+        instance = self.backend._backend_instance_to_instance(
+            self.tenant, partial_server
+        )
+
+        self.assertEqual(instance.backend_id, "partial-id")
+        self.assertEqual(instance.runtime_state, "UNKNOWN")
+        self.assertIsNone(instance.created)
+
+    def test_partial_cell_server_with_missing_networks(self):
+        partial_server = Server(
+            manager=None,
+            info={
+                "id": "partial-id-2",
+                "name": "partial-2",
+                "status": "UNKNOWN",
+                "key_name": "",
+                "created": None,
+                "image": "",
+            },
+        )
+
+        instance = self.backend._backend_instance_to_instance(
+            self.tenant, partial_server
+        )
+
+        self.assertEqual(instance.directly_connected_ips, "")
 
 
 class PullInstancePortsTest(BaseBackendTest):
@@ -736,6 +822,51 @@ class PullPortsTest(BaseBackendTest):
 
         # Assert
         self.assertEqual(instance.ports.count(), 0)
+
+    @data(
+        CoreStates.CREATION_SCHEDULED,
+        CoreStates.CREATING,
+        CoreStates.UPDATE_SCHEDULED,
+        CoreStates.UPDATING,
+        CoreStates.DELETION_SCHEDULED,
+        CoreStates.DELETING,
+    )
+    def test_in_flight_ports_are_not_deleted(self, port_state):
+        # Regression: OpenStackInstanceSerializer.create() saves Port rows in
+        # CREATION_SCHEDULED state with backend_id=None, then create_instance_-
+        # ports pushes them to Neutron and transitions them to OK. The
+        # 2-hour periodic pull_tenant_ports must NOT delete these in-flight
+        # ports — same goes for ports being updated or torn down.
+        #
+        # Original bug: pull_tenant_ports filtered only on tenant + backend_id,
+        # so any in-flight port (state != OK/ERRED) whose backend_id wasn't yet
+        # in Neutron's response — including the un-pushed NULL-backend_id port
+        # from the create() flow — was wrongly deleted as "stale". Fixed by
+        # adding state__in=[OK, ERRED] to the filter, matching every other
+        # stale-detection site in this module.
+        instance = self.fixture.instance
+        in_flight_port = PortFactory(
+            tenant=self.tenant,
+            service_settings=self.openstack_settings,
+            project=self.fixture.project,
+            subnet=self.fixture.subnet,
+            network=self.fixture.network,
+            instance=instance,
+            state=port_state,
+            backend_id=None,
+        )
+
+        # Neutron returns no ports for this tenant — the in-flight Waldur
+        # port has not yet been pushed, so Neutron doesn't know about it.
+        self.mocked_neutron.list_ports.return_value = {"ports": []}
+
+        self.backend.pull_tenant_ports(self.tenant)
+
+        self.assertTrue(
+            Port.objects.filter(pk=in_flight_port.pk).exists(),
+            f"pull_tenant_ports must not delete ports in state {port_state} "
+            "(only ports in OK or ERRED state should be considered stale)",
+        )
 
     def test_existing_ports_are_updated(self):
         # Arrange
@@ -971,11 +1102,7 @@ class GetInstancesTest(BaseBackendTest):
         backend_instances = self._generate_instances(backend=True, count=3)
         instances = backend_instances + self._generate_instances()
 
-        def get_volume(backend_id):
-            return self._get_valid_flavor(backend_id=backend_id)
-
         self.mocked_nova.servers.list.return_value = instances
-        self.mocked_nova.flavors.get.side_effect = get_volume
 
         result = self.backend.get_instances(self.tenant)
 
@@ -991,13 +1118,8 @@ class ImportInstanceTest(BaseBackendTest):
         self.backend_instance = self._get_valid_instance(self.backend_id)
         self.mocked_nova.servers.get.return_value = self.backend_instance
 
-        backend_flavor = self._get_valid_flavor(self.backend_id)
-        self.backend_instance.flavor = backend_flavor._info
-        self.mocked_nova.flavors.get.return_value = backend_flavor
-
         backend_image = self._get_valid_image(self.backend_id)
         self.backend_instance.image = backend_image
-        self.mocked_glance.images.get.return_value = backend_flavor
 
     def test_backend_instance_without_volumes_is_imported(self):
         self.mocked_nova.volumes.get_server_volumes.return_value = []
@@ -1118,6 +1240,102 @@ class PullInstanceFloatingIpsTest(BaseBackendTest):
         self.assertEqual(ip2, fip.port)
 
 
+class PushInstanceFloatingIpsTest(BaseBackendTest):
+    # Regression: push_instance_floating_ips calls
+    # update_floatingip(port_id=floating_ip.port.backend_id). If the port row
+    # has no backend_id (port not pushed to Neutron yet, or its push failed),
+    # Neutron silently disassociates the FIP and its status stays at DOWN.
+    # The PollRuntimeStateTask scheduled after this step then retries for
+    # ~100 minutes before failing with no actionable message. Fail fast with
+    # a clear error instead.
+
+    def _make_attached_fip(self):
+        port = PortFactory(
+            tenant=self.fixture.tenant,
+            subnet=self.fixture.subnet,
+            instance=self.fixture.instance,
+        )
+        fip = FloatingIPFactory(
+            tenant=self.fixture.tenant,
+            port=port,
+        )
+        return fip, port
+
+    def test_unpushed_port_raises_clear_backend_error(self):
+        fip, port = self._make_attached_fip()
+        port.backend_id = ""
+        port.save()
+
+        with self.assertRaises(OpenStackBackendError) as ctx:
+            self.backend.push_instance_floating_ips(self.fixture.instance)
+
+        self.assertIn("empty backend_id", str(ctx.exception))
+        self.assertIn(port.uuid.hex, str(ctx.exception))
+        self.mocked_neutron.update_floatingip.assert_not_called()
+        self.mocked_neutron.list_floatingips.assert_not_called()
+
+    def test_uncreated_floating_ip_raises_clear_backend_error(self):
+        fip, _port = self._make_attached_fip()
+        fip.backend_id = ""
+        fip.save()
+
+        with self.assertRaises(OpenStackBackendError) as ctx:
+            self.backend.push_instance_floating_ips(self.fixture.instance)
+
+        self.assertIn("no backend_id", str(ctx.exception))
+        self.assertIn("create_floating_ip", str(ctx.exception))
+        self.mocked_neutron.update_floatingip.assert_not_called()
+        self.mocked_neutron.list_floatingips.assert_not_called()
+
+    def test_happy_path_associates_floating_ip(self):
+        fip, port = self._make_attached_fip()
+        self.mocked_neutron.list_floatingips.return_value = {"floatingips": []}
+
+        self.backend.push_instance_floating_ips(self.fixture.instance)
+
+        self.mocked_neutron.update_floatingip.assert_called_once_with(
+            fip.backend_id,
+            body={"floatingip": {"port_id": port.backend_id}},
+        )
+
+
+class PushInstanceFloatingIpsNotFoundTest(BaseBackendTest):
+    # Regression for the rc.10 silent-skip path: prior to this fix,
+    # push_instance_floating_ips caught neutron NotFound on update_floatingip
+    # and just logged a warning, leaving the FIP unassociated. The downstream
+    # PollRuntimeStateTask would then spin on runtime_state=DOWN for ~100 min
+    # before failing with no actionable error. Surface a clear, fail-fast
+    # OpenStackBackendError instead — Neutron NotFound here can mean either
+    # the FIP or the port_id we passed in is not visible to this session.
+
+    def test_notfound_on_update_floatingip_raises_clear_backend_error(self):
+        port = PortFactory(
+            tenant=self.fixture.tenant,
+            subnet=self.fixture.subnet,
+            instance=self.fixture.instance,
+        )
+        fip = FloatingIPFactory(
+            tenant=self.fixture.tenant,
+            port=port,
+        )
+        # Brand-new FIP not yet associated to any port in Neutron, so the
+        # initial list_floatingips returns empty and the connect-new loop
+        # calls update_floatingip — which we mock to raise NotFound.
+        self.mocked_neutron.list_floatingips.return_value = {"floatingips": []}
+        self.mocked_neutron.update_floatingip.side_effect = neutron_exceptions.NotFound(
+            "Resource not found"
+        )
+
+        with self.assertRaises(OpenStackBackendError) as ctx:
+            self.backend.push_instance_floating_ips(self.fixture.instance)
+
+        msg = str(ctx.exception)
+        # Names both sides — operator can see which is missing.
+        self.assertIn(fip.backend_id, msg)
+        self.assertIn(port.backend_id, msg)
+        self.assertIn("NotFound", msg)
+
+
 class CreateInstanceTest(VolumesBaseTest):
     def setUp(self):
         super().setUp()
@@ -1125,6 +1343,9 @@ class CreateInstanceTest(VolumesBaseTest):
         backend_flavor = self._get_valid_flavor(self.flavor_id)
         self.mocked_nova.flavors.get.return_value = backend_flavor
         self.mocked_nova.servers.create.return_value.id = uuid.uuid4()
+        # Nova microversion >= 2.36 requires at least one nic; the backend
+        # builds nics from instance.ports, so each test needs a port.
+        self.fixture.port
 
     def test_zone_name_is_passed_to_nova_client(self):
         # Arrange
@@ -1153,6 +1374,113 @@ class CreateInstanceTest(VolumesBaseTest):
         kwargs = self.mocked_nova.servers.create.mock_calls[0][2]
         self.assertEqual(kwargs["availability_zone"], "default_availability_zone")
 
+    def test_scheduler_hints_use_server_group_when_backend_id_present(self):
+        # Act
+        self.backend.create_instance(
+            self.fixture.instance, self.flavor_id, server_group="sg-backend-id"
+        )
+
+        # Assert
+        kwargs = self.mocked_nova.servers.create.mock_calls[0][2]
+        self.assertEqual(kwargs["scheduler_hints"], {"group": "sg-backend-id"})
+
+    def test_scheduler_hints_omitted_when_server_group_backend_id_is_empty(self):
+        # Regression: an empty server_group string used to forward
+        # scheduler_hints={"group": ""} to Nova, which rejects it
+        # with "'' is not a 'uuid'".
+        self.backend.create_instance(
+            self.fixture.instance, self.flavor_id, server_group=""
+        )
+
+        kwargs = self.mocked_nova.servers.create.mock_calls[0][2]
+        self.assertNotIn("scheduler_hints", kwargs)
+
+    def test_empty_nics_raises_clear_backend_error(self):
+        # Regression: Nova microversion 2.36+ rejects an empty `nics` list with
+        # a bare ValueError that escapes the ClientException handler. The
+        # backend should raise OpenStackBackendError with an actionable message.
+        instance = self.fixture.instance
+        instance.ports.all().delete()
+
+        with self.assertRaises(OpenStackBackendError) as ctx:
+            self.backend.create_instance(instance, self.flavor_id)
+
+        self.assertIn("at least one network port is required", str(ctx.exception))
+        self.mocked_nova.servers.create.assert_not_called()
+
+    def test_ports_without_backend_id_raise_clear_backend_error(self):
+        # Regression: if port creation failed earlier and ports have empty
+        # backend_id, nics ends up empty and Nova rejects the call. Surface a
+        # clearer error pointing to the offending ports.
+        instance = self.fixture.instance
+        port = self.fixture.port
+        port.backend_id = ""
+        port.save()
+
+        with self.assertRaises(OpenStackBackendError) as ctx:
+            self.backend.create_instance(instance, self.flavor_id)
+
+        self.assertIn("port creation likely failed earlier", str(ctx.exception))
+        self.mocked_nova.servers.create.assert_not_called()
+
+    def test_config_drive_per_instance_true_overrides_tenant_false(self):
+        # Per-instance True must win over tenant-wide False.
+        self.openstack_settings.options["config_drive"] = False
+        instance = self.fixture.instance
+        instance.config_drive = True
+        instance.save()
+
+        self.backend.create_instance(instance, self.flavor_id)
+
+        kwargs = self.mocked_nova.servers.create.mock_calls[0][2]
+        self.assertIs(kwargs["config_drive"], True)
+
+    def test_config_drive_per_instance_false_overrides_tenant_true(self):
+        # Per-instance False must win over tenant-wide True. Key absent from
+        # kwargs preserves the existing behaviour of only setting the flag
+        # when it is truthy.
+        self.openstack_settings.options["config_drive"] = True
+        instance = self.fixture.instance
+        instance.config_drive = False
+        instance.save()
+
+        self.backend.create_instance(instance, self.flavor_id)
+
+        kwargs = self.mocked_nova.servers.create.mock_calls[0][2]
+        self.assertNotIn("config_drive", kwargs)
+
+    def test_config_drive_falls_back_to_tenant_default_when_null(self):
+        # config_drive=None on the instance → use the tenant-wide setting.
+        self.openstack_settings.options["config_drive"] = True
+        instance = self.fixture.instance
+        instance.config_drive = None
+        instance.save()
+
+        self.backend.create_instance(instance, self.flavor_id)
+
+        kwargs = self.mocked_nova.servers.create.mock_calls[0][2]
+        self.assertIs(kwargs["config_drive"], True)
+
+
+class CreateServerGroupTest(BaseBackendTest):
+    def test_server_group_is_created_with_policy_kwarg(self):
+        # Regression: novaclient microversion 2.64+ replaced the list-typed
+        # `policies` kwarg with a single-string `policy`. Passing `policies`
+        # raises TypeError("ServerGroupsManager.create() got an unexpected
+        # keyword argument 'policies'").
+        server_group = self.fixture.server_group
+        server_group.backend_id = ""
+        server_group.save()
+        self.mocked_nova.server_groups.create.return_value.id = "sg-backend-id"
+
+        self.backend.create_server_group(server_group)
+
+        self.mocked_nova.server_groups.create.assert_called_once_with(
+            name=server_group.name, policy=server_group.policy
+        )
+        server_group.refresh_from_db()
+        self.assertEqual(server_group.backend_id, "sg-backend-id")
+
 
 class EnhancedImageDetectionTest(BaseBackendTest):
     def setUp(self):
@@ -1168,7 +1496,14 @@ class EnhancedImageDetectionTest(BaseBackendTest):
                 "key_name": "",
                 "created": "2012-04-23T08:10:00Z",
                 "OS-SRV-USG:launched_at": "2012-04-23T09:15",
-                "flavor": {"id": "flavor_id"},
+                "flavor": {
+                    "vcpus": 2,
+                    "ram": 4096,
+                    "disk": 10,
+                    "ephemeral": 0,
+                    "swap": 0,
+                    "original_name": "m1.small",
+                },
                 "image": "",  # No image metadata
                 "OS-EXT-SRV-ATTR:root_device_name": "/dev/vda",
                 "networks": {"test-int-net": ["192.168.42.60"]},
@@ -1212,11 +1547,7 @@ class EnhancedImageDetectionTest(BaseBackendTest):
         # Create volume reference object for nova API
         self.volume_ref = type("VolumeRef", (), {"volumeId": self.volume_backend_id})
 
-        # Setup flavor mock (required for instance creation)
-        self.flavor_id = "test_flavor_id"
-        self.backend_flavor = self._get_valid_flavor(self.flavor_id)
-        self.backend_instance_no_image.flavor = self.backend_flavor._info
-        self.mocked_nova.flavors.get.return_value = self.backend_flavor
+        # Flavor is embedded in server response with microversion 2.47+
 
     def test_image_detection_from_bootable_volume_with_image_id(self):
         """Test that image is detected from bootable volume when instance has no image metadata"""
@@ -1415,6 +1746,38 @@ class EnhancedImageDetectionTest(BaseBackendTest):
         self.assertEqual(instance.backend_id, self.backend_id)
         self.assertEqual(instance.image_name, "")  # No image name available
 
+    def test_image_detection_falls_back_to_volume_image_fk(self):
+        """Test that image is detected from volume.image FK when image_metadata is empty"""
+        self.mocked_nova.servers.get.return_value = self.backend_instance_no_image
+        self.mocked_nova.volumes.get_server_volumes.return_value = [self.volume_ref]
+        self.mocked_cinder.volumes.get.return_value = self.bootable_volume
+
+        # Create Image in Waldur database
+        image = ImageFactory(
+            settings=self.openstack_settings,
+            backend_id=self.image_id_in_volume,
+            name=self.image_name_in_volume,
+        )
+
+        # Create Volume with empty image_metadata but with image FK set
+        factories.VolumeFactory(
+            tenant=self.tenant,
+            project=self.fixture.project,
+            backend_id=self.volume_backend_id,
+            bootable=True,
+            device="/dev/vda",
+            image_metadata="",
+            image=image,
+        )
+
+        # Act
+        instance = self.backend.import_instance(
+            self.tenant, self.backend_id, self.fixture.project
+        )
+
+        # Assert - should resolve image name via volume.image FK
+        self.assertEqual(instance.image_name, self.image_name_in_volume)
+
     def test_pull_tenant_instances_uses_enhanced_detection(self):
         """Test that pull_tenant_instances now uses enhanced image detection via pull_instance"""
         # Create instance in Waldur database
@@ -1477,3 +1840,259 @@ class EnhancedImageDetectionTest(BaseBackendTest):
         instance.refresh_from_db()
         self.assertEqual(instance.state, CoreStates.ERRED)
         self.assertIn("Does not exist at backend", instance.error_message)
+
+
+class GetConsoleUrlDomainOverrideTest(BaseBackendTest):
+    def setUp(self):
+        super().setUp()
+        self.instance = self.fixture.instance
+        self.original_url = (
+            "http://nova-console.internal:13080/vnc_auto.html?token=abc123"
+        )
+
+    def _get_console_url(self, override_value):
+        self.openstack_settings.options["console_domain_override"] = override_value
+        self.openstack_settings.save()
+        self.mocked_nova.servers.get_console_url.return_value = {
+            "console": {"url": self.original_url}
+        }
+        return self.backend.get_console_url(self.instance)
+
+    def test_domain_only_override_preserves_original_port(self):
+        url = self._get_console_url("lb.example.com")
+        self.assertEqual(url, "http://lb.example.com:13080/vnc_auto.html?token=abc123")
+
+    def test_domain_and_port_override_replaces_both(self):
+        url = self._get_console_url("lb.example.com:443")
+        self.assertEqual(url, "http://lb.example.com:443/vnc_auto.html?token=abc123")
+
+    def test_domain_override_without_original_port(self):
+        self.original_url = "http://nova-console.internal/vnc_auto.html?token=abc123"
+        url = self._get_console_url("lb.example.com")
+        self.assertEqual(url, "http://lb.example.com/vnc_auto.html?token=abc123")
+
+    def test_domain_and_port_override_without_original_port(self):
+        self.original_url = "http://nova-console.internal/vnc_auto.html?token=abc123"
+        url = self._get_console_url("lb.example.com:443")
+        self.assertEqual(url, "http://lb.example.com:443/vnc_auto.html?token=abc123")
+
+    def test_no_override_returns_original_url(self):
+        self.mocked_nova.servers.get_console_url.return_value = {
+            "console": {"url": self.original_url}
+        }
+        url = self.backend.get_console_url(self.instance)
+        self.assertEqual(url, self.original_url)
+
+
+class RescueBackendTest(BaseBackendTest):
+    """Lock in the novaclient calling convention for rescue / unrescue.
+
+    Lab validation caught a real bug where backend was passing image_ref=
+    instead of image= — novaclient's servers.rescue() takes image=
+    (and maps it to rescue_image_ref in the wire request body).
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.instance = self.fixture.instance
+
+    def test_rescue_uses_image_kwarg_not_image_ref(self):
+        # Regression guard: novaclient's servers.rescue() takes `image=`,
+        # NOT `image_ref=`. Calling with image_ref= raises TypeError at
+        # runtime — verified against the lab cloud.
+        self.backend.rescue_instance(
+            self.instance, rescue_image_ref="rescue-image-uuid"
+        )
+        call_kwargs = self.mocked_nova.servers.rescue.call_args.kwargs
+        self.assertIn("image", call_kwargs)
+        self.assertNotIn("image_ref", call_kwargs)
+        self.assertEqual(call_kwargs["image"], "rescue-image-uuid")
+
+    def test_rescue_passes_none_when_no_image_provided(self):
+        self.backend.rescue_instance(self.instance)
+        call_kwargs = self.mocked_nova.servers.rescue.call_args.kwargs
+        self.assertIsNone(call_kwargs["image"])
+
+    def test_rescue_409_already_rescued_is_idempotent(self):
+        self.mocked_nova.servers.rescue.side_effect = nova_exceptions.ClientException(
+            code=409, message="Cannot rescue while in vm_state rescued"
+        )
+        # Should NOT raise.
+        self.backend.rescue_instance(self.instance, rescue_image_ref="x")
+
+    def test_unrescue_409_already_active_is_idempotent(self):
+        self.mocked_nova.servers.unrescue.side_effect = nova_exceptions.ClientException(
+            code=409, message="Cannot unrescue while in vm_state active"
+        )
+        # Should NOT raise.
+        self.backend.unrescue_instance(self.instance)
+
+
+class PushTenantQuotasTest(BaseBackendTest):
+    """Verify that push_tenant_quotas maps Waldur quota names to the correct
+    neutron/nova/cinder API keys and passes them to the right client calls."""
+
+    def _push(self, quotas):
+        self.backend.push_tenant_quotas(self.tenant, quotas)
+
+    def test_security_group_quotas_map_to_neutron(self):
+        self._push({"security_group_count": 10, "security_group_rule_count": 20})
+        self.mocked_neutron.update_quota.assert_called_once_with(
+            self.tenant.backend_id,
+            {"quota": {"security_group": 10, "security_group_rule": 20}},
+        )
+
+    def test_floating_ip_count_maps_to_floatingip(self):
+        self._push({"floating_ip_count": 5})
+        call_args = self.mocked_neutron.update_quota.call_args
+        quota_body = call_args[0][1]["quota"]
+        self.assertEqual(quota_body["floatingip"], 5)
+        self.assertNotIn("floating_ip_count", quota_body)
+
+    def test_network_count_maps_to_network(self):
+        self._push({"network_count": 3})
+        quota_body = self.mocked_neutron.update_quota.call_args[0][1]["quota"]
+        self.assertEqual(quota_body["network"], 3)
+        self.assertNotIn("network_count", quota_body)
+
+    def test_subnet_count_maps_to_subnet(self):
+        self._push({"subnet_count": 15})
+        quota_body = self.mocked_neutron.update_quota.call_args[0][1]["quota"]
+        self.assertEqual(quota_body["subnet"], 15)
+        self.assertNotIn("subnet_count", quota_body)
+
+    def test_port_count_maps_to_port(self):
+        self._push({"port_count": 50})
+        quota_body = self.mocked_neutron.update_quota.call_args[0][1]["quota"]
+        self.assertEqual(quota_body["port"], 50)
+        self.assertNotIn("port_count", quota_body)
+
+    def test_neutron_quotas_accept_zero(self):
+        self._push({"floating_ip_count": 0})
+        quota_body = self.mocked_neutron.update_quota.call_args[0][1]["quota"]
+        self.assertEqual(quota_body["floatingip"], 0)
+
+    def test_neutron_quotas_accept_unlimited(self):
+        self._push({"floating_ip_count": -1})
+        quota_body = self.mocked_neutron.update_quota.call_args[0][1]["quota"]
+        self.assertEqual(quota_body["floatingip"], -1)
+
+    def test_all_four_neutron_quotas_sent_together(self):
+        self._push(
+            {
+                "floating_ip_count": 10,
+                "network_count": 5,
+                "subnet_count": 20,
+                "port_count": 100,
+            }
+        )
+        quota_body = self.mocked_neutron.update_quota.call_args[0][1]["quota"]
+        self.assertEqual(quota_body["floatingip"], 10)
+        self.assertEqual(quota_body["network"], 5)
+        self.assertEqual(quota_body["subnet"], 20)
+        self.assertEqual(quota_body["port"], 100)
+
+    def test_omitted_neutron_quotas_not_sent(self):
+        # Only floating_ip_count provided — other neutron keys must be absent.
+        self._push({"floating_ip_count": 5})
+        quota_body = self.mocked_neutron.update_quota.call_args[0][1]["quota"]
+        self.assertNotIn("network", quota_body)
+        self.assertNotIn("subnet", quota_body)
+        self.assertNotIn("port", quota_body)
+
+    def test_neutron_call_skipped_when_no_neutron_quotas(self):
+        # Nova-only quotas must not trigger a neutron update_quota call.
+        self._push({"instances": 10, "vcpu": 4, "ram": 8192})
+        self.mocked_neutron.update_quota.assert_not_called()
+
+    def test_volume_type_quota_forwarded_to_cinder(self):
+        self._push({"gigabytes_ssd": 500})
+        self.mocked_cinder.quotas.update.assert_called_once_with(
+            self.tenant.backend_id, gigabytes_ssd=500
+        )
+
+    def test_multiple_volume_type_quotas_merged_with_cinder_quotas(self):
+        # storage (MiB) is converted to GB for Cinder; gigabytes_* are passed as-is (GB).
+        self._push(
+            {"storage": 1024, "gigabytes_ssd": 200, "gigabytes___DEFAULT__": 400}
+        )
+        call_kwargs = self.mocked_cinder.quotas.update.call_args[1]
+        self.assertEqual(call_kwargs["gigabytes"], 1)
+        self.assertEqual(call_kwargs["gigabytes_ssd"], 200)
+        self.assertEqual(call_kwargs["gigabytes___DEFAULT__"], 400)
+
+    def test_volume_type_quota_unlimited_value_forwarded(self):
+        self._push({"gigabytes_ssd": -1})
+        call_kwargs = self.mocked_cinder.quotas.update.call_args[1]
+        self.assertEqual(call_kwargs["gigabytes_ssd"], -1)
+
+    def test_volume_type_quota_zero_value_forwarded(self):
+        self._push({"gigabytes_ssd": 0})
+        call_kwargs = self.mocked_cinder.quotas.update.call_args[1]
+        self.assertEqual(call_kwargs["gigabytes_ssd"], 0)
+
+    def test_nova_not_called_when_only_volume_type_quotas(self):
+        self._push({"gigabytes_ssd": 100})
+        self.mocked_nova.quotas.update.assert_not_called()
+
+
+class PushInstancePortsTest(BaseBackendTest):
+    def _prepare_new_port(self):
+        instance = self.fixture.instance
+        port = self.fixture.port
+        # A port pulled from the backend carries the concrete fixed IP but has
+        # not yet been (re)created in Neutron.
+        port.backend_id = ""
+        port.fixed_ips = [
+            {"subnet_id": self.fixture.subnet.backend_id, "ip_address": "10.0.0.5"}
+        ]
+        port.save()
+        return instance, port
+
+    def test_new_port_is_created_via_admin_session(self):
+        instance, port = self._prepare_new_port()
+
+        tenant_neutron = mock.Mock()
+        tenant_neutron.list_ports.return_value = {"ports": []}
+        admin_neutron = mock.Mock()
+        admin_neutron.create_port.return_value = {
+            "port": {
+                "id": "created-port-id",
+                "mac_address": "fa:16:3e:00:00:01",
+                "fixed_ips": port.fixed_ips,
+            }
+        }
+
+        def fake_get_neutron_client(session):
+            return admin_neutron if session == "ADMIN" else tenant_neutron
+
+        with (
+            mock.patch(
+                "waldur_openstack.backend.get_tenant_session", return_value="TENANT"
+            ),
+            mock.patch.object(
+                OpenStackBackend,
+                "admin_session",
+                new_callable=mock.PropertyMock,
+                return_value="ADMIN",
+            ),
+            mock.patch(
+                "waldur_openstack.backend.get_neutron_client",
+                side_effect=fake_get_neutron_client,
+            ),
+            mock.patch("waldur_openstack.backend.get_nova_client") as mock_nova,
+        ):
+            self.backend.push_instance_ports(instance)
+
+        # Specifying an explicit fixed ip_address on create is admin-only in
+        # Neutron, so the port must be created through the admin session and
+        # never the tenant one.
+        admin_neutron.create_port.assert_called_once()
+        tenant_neutron.create_port.assert_not_called()
+
+        payload = admin_neutron.create_port.call_args[0][0]["port"]
+        self.assertEqual(payload["fixed_ips"], port.fixed_ips)
+
+        mock_nova.return_value.servers.interface_attach.assert_called_once()
+        port.refresh_from_db()
+        self.assertEqual(port.backend_id, "created-port-id")

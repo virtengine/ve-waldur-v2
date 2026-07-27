@@ -85,12 +85,29 @@ class SyncFromSmaxTest(smax_base.BaseTest):
 
     def test_web_hook(self):
         url = "/api/support-smax-webhook/"
-        response = self.client.post(url, data={"id": self.issue.backend_id})
+        response = self.client.post(
+            url,
+            data={"id": self.issue.backend_id},
+            HTTP_X_WEBHOOK_SECRET=smax_base.SMAX_WEBHOOK_TEST_SECRET,
+        )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.mock_smax().get_issue.assert_called_once()
         self.issue.refresh_from_db()
         self.assertEqual(self.issue.status, self.smax_issue.status)
         self.assertEqual(self.issue.summary, self.smax_issue.summary)
+
+    def test_sync_skips_issue_without_backend_id(self):
+        """Issues that have not been pushed to SMAX yet (backend_id IS NULL)
+        must be skipped without calling the SMAX API — otherwise SMAX returns
+        HTTP 500 "Invalid entity id 'None'".
+        """
+        self.issue.backend_id = None
+        self.issue.save()
+        self.mock_smax().get_issue.reset_mock()
+
+        self.backend.sync_issues()
+
+        self.mock_smax().get_issue.assert_not_called()
 
 
 class IssueLinksTest(smax_base.BaseTest):

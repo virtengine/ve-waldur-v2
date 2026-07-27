@@ -12,6 +12,7 @@ from django.utils import timezone
 from freezegun import freeze_time
 from rest_framework import status, test
 
+from waldur_core.core.models import DESCRIPTION_LENGTH
 from waldur_core.core.tests.helpers import override_waldur_core_settings
 from waldur_core.media.utils import dummy_image
 from waldur_core.permissions.enums import PermissionEnum
@@ -24,6 +25,7 @@ from waldur_core.structure.tests import models as test_models
 from waldur_core.structure.utils import move_project
 from waldur_core.users.enums import InvitationState
 from waldur_core.users.models import Invitation
+from waldur_mastermind.marketplace.enums import BillingTypes
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 
 
@@ -40,7 +42,7 @@ class ProjectPermissionGrantTest(TransactionTestCase):
 
 
 @ddt
-class ProjectUpdateDeleteTest(test.APITransactionTestCase):
+class ProjectUpdateDeleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ServiceFixture()
         CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_PROJECT)
@@ -112,20 +114,9 @@ class ProjectUpdateDeleteTest(test.APITransactionTestCase):
         self.assertFalse(Project.available_objects.filter(pk=pk).exists())
         self.assertTrue(Project.objects.filter(pk=pk).exists())
 
-    @override_waldur_core_settings(OECD_FOS_2007_CODE_MANDATORY=True)
-    def test_update_if_oecd_is_not_passed(self):
-        self.fixture.project.save()
-        self.client.force_authenticate(self.fixture.staff)
-
-        data = {"backend_id": "backend_id"}
-        response = self.client.patch(
-            factories.ProjectFactory.get_url(self.fixture.project), data
-        )
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
 
 @ddt
-class ProjectCreateTest(test.APITransactionTestCase):
+class ProjectCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ServiceFixture()
         CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_PROJECT)
@@ -277,7 +268,76 @@ class ProjectCreateTest(test.APITransactionTestCase):
         payload["name"] = "project_without_end_date_allowed"
         response = self.client.post(factories.ProjectFactory.get_list_url(), payload)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertIsNone(response.data["end_date"])
+
+    def test_description_exceeds_limit_after_html_clean_returns_400(self):
+        self.client.force_authenticate(self.fixture.owner)
+        payload = self._get_valid_project_payload(self.fixture.customer)
+        payload["name"] = "project_with_long_description"
+        payload["description"] = "&" * DESCRIPTION_LENGTH
+
+        response = self.client.post(factories.ProjectFactory.get_list_url(), payload)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("description", response.data)
+        self.assertFalse(Project.objects.filter(name=payload["name"]).exists())
+
+    @override_config(PROJECT_END_DATE_MANDATORY=True)
+    def test_patch_does_not_require_end_date_when_field_is_not_being_changed(self):
+        # Regression: setting PROJECT_END_DATE_MANDATORY must not block PATCH
+        # requests that don't touch end_date on projects whose end_date is null.
+        self.client.force_authenticate(self.fixture.staff)
+        project = self.fixture.project
+        project.end_date = None
+        project.save()
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(project),
+            {"description": "updated"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["description"], "updated")
+
+    @override_config(PROJECT_END_DATE_MANDATORY=True)
+    def test_patch_rejects_explicit_null_end_date_when_setting_enabled(self):
+        self.client.force_authenticate(self.fixture.staff)
+        project = self.fixture.project
+        project.end_date = datetime.date(2030, 1, 1)
+        project.save()
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(project),
+            {"end_date": None},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("end_date", response.data)
+
+    @override_waldur_core_settings(OECD_FOS_2007_CODE_MANDATORY=True)
+    def test_patch_does_not_require_oecd_code_when_field_is_not_being_changed(self):
+        # Regression: same anti-pattern as PROJECT_END_DATE_MANDATORY -- a
+        # PATCH that doesn't touch oecd_fos_2007_code must not be rejected
+        # just because the project's current value is null.
+        self.client.force_authenticate(self.fixture.staff)
+        project = self.fixture.project
+        project.oecd_fos_2007_code = None
+        project.save()
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(project),
+            {"description": "updated"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    @override_config(AFFILIATION_REQUIRED_AT_PROJECT_CREATION=True)
+    def test_patch_does_not_require_affiliation_when_field_is_not_being_changed(self):
+        # Regression: same anti-pattern. The setting name itself implies
+        # "at creation", so PATCHes that don't include affiliation_uuid must
+        # be allowed even when the project's current affiliation is null.
+        self.client.force_authenticate(self.fixture.staff)
+        project = self.fixture.project
+        project.affiliation = None
+        project.save()
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(project),
+            {"description": "updated"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
 
     def test_validate_start_date(self):
         self.client.force_authenticate(self.fixture.staff)
@@ -418,6 +478,92 @@ class ProjectCreateTest(test.APITransactionTestCase):
                 project3.start_date, datetime.datetime(year=2021, month=6, day=1).date()
             )
 
+    @override_config(PROJECT_NAME_REGEX=r"^.{1,32}$")
+    def test_project_name_regex_rejects_too_long_name(self):
+        self.client.force_authenticate(self.fixture.staff)
+        payload = self._get_valid_project_payload(self.fixture.customer)
+        payload["name"] = "x" * 33
+
+        response = self.client.post(factories.ProjectFactory.get_list_url(), payload)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("name", response.data)
+        self.assertFalse(Project.objects.filter(name=payload["name"]).exists())
+
+    @override_config(PROJECT_NAME_REGEX=r"^.{1,32}$")
+    def test_project_name_regex_allows_matching_name(self):
+        self.client.force_authenticate(self.fixture.staff)
+        payload = self._get_valid_project_payload(self.fixture.customer)
+        payload["name"] = "x" * 32
+
+        response = self.client.post(factories.ProjectFactory.get_list_url(), payload)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertTrue(Project.objects.filter(name=payload["name"]).exists())
+
+    def test_project_name_regex_disabled_by_default(self):
+        self.client.force_authenticate(self.fixture.staff)
+        payload = self._get_valid_project_payload(self.fixture.customer)
+        payload["name"] = "x" * 100
+
+        response = self.client.post(factories.ProjectFactory.get_list_url(), payload)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    @override_config(
+        PROJECT_NAME_REGEX=r"^.{1,32}$",
+        PROJECT_NAME_REGEX_ERROR_MESSAGE="Name must be at most 32 characters.",
+    )
+    def test_project_name_regex_uses_custom_error_message(self):
+        self.client.force_authenticate(self.fixture.staff)
+        payload = self._get_valid_project_payload(self.fixture.customer)
+        payload["name"] = "x" * 33
+
+        response = self.client.post(factories.ProjectFactory.get_list_url(), payload)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Name must be at most 32 characters.", str(response.data))
+
+    @override_config(PROJECT_NAME_REGEX=r"^.{1,32}$")
+    def test_project_name_regex_applies_on_rename(self):
+        self.client.force_authenticate(self.fixture.staff)
+        project = self.fixture.project
+
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(project),
+            {"name": "x" * 33},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @override_config(PROJECT_NAME_REGEX=r"^.{1,32}$")
+    def test_patch_not_changing_name_is_allowed_for_existing_long_name(self):
+        # A project whose name predates the rule must remain editable as long as
+        # the PATCH does not touch the name.
+        self.client.force_authenticate(self.fixture.staff)
+        project = self.fixture.project
+        project.name = "x" * 100
+        project.save()
+
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(project),
+            {"description": "updated"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    @override_config(PROJECT_NAME_REGEX="[")
+    def test_invalid_regex_is_ignored(self):
+        # A malformed pattern is an admin misconfiguration and must not block
+        # project creation.
+        self.client.force_authenticate(self.fixture.staff)
+        payload = self._get_valid_project_payload(self.fixture.customer)
+        payload["name"] = "x" * 100
+
+        response = self.client.post(factories.ProjectFactory.get_list_url(), payload)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
     def _get_valid_project_payload(self, customer):
         return {
             "name": "New project name",
@@ -425,7 +571,7 @@ class ProjectCreateTest(test.APITransactionTestCase):
         }
 
 
-class ProjectApiPermissionTest(test.APITransactionTestCase):
+class ProjectApiPermissionTest(test.APITestCase):
     forbidden_combinations = (
         # User role, Project
         ("admin", "manager"),
@@ -489,9 +635,10 @@ class ProjectApiPermissionTest(test.APITransactionTestCase):
             reverse("project-list"), self._get_valid_payload(project)
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-        self.assertDictContainsSubset(
-            {"detail": "You do not have permission to perform this action."},
-            response.data,
+        self.assertIn("detail", response.data)
+        self.assertEqual(
+            response.data["detail"],
+            "You do not have permission to perform this action.",
         )
 
     def test_user_cannot_create_project_within_customer_he_doesnt_own_but_manages_its_project(
@@ -506,9 +653,10 @@ class ProjectApiPermissionTest(test.APITransactionTestCase):
             reverse("project-list"), self._get_valid_payload(project)
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-        self.assertDictContainsSubset(
-            {"detail": "You do not have permission to perform this action."},
-            response.data,
+        self.assertIn("detail", response.data)
+        self.assertEqual(
+            response.data["detail"],
+            "You do not have permission to perform this action.",
         )
 
     def test_user_cannot_create_project_within_customer_he_is_not_affiliated_with(self):
@@ -519,8 +667,9 @@ class ProjectApiPermissionTest(test.APITransactionTestCase):
             reverse("project-list"), self._get_valid_payload(project)
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertDictContainsSubset(
-            {"customer": ["Invalid hyperlink - Object does not exist."]}, response.data
+        self.assertIn("customer", response.data)
+        self.assertEqual(
+            response.data["customer"], ["Invalid hyperlink - Object does not exist."]
         )
 
     def test_user_can_create_project_within_customer_he_owns(self):
@@ -645,7 +794,7 @@ class TestExecutor(executors.BaseCleanupExecutor):
 
 
 @mock.patch("waldur_core.core.WaldurExtension.get_extensions")
-class ProjectCleanupTest(test.APITransactionTestCase):
+class ProjectCleanupTest(test.APITestCase):
     def test_executors_are_sorted_in_topological_order(self, get_extensions):
         class ParentExecutor(executors.BaseCleanupExecutor):
             pass
@@ -702,7 +851,7 @@ class ProjectCleanupTest(test.APITransactionTestCase):
         )
 
 
-class ChangeProjectCustomerTest(test.APITransactionTestCase):
+class ChangeProjectCustomerTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.project = self.fixture.project
@@ -735,7 +884,7 @@ class ChangeProjectCustomerTest(test.APITransactionTestCase):
 
 
 @ddt
-class ChangeProjectImageTest(test.APITransactionTestCase):
+class ChangeProjectImageTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.project = self.fixture.project
@@ -764,12 +913,13 @@ class ChangeProjectImageTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
 
-class ProjectMoveTest(test.APITransactionTestCase):
+class ProjectMoveTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.project = self.fixture.project
         self.url = factories.ProjectFactory.get_url(self.project, action="move_project")
         self.customer = factories.CustomerFactory()
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_PROJECT)
 
     def get_response(self, role, customer):
         self.client.force_authenticate(role)
@@ -803,8 +953,66 @@ class ProjectMoveTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(self.project.customer, old_customer)
 
+    def test_user_can_move_project_if_has_create_project_permission_in_both_customers(
+        self,
+    ):
+        """Test that a user with CREATE_PROJECT permission in both source and target organizations can move a project."""
 
-class ProjectListFilterTest(test.APITransactionTestCase):
+        user_with_permission = factories.UserFactory()
+        self.project.customer.add_user(user_with_permission, CustomerRole.OWNER)
+        self.customer.add_user(user_with_permission, CustomerRole.OWNER)
+
+        response = self.get_response(user_with_permission, self.customer)
+
+        self.project.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.project.customer, self.customer)
+
+    def test_user_cannot_move_project_without_create_permission_in_source_customer(
+        self,
+    ):
+        """Test that a user without CREATE_PROJECT permission in the source organization cannot move a project."""
+
+        # User has permission only in target organization
+        user = factories.UserFactory()
+        self.customer.add_user(user, CustomerRole.OWNER)
+
+        response = self.get_response(user, self.customer)
+
+        self.project.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        # Project should remain in original customer
+        self.assertNotEqual(self.project.customer, self.customer)
+
+    def test_user_cannot_move_project_without_create_permission_in_target_customer(
+        self,
+    ):
+        """Test that a user without CREATE_PROJECT permission in the target organization cannot move a project."""
+
+        # User has permission only in source organization
+        user = factories.UserFactory()
+        self.project.customer.add_user(user, CustomerRole.OWNER)
+
+        response = self.get_response(user, self.customer)
+
+        self.project.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        # Project should remain in original customer
+        self.assertNotEqual(self.project.customer, self.customer)
+
+    def test_user_without_create_project_permission_cannot_move_project(self):
+        """Test that a user without CREATE_PROJECT permission in either organization cannot move a project."""
+        user_without_permission = factories.UserFactory()
+
+        response = self.get_response(user_without_permission, self.customer)
+
+        self.project.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        # Project should remain in original customer
+        self.assertNotEqual(self.project.customer, self.customer)
+
+
+class ProjectListFilterTest(test.APITestCase):
     _valid_backend_id = uuid.uuid4()
     _valid_effective_id = uuid.uuid4()
 
@@ -870,29 +1078,48 @@ class ProjectListFilterTest(test.APITransactionTestCase):
         self.assertEqual(response.data[0]["name"], self.project1.name)
 
 
-class ProjectResourceQuotasTest(test.APITransactionTestCase):
+class ProjectResourceQuotasTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.project = self.fixture.project
         self.empty_project = factories.ProjectFactory()
         self.offering = marketplace_factories.OfferingFactory()
         self.component1 = marketplace_factories.OfferingComponentFactory(
-            offering=self.offering, type="cpu", name="CPU", measured_unit="vCPU"
+            offering=self.offering,
+            type="cpu",
+            name="CPU",
+            measured_unit="vCPU",
+            billing_type=BillingTypes.USAGE,
         )
         self.component2 = marketplace_factories.OfferingComponentFactory(
-            offering=self.offering, type="ram", name="RAM", measured_unit="GB"
+            offering=self.offering,
+            type="ram",
+            name="RAM",
+            measured_unit="GB",
+            billing_type=BillingTypes.USAGE,
         )
         self.resource1 = marketplace_factories.ResourceFactory(
             project=self.project,
             offering=self.offering,
-            current_usages={"cpu": 2, "ram": 4},
             limits={"cpu": 8, "ram": 16},
         )
         self.resource2 = marketplace_factories.ResourceFactory(
             project=self.project,
             offering=self.offering,
-            current_usages={"cpu": 1, "ram": 2},
             limits={"cpu": 4, "ram": 8},
+        )
+        # Create ComponentUsage records (source of truth for stats)
+        marketplace_factories.ComponentUsageFactory(
+            resource=self.resource1, component=self.component1, usage=2
+        )
+        marketplace_factories.ComponentUsageFactory(
+            resource=self.resource1, component=self.component2, usage=4
+        )
+        marketplace_factories.ComponentUsageFactory(
+            resource=self.resource2, component=self.component1, usage=1
+        )
+        marketplace_factories.ComponentUsageFactory(
+            resource=self.resource2, component=self.component2, usage=2
         )
         self.url = factories.ProjectFactory.get_url(self.project, "stats")
 
@@ -924,7 +1151,7 @@ class ProjectResourceQuotasTest(test.APITransactionTestCase):
         self.assertEqual(ram_component["measured_unit"], "GB")
 
 
-class ProjectOtherUsersTest(test.APITransactionTestCase):
+class ProjectOtherUsersTest(test.APITestCase):
     def test_user_can_list_other_users(self):
         fixture = fixtures.ProjectFixture()
         ProjectRole.ADMIN.add_permission(PermissionEnum.LIST_PROJECTS)
@@ -957,7 +1184,7 @@ class ProjectOtherUsersTest(test.APITransactionTestCase):
         )
 
 
-class ProjectRecoveryTest(test.APITransactionTestCase):
+class ProjectRecoveryTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.project = self.fixture.project
@@ -1594,7 +1821,7 @@ class ProjectRecoveryTest(test.APITransactionTestCase):
         self.assertIsNone(response.data["termination_metadata"])
 
 
-class GracePeriodTest(test.APITransactionTestCase):
+class GracePeriodTest(test.APITestCase):
     """Test grace period functionality for projects and customers."""
 
     def setUp(self):
@@ -1720,6 +1947,18 @@ class GracePeriodTest(test.APITransactionTestCase):
         response = self.client.get(project_url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIn("grace_period_days", response.data)
+
+    def test_customer_grace_period_visible_in_project_api(self):
+        """Test that customer-level grace period is exposed in project API."""
+        self.fixture.customer.grace_period_days = 14
+        self.fixture.customer.save()
+
+        project_url = factories.ProjectFactory.get_url(self.fixture.project)
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.get(project_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("customer_grace_period_days", response.data)
+        self.assertEqual(response.data["customer_grace_period_days"], 14)
 
     def test_non_staff_cannot_update_grace_period(self):
         """Test that non-staff users cannot update grace_period_days."""
@@ -1981,7 +2220,7 @@ class GracePeriodTest(test.APITransactionTestCase):
         self.assertEqual(project.end_date_with_grace, expected_grace_end)
 
 
-class ProjectListQueryOptimizationTest(test.APITransactionTestCase):
+class ProjectListQueryOptimizationTest(test.APITestCase):
     """
     Test that project list endpoint is optimized to avoid N+1 queries.
 

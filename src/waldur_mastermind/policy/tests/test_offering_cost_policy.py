@@ -1,4 +1,5 @@
 from ddt import data, ddt
+from django.test import override_settings
 from rest_framework import status, test
 
 from waldur_core.structure.tests import factories as structure_factories
@@ -10,7 +11,7 @@ from waldur_mastermind.policy.tests import factories
 
 
 @ddt
-class GetPolicyTest(test.APITransactionTestCase):
+class GetPolicyTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -33,7 +34,7 @@ class GetPolicyTest(test.APITransactionTestCase):
 
 
 @ddt
-class CreatePolicyTest(test.APITransactionTestCase):
+class CreatePolicyTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -85,7 +86,7 @@ class CreatePolicyTest(test.APITransactionTestCase):
 
 
 @ddt
-class DeletePolicyTest(test.APITransactionTestCase):
+class DeletePolicyTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -108,7 +109,7 @@ class DeletePolicyTest(test.APITransactionTestCase):
 
 
 @ddt
-class UpdatePolicyTest(test.APITransactionTestCase):
+class UpdatePolicyTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -130,14 +131,15 @@ class UpdatePolicyTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
 
-class OfferingEstimatedCostPolicyTriggerTest(test.APITransactionTestCase):
+@override_settings(task_always_eager=True)
+class OfferingEstimatedCostPolicyTriggerTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
         self.customer = self.fixture.customer
         self.resource = self.fixture.resource
         self.policy = factories.OfferingEstimatedCostPolicyFactory(
-            scope=self.offering, limit_cost=10
+            scope=self.offering, limit_cost=10, apply_to_all=False
         )
         self.organization_group = structure_factories.OrganizationGroupFactory()
         self.policy.organization_groups.add(self.organization_group)

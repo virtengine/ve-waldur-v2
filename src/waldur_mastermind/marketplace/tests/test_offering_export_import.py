@@ -11,7 +11,7 @@ from waldur_mastermind.marketplace.tests import factories, fixtures
 
 
 @ddt
-class OfferingExportImportTestCase(test.APITransactionTestCase):
+class OfferingExportImportTestCase(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.customer = self.fixture.customer
@@ -384,6 +384,43 @@ class OfferingExportImportTestCase(test.APITransactionTestCase):
         # Always DRAFT state regardless of input data
         self.assertEqual(offering.state, models.Offering.States.DRAFT)
 
+    def test_import_offering_terms_of_service_link_null_is_coerced_to_blank(self):
+        """Handle case where `terms_of_service_link:` is null in YAML data."""
+        self.client.force_authenticate(self.user)
+
+        import_data = {
+            "offering": {"name": "ToS Link Null Test"},
+            "terms_of_service": [
+                {
+                    "terms_of_service": "# Sample Terms\n\nThis is the sample ...",
+                    "terms_of_service_link": None,
+                    "version": "1.0",
+                    "is_active": True,
+                    "requires_reconsent": False,
+                    "grace_period_days": 60,
+                }
+            ],
+        }
+
+        yaml_data = yaml.safe_dump(import_data)
+
+        url = reverse("marketplace-provider-offering-import-offering")
+        response = self.client.post(
+            url,
+            {
+                "customer": self.customer.uuid.hex,
+                "category": self.category.title,
+                "import_terms_of_service": True,
+                "offering_data": yaml_data,
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        offering = models.Offering.objects.get(name="ToS Link Null Test")
+        tos = offering.terms_of_service_configs.get()
+        self.assertEqual(tos.terms_of_service_link, "")
+
     def test_import_offering_with_invalid_yaml(self):
         """Test import fails with invalid YAML data."""
         self.client.force_authenticate(self.user)
@@ -438,6 +475,52 @@ class OfferingExportImportTestCase(test.APITransactionTestCase):
                 for warning in response.data["warnings"]
             )
         )
+
+    def test_import_offering_ambiguous_category_param_returns_400(self):
+        """Ambiguous category title in the 'category' param -> 400, not 500."""
+        self.client.force_authenticate(self.user)
+        factories.CategoryFactory(title="Duplicate Title")
+        factories.CategoryFactory(title="Duplicate Title")
+
+        yaml_data = yaml.safe_dump({"offering": {"name": "Ambiguous Cat Offering"}})
+        url = reverse("marketplace-provider-offering-import-offering")
+        response = self.client.post(
+            url,
+            {
+                "customer": self.customer.uuid.hex,
+                "category": "Duplicate Title",
+                "offering_data": yaml_data,
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Multiple categories", str(response.data))
+
+    def test_import_offering_ambiguous_category_name_returns_400(self):
+        """Ambiguous category title from offering_data.category_name -> 400, not 500."""
+        self.client.force_authenticate(self.user)
+        factories.CategoryFactory(title="Duplicate Title")
+        factories.CategoryFactory(title="Duplicate Title")
+
+        yaml_data = yaml.safe_dump(
+            {
+                "offering": {
+                    "name": "Ambiguous Cat Name Offering",
+                    "category_name": "Duplicate Title",
+                }
+            }
+        )
+        url = reverse("marketplace-provider-offering-import-offering")
+        response = self.client.post(
+            url,
+            {
+                "customer": self.customer.uuid.hex,
+                "offering_data": yaml_data,
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Multiple categories", str(response.data))
 
     def test_import_offering_components_with_missing_components_in_plans(self):
         """Test import handles plan components referencing non-existent components."""

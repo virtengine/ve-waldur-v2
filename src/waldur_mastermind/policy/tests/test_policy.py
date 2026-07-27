@@ -1,6 +1,7 @@
 from unittest import mock
 
 from ddt import data, ddt
+from django.test import override_settings
 from freezegun import freeze_time
 from rest_framework import status, test
 
@@ -16,8 +17,9 @@ from waldur_mastermind.policy.tasks import check_polices
 from waldur_mastermind.policy.tests import factories
 
 
+@override_settings(task_always_eager=True)
 @freeze_time("2024-09-01")
-class ActionsFunctionsTest(test.APITransactionTestCase):
+class ActionsFunctionsTest(test.APITestCase):
     def setUp(self):
         self.notify_project_team_mock = mock.MagicMock()
         self.notify_project_team_mock.__name__ = "notify_project_team"
@@ -97,6 +99,12 @@ class ActionsFunctionsTest(test.APITransactionTestCase):
             self.block_creation_of_new_resources_mock.reset_mock()
 
     def test_calling_of_threshold_actions(self):
+        # The pre-flight handler reads policy.actions (CharField) directly and
+        # would block creation before the post-save threshold runs. Drop the
+        # blocking action from the stored string; the mock-patched
+        # get_all_actions still injects it for the post-save check.
+        self.policy.actions = "notify_project_team"
+        self.policy.save()
         with mock.patch.object(
             ProjectEstimatedCostPolicy,
             "get_all_actions",
@@ -392,7 +400,7 @@ class ActionsFunctionsTest(test.APITransactionTestCase):
 
 
 @ddt
-class GetPolicyTest(test.APITransactionTestCase):
+class GetPolicyTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.project = self.fixture.project
@@ -549,7 +557,7 @@ class CreatePolicyTest(test.APITransactionTestCase):
 
 
 @ddt
-class DeletePolicyTest(test.APITransactionTestCase):
+class DeletePolicyTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.project = self.fixture.project
@@ -577,7 +585,7 @@ class DeletePolicyTest(test.APITransactionTestCase):
 
 
 @ddt
-class UpdatePolicyTest(test.APITransactionTestCase):
+class UpdatePolicyTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.project = self.fixture.project
@@ -602,3 +610,112 @@ class UpdatePolicyTest(test.APITransactionTestCase):
     def test_project_member_can_not_update_policy(self, user):
         response = self._update_policy(user)
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class ProjectCostPolicyQueryFilterTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = marketplace_fixtures.MarketplaceFixture()
+        self.project = self.fixture.project
+        self.project.name = "Alpha Research Lab"
+        self.project.save()
+        self.policy = factories.ProjectEstimatedCostPolicyFactory(scope=self.project)
+        self.url = factories.ProjectEstimatedCostPolicyFactory.get_list_url()
+
+    def test_query_filters_by_project_name(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"query": "Alpha"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["scope_name"], "Alpha Research Lab")
+
+    def test_query_excludes_non_matching(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"query": "Nonexistent"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 0)
+
+    def test_query_is_case_insensitive(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url, {"query": "alpha"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+
+
+@override_settings(task_always_eager=True)
+@freeze_time("2024-09-01")
+class AffectedResourcesCountTest(test.APITestCase):
+    """WAL-9808: Verify affected_resources_count in cost policy API response."""
+
+    def setUp(self):
+        self.fixture = marketplace_fixtures.MarketplaceFixture()
+        self.policy = factories.ProjectEstimatedCostPolicyFactory(
+            scope=self.fixture.project,
+            actions="request_pausing",
+            limit_cost=10,
+        )
+        self.resource = self.fixture.resource
+        self.resource.offering.plugin_options = {"supports_pausing": True}
+        self.resource.offering.save()
+        self.url = factories.ProjectEstimatedCostPolicyFactory.get_list_url()
+
+    def test_count_is_zero_when_policy_not_fired(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data[0]["affected_resources_count"], 0)
+
+    def test_count_reflects_paused_resources(self):
+        # Fire the policy and pause the resource
+        policy_actions.request_pausing(self.policy)
+        self.policy.has_fired = True
+        self.policy.save()
+
+        self.resource.refresh_from_db()
+        self.assertTrue(self.resource.paused)
+
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data[0]["affected_resources_count"], 1)
+
+    def test_count_excludes_resources_without_offering_support(self):
+        # Pause resource but disable offering support
+        self.resource.paused = True
+        self.resource.save()
+        self.resource.offering.plugin_options = {"supports_pausing": False}
+        self.resource.offering.save()
+        self.policy.has_fired = True
+        self.policy.save()
+
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data[0]["affected_resources_count"], 0)
+
+    def test_count_filtered_by_user_permissions(self):
+        """affected_resources_count applies user permission filtering.
+
+        The count uses filter_queryset_for_user for non-staff users to prevent
+        information disclosure. In practice, users who can see a policy already
+        have access to its scope resources (enforced by GenericRoleFilter on
+        the policy viewset), so this is a defense-in-depth measure.
+        """
+        # Fire the policy and pause the resource
+        policy_actions.request_pausing(self.policy)
+        self.policy.has_fired = True
+        self.policy.save()
+
+        self.resource.refresh_from_db()
+        self.assertTrue(self.resource.paused)
+
+        # Owner has access to the project and can see the policy + count
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data[0]["affected_resources_count"], 1)
+
+        # A user with no role cannot even see the policy
+        self.client.force_authenticate(self.fixture.user)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 0)

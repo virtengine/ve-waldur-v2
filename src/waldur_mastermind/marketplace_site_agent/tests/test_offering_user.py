@@ -1,4 +1,4 @@
-import textwrap
+import tomllib
 from unittest import mock
 
 from constance.test.unittest import override_config as override_constance_config
@@ -20,7 +20,10 @@ from waldur_mastermind.marketplace.enums import (
 )
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 from waldur_mastermind.marketplace.tests import fixtures as marketplace_fixtures
-from waldur_mastermind.marketplace_site_agent.tests.fixtures import GlauthUserFixture
+from waldur_mastermind.marketplace_site_agent.tests.fixtures import (
+    GlauthUserFixture,
+    add_posix_ranges,
+)
 
 
 def add_user_to_project(user, project, role=None):
@@ -31,7 +34,7 @@ def add_user_to_project(user, project, role=None):
     tasks.create_or_restore_offering_users_for_user(user.uuid.hex, project.uuid.hex)
 
 
-class OfferingUserCreationTest(test.APITransactionTestCase):
+class OfferingUserCreationTest(test.APITestCase):
     def setUp(self) -> None:
         fixture = marketplace_fixtures.MarketplaceFixture()
         self.resource = fixture.resource
@@ -41,11 +44,10 @@ class OfferingUserCreationTest(test.APITransactionTestCase):
         offering.plugin_options = {
             "service_provider_can_create_offering_user": True,
             "username_generation_policy": "waldur_username",
-            "initial_uidnumber": 1000,
-            "initial_primarygroup_number": 2000,
             "homedir_prefix": "/tmp/",
         }
         offering.save()
+        add_posix_ranges(offering)
 
         self.offering_admin = fixture.offering_admin
         self.offering_owner = fixture.offering_owner
@@ -107,7 +109,12 @@ class OfferingUserCreationTest(test.APITransactionTestCase):
         )
 
         self.resource.project.add_user(self.offering_admin, ProjectRole.ADMIN)
-        resource_creation_succeeded(self.resource)
+        with mock.patch(
+            "waldur_mastermind.marketplace.tasks.create_or_restore_offering_users_for_project.delay",
+            side_effect=tasks.create_or_restore_offering_users_for_project,
+        ):
+            with self.captureOnCommitCallbacks(execute=True):
+                resource_creation_succeeded(self.resource)
 
         # Verify that publish_messages.delay was called
         mocked_publish_messages.assert_called()
@@ -132,7 +139,12 @@ class OfferingUserCreationTest(test.APITransactionTestCase):
             ).exists()
         )
 
-        resource_creation_succeeded(self.resource)
+        with mock.patch(
+            "waldur_mastermind.marketplace.tasks.create_or_restore_offering_users_for_project.delay",
+            side_effect=tasks.create_or_restore_offering_users_for_project,
+        ):
+            with self.captureOnCommitCallbacks(execute=True):
+                resource_creation_succeeded(self.resource)
 
         self.assertTrue(
             marketplace_models.OfferingUser.objects.filter(
@@ -148,7 +160,12 @@ class OfferingUserCreationTest(test.APITransactionTestCase):
         self.resource.project.add_user(self.offering_admin, ProjectRole.ADMIN)
         self.resource.project.add_user(self.offering_owner, ProjectRole.MANAGER)
 
-        resource_creation_succeeded(self.resource)
+        with mock.patch(
+            "waldur_mastermind.marketplace.tasks.create_or_restore_offering_users_for_project.delay",
+            side_effect=tasks.create_or_restore_offering_users_for_project,
+        ):
+            with self.captureOnCommitCallbacks(execute=True):
+                resource_creation_succeeded(self.resource)
         offering_user = marketplace_models.OfferingUser.objects.get(
             offering=self.resource.offering, user=self.offering_admin
         )
@@ -162,21 +179,21 @@ class OfferingUserCreationTest(test.APITransactionTestCase):
         self.assertIn("homeDir", offering_user.backend_metadata)
         self.assertIn("loginShell", offering_user.backend_metadata)
 
-        # Verify uidnumber and primarygroup are properly set (relative to initial values)
-        # The exact values depend on database state, but they should be unique and valid
+        # Verify uidnumber and primarygroup are allocated from the configured ranges
+        # The exact values depend on allocation order, but they should be unique and valid
         uidnumber1 = offering_user.backend_metadata["uidnumber"]
         primarygroup1 = offering_user.backend_metadata["primarygroup"]
         uidnumber2 = offering_user2.backend_metadata["uidnumber"]
         primarygroup2 = offering_user2.backend_metadata["primarygroup"]
 
-        # Verify both users got unique uidnumbers above the initial value
-        self.assertGreater(uidnumber1, 1000)  # initial_uidnumber is 1000
-        self.assertGreater(uidnumber2, 1000)
+        # Verify both users got unique uidnumbers from the uid range (start 1001)
+        self.assertGreaterEqual(uidnumber1, 1001)
+        self.assertGreaterEqual(uidnumber2, 1001)
         self.assertNotEqual(uidnumber1, uidnumber2)
 
-        # Verify both users got unique primarygroup numbers above the initial value
-        self.assertGreater(primarygroup1, 2000)  # initial_primarygroup_number is 2000
-        self.assertGreater(primarygroup2, 2000)
+        # Verify both users got unique primarygroup numbers from the gid range (start 2001)
+        self.assertGreaterEqual(primarygroup1, 2001)
+        self.assertGreaterEqual(primarygroup2, 2001)
         self.assertNotEqual(primarygroup1, primarygroup2)
 
         # Verify other fields are correctly set
@@ -193,7 +210,7 @@ class OfferingUserCreationTest(test.APITransactionTestCase):
         self.assertEqual(offering_user2.backend_metadata["loginShell"], "/bin/bash")
 
 
-class OfferingUserUpdateTest(test.APITransactionTestCase):
+class OfferingUserUpdateTest(test.APITestCase):
     def setUp(self) -> None:
         fixture = marketplace_fixtures.MarketplaceFixture()
 
@@ -253,7 +270,7 @@ class OfferingUserUpdateTest(test.APITransactionTestCase):
 
 
 @ddt
-class OfferingUserGlauthConfigTest(test.APITransactionTestCase):
+class OfferingUserGlauthConfigTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = GlauthUserFixture()
         self.maxDiff = None
@@ -300,6 +317,37 @@ class OfferingUserGlauthConfigTest(test.APITransactionTestCase):
             f"Expected disabled = true, but got {response.data}",
         )
 
+    def test_glauth_config_excludes_users_without_username(self):
+        """Accounts with a blank ("") or NULL username must never be
+        rendered into the GLAuth config, even if they carry a uidnumber."""
+        offering = self.fixture.offering
+        # Two accounts that would otherwise render (uidnumber present), but
+        # have no username: one empty string, one SQL NULL.
+        for marker, username in ((9998, ""), (9999, None)):
+            offering_user = marketplace_models.OfferingUser.objects.create(
+                offering=offering,
+                user=structure_factories.UserFactory(),
+                username=username,
+            )
+            offering_user.backend_metadata = {
+                "uidnumber": marker,
+                "primarygroup": marker,
+                "loginShell": "/bin/bash",
+                "homeDir": "/tmp/",
+            }
+            offering_user.save()
+
+        self.client.force_login(self.fixture.offering_owner)
+        response = self.client.get(self.fixture.url)
+        self.assertEqual(200, response.status_code)
+
+        # The valid manager account is still present...
+        self.assertIn(self.fixture.manager.username, response.data)
+        # ...but no empty-name record and none of the blank accounts' ids.
+        self.assertNotIn('name = ""', response.data)
+        self.assertNotIn("9998", response.data)
+        self.assertNotIn("9999", response.data)
+
     def test_glauth_config_file_fetching_not_allowed(self):
         self.client.force_login(self.fixture.owner)
         response = self.client.get(self.fixture.url)
@@ -321,40 +369,40 @@ class OfferingUserGlauthConfigTest(test.APITransactionTestCase):
         response = self.client.get(self.fixture.url)
         self.assertEqual(200, response.status_code)
 
-        expected_config_file = textwrap.dedent(
-            f"""
-        [[users]]
-          name = "{self.fixture.manager.get_username()}"
-          givenname="{self.fixture.manager.first_name}"
-          sn="{self.fixture.manager.last_name}"
-          mail = "{self.fixture.manager.email}"
-          uidnumber = 1001
-          primarygroup = 2001
-          otherGroups = [6001]
-          sshkeys = ["{ssh_key.public_key}"]
-          loginShell = "/bin/bash"
-          homeDir = "/tmp/{self.fixture.offering_user.username}"
-          passsha256 = ""
-          disabled = false
-            [[users.customattributes]]
-            preferredUsername = ["{self.fixture.offering_user.username}"]
+        expected_data = {
+            "users": [
+                {
+                    "name": self.fixture.manager.get_username(),
+                    "givenname": self.fixture.manager.first_name,
+                    "sn": self.fixture.manager.last_name,
+                    "mail": self.fixture.manager.email,
+                    "uidnumber": 1001,
+                    "primarygroup": 2001,
+                    "otherGroups": [6001],
+                    "sshkeys": [ssh_key.public_key],
+                    "loginShell": "/bin/bash",
+                    "homeDir": f"/tmp/{self.fixture.offering_user.username}",
+                    "passsha256": "",
+                    "disabled": False,
+                    "customattributes": {
+                        "preferredUsername": [self.fixture.offering_user.username]
+                    },
+                }
+            ],
+            "groups": [
+                {"name": self.fixture.offering_user.username, "gidnumber": 2001},
+                {"name": "6001", "gidnumber": 6001},
+                {"name": "6002", "gidnumber": 6002},
+            ],
+        }
+        self.assertEqual(expected_data, tomllib.loads(response.data))
 
-        [[groups]]
-          name = "{self.fixture.offering_user.username}"
-          gidnumber = 2001
-
-
-        [[groups]]
-          name = "6001"
-          gidnumber = 6001
-
-
-        [[groups]]
-          name = "6002"
-          gidnumber = 6002
-        """
-        )
-        self.assertEqual(expected_config_file, response.data)
+        # Groups must be emitted as [[groups]] array-of-tables, not an inline
+        # "groups = [...]" array: the glauth image concatenates this export onto
+        # a base config that already declares [[groups]], and a bare groups key
+        # collides with it and is silently dropped (so no group reaches LDAP).
+        self.assertIn("[[groups]]", response.data)
+        self.assertNotIn("groups = [", response.data)
 
         self.assertEqual(
             1,
@@ -371,9 +419,44 @@ class OfferingUserGlauthConfigTest(test.APITransactionTestCase):
         )
         self.assertIsNotNone(integration_status.last_request_timestamp)
 
+    def test_glauth_config_escapes_backslashes_in_ssh_keys(self):
+        """SSH keys with backslashes in comments must be escaped for valid TOML."""
+        structure_factories.SshPublicKeyFactory(
+            user=self.fixture.manager,
+            public_key=r"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINweobRRnzaUEIM5nbLFGm/MuFcioMwFtKkycv2m781l ul\sd41041@LAP-113622",
+        )
+        self.client.force_login(self.fixture.offering_owner)
+        response = self.client.get(self.fixture.url)
+        self.assertEqual(200, response.status_code)
+        self.assertIn(r"ul\\sd41041@LAP-113622", response.data)
+        self.assertNotIn(r"ul\sd41041@LAP-113622", response.data)
+
+    def test_glauth_config_handles_special_characters_robustly(self):
+        """User attributes containing backslashes and double quotes must be successfully serialized and parsed."""
+        self.fixture.offering.plugin_options["emit_display_name"] = True
+        self.fixture.offering.save(update_fields=["plugin_options"])
+
+        manager = self.fixture.manager
+        manager.first_name = 'John "Johnny"'
+        manager.last_name = r"Doe\Smith"
+        manager.save()
+
+        self.client.force_login(self.fixture.offering_owner)
+        response = self.client.get(self.fixture.url)
+        self.assertEqual(200, response.status_code)
+
+        # Parse TOML to ensure validity
+        parsed_config = tomllib.loads(response.data)
+        user_record = parsed_config["users"][0]
+        self.assertEqual(user_record["givenname"], 'John "Johnny"')
+        self.assertEqual(user_record["sn"], r"Doe\Smith")
+        self.assertEqual(
+            user_record["customattributes"]["displayName"], ['John "Johnny" Doe\\Smith']
+        )
+
 
 @ddt
-class OfferingUserGlauthConfigQueryCountTest(test.APITransactionTestCase):
+class OfferingUserGlauthConfigQueryCountTest(test.APITestCase):
     """Test that glauth_users_config endpoint has constant query count regardless of user count."""
 
     def setUp(self) -> None:
@@ -445,8 +528,176 @@ class OfferingUserGlauthConfigQueryCountTest(test.APITransactionTestCase):
         )
 
 
+class UidNumberPerOfferingScopeTest(test.APITestCase):
+    """Test that uidnumber generation is scoped per offering, not global."""
+
+    def test_uidnumbers_are_sequential_per_offering(self):
+        """
+        When two offerings exist, creating users in offering A should not
+        create gaps in uidnumber sequence of offering B.
+        """
+        fixture = marketplace_fixtures.MarketplaceFixture()
+
+        offering_a = marketplace_factories.OfferingFactory(
+            type=SITE_AGENT_OFFERING,
+            customer=fixture.offering_customer,
+            plugin_options={
+                "service_provider_can_create_offering_user": True,
+                "username_generation_policy": "anonymized",
+                "username_anonymized_prefix": "user_a_",
+                "homedir_prefix": "/home/",
+            },
+        )
+        add_posix_ranges(offering_a, uid_start=10001, gid_start=1001)
+        offering_b = marketplace_factories.OfferingFactory(
+            type=SITE_AGENT_OFFERING,
+            customer=fixture.offering_customer,
+            plugin_options={
+                "service_provider_can_create_offering_user": True,
+                "username_generation_policy": "anonymized",
+                "username_anonymized_prefix": "user_b_",
+                "homedir_prefix": "/home/",
+            },
+        )
+        add_posix_ranges(offering_b, uid_start=10001, gid_start=1001)
+
+        # Create 3 users in offering A
+        for i in range(3):
+            user = structure_factories.UserFactory()
+            ou = marketplace_models.OfferingUser.objects.create(
+                offering=offering_a,
+                user=user,
+                username=f"user_a_{str(i).zfill(5)}",
+            )
+            marketplace_utils.setup_linux_related_data(ou, offering_a)
+            ou.save()
+
+        # Create 2 users in offering B
+        offering_b_users = []
+        for i in range(2):
+            user = structure_factories.UserFactory()
+            ou = marketplace_models.OfferingUser.objects.create(
+                offering=offering_b,
+                user=user,
+                username=f"user_b_{str(i).zfill(5)}",
+            )
+            marketplace_utils.setup_linux_related_data(ou, offering_b)
+            ou.save()
+            offering_b_users.append(ou)
+
+        # Offering B's first user should get uidnumber 10001, not 10004
+        self.assertEqual(offering_b_users[0].backend_metadata["uidnumber"], 10001)
+        self.assertEqual(offering_b_users[0].backend_metadata["primarygroup"], 1001)
+
+        # Offering B's second user should get uidnumber 10002, not 10005
+        self.assertEqual(offering_b_users[1].backend_metadata["uidnumber"], 10002)
+        self.assertEqual(offering_b_users[1].backend_metadata["primarygroup"], 1002)
+
+    def test_uidnumbers_are_sequential_within_single_offering(self):
+        """
+        Verify that uidnumbers increment sequentially within one offering.
+        """
+        fixture = marketplace_fixtures.MarketplaceFixture()
+
+        offering = marketplace_factories.OfferingFactory(
+            type=SITE_AGENT_OFFERING,
+            customer=fixture.offering_customer,
+            plugin_options={
+                "service_provider_can_create_offering_user": True,
+                "username_generation_policy": "waldur_username",
+                "homedir_prefix": "/home/",
+            },
+        )
+        add_posix_ranges(offering, uid_start=5001, gid_start=6001)
+
+        users = []
+        for i in range(4):
+            user = structure_factories.UserFactory()
+            ou = marketplace_models.OfferingUser.objects.create(
+                offering=offering,
+                user=user,
+                username=user.username,
+            )
+            marketplace_utils.setup_linux_related_data(ou, offering)
+            ou.save()
+            users.append(ou)
+
+        for i, ou in enumerate(users):
+            expected_uid = 5001 + i
+            expected_group = 6001 + i
+            self.assertEqual(
+                ou.backend_metadata["uidnumber"],
+                expected_uid,
+                f"User {i} expected uidnumber {expected_uid}, got {ou.backend_metadata['uidnumber']}",
+            )
+            self.assertEqual(
+                ou.backend_metadata["primarygroup"],
+                expected_group,
+                f"User {i} expected primarygroup {expected_group}, got {ou.backend_metadata['primarygroup']}",
+            )
+
+
+class GlauthSettableAttributesTest(test.APITestCase):
+    """Configurable login shell + opt-in displayName/waldurUsername attributes."""
+
+    def setUp(self):
+        self.fixture = GlauthUserFixture()
+        self.maxDiff = None
+
+    def _get_config(self):
+        self.client.force_login(self.fixture.offering_owner)
+        return self.client.get(self.fixture.url).data
+
+    def test_login_shell_is_configurable(self):
+        offering = marketplace_factories.OfferingFactory(
+            type=SITE_AGENT_OFFERING,
+            customer=self.fixture.offering_customer,
+            plugin_options={
+                "service_provider_can_create_offering_user": True,
+                "username_generation_policy": "waldur_username",
+                "login_shell": "/bin/zsh",
+            },
+        )
+        add_posix_ranges(offering)
+        offering_user = marketplace_models.OfferingUser.objects.create(
+            offering=offering, user=self.fixture.manager, username="shelltest"
+        )
+        marketplace_utils.setup_linux_related_data(offering_user, offering)
+        self.assertEqual(offering_user.backend_metadata["loginShell"], "/bin/zsh")
+
+    def test_login_shell_defaults_to_bash(self):
+        self.assertEqual(
+            self.fixture.offering_user.backend_metadata["loginShell"], "/bin/bash"
+        )
+
+    def test_display_name_emitted_when_enabled(self):
+        self.fixture.offering.plugin_options["emit_display_name"] = True
+        self.fixture.offering.save(update_fields=["plugin_options"])
+        user_record = tomllib.loads(self._get_config())["users"][0]
+        self.assertEqual(
+            user_record["customattributes"]["displayName"],
+            [self.fixture.manager.get_full_name()],
+        )
+
+    def test_waldur_username_emitted_when_enabled(self):
+        self.fixture.offering.plugin_options["emit_waldur_username"] = True
+        self.fixture.offering.save(update_fields=["plugin_options"])
+        user_record = tomllib.loads(self._get_config())["users"][0]
+        self.assertEqual(
+            user_record["customattributes"]["waldurUsername"],
+            [self.fixture.manager.username],
+        )
+
+    def test_custom_attributes_absent_by_default(self):
+        config = self._get_config()
+        self.assertNotIn("displayName", config)
+        self.assertNotIn("waldurUsername", config)
+        # preferredUsername is always present
+        self.assertIn("preferredUsername", config)
+
+
 @override_constance_config(ENFORCE_USER_CONSENT_FOR_OFFERINGS=True)
-class UserOfferingsMappingTest(test.APITransactionTestCase):
+class UserOfferingsMappingTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.resource = self.fixture.resource

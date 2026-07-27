@@ -1,6 +1,7 @@
 import datetime
 from decimal import ROUND_HALF_UP, Decimal
 
+from constance import config
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db.models import F, Sum
@@ -291,6 +292,10 @@ class InvoiceItemMigrateToSerializer(serializers.HyperlinkedModelSerializer):
         fields = ("invoice",)
 
 
+class InvoiceItemUUIDSerializer(serializers.Serializer):
+    invoice_item_uuid = serializers.UUIDField()
+
+
 class CustomerDetailsSerializer(serializers.ModelSerializer):
     country_name = serializers.ReadOnlyField(source="get_country_display")
 
@@ -398,6 +403,12 @@ class InvoiceItemCostsForPeriodSerializer(serializers.Serializer):
 class InvoiceItemProjectCostsForPeriodSerializer(InvoiceItemCostsForPeriodSerializer):
     project_uuid = serializers.UUIDField(
         help_text="UUID of the project for which statistics should be calculated."
+    )
+    resource_uuid = serializers.UUIDField(
+        required=False,
+        allow_null=True,
+        help_text="Optional marketplace resource UUID. When provided, costs are "
+        "limited to this resource only.",
     )
 
     def validate(self, attrs):
@@ -604,10 +615,7 @@ class SAPReportSerializer(serializers.Serializer):
             )
 
     def get_cond_value(self, invoice_item):
-        import locale
-
-        locale.setlocale(locale.LC_ALL, "de_DE.UTF-8")
-        return locale.format_string("%.4f", invoice_item.unit_price)
+        return f"{invoice_item.unit_price:.4f}".replace(".", ",")
 
     def get_material_code(self, invoice_item):
         try:
@@ -811,7 +819,11 @@ class SAFReportSerializer(serializers.Serializer):
 class PaymentProfileAttributesSerializer(serializers.Serializer):
     end_date = serializers.CharField(required=False)
     agreement_number = serializers.CharField(required=False)
-    contract_sum = serializers.IntegerField(required=False)
+    # Declared IntegerField previously, but every contract_sum value in
+    # production is actually a string (e.g. "111") -- this is a documentation-
+    # only field (see PaymentProfileAttributesField below), so make it match
+    # what's really stored instead of a type that's never actually observed.
+    contract_sum = serializers.CharField(required=False)
 
 
 @extend_schema_field(PaymentProfileAttributesSerializer)
@@ -823,7 +835,9 @@ class PaymentProfileSerializer(serializers.HyperlinkedModelSerializer):
     organization_uuid = serializers.UUIDField(
         read_only=True, source="organization.uuid"
     )
-    payment_type_display = serializers.ReadOnlyField(source="get_payment_type_display")
+    payment_type_display = serializers.CharField(
+        read_only=True, source="get_payment_type_display"
+    )
     attributes = PaymentProfileAttributesField(required=False)
 
     class Meta:
@@ -1032,8 +1046,10 @@ class CustomerCreditSerializer(serializers.HyperlinkedModelSerializer):
             "apply_as_minimal_consumption",
             "allocated_to_projects",
             "consumption_last_month",
+            "withdrawable_balance",
         )
         protected_fields = ("customer",)
+        read_only_fields = ("withdrawable_balance",)
 
         extra_kwargs = {
             "url": {
@@ -1144,7 +1160,8 @@ class ProjectCreditSerializer(serializers.HyperlinkedModelSerializer):
         read_only=True, many=True, source="project.customer.customercredit.offerings"
     )
 
-    def get_allocated_customer_credit(self, project_credit) -> float:
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_allocated_customer_credit(self, project_credit) -> Decimal | None:
         return models.ProjectCredit.objects.filter(
             project__customer=project_credit.project.customer
         ).aggregate(sum=Sum("value"))["sum"]
@@ -1195,9 +1212,170 @@ class ProjectCreditSerializer(serializers.HyperlinkedModelSerializer):
         }
 
 
+class CustomerAffiliateSerializer(serializers.HyperlinkedModelSerializer):
+    customer_name = serializers.ReadOnlyField(source="customer.name")
+    customer_uuid = serializers.UUIDField(read_only=True, source="customer.uuid")
+    affiliate_name = serializers.ReadOnlyField(source="affiliate.name")
+    affiliate_uuid = serializers.UUIDField(read_only=True, source="affiliate.uuid")
+    total_earned = serializers.SerializerMethodField()
+
+    def get_total_earned(self, link) -> float:
+        # Prefer the queryset annotation (list endpoint) and fall back to a
+        # per-object aggregate when it is absent (e.g. just-created links).
+        total = getattr(link, "total_earned_agg", None)
+        if total is None:
+            total = link.accruals.aggregate(sum=Sum("amount"))["sum"]
+        return total or 0
+
+    class Meta:
+        model = models.CustomerAffiliate
+        fields = (
+            "uuid",
+            "url",
+            "customer",
+            "customer_name",
+            "customer_uuid",
+            "affiliate",
+            "affiliate_name",
+            "affiliate_uuid",
+            "fee_percent",
+            "is_active",
+            "start_date",
+            "end_date",
+            "total_earned",
+            "created",
+        )
+        protected_fields = ("customer", "affiliate")
+
+        extra_kwargs = {
+            "url": {
+                "view_name": "customer-affiliate-detail",
+                "lookup_field": "uuid",
+            },
+            "customer": {
+                "view_name": "customer-detail",
+                "lookup_field": "uuid",
+            },
+            "affiliate": {
+                "view_name": "customer-detail",
+                "lookup_field": "uuid",
+            },
+        }
+
+
+class CreateCustomerAffiliateSerializer(CustomerAffiliateSerializer):
+    def get_from_attrs_or_instance(self, attrs, field_name, default=None):
+        return attrs.get(field_name, getattr(self.instance, field_name, default))
+
+    def validate(self, attrs):
+        customer = self.get_from_attrs_or_instance(attrs, "customer")
+        affiliate = self.get_from_attrs_or_instance(attrs, "affiliate")
+        start_date = self.get_from_attrs_or_instance(attrs, "start_date")
+        end_date = self.get_from_attrs_or_instance(attrs, "end_date")
+
+        if customer == affiliate:
+            raise exceptions.ValidationError(
+                _("An organization cannot be its own affiliate.")
+            )
+
+        if start_date and end_date and end_date <= start_date:
+            raise exceptions.ValidationError(
+                {"end_date": _("End date must be after the start date.")}
+            )
+
+        return attrs
+
+
+class AffiliateFeeAccrualSerializer(serializers.ModelSerializer):
+    """Affiliate-facing accrual representation.
+
+    Deliberately exposes only the fee amount, the invoice period and the
+    referred customer name — never the invoice object itself, so affiliate
+    users cannot see what the referred customer bought.
+    """
+
+    customer_name = serializers.ReadOnlyField(source="affiliate_link.customer.name")
+    affiliate_uuid = serializers.UUIDField(
+        read_only=True, source="affiliate_link.affiliate.uuid"
+    )
+    invoice_year = serializers.IntegerField(read_only=True, source="invoice.year")
+    invoice_month = serializers.IntegerField(read_only=True, source="invoice.month")
+
+    class Meta:
+        model = models.AffiliateFeeAccrual
+        fields = (
+            "uuid",
+            "amount",
+            "customer_name",
+            "affiliate_uuid",
+            "invoice_year",
+            "invoice_month",
+            "created",
+        )
+
+
+class AffiliateEarningsMonthSerializer(serializers.Serializer):
+    year = serializers.IntegerField()
+    month = serializers.IntegerField()
+    amount = serializers.DecimalField(max_digits=16, decimal_places=5)
+
+
+class AffiliateEarningsSerializer(serializers.Serializer):
+    total_earned = serializers.DecimalField(max_digits=16, decimal_places=5)
+    withdrawable_balance = serializers.DecimalField(max_digits=16, decimal_places=5)
+    per_month = AffiliateEarningsMonthSerializer(many=True)
+
+
+class WithdrawableAdjustmentSerializer(serializers.Serializer):
+    """Staff input for a manual adjustment of the withdrawable credit part."""
+
+    amount = serializers.DecimalField(max_digits=16, decimal_places=5)
+    comment = serializers.CharField()
+
+    def validate_amount(self, value):
+        if value == 0:
+            raise serializers.ValidationError(_("Amount must not be zero."))
+        return value
+
+    def validate_comment(self, value):
+        value = (value or "").strip()
+        if not value:
+            raise serializers.ValidationError(_("A comment is required."))
+        return value
+
+
+class CreditTransactionSerializer(serializers.ModelSerializer):
+    """Read-only ledger entry: the trace of how a credit's value changed."""
+
+    transaction_type_display = serializers.CharField(
+        source="get_transaction_type_display", read_only=True
+    )
+    customer_uuid = serializers.UUIDField(source="credit.customer.uuid", read_only=True)
+    customer_name = serializers.ReadOnlyField(source="credit.customer.name")
+
+    class Meta:
+        model = models.CreditTransaction
+        fields = (
+            "uuid",
+            "created",
+            "amount",
+            "transaction_type",
+            "transaction_type_display",
+            "comment",
+            "customer_uuid",
+            "customer_name",
+        )
+
+
 def get_project_credit(serializer, project) -> float | None:
+    # 1. Check bulk context
+    bulk_credits = serializer.context.get("bulk_data", {}).get("project_credits")
+    if bulk_credits and project.id in bulk_credits:
+        return bulk_credits[project.id]
+
+    # 2. Fallback to prefetch/query
     try:
-        return models.ProjectCredit.objects.get(project=project).value
+        return project.projectcredit.value
     except models.ProjectCredit.DoesNotExist:
         return None
 
@@ -1214,8 +1392,14 @@ core_signals.pre_serializer_fields.connect(
 )
 
 
-def get_customer_credit(serializer, customer) -> float | None:
-    # Use prefetched data if available to avoid N+1 queries
+@extend_schema_field(serializers.CharField(allow_null=True))
+def get_customer_credit(serializer, customer) -> Decimal | None:
+    # 1. Check bulk context
+    bulk_credits = serializer.context.get("bulk_data", {}).get("customer_credits")
+    if bulk_credits and customer.id in bulk_credits:
+        return bulk_credits[customer.id]
+
+    # 2. Fallback to prefetched data
     if (
         hasattr(customer, "_prefetched_objects_cache")
         and "customercredit" in customer._prefetched_objects_cache
@@ -1225,12 +1409,12 @@ def get_customer_credit(serializer, customer) -> float | None:
         if credit:
             return credit.value
         return None
-    else:
-        # Fallback to original query behavior
-        try:
-            return models.CustomerCredit.objects.get(customer=customer).value
-        except models.CustomerCredit.DoesNotExist:
-            return None
+
+    # 3. Final fallback: database query
+    try:
+        return models.CustomerCredit.objects.get(customer=customer).value
+    except models.CustomerCredit.DoesNotExist:
+        return None
 
 
 def add_customer_credit(sender, fields, **kwargs):
@@ -1238,104 +1422,26 @@ def add_customer_credit(sender, fields, **kwargs):
     fields["customer_credit"] = serializers.SerializerMethodField()
     setattr(sender, "get_customer_credit", get_customer_credit)
 
-    # Also optimize eager loading for CustomerSerializer
-    if sender.__name__ == "CustomerSerializer":
-        _optimize_customer_serializer_eager_load_for_credit(sender)
 
+@extend_schema_field(serializers.CharField(allow_null=True))
+def get_customer_unallocated_credit(serializer, customer) -> Decimal | None:
+    # 1. Get customer credit (using bulk context if available)
+    customer_credit = get_customer_credit(serializer, customer)
+    if customer_credit is None:
+        return None
 
-def _optimize_customer_serializer_eager_load_for_credit(sender):
-    """Optimize eager loading for CustomerSerializer to prefetch customer credits."""
-    # Check if we already have an optimized eager_load method
-    # The flag is on the underlying function if it's a staticmethod
-    eager_load_func = getattr(sender.eager_load, "__func__", sender.eager_load)
-    if hasattr(eager_load_func, "_credit_optimized"):
-        return
-
-    # If billing optimization is already applied, we need to combine them
-    if hasattr(eager_load_func, "_billing_optimized"):
-        # Get the true original method that was stored by the billing optimization
-        original_eager_load = getattr(
-            eager_load_func, "_original_eager_load", sender.eager_load
-        )
-
-        def combined_eager_load(queryset, request=None):
-            # Call the true original method first
-            queryset = original_eager_load(queryset, request)
-
-            # Add billing optimizations
-            if request:
-                fields = request.query_params.getlist("field")
-                if "billing_price_estimate" in fields:
-                    queryset._billing_optimization_enabled = True
-
-            # Add credit optimizations
-            if request:
-                fields = request.query_params.getlist("field")
-                if "customer_credit" in fields:
-                    queryset = queryset.select_related("customercredit")
-
-            return queryset
-
-        # Mark as optimized for both and store original
-        combined_eager_load._billing_optimized = True
-        combined_eager_load._credit_optimized = True
-        combined_eager_load._original_eager_load = original_eager_load
-
-        # Replace the eager_load method
-        sender.eager_load = staticmethod(combined_eager_load)
-        return
-
-    # Store the original eager_load method
-    original_eager_load = sender.eager_load
-
-    def optimized_eager_load(queryset, request=None):
-        # Call the original eager_load first
-        queryset = original_eager_load(queryset, request)
-
-        # Add optimizations for customer_credit if requested
-        if request:
-            fields = request.query_params.getlist("field")
-
-            # Prefetch customer credit if requested
-            if "customer_credit" in fields:
-                queryset = queryset.select_related("customercredit")
-
-        return queryset
-
-    # Mark as optimized to avoid double optimization and store original
-    optimized_eager_load._credit_optimized = True
-    optimized_eager_load._original_eager_load = original_eager_load
-
-    # Replace the eager_load method
-    sender.eager_load = staticmethod(optimized_eager_load)
-
-
-def get_customer_unallocated_credit(serializer, customer) -> float | None:
-    # Use prefetched data if available to avoid N+1 queries for customer credit
-    if (
-        hasattr(customer, "_prefetched_objects_cache")
-        and "customercredit" in customer._prefetched_objects_cache
-    ):
-        # For OneToOneField, Django stores the related object directly, not as a list
-        credit = customer._prefetched_objects_cache.get("customercredit")
-        if not credit:
-            return None
-        customer_credit = credit.value
+    # 2. Get project credits sum
+    bulk_sums = serializer.context.get("bulk_data", {}).get("project_credits_sums")
+    if bulk_sums and customer.id in bulk_sums:
+        project_credits_sum = bulk_sums[customer.id]
     else:
-        # Fallback to original query behavior
-        try:
-            customer_credit = models.CustomerCredit.objects.get(customer=customer).value
-        except models.CustomerCredit.DoesNotExist:
-            return None
-
-    # Calculate project credits sum
-    # TODO: This could be further optimized with bulk prefetching
-    project_credits_sum = (
-        models.ProjectCredit.objects.filter(project__customer=customer).aggregate(
-            sum=Sum("value")
-        )["sum"]
-        or 0
-    )
+        # Fallback: calculate project credits sum
+        project_credits_sum = (
+            models.ProjectCredit.objects.filter(project__customer=customer).aggregate(
+                sum=Sum("value")
+            )["sum"]
+            or 0
+        )
 
     return customer_credit - project_credits_sum
 
@@ -1346,6 +1452,22 @@ def add_customer_unallocated_credit(sender, fields, **kwargs):
     setattr(sender, "get_customer_unallocated_credit", get_customer_unallocated_credit)
 
 
+def get_has_affiliate_links(serializer, customer) -> bool:
+    # The affiliate earnings view is only relevant to an organization that is
+    # itself an affiliate on at least one link; the flag lets the UI hide it
+    # otherwise. Skipped entirely when the affiliate program is disabled so the
+    # common case costs no query.
+    if not config.AFFILIATES_ENABLED:
+        return False
+    return customer.affiliate_terms.exists()
+
+
+def add_has_affiliate_links(sender, fields, **kwargs):
+    """Add a flag telling whether the organization is an affiliate on any link."""
+    fields["has_affiliate_links"] = serializers.SerializerMethodField()
+    setattr(sender, "get_has_affiliate_links", get_has_affiliate_links)
+
+
 core_signals.pre_serializer_fields.connect(
     sender=structure_serializers.CustomerSerializer,
     receiver=add_customer_credit,
@@ -1354,6 +1476,11 @@ core_signals.pre_serializer_fields.connect(
 core_signals.pre_serializer_fields.connect(
     sender=structure_serializers.CustomerSerializer,
     receiver=add_customer_unallocated_credit,
+)
+
+core_signals.pre_serializer_fields.connect(
+    sender=structure_serializers.CustomerSerializer,
+    receiver=add_has_affiliate_links,
 )
 
 
@@ -1387,10 +1514,24 @@ class InvoiceGrowthSerializer(serializers.Serializer):
     customer_periods = InvoiceGrowthCustomerPeriodSerializer(many=True)
 
 
+class InvoiceCostItemSerializer(serializers.Serializer):
+    name = serializers.CharField(read_only=True)
+    unit_price = serializers.DecimalField(
+        read_only=True, max_digits=20, decimal_places=10
+    )
+    unit = serializers.CharField(read_only=True)
+    quantity = serializers.DecimalField(
+        read_only=True, max_digits=20, decimal_places=10
+    )
+    measured_unit = serializers.CharField(read_only=True)
+    price = serializers.FloatField(read_only=True)
+
+
 class InvoiceCostSerializer(serializers.Serializer):
     price = serializers.FloatField(read_only=True)
     year = serializers.IntegerField(read_only=True)
     month = serializers.IntegerField(read_only=True)
+    items = InvoiceCostItemSerializer(many=True, required=False)
 
 
 class CostsForPeriodSerializer(serializers.Serializer):
@@ -1401,6 +1542,13 @@ class CostsForPeriodSerializer(serializers.Serializer):
 
 class CustomerCreditConsumptionSerializer(serializers.Serializer):
     date = serializers.DateField(read_only=True)
+    price = serializers.DecimalField(
+        read_only=True, max_digits=PRICE_MAX_DIGITS, decimal_places=2
+    )
+
+
+class CustomerCreditConsumptionByMonthSerializer(serializers.Serializer):
+    month = serializers.CharField(read_only=True)
     price = serializers.DecimalField(
         read_only=True, max_digits=PRICE_MAX_DIGITS, decimal_places=2
     )
@@ -1437,9 +1585,12 @@ class ImportUsageSerializer(serializers.Serializer):
         return value
 
 
+class ImportUsageErrorSerializer(serializers.Serializer):
+    customer_name = serializers.CharField()
+    reason = serializers.CharField()
+
+
 class ImportUsageResponseSerializer(serializers.Serializer):
     created = serializers.IntegerField()
     skipped = serializers.IntegerField()
-    errors = serializers.ListField(
-        child=serializers.DictField(child=serializers.CharField())
-    )
+    errors = ImportUsageErrorSerializer(many=True)

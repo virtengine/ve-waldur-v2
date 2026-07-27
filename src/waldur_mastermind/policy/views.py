@@ -1,7 +1,6 @@
-import datetime
 import logging
 
-from django.db.models import Sum
+from django.db.models import Q, Sum
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema
@@ -16,7 +15,16 @@ from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import permissions as structure_permissions
 from waldur_mastermind.marketplace import models as marketplace_models
 
-from . import filters, models, serializers, slurm_commands, slurm_preview
+from . import (
+    filters,
+    models,
+    serializers,
+    slurm_commands,
+    slurm_preview,
+)
+from . import (
+    tasks as policy_tasks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +57,7 @@ class ProjectEstimatedCostPolicyViewSet(ActionsViewSet):
         self._check_terminated_project(policy)
         return super().partial_update(request, *args, **kwargs)
 
-    @extend_schema(parameters=[])
+    @extend_schema(responses={status.HTTP_200_OK: list[str]}, parameters=[])
     @action(detail=False, methods=["get"])
     def actions(self, request, *args, **kwargs):
         data = list(models.ProjectEstimatedCostPolicy.available_actions)
@@ -69,7 +77,7 @@ class CustomerEstimatedCostPolicyViewSet(ActionsViewSet):
         structure_permissions.is_staff
     ]
 
-    @extend_schema(parameters=[])
+    @extend_schema(responses={status.HTTP_200_OK: list[str]}, parameters=[])
     @action(detail=False, methods=["get"])
     def actions(self, request, *args, **kwargs):
         data = list(models.CustomerEstimatedCostPolicy.available_actions)
@@ -90,6 +98,7 @@ class OfferingEstimatedCostPolicyViewSet(ActionsViewSet):
     ]
 
     @extend_schema(
+        responses={status.HTTP_200_OK: list[str]},
         parameters=[],
         description="List available actions for OfferingEstimatedCostPolicy",
     )
@@ -112,7 +121,7 @@ class OfferingUsagePolicyViewSet(ActionsViewSet):
         structure_permissions.is_owner
     ]
 
-    @extend_schema(parameters=[])
+    @extend_schema(responses={status.HTTP_200_OK: list[str]}, parameters=[])
     @action(detail=False, methods=["get"])
     def actions(self, request, *args, **kwargs):
         data = list(models.OfferingUsagePolicy.available_actions)
@@ -132,7 +141,7 @@ class CustomerComponentUsagePolicyViewSet(ActionsViewSet):
         partial_update_permissions
     ) = [structure_permissions.is_staff]
 
-    @extend_schema(parameters=[])
+    @extend_schema(responses={status.HTTP_200_OK: list[str]}, parameters=[])
     @action(detail=False, methods=["get"])
     def actions(self, request, *args, **kwargs):
         data = list(models.CustomerComponentUsagePolicy.available_actions)
@@ -160,46 +169,20 @@ class SlurmPeriodicUsagePolicyViewSet(ActionsViewSet):
     dry_run_permissions = [structure_permissions.is_staff]
     evaluate_permissions = [structure_permissions.is_staff]
 
-    @extend_schema(parameters=[])
+    @extend_schema(responses={status.HTTP_200_OK: list[str]}, parameters=[])
     @action(detail=False, methods=["get"])
     def actions(self, request, *args, **kwargs):
         data = list(models.SlurmPeriodicUsagePolicy.available_actions)
         return Response(data, status=status.HTTP_200_OK)
-
-    def _get_quarter_period(self, today):
-        """Calculate the current quarter's start and end dates."""
-        current_quarter = (today.month - 1) // 3 + 1
-        quarter_start_month = (current_quarter - 1) * 3 + 1
-        period_start = datetime.date(today.year, quarter_start_month, 1)
-
-        if current_quarter == 4:
-            period_end = datetime.date(today.year, 12, 31)
-        else:
-            next_quarter_month = quarter_start_month + 3
-            period_end = datetime.date(
-                today.year, next_quarter_month, 1
-            ) - datetime.timedelta(days=1)
-
-        return period_start, period_end, current_quarter, quarter_start_month
-
-    def _get_previous_quarter_period(self, today, current_quarter, quarter_start_month):
-        """Calculate the previous quarter's start and end dates."""
-        if current_quarter == 1:
-            prev_quarter_start = datetime.date(today.year - 1, 10, 1)
-            prev_quarter_end = datetime.date(today.year - 1, 12, 31)
-        else:
-            prev_quarter_start_month = quarter_start_month - 3
-            prev_quarter_start = datetime.date(today.year, prev_quarter_start_month, 1)
-            period_start = datetime.date(today.year, quarter_start_month, 1)
-            prev_quarter_end = period_start - datetime.timedelta(days=1)
-
-        return prev_quarter_start, prev_quarter_end
 
     def _fetch_resource_usage_data(self, resource_uuid, defaults):
         """Fetch usage data from resource if available.
 
         Returns a dict with allocation, current_usage, daily_usage_rate, and previous_usage.
         The preview API stays scalar (frontend-facing with simple example values).
+
+        Uses the policy's period setting to determine the correct date range.
+        If no policy exists, queries all usage without date bounds.
         """
         result = defaults.copy()
 
@@ -218,23 +201,40 @@ class SlurmPeriodicUsagePolicyViewSet(ActionsViewSet):
                 result["allocation"] = total_alloc
 
         today = timezone.now().date()
-        period_start, period_end, current_quarter, quarter_start_month = (
-            self._get_quarter_period(today)
-        )
 
-        # Get per-component usages for the current quarter, summed into scalar
-        usages = (
-            marketplace_models.ComponentUsage.objects.filter(
-                resource=resource,
+        # Look up the policy for this offering to determine the correct period
+        policy = models.SlurmPeriodicUsagePolicy.objects.filter(
+            scope=resource.offering,
+        ).first()
+
+        if policy:
+            current_period = policy._get_current_period()
+            date_range = policy._get_period_date_range(current_period)
+            if date_range:
+                period_start, period_end = date_range
+            else:
+                # TOTAL period: no date range, query all usage
+                period_start = None
+                period_end = None
+
+            previous_period = policy._get_previous_period(current_period)
+        else:
+            # No policy for offering — query all usage without date bounds
+            period_start = None
+            period_end = None
+            previous_period = None
+
+        # Get per-component usages for the current period, summed into scalar
+        usage_qs = marketplace_models.ComponentUsage.objects.filter(resource=resource)
+        if period_start is not None and period_end is not None:
+            usage_qs = usage_qs.filter(
                 billing_period__gte=period_start,
                 billing_period__lte=period_end,
             )
-            .values("component__type")
-            .annotate(total=Sum("usage"))
-        )
+        usages = usage_qs.values("component__type").annotate(total=Sum("usage"))
         current_usage = sum(float(u["total"]) for u in usages if u["total"])
 
-        # If no usage in current quarter, try to get most recent usage
+        # If no usage in current period, try to get most recent usage
         if current_usage == 0:
             recent_usage = (
                 marketplace_models.ComponentUsage.objects.filter(resource=resource)
@@ -248,22 +248,33 @@ class SlurmPeriodicUsagePolicyViewSet(ActionsViewSet):
         result["current_usage"] = current_usage
 
         # Calculate daily usage rate
-        days_in_period = max(1, (today - period_start).days + 1)
+        if period_start is not None:
+            days_in_period = max(1, (today - period_start).days + 1)
+        else:
+            # TOTAL period: use earliest usage date as start
+            earliest = (
+                marketplace_models.ComponentUsage.objects.filter(resource=resource)
+                .order_by("billing_period")
+                .values_list("billing_period", flat=True)
+                .first()
+            )
+            days_in_period = max(1, (today - earliest).days + 1) if earliest else 1
         if current_usage > 0:
             result["daily_usage_rate"] = current_usage / days_in_period
 
-        # Get previous quarter usage
-        prev_quarter_start, prev_quarter_end = self._get_previous_quarter_period(
-            today, current_quarter, quarter_start_month
-        )
-        prev_usages = marketplace_models.ComponentUsage.objects.filter(
-            resource=resource,
-            billing_period__gte=prev_quarter_start,
-            billing_period__lte=prev_quarter_end,
-        )
-        prev_usage_sum = prev_usages.aggregate(total=Sum("usage"))["total"]
-        if prev_usage_sum:
-            result["previous_usage"] = float(prev_usage_sum)
+        # Get previous period usage
+        if policy and previous_period:
+            prev_date_range = policy._get_period_date_range(previous_period)
+            if prev_date_range:
+                prev_start, prev_end = prev_date_range
+                prev_usages = marketplace_models.ComponentUsage.objects.filter(
+                    resource=resource,
+                    billing_period__gte=prev_start,
+                    billing_period__lte=prev_end,
+                )
+                prev_usage_sum = prev_usages.aggregate(total=Sum("usage"))["total"]
+                if prev_usage_sum:
+                    result["previous_usage"] = float(prev_usage_sum)
 
         return result
 
@@ -297,8 +308,6 @@ class SlurmPeriodicUsagePolicyViewSet(ActionsViewSet):
 
         settings = {
             "fairshare": data.get("fairshare", 500),
-            "threshold": allocation,
-            "grace_limit": allocation * (1 + grace_ratio) if allocation else None,
             "reset_raw_usage": data.get("raw_usage_reset", False),
         }
 
@@ -434,17 +443,28 @@ class SlurmPeriodicUsagePolicyViewSet(ActionsViewSet):
             raise ValidationError({"resource_uuid": "Resource not found."})
 
         # Update the most recent SlurmCommandHistory records for this resource
-        recent_commands = models.SlurmCommandHistory.objects.filter(
-            policy=policy,
-            resource=resource,
-        ).order_by("-executed_at")[:20]
+        recent_commands = list(
+            models.SlurmCommandHistory.objects.filter(
+                policy=policy,
+                resource=resource,
+            ).order_by("-executed_at")[:20]
+        )
 
+        now = timezone.now()
         for cmd in recent_commands:
             cmd.execution_mode = mode
+            cmd.modified = now
             if not success:
                 cmd.success = False
                 cmd.error_message = error_message
-            cmd.save()
+
+        if recent_commands:
+            update_fields = ["execution_mode", "modified"]
+            if not success:
+                update_fields += ["success", "error_message"]
+            models.SlurmCommandHistory.objects.bulk_update(
+                recent_commands, update_fields
+            )
 
         # Update the most recent evaluation log for this resource
         evaluation_log = (
@@ -594,7 +614,6 @@ class SlurmPeriodicUsagePolicyViewSet(ActionsViewSet):
     @action(detail=True, methods=["post"], url_path="evaluate")
     def evaluate(self, request, uuid=None):
         """Run synchronous policy evaluation — applies actions and creates logs."""
-        from . import tasks as policy_tasks
 
         policy = self.get_object()
         serializer = serializers.SlurmPolicyEvaluateRequestSerializer(data=request.data)
@@ -632,6 +651,85 @@ class SlurmPeriodicUsagePolicyViewSet(ActionsViewSet):
                         "new_state": log.new_state,
                     }
                 )
+
+        response_data = {
+            "policy_uuid": policy.uuid,
+            "billing_period": current_period,
+            "resources": results,
+        }
+        return Response(
+            serializers.SlurmPolicyEvaluateResponseSerializer(response_data).data,
+            status=status.HTTP_200_OK,
+        )
+
+    force_period_reset_permissions = [structure_permissions.is_staff]
+
+    @extend_schema(
+        request=serializers.SlurmPolicyEvaluateRequestSerializer,
+        responses={200: serializers.SlurmPolicyEvaluateResponseSerializer},
+        description="Staff-only. Force-trigger period reset: re-evaluates paused/downscaled "
+        "resources whose usage in the current period is below thresholds. "
+        "Useful after a Celery beat outage or to immediately unblock resources.",
+    )
+    @action(detail=True, methods=["post"], url_path="force-period-reset")
+    def force_period_reset(self, request, uuid=None):
+        """Force-trigger period reset for paused/downscaled resources."""
+
+        policy = self.get_object()
+        serializer = serializers.SlurmPolicyEvaluateRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        resource_uuid = serializer.validated_data.get("resource_uuid")
+
+        current_period = policy._get_current_period()
+
+        # Get paused/downscaled resources under this policy's offering
+        resources_qs = (
+            marketplace_models.Resource.objects.filter(
+                offering=policy.scope,
+            )
+            .exclude(
+                state__in=(
+                    marketplace_models.ResourceStates.TERMINATED,
+                    marketplace_models.ResourceStates.TERMINATING,
+                ),
+            )
+            .filter(
+                Q(paused=True) | Q(downscaled=True),
+            )
+        )
+        if resource_uuid:
+            resources_qs = resources_qs.filter(uuid=resource_uuid)
+
+        resources = list(resources_qs)
+
+        results = []
+        for resource in resources:
+            usage_pct = policy.get_resource_usage_percentage(resource, current_period)
+            if usage_pct < 100:
+                policy_tasks.evaluate_resource_against_policy(
+                    str(resource.uuid), str(policy.uuid)
+                )
+
+                log = (
+                    models.SlurmPolicyEvaluationLog.objects.filter(
+                        policy=policy,
+                        resource=resource,
+                    )
+                    .order_by("-evaluated_at")
+                    .first()
+                )
+
+                if log:
+                    results.append(
+                        {
+                            "resource_uuid": resource.uuid,
+                            "resource_name": resource.name,
+                            "usage_percentage": log.usage_percentage,
+                            "actions_taken": log.actions_taken,
+                            "previous_state": log.previous_state,
+                            "new_state": log.new_state,
+                        }
+                    )
 
         response_data = {
             "policy_uuid": policy.uuid,

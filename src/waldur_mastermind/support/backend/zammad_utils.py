@@ -1,5 +1,4 @@
 import functools
-import re
 from dataclasses import dataclass
 
 from constance import config
@@ -76,13 +75,34 @@ class Priority:
 
 
 class ZammadBackend:
-    def __init__(self):
-        if not config.ZAMMAD_API_URL.endswith("/"):
-            url = f"{config.ZAMMAD_API_URL}/api/v1/"
-        else:
-            url = f"{config.ZAMMAD_API_URL}api/v1/"
+    def __init__(self, settings_override=None):
+        self._settings_override = settings_override or {}
+        api_url = self._get_config("ZAMMAD_API_URL")
+        token = self._get_config("ZAMMAD_TOKEN")
 
-        self.manager = ZammadAPI(url, http_token=config.ZAMMAD_TOKEN)
+        if not api_url.endswith("/"):
+            url = f"{api_url}/api/v1/"
+        else:
+            url = f"{api_url}api/v1/"
+
+        self.manager = ZammadAPI(url, http_token=token)
+
+    def _get_config(self, key, default=None):
+        """Get config value from provider settings override or Constance."""
+        if key in self._settings_override:
+            return self._settings_override[key]
+        return getattr(config, key, default)
+
+    @functools.cached_property
+    def waldur_zammad_user_id(self):
+        """ID of the Zammad user Waldur authenticates as.
+
+        Articles created via Waldur carry this ``created_by_id``. This is
+        used to distinguish Waldur-originated comments from natively added
+        ones without relying on a body-text marker (which travels into
+        staff replies that quote a previous Waldur comment).
+        """
+        return str(self.manager.user.me()["id"])
 
     def _zammad_response_to_issue(self, response):
         return Issue(
@@ -117,11 +137,8 @@ class ZammadBackend:
             content=clean_html(response.get("body", "")),
             is_public=not response.get("internal", False),
             user_id=response.get("created_by_id"),
-            is_waldur_comment=re.search(
-                r"^" + config.ZAMMAD_COMMENT_MARKER,
-                clean_html(response.get("body", "")),
-                re.MULTILINE,
-            ),
+            is_waldur_comment=str(response.get("created_by_id"))
+            == self.waldur_zammad_user_id,
             attachments=[
                 self._zammad_response_to_attachment(a, article_id, ticket_id)
                 for a in response.get("attachments", [])
@@ -224,10 +241,10 @@ class ZammadBackend:
             "ticket_id": ticket_id,
             "body": content
             + "\n\n"
-            + config.ZAMMAD_COMMENT_MARKER
+            + self._get_config("ZAMMAD_COMMENT_MARKER")
             + "\n\n"
-            + config.ZAMMAD_COMMENT_PREFIX.format(name=support_user_name),
-            "type": config.ZAMMAD_ARTICLE_TYPE,
+            + self._get_config("ZAMMAD_COMMENT_PREFIX").format(name=support_user_name),
+            "type": self._get_config("ZAMMAD_ARTICLE_TYPE"),
             "internal": not is_public,  # if internal equals False so deleting of comment will be impossible
         }
 
@@ -262,9 +279,9 @@ class ZammadBackend:
 
         params = {
             "ticket_id": ticket_id,
-            "body": body + "\n\n" + config.ZAMMAD_COMMENT_MARKER,
+            "body": body + "\n\n" + self._get_config("ZAMMAD_COMMENT_MARKER"),
             "to": waldur_user_email,
-            "type": config.ZAMMAD_ARTICLE_TYPE,
+            "type": self._get_config("ZAMMAD_ARTICLE_TYPE"),
             "internal": True,  # if internal equals False so deleting of comment will be impossible
             "attachments": [
                 {
@@ -294,7 +311,9 @@ class ZammadBackend:
         group=None,
         tags: list[str] = "",
     ):
-        group = group or config.ZAMMAD_GROUP or self.get_groups()[0]["name"]
+        group = (
+            group or self._get_config("ZAMMAD_GROUP") or self.get_groups()[0]["name"]
+        )
         tags = ",".join(tags)
         params = {
             "title": subject,
@@ -303,7 +322,7 @@ class ZammadBackend:
             "article": {
                 "subject": "Task description",
                 "body": description,  # We do not add marker as we treat first article as a special one.
-                "type": config.ZAMMAD_ARTICLE_TYPE,
+                "type": self._get_config("ZAMMAD_ARTICLE_TYPE"),
                 "internal": False,
                 "to": waldur_user_email,
             },

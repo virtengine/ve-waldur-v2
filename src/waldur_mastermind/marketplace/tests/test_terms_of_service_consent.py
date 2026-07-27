@@ -12,7 +12,7 @@ from django.test.utils import override_settings
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.test import APITransactionTestCase
+from rest_framework.test import APITestCase, APITransactionTestCase
 
 from waldur_core.logging.models import Event
 from waldur_core.permissions.enums import PermissionEnum
@@ -64,9 +64,13 @@ def deactivate_tos_config(tos_config):
 
 
 @override_constance_config(ENFORCE_USER_CONSENT_FOR_OFFERINGS=True)
-class TermsOfServiceConsentTest(APITransactionTestCase):
+class TermsOfServiceConsentTest(APITestCase):
     def setUp(self):
         ProjectRole.MANAGER.add_permission(PermissionEnum.LIST_RESOURCES)
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_ORDER)
+        ProjectRole.ADMIN.add_permission(PermissionEnum.CREATE_ORDER)
+        ProjectRole.MANAGER.add_permission(PermissionEnum.CREATE_ORDER)
+        ProjectRole.MEMBER.add_permission(PermissionEnum.CREATE_ORDER)
 
         self.user = UserFactory()
         self.customer = CustomerFactory()
@@ -1347,6 +1351,8 @@ class TermsOfServiceConsentTest(APITransactionTestCase):
         self.assertIn("requires_reconsent", response.data)
         self.assertFalse(response.data["has_consent"])
         self.assertFalse(response.data["requires_reconsent"])
+        self.assertIn("offering_has_active_tos", response.data)
+        self.assertTrue(response.data["offering_has_active_tos"])
 
         # Check consent_data field is None when no consent
         self.assertIn("consent_data", response.data)
@@ -1487,9 +1493,105 @@ class TermsOfServiceConsentTest(APITransactionTestCase):
         user_uuids = [ou["user_uuid"] for ou in response.data]
         self.assertIn(str(other_user.uuid), user_uuids)
 
+    def test_offering_user_response_includes_offering_has_active_tos(self):
+        """OfferingUser response should include offering_has_active_tos flag."""
+        offering_without_tos = OfferingFactory(
+            category=self.category,
+            customer=self.customer,
+            type="Marketplace.Basic",
+            plugin_options={
+                "service_provider_can_create_offering_user": True,
+                "username_generation_policy": "waldur_username",
+            },
+        )
+        plan_without_tos = PlanFactory(offering=offering_without_tos)
+        resource_without_tos = ResourceFactory(
+            project=self.project,
+            offering=offering_without_tos,
+            plan=plan_without_tos,
+        )
+        resource_without_tos.state = ResourceStates.OK
+        resource_without_tos.save()
+        resource_creation_succeeded(resource_without_tos)
+        tasks.create_or_restore_offering_users_for_user(
+            self.user.uuid.hex, self.project.uuid.hex
+        )
+
+        offering_user_with_tos = models.OfferingUser.objects.get(
+            user=self.user, offering=self.offering
+        )
+        offering_user_without_tos = models.OfferingUser.objects.get(
+            user=self.user, offering=offering_without_tos
+        )
+
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.get(
+            f"/api/marketplace-offering-users/{offering_user_with_tos.uuid}/"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["offering_has_active_tos"])
+
+        response = self.client.get(
+            f"/api/marketplace-offering-users/{offering_user_without_tos.uuid}/"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["offering_has_active_tos"])
+
+    def test_offering_user_filter_offering_has_active_tos(self):
+        """Test filtering offering users by offering_has_active_tos."""
+        offering_without_tos = OfferingFactory(
+            category=self.category,
+            customer=self.customer,
+            type="Marketplace.Basic",
+            plugin_options={
+                "service_provider_can_create_offering_user": True,
+                "username_generation_policy": "waldur_username",
+            },
+        )
+        plan_without_tos = PlanFactory(offering=offering_without_tos)
+        resource_without_tos = ResourceFactory(
+            project=self.project,
+            offering=offering_without_tos,
+            plan=plan_without_tos,
+        )
+        resource_without_tos.state = ResourceStates.OK
+        resource_without_tos.save()
+        resource_creation_succeeded(resource_without_tos)
+        tasks.create_or_restore_offering_users_for_user(
+            self.user.uuid.hex, self.project.uuid.hex
+        )
+
+        offering_user_with_tos = models.OfferingUser.objects.get(
+            user=self.user, offering=self.offering
+        )
+        offering_user_without_tos = models.OfferingUser.objects.get(
+            user=self.user, offering=offering_without_tos
+        )
+
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.get(
+            "/api/marketplace-offering-users/",
+            {"offering_has_active_tos": "true"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        offering_user_uuids = {ou["uuid"] for ou in response.data}
+        self.assertIn(str(offering_user_with_tos.uuid), offering_user_uuids)
+        self.assertNotIn(str(offering_user_without_tos.uuid), offering_user_uuids)
+
+        response = self.client.get(
+            "/api/marketplace-offering-users/",
+            {"offering_has_active_tos": "false"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        offering_user_uuids = {ou["uuid"] for ou in response.data}
+        self.assertIn(str(offering_user_without_tos.uuid), offering_user_uuids)
+        self.assertNotIn(str(offering_user_with_tos.uuid), offering_user_uuids)
+
 
 @override_constance_config(ENFORCE_USER_CONSENT_FOR_OFFERINGS=True)
-class ProviderOfferingToSManagementViewsetTest(APITransactionTestCase):
+class ProviderOfferingToSManagementViewsetTest(APITestCase):
     """Test cases for ProviderOfferingToSManagementViewset."""
 
     def setUp(self):
@@ -2001,7 +2103,7 @@ class ProviderOfferingToSManagementViewsetTest(APITransactionTestCase):
 
 
 @override_constance_config(ENFORCE_USER_CONSENT_FOR_OFFERINGS=True)
-class ResourceToSConsentPermissionTest(APITransactionTestCase):
+class ResourceToSConsentPermissionTest(APITestCase):
     """Test cases for resource access control based on ToS consent."""
 
     def setUp(self):
@@ -2086,7 +2188,7 @@ class ResourceToSConsentPermissionTest(APITransactionTestCase):
 
 
 @override_constance_config(ENFORCE_USER_CONSENT_FOR_OFFERINGS=True)
-class ResourceConsentUIFieldsTest(APITransactionTestCase):
+class ResourceConsentUIFieldsTest(APITestCase):
     """Test cases for user_requires_reconsent field in ResourceSerializer."""
 
     def setUp(self):
@@ -2411,7 +2513,7 @@ class ResourceConsentUIFieldsTest(APITransactionTestCase):
 
 
 @override_constance_config(ENFORCE_USER_CONSENT_FOR_OFFERINGS=True)
-class OfferingUsersViewSetPerformanceTest(APITransactionTestCase):
+class OfferingUsersViewSetPerformanceTest(APITestCase):
     """Test performance of OfferingUsersViewSet.get_queryset method."""
 
     def setUp(self):
@@ -2478,6 +2580,22 @@ class OfferingUsersViewSetPerformanceTest(APITransactionTestCase):
 
         self.viewset = OfferingUsersViewSet()
         self.viewset.queryset = models.OfferingUser.objects.all()
+
+        # Warm up ContentType cache and constance config so that
+        # one-time lookups don't inflate query counts in tests.
+        from constance import config as constance_config
+        from django.contrib.contenttypes.models import ContentType
+
+        from waldur_core.structure.models import Customer, Project
+        from waldur_mastermind.proposal.models import Call, CallManagingOrganisation
+
+        ContentType.objects.get_for_model(Customer)
+        ContentType.objects.get_for_model(Project)
+        ContentType.objects.get_for_model(CallManagingOrganisation)
+        ContentType.objects.get_for_model(Call)
+        # Access constance keys to populate their defaults in the DB
+        _ = constance_config.ENFORCE_USER_CONSENT_FOR_OFFERINGS
+        _ = constance_config.ENFORCE_OFFERING_USER_PROFILE_COMPLETENESS
 
     def test_offering_users_queryset_query_optimization(self):
         """Test that OfferingUsersViewSet.get_queryset uses optimized queries."""
@@ -2682,7 +2800,7 @@ class OfferingUsersViewSetPerformanceTest(APITransactionTestCase):
             )
 
 
-class OfferingTermsOfServiceFilterTest(APITransactionTestCase):
+class OfferingTermsOfServiceFilterTest(APITestCase):
     """Test the has_active_terms_of_service filter for offerings."""
 
     def setUp(self):
@@ -2908,6 +3026,69 @@ class OfferingTermsOfServiceFilterTest(APITransactionTestCase):
         for offering in response.data:
             self.assertFalse(offering["user_has_consent"])
 
+    def test_filter_user_has_consent_false_no_consent_records(self):
+        """Regression: offering with NO consent records must be returned by user_has_consent=false.
+
+        The old exclude()-based implementation incorrectly excluded such offerings because
+        the LEFT JOIN produced NULL rows and NOT (NULL AND TRUE) evaluates to NULL in SQL,
+        which WHERE treats as FALSE.
+        """
+        # No UserOfferingConsent records exist at all for this offering
+        response = self.client.get(
+            self.url,
+            {
+                "user_has_consent": "false",
+                "has_active_terms_of_service": "true",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(
+            response.data[0]["uuid"], self.offering_with_active_tos.uuid.hex
+        )
+        self.assertFalse(response.data[0]["user_has_consent"])
+
+    def test_filter_user_has_consent_false_with_revoked_consent(self):
+        """Offering with a revoked consent must be returned by user_has_consent=false."""
+        models.UserOfferingConsent.objects.create(
+            user=self.user,
+            offering=self.offering_with_active_tos,
+            version="1.0",
+            revocation_date=timezone.now(),
+        )
+
+        response = self.client.get(
+            self.url,
+            {
+                "user_has_consent": "false",
+                "has_active_terms_of_service": "true",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(
+            response.data[0]["uuid"], self.offering_with_active_tos.uuid.hex
+        )
+        self.assertFalse(response.data[0]["user_has_consent"])
+
+    def test_filter_user_has_consent_false_excludes_active_consent(self):
+        """Offering with an active consent must NOT be returned by user_has_consent=false."""
+        models.UserOfferingConsent.objects.create(
+            user=self.user,
+            offering=self.offering_with_active_tos,
+            version="1.0",
+        )
+
+        response = self.client.get(
+            self.url,
+            {
+                "user_has_consent": "false",
+                "has_active_terms_of_service": "true",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 0)
+
     def test_filter_offerings_user_has_offering_user_true(self):
         """Test filtering offerings where user has OfferingUser record."""
         models.OfferingUser.objects.create(
@@ -2967,7 +3148,7 @@ class OfferingTermsOfServiceFilterTest(APITransactionTestCase):
 
 
 @override_constance_config(ENFORCE_USER_CONSENT_FOR_OFFERINGS=True)
-class TermsOfServiceConsentEventLoggingTest(APITransactionTestCase):
+class TermsOfServiceConsentEventLoggingTest(APITestCase):
     """Test event logging for Terms of Service consent operations."""
 
     def setUp(self):
@@ -3179,7 +3360,7 @@ class TermsOfServiceConsentEventLoggingTest(APITransactionTestCase):
 
 
 @override_constance_config(ENFORCE_USER_CONSENT_FOR_OFFERINGS=True)
-class ToSConsentStatsTest(APITransactionTestCase):
+class ToSConsentStatsTest(APITestCase):
     """Test cases for ToS consent statistics using quota system."""
 
     def setUp(self):
@@ -4016,7 +4197,7 @@ class ToSConsentNotificationTest(APITransactionTestCase):
 
 
 @override_constance_config(ENFORCE_USER_CONSENT_FOR_OFFERINGS=True)
-class GracePeriodRevokeConsentsTest(APITransactionTestCase):
+class GracePeriodRevokeConsentsTest(APITestCase):
     """Test cases for grace period and automatic consent revocation."""
 
     def setUp(self):

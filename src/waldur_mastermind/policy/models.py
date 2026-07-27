@@ -1,12 +1,15 @@
 import datetime
+import decimal
 import logging
 
 from dateutil.relativedelta import relativedelta
 from django.conf import settings
 from django.core import exceptions
+from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.db import models
-from django.db.models import Q, Sum
+from django.db.models import DecimalField, ExpressionWrapper, F, Q, Sum, Value
+from django.db.models.functions import Abs, Ceil, Sign
 from django.utils.translation import gettext_lazy as _
 from model_utils.models import TimeStampedModel
 
@@ -21,12 +24,22 @@ from waldur_mastermind.invoices import (
     models as invoices_models,
 )
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import BillingTypes, LimitPeriods
 
 from . import enums, structures
 
 logger = logging.getLogger(__name__)
 
-# Import for TRES billing calculations
+# Mapping from OfferingComponent.limit_period to PeriodMixin.Periods
+LIMIT_PERIOD_TO_POLICY_PERIOD = {
+    LimitPeriods.MONTH: invoices_models.PeriodMixin.Periods.MONTH_1,
+    LimitPeriods.QUARTERLY: invoices_models.PeriodMixin.Periods.MONTH_3,
+    LimitPeriods.ANNUAL: invoices_models.PeriodMixin.Periods.MONTH_12,
+    LimitPeriods.TOTAL: invoices_models.PeriodMixin.Periods.TOTAL,
+}
+
+# Reverse mapping: PeriodMixin.Periods → LimitPeriods
+POLICY_PERIOD_TO_LIMIT_PERIOD = {v: k for k, v in LIMIT_PERIOD_TO_POLICY_PERIOD.items()}
 
 
 class Policy(
@@ -133,8 +146,42 @@ class EstimatedCostPolicyMixin(invoices_models.PeriodMixin):
 
         invoice_items = invoice_items.filter(query)
 
-        total = sum([i.total for i in invoice_items])
+        total = self._scoped_cost(invoice_items)
         return total - compensation > self.limit_cost
+
+    @staticmethod
+    def _scoped_cost(invoice_items) -> decimal.Decimal:
+        """Sum ``InvoiceItem.total`` over the queryset in the database instead
+        of loading every row and summing in Python.
+
+        This must reproduce the Python semantics exactly:
+        ``InvoiceItem.price = quantize_price(unit_price * quantity)`` rounds each
+        item UP to 2 decimals (``ROUND_UP``, away from zero), and
+        ``total = price + price * invoice.tax_percent / 100``.
+
+        The per-item rounding is done in SQL as
+        ``sign(v) * ceil(abs(v) * 100) / 100`` — exact on Postgres ``numeric``
+        and equal to ``quantize_price``. Tax is per-invoice, so items are grouped
+        by tax rate and the (constant-per-group) tax factor is applied in Python
+        with ``Decimal`` — ``Σ price·(1+t) == Σ(price + price·t)`` — keeping the
+        query at O(distinct tax rates) rows and avoiding the per-item invoice
+        fetch (the previous N+1).
+        """
+        hundred = Value(decimal.Decimal(100))
+        raw = F("unit_price") * F("quantity")
+        quantized_price = ExpressionWrapper(
+            Sign(raw) * Ceil(Abs(raw) * hundred) / hundred,
+            output_field=DecimalField(max_digits=30, decimal_places=2),
+        )
+        rows = invoice_items.values("invoice__tax_percent").annotate(
+            subtotal=Sum(quantized_price)
+        )
+        total = decimal.Decimal(0)
+        for row in rows:
+            subtotal = row["subtotal"] or decimal.Decimal(0)
+            tax_percent = row["invoice__tax_percent"] or decimal.Decimal(0)
+            total += subtotal * (1 + tax_percent / decimal.Decimal(100))
+        return total
 
     def __str__(self):
         return super().__str__() + f" Limit cost: {self.limit_cost}"
@@ -177,13 +224,67 @@ class ProjectPolicy(Policy):
 
 
 class ProjectEstimatedCostPolicy(EstimatedCostPolicyMixin, ProjectPolicy):
+    # Optional narrowing of the policy to a single marketplace resource. When
+    # set, cost is measured only from that resource's invoice items and actions
+    # target only that resource. CASCADE (not SET_NULL) is deliberate: a
+    # resource-scoped policy is meaningless without its subject, and reverting
+    # to project-wide scope on resource deletion would silently widen the
+    # policy to every resource — a dangerous change. The pre_delete reset
+    # handler cleans up any applied actions before the policy is removed.
+    resource = models.ForeignKey(
+        marketplace_models.Resource,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="+",
+    )
+    # When False, credit is ignored entirely: neither monthly compensation is
+    # subtracted nor the credit-balance override applied — raw invoice cost is
+    # compared against limit_cost. Defaults to True to preserve behavior of
+    # existing policies.
+    use_credit = models.BooleanField(default=True)
+
     def is_triggered(self):
         project = self.scope
         invoice_items = invoices_models.InvoiceItem.objects.filter(project=project)
-        compensation = invoices_compensation.MonthlyCompensation(project.customer)
-        return self._is_triggered(
-            invoice_items, compensation.get_project_compensation(project)
-        )
+        if self.resource_id:
+            invoice_items = invoice_items.filter(resource_id=self.resource_id)
+
+        if self.use_credit:
+            compensation = invoices_compensation.MonthlyCompensation(project.customer)
+            if self.resource_id:
+                deduction = compensation.get_resource_compensation(self.resource)
+            else:
+                deduction = compensation.get_project_compensation(project)
+        else:
+            deduction = 0
+
+        if not self._is_triggered(invoice_items, deduction):
+            return False
+
+        if not self.use_credit:
+            return True
+
+        # Cost exceeds limit even after compensation. Check whether
+        # available credit can cover the overage. Credit values are
+        # persisted in DB — unlike MonthlyCompensation (which simulates
+        # credit allocation in-memory and is order-dependent), the DB
+        # values are authoritative.
+        # If a ProjectCredit exists, it defines the budget for this project.
+        # Otherwise fall back to CustomerCredit.
+        project_credit = invoices_models.ProjectCredit.objects.filter(
+            project=project
+        ).first()
+        if project_credit:
+            return project_credit.value <= self.limit_cost
+
+        customer_credit = invoices_models.CustomerCredit.objects.filter(
+            customer=project.customer
+        ).first()
+        if customer_credit and customer_credit.value > self.limit_cost:
+            return False
+
+        return True
 
     class Meta:
         verbose_name_plural = "Project estimated cost policies"
@@ -228,7 +329,19 @@ class CustomerEstimatedCostPolicy(EstimatedCostPolicyMixin, CustomerPolicy):
         )
         compensation = invoices_compensation.MonthlyCompensation(customer)
 
-        return self._is_triggered(invoice_items, compensation.total_compensation)
+        if not self._is_triggered(invoice_items, compensation.total_compensation):
+            return False
+
+        try:
+            customer_credit = invoices_models.CustomerCredit.objects.get(
+                customer=customer
+            )
+            if customer_credit.value > self.limit_cost:
+                return False
+        except invoices_models.CustomerCredit.DoesNotExist:
+            pass
+
+        return True
 
     class Meta:
         verbose_name_plural = "Customer estimated cost policies"
@@ -545,6 +658,42 @@ class SlurmPeriodicUsagePolicy(OfferingUsagePolicy):
         self.clean()
         super().save(*args, **kwargs)
 
+    def _get_offering(self):
+        """Return the linked offering, or None if missing/deleted."""
+        try:
+            return self.scope if self.scope else None
+        except self.__class__.scope.RelatedObjectDoesNotExist:
+            return None
+
+    def _get_limit_based_component(self):
+        """Return the offering's limit-based component, or None."""
+        offering = self._get_offering()
+        if not offering:
+            return None
+        return offering.components.filter(billing_type=BillingTypes.LIMIT).first()
+
+    def _get_component_limit_period(self):
+        """Return the single limit_period string from this offering's limit-based components.
+
+        Returns None if:
+        - offering is missing
+        - no limit-based components have a limit_period set
+        - multiple limit-based components have different limit_periods (ambiguous)
+        """
+        offering = self._get_offering()
+        if not offering:
+            return None
+        periods = set(
+            offering.components.filter(billing_type=BillingTypes.LIMIT)
+            .exclude(limit_period__isnull=True)
+            .exclude(limit_period="")
+            .values_list("limit_period", flat=True)
+            .distinct()
+        )
+        if len(periods) == 1:
+            return periods.pop()
+        return None
+
     def calculate_slurm_settings(self, resource, config_override=None):
         """Calculate SLURM settings with configurable behavior and decay logic.
 
@@ -577,6 +726,17 @@ class SlurmPeriodicUsagePolicy(OfferingUsagePolicy):
         # Convert per-component allocation to TRES minutes
         tres_minutes = self._calculate_tres_minutes(total_allocation, final_config)
 
+        # When grace is configured, the SLURM hard limit (GrpTRESMins) is set
+        # at the grace level rather than the base level so SLURM itself
+        # enforces the 100%–130% overrun band that the policy engine governs
+        # via resource.paused / resource.downscaled transitions.
+        grace_ratio = final_config.get("grace_ratio", 0)
+        if grace_ratio > 0:
+            grace_multiplier = 1 + grace_ratio
+            tres_minutes = {
+                k: int(v * grace_multiplier) for k, v in tres_minutes.items()
+            }
+
         # Determine limit key from limit_type config
         limit_type = final_config.get("limit_type", "GrpTRESMins")
         if "GrpTRESMins" in limit_type:
@@ -588,28 +748,59 @@ class SlurmPeriodicUsagePolicy(OfferingUsagePolicy):
 
         limits = {limit_key: tres_minutes}
 
-        # Calculate QoS thresholds (uses billing metric)
-        qos_threshold, grace_limit = self._calculate_qos_thresholds(
-            total_allocation, final_config
+        # reset_raw_usage wipes SLURM's RawUsage counter on the account.
+        # That belongs at the period boundary only — emitting it on every
+        # 10-min sync turns GrpTRESMins into a non-budget (usage never
+        # accumulates between resets). The sync task records the synced
+        # period on each successful send via _record_synced_period; we
+        # gate on that here.
+        #
+        # Single-shot offerings (TOTAL limit_period → period "total") have no
+        # period boundary: the budget spans the whole active life of the
+        # resource. Resetting RawUsage there is never correct — it would
+        # discard the accumulated usage the limit is meant to cap. The
+        # period-boundary gate below would still emit one reset on the very
+        # first sync (last_synced_period is None) and again on any cache
+        # eviction, so we short-circuit single-shot resources to never reset.
+        raw_usage_reset_configured = final_config.get("raw_usage_reset", True)
+        last_synced_period = self._get_last_synced_period(resource)
+        is_single_shot = current_period == "total"
+        reset_raw_usage = bool(
+            raw_usage_reset_configured
+            and not is_single_shot
+            and last_synced_period != current_period
         )
 
         settings = {
             "fairshare": fairshare,
-            "qos_threshold": qos_threshold,
-            "grace_limit": grace_limit,
             "limit_type": limit_type,
-            "reset_raw_usage": final_config.get("raw_usage_reset", True),
+            "reset_raw_usage": reset_raw_usage,
             "carryover_details": carryover_details,
             **limits,
         }
 
         logger.info(
             f"Calculated SLURM settings: fairshare={fairshare}, "
-            f"allocation={total_allocation}, "
-            f"threshold={list(qos_threshold.values())[0] if qos_threshold else 'N/A'}"
+            f"allocation={total_allocation}"
         )
 
         return settings
+
+    def _last_synced_period_cache_key(self, resource):
+        return f"slurm_periodic_settings_period:{self.uuid}:{resource.uuid}"
+
+    def _get_last_synced_period(self, resource):
+        return cache.get(self._last_synced_period_cache_key(resource))
+
+    def _record_synced_period(self, resource, period):
+        # 90-day TTL keeps the marker alive across longer-than-monthly
+        # periods. A stale cache (cleared, evicted) just means an extra
+        # reset on the next sync — same as a fresh install.
+        cache.set(
+            self._last_synced_period_cache_key(resource),
+            period,
+            timeout=86400 * 90,
+        )
 
     def _resolve_configuration(self, config_override=None):
         """Resolve configuration from multiple sources with proper precedence."""
@@ -641,10 +832,35 @@ class SlurmPeriodicUsagePolicy(OfferingUsagePolicy):
         }
 
     def _get_current_period(self):
-        """Get current period (quarterly by default)."""
+        """Get current period, preferring the offering component's limit_period.
+
+        Falls back to the DB period field if no limit-based component exists
+        or if the component's limit_period is empty/null.
+
+        Returns:
+            str: Period string in format appropriate for the period type:
+                - MONTH_1: "YYYY-MM" (e.g. "2026-03")
+                - MONTH_3: "YYYY-Q#" (e.g. "2026-Q1")
+                - MONTH_12: "YYYY" (e.g. "2026")
+                - TOTAL: "total"
+        """
+        limit_period = self._get_component_limit_period()
+        effective_period = (
+            LIMIT_PERIOD_TO_POLICY_PERIOD.get(limit_period) if limit_period else None
+        ) or self.period
         now = core_utils.datetime.date.today()
-        quarter = (now.month - 1) // 3 + 1
-        return f"{now.year}-Q{quarter}"
+        Periods = invoices_models.PeriodMixin.Periods
+
+        if effective_period == Periods.MONTH_1:
+            return f"{now.year}-{now.month:02d}"
+        elif effective_period == Periods.MONTH_12:
+            return f"{now.year}"
+        elif effective_period == Periods.TOTAL:
+            return "total"
+        else:
+            # MONTH_3 (quarterly) - existing behavior
+            quarter = (now.month - 1) // 3 + 1
+            return f"{now.year}-Q{quarter}"
 
     def _get_base_allocation(self, resource):
         """Get base allocation for resource from resource.limits.
@@ -724,48 +940,106 @@ class SlurmPeriodicUsagePolicy(OfferingUsagePolicy):
         return total_allocation, carryover_details
 
     def _get_previous_period(self, current_period):
-        """Get the previous quarter for a given quarter."""
+        """Get the previous period for a given period string.
+
+        Detects period format from the string:
+        - "YYYY-MM" (monthly): go back one month
+        - "YYYY-Q#" (quarterly): go back one quarter
+        - "YYYY" (annual): go back one year
+        - "total": no previous period
+        """
         try:
-            # Parse "2024-Q2" format
-            year_str, q_str = current_period.split("-Q")
-            year = int(year_str)
-            quarter = int(q_str)
+            if current_period == "total":
+                return None
 
-            if quarter == 1:
-                # Q1 -> previous year Q4
-                prev_quarter = 4
-                prev_year = year - 1
+            if "-Q" in current_period:
+                # Quarterly: "2024-Q2" format
+                year_str, q_str = current_period.split("-Q")
+                year = int(year_str)
+                quarter = int(q_str)
+
+                if quarter == 1:
+                    return f"{year - 1}-Q4"
+                else:
+                    return f"{year}-Q{quarter - 1}"
+
+            elif "-" in current_period:
+                # Monthly: "2026-03" format
+                year_str, month_str = current_period.split("-")
+                year = int(year_str)
+                month = int(month_str)
+
+                if month == 1:
+                    return f"{year - 1}-12"
+                else:
+                    return f"{year}-{month - 1:02d}"
+
             else:
-                # Q2->Q1, Q3->Q2, Q4->Q3
-                prev_quarter = quarter - 1
-                prev_year = year
+                # Annual: "2026" format
+                year = int(current_period)
+                return f"{year - 1}"
 
-            return f"{prev_year}-Q{prev_quarter}"
         except (ValueError, AttributeError):
             logger.error(f"Failed to parse period: {current_period}")
             return None
 
     def _get_period_date_range(self, period):
-        """Parse a period string (e.g. '2024-Q2') into (start_date, end_date).
+        """Parse a period string into (start_date, end_date).
+
+        Supports formats:
+        - "YYYY-MM" (monthly): e.g. "2026-03" → (2026-03-01, 2026-03-31)
+        - "YYYY-Q#" (quarterly): e.g. "2026-Q1" → (2026-01-01, 2026-03-31)
+        - "YYYY" (annual): e.g. "2026" → (2026-01-01, 2026-12-31)
+        - "total": returns None (no date range)
 
         Returns:
             tuple[datetime.date, datetime.date] or None on parse error
         """
         try:
-            year_str, q_str = period.split("-Q")
-            year = int(year_str)
-            quarter = int(q_str)
+            if period == "total":
+                return None
 
-            start_month = (quarter - 1) * 3 + 1
-            start_date = datetime.date(year, start_month, 1)
+            if "-Q" in period:
+                # Quarterly: "2024-Q2" format
+                year_str, q_str = period.split("-Q")
+                year = int(year_str)
+                quarter = int(q_str)
 
-            if quarter == 4:
-                end_date = datetime.date(year, 12, 31)
+                start_month = (quarter - 1) * 3 + 1
+                start_date = datetime.date(year, start_month, 1)
+
+                if quarter == 4:
+                    end_date = datetime.date(year, 12, 31)
+                else:
+                    next_quarter_start = datetime.date(year, start_month + 3, 1)
+                    end_date = next_quarter_start - datetime.timedelta(days=1)
+
+                return start_date, end_date
+
+            elif "-" in period:
+                # Monthly: "2026-03" format
+                year_str, month_str = period.split("-")
+                year = int(year_str)
+                month = int(month_str)
+
+                start_date = datetime.date(year, month, 1)
+                # Last day of the month
+                if month == 12:
+                    end_date = datetime.date(year, 12, 31)
+                else:
+                    end_date = datetime.date(year, month + 1, 1) - datetime.timedelta(
+                        days=1
+                    )
+
+                return start_date, end_date
+
             else:
-                next_quarter_start = datetime.date(year, start_month + 3, 1)
-                end_date = next_quarter_start - relativedelta(days=1)
+                # Annual: "2026" format
+                year = int(period)
+                start_date = datetime.date(year, 1, 1)
+                end_date = datetime.date(year, 12, 31)
+                return start_date, end_date
 
-            return start_date, end_date
         except (ValueError, AttributeError):
             logger.error(f"Failed to parse period: {period}")
             return None
@@ -777,19 +1051,23 @@ class SlurmPeriodicUsagePolicy(OfferingUsagePolicy):
             dict[str, float]: Usage per component type, e.g. {"cpu": 3200.0, "mem": 128000.0}
         """
         date_range = self._get_period_date_range(period)
-        if not date_range:
-            return {}
 
-        start_date, end_date = date_range
-
-        usages = marketplace_models.ComponentUsage.objects.filter(
+        qs = marketplace_models.ComponentUsage.objects.filter(
             resource=resource,
-            billing_period__gte=start_date,
-            billing_period__lte=end_date,
         ).select_related("component")
 
+        if date_range:
+            start_date, end_date = date_range
+            qs = qs.filter(
+                billing_period__gte=start_date,
+                billing_period__lte=end_date,
+            )
+        elif period != "total":
+            # Unknown period format with no date range — return empty
+            return {}
+
         result = {}
-        for usage in usages:
+        for usage in qs:
             comp_type = usage.component.type
             result[comp_type] = result.get(comp_type, 0.0) + float(usage.usage)
 
@@ -850,53 +1128,6 @@ class SlurmPeriodicUsagePolicy(OfferingUsagePolicy):
                 tres_minutes["billing"] = int(billing_total * 60)
 
         return tres_minutes
-
-    def _calculate_qos_thresholds(self, total_allocation, config):
-        """Calculate QoS thresholds for slowdown and blocking.
-
-        QoS decisions use the unified billing metric (weighted sum of components).
-        If TRES billing is disabled, falls back to sum of all component hours.
-
-        Args:
-            total_allocation: dict[str, float] per-component allocation in hours,
-                              or float for backward compat
-            config: Policy configuration dict
-
-        Returns:
-            tuple[dict, dict]: (qos_threshold, grace_limit) each with billing/node key
-        """
-        grace_ratio = config.get("grace_ratio", 0.2)
-        tres_billing_enabled = config.get("tres_billing_enabled", True)
-
-        # Compute scalar allocation value for threshold calculation
-        if isinstance(total_allocation, dict):
-            if tres_billing_enabled:
-                weights = config.get("tres_billing_weights", {})
-                if weights:
-                    scalar = 0.0
-                    for comp, hours in total_allocation.items():
-                        weight = weights.get(comp, 0)
-                        if not weight:
-                            for wk, wv in weights.items():
-                                if wk.lower() == comp.lower():
-                                    weight = wv
-                                    break
-                        scalar += hours * weight
-                else:
-                    scalar = sum(total_allocation.values())
-            else:
-                scalar = sum(total_allocation.values())
-        else:
-            scalar = total_allocation
-
-        qos_threshold_value = scalar
-        grace_limit_value = scalar * (1 + grace_ratio)
-
-        metric_key = "billing" if tres_billing_enabled else "node"
-        qos_threshold = {metric_key: int(qos_threshold_value * 60)}
-        grace_limit = {metric_key: int(grace_limit_value * 60)}
-
-        return qos_threshold, grace_limit
 
     def is_triggered(self):
         """Check if policy should be triggered based on usage thresholds.
@@ -1026,10 +1257,20 @@ class SlurmPeriodicUsagePolicy(OfferingUsagePolicy):
     def _get_current_period_usage(self, resource, current_period):
         """Get per-component usage for resource in current period.
 
+        Delegates to the shared get_current_period_usage() so the UI
+        panel and policy enforcement use the same ComponentUsage aggregation.
+
         Returns:
             dict[str, float]: Usage per component type
         """
-        return self._get_period_usage(resource, current_period)
+        # Local import to avoid circular dependency:
+        # policy.models → marketplace.utils → marketplace.models
+        from waldur_mastermind.marketplace.utils import get_current_period_usage
+
+        limit_period = self._get_component_limit_period()
+        if not limit_period:
+            limit_period = POLICY_PERIOD_TO_LIMIT_PERIOD.get(self.period)
+        return get_current_period_usage(resource, limit_period=limit_period)
 
     def apply_policy_actions(self, resource):
         """Apply policy actions - calculate and send settings to site agent."""
@@ -1047,7 +1288,7 @@ class SlurmPeriodicUsagePolicy(OfferingUsagePolicy):
                 )
                 return True
             else:
-                logger.error(
+                logger.warning(
                     f"Failed to apply periodic settings for resource {resource.uuid}"
                 )
                 return False
@@ -1077,7 +1318,7 @@ class SlurmPeriodicUsagePolicy(OfferingUsagePolicy):
                 "policy_uuid": str(self.uuid),
                 "action": "apply_periodic_settings",
                 "settings": settings,
-                "timestamp": datetime.datetime.now().isoformat(),  # Use ISO timestamp
+                "timestamp": datetime.datetime.now().isoformat(),
             }
 
             # Prepare messages using marketplace utils
@@ -1093,6 +1334,9 @@ class SlurmPeriodicUsagePolicy(OfferingUsagePolicy):
                 logger.info(
                     f"Published periodic limits STOMP message for resource {resource.backend_id}"
                 )
+                # Mark the period as synced so the next sync within this
+                # same period emits reset_raw_usage=False.
+                self._record_synced_period(resource, self._get_current_period())
 
                 # Write SlurmCommandHistory records for the commands sent
                 try:
@@ -1125,7 +1369,11 @@ class SlurmPeriodicUsagePolicy(OfferingUsagePolicy):
                 return True
             else:
                 logger.warning(
-                    f"No messages prepared for resource {resource.backend_id}"
+                    "No STOMP messages prepared for resource %s (offering %s). "
+                    "Ensure the site agent has periodic_limits.enabled=true "
+                    "and has registered a queue for object_type=resource_periodic_limits.",
+                    resource.backend_id,
+                    resource.offering.uuid,
                 )
                 return False
 

@@ -1,4 +1,18 @@
-# Event Subscription Queues
+# Event Subscription Queues (Legacy — DEPRECATED)
+
+> **DEPRECATED.** This documents the legacy per-offering, per-object-type queue
+> approach. Its API endpoints are marked `deprecated` in the OpenAPI schema (and
+> therefore in the generated SDKs). It still runs unchanged, so existing
+> consumers keep working, but **no new integration should use it**.
+>
+> Use the [Unified Agent Queue](agent-pubsub.md) instead: one queue per consumer,
+> bound to the entities you have access to, with enriched payloads.
+>
+> Removal is tracked in **WAL-10111** and gated on drain telemetry (zero legacy
+> queues, sustained) rather than a date — see "The legacy path" in
+> `docs/design/pubsub-architecture.md`. A consumer that already owns a unified
+> queue is automatically suppressed from this path, so the two never
+> double-deliver.
 
 This guide explains the `EventSubscriptionQueue` system for managing RabbitMQ queues
 used by event subscriptions, including queue lifecycle management and cleanup mechanisms.
@@ -232,6 +246,13 @@ POST /api/event-subscriptions/{uuid}/create_queue/
 
 **Response (200 OK):** Same format, returned when queue already exists.
 
+**Access control:** The `offering_uuid` is validated against the user's permissions:
+
+1. Users with standard offering access (customer owner, offering manager, etc.) can create queues for their offerings
+2. ISD identity managers (`is_identity_manager=True` with non-empty `managed_isds`) can create queues for offerings in Active, Paused, or Unavailable states — Draft and Archived offerings are rejected with HTTP 400
+
+This ISD manager access path enables federated agents to subscribe to events without requiring pre-existing offering users. See [Identity Bridge](../identity-bridge.md) for details on ISD identity managers.
+
 **Valid object_type values:**
 - `resource`
 - `order`
@@ -239,6 +260,9 @@ POST /api/event-subscriptions/{uuid}/create_queue/
 - `service_account`
 - `course_account`
 - `importable_resources`
+- `resource_periodic_limits`
+- `resource_api_key_rotation`
+- `offering_user`
 
 ## Monitoring
 
@@ -316,6 +340,18 @@ rmq.list_all_subscription_queues()
    ```
 2. Or delete via RabbitMQ Management API
 
+### Periodic Limits Messages Not Delivered
+
+**Symptom:** SlurmPeriodicUsagePolicy fires but site agent QoS doesn't change
+
+**Check:**
+
+1. Site agent config has `periodic_limits.enabled: true` for the offering
+2. `EventSubscriptionQueue` record exists with `object_type=resource_periodic_limits`
+3. Waldur logs for "No STOMP messages prepared for resource"
+
+**Fix:** Enable `periodic_limits` in site agent config and restart the agent.
+
 ### precondition_failed Errors
 
 **Symptom:** RabbitMQ logs show `PRECONDITION_FAILED - inequivalent arg`
@@ -358,4 +394,6 @@ SUBSCRIPTION_QUEUE_ARGUMENTS = {
 
 ## Related Documentation
 
+- [Unified Agent Queue](agent-pubsub.md) - The recommended approach for new agents
+- [Event-Based Order Processing](../core-concepts/event-based-order-processing.md)
 - [Waldur Architecture](waldur-architecture.md)

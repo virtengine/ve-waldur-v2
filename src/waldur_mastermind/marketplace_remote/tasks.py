@@ -1,8 +1,15 @@
+from __future__ import annotations
+
+# SDK (waldur_api_client) imports are deferred to function-local scope (and a
+# TYPE_CHECKING block for annotation-only symbols) to keep the heavy SDK out of
+# process startup — see the "Lazy imports for heavy optional backends" section
+# of CLAUDE.md.
 import collections
 import logging
+import threading
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
 import requests
@@ -12,66 +19,9 @@ from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
 from django.db.models import Q
 from django.utils import dateparse, timezone
-from httpx import TimeoutException
+from httpx import TransportError
 from rest_framework import exceptions as rf_exceptions
 from rest_framework import status
-from waldur_api_client.api.invoice_items import invoice_items_list
-from waldur_api_client.api.maintenance_announcements import (
-    maintenance_announcements_list,
-)
-from waldur_api_client.api.marketplace_component_usages import (
-    marketplace_component_usages_list,
-)
-from waldur_api_client.api.marketplace_component_user_usages import (
-    marketplace_component_user_usages_list,
-)
-from waldur_api_client.api.marketplace_offering_terms_of_service import (
-    marketplace_offering_terms_of_service_list,
-)
-from waldur_api_client.api.marketplace_offering_users import (
-    marketplace_offering_users_list,
-)
-from waldur_api_client.api.marketplace_orders import marketplace_orders_retrieve
-from waldur_api_client.api.marketplace_public_offerings import (
-    marketplace_public_offerings_retrieve,
-)
-from waldur_api_client.api.marketplace_resources import (
-    marketplace_resources_retrieve,
-)
-from waldur_api_client.api.marketplace_robot_accounts import (
-    marketplace_robot_accounts_list,
-)
-from waldur_api_client.api.projects import (
-    projects_add_user,
-    projects_delete_user,
-    projects_destroy,
-    projects_list,
-    projects_list_users_list,
-    projects_update_user,
-)
-from waldur_api_client.api.remote_eduteams import (
-    remote_eduteams as get_remote_eduteams_user,
-)
-from waldur_api_client.client import AuthenticatedClient
-from waldur_api_client.errors import UnexpectedStatus
-from waldur_api_client.models.base_public_plan import BasePublicPlan
-from waldur_api_client.models.maintenance_announcement import (
-    MaintenanceAnnouncement as RemoteMaintenanceAnnouncement,
-)
-from waldur_api_client.models.maintenance_announcements_list_state_item import (
-    MaintenanceAnnouncementsListStateItem,
-)
-from waldur_api_client.models.offering_component import OfferingComponent
-from waldur_api_client.models.public_offering_details import PublicOfferingDetails
-from waldur_api_client.models.remote_eduteams_request_request import (
-    RemoteEduteamsRequestRequest as RemoteEduteamsRequest,
-)
-from waldur_api_client.models.robot_account_states import (
-    RobotAccountStates as ApiRobotAccountStates,
-)
-from waldur_api_client.models.user_role_create_request import UserRoleCreateRequest
-from waldur_api_client.models.user_role_delete_request import UserRoleDeleteRequest
-from waldur_api_client.models.user_role_update_request import UserRoleUpdateRequest
 
 from waldur_core.core.client import ClientValidationError, get_waldur_client
 from waldur_core.core.enums import ReviewStates
@@ -82,13 +32,13 @@ from waldur_core.core.utils import (
     month_start,
     serialize_instance,
 )
+from waldur_core.logging.enums import EventType
+from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.permissions.utils import get_users_with_permission
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.exceptions import ServiceBackendError
 from waldur_core.structure.tasks import BackgroundListPullTask, BackgroundPullTask
-from waldur_mastermind.invoices import models as invoice_models
-from waldur_mastermind.invoices.utils import get_previous_month
 from waldur_mastermind.marketplace import models
-from waldur_mastermind.marketplace.billing import MarketplaceBillingService
 from waldur_mastermind.marketplace.callbacks import sync_order_state
 from waldur_mastermind.marketplace.enums import (
     REMOTE_OFFERING,
@@ -118,6 +68,15 @@ from waldur_mastermind.marketplace_remote.utils import (
     sync_project_permission,
 )
 
+if TYPE_CHECKING:
+    from waldur_api_client.client import AuthenticatedClient
+    from waldur_api_client.models.base_public_plan import BasePublicPlan
+    from waldur_api_client.models.maintenance_announcement import (
+        MaintenanceAnnouncement as RemoteMaintenanceAnnouncement,
+    )
+    from waldur_api_client.models.offering_component import OfferingComponent
+    from waldur_api_client.models.public_offering_details import PublicOfferingDetails
+
 logger = logging.getLogger(__name__)
 
 # For logging purposes only
@@ -138,6 +97,17 @@ DEFAULT_TOVERSION = "1.0"
 
 class OfferingPullTask(BackgroundPullTask):
     def pull(self, local_offering: models.Offering):
+        from waldur_api_client.api.marketplace_public_offerings import (
+            marketplace_public_offerings_retrieve,
+        )
+        from waldur_api_client.errors import UnexpectedStatus
+
+        if not local_offering.backend_id:
+            logger.warning(
+                "Skipping pull for offering %s because its backend_id is empty.",
+                local_offering,
+            )
+            return
         try:
             client = get_client_for_offering(local_offering)
             remote_offering = marketplace_public_offerings_retrieve.sync(
@@ -167,6 +137,11 @@ class OfferingPullTask(BackgroundPullTask):
         client: AuthenticatedClient,
     ):
         """Backwards compatibility for old-style ToS of remote offerings."""
+        from waldur_api_client.api.marketplace_offering_terms_of_service import (
+            marketplace_offering_terms_of_service_list,
+        )
+        from waldur_api_client.errors import UnexpectedStatus
+
         terms_of_service = getattr(remote_offering_data, "terms_of_service", "") or ""
         terms_of_service_link = (
             getattr(remote_offering_data, "terms_of_service_link", "") or ""
@@ -459,11 +434,15 @@ class OfferingListPullTask(BackgroundListPullTask):
     def get_pulled_objects(self):
         return models.Offering.objects.filter(
             type=REMOTE_OFFERING, secret_options__has_keys=["api_url", "token"]
-        )
+        ).exclude(backend_id="")
 
 
 class OfferingUserPullTask(BackgroundPullTask):
     def pull(self, local_offering: models.Offering):
+        from waldur_api_client.api.marketplace_offering_users import (
+            marketplace_offering_users_list,
+        )
+
         client = get_client_for_offering(local_offering)
         remote_offering_users = {
             remote_offering_user.user_username: remote_offering_user.username
@@ -559,6 +538,10 @@ class OfferingUserListPullTask(BackgroundListPullTask):
 
 class ResourcePullTask(BackgroundPullTask):
     def pull(self, local_resource: models.Resource):
+        from waldur_api_client.api.marketplace_resources import (
+            marketplace_resources_retrieve,
+        )
+
         client = get_client_for_offering(local_resource.offering)
         remote_resource = marketplace_resources_retrieve.sync(
             client=client, uuid=local_resource.backend_id
@@ -567,13 +550,11 @@ class ResourcePullTask(BackgroundPullTask):
         if local_resource.effective_id != remote_resource.backend_id:
             local_resource.effective_id = remote_resource.backend_id
             local_resource.save(update_fields=["effective_id"])
-        # When pulling resource, if remote state is different from local, import remote orders.
         utils.import_resource_orders(local_resource)
-        if (
-            utils.parse_resource_state(remote_resource.state.value)
-            != local_resource.state
-        ):
-            utils.pull_resource_state(local_resource)
+        remote_state = utils.parse_resource_state(remote_resource.state.value)
+        if remote_state != local_resource.state:
+            local_resource.state = remote_state
+            local_resource.save(update_fields=["state"])
 
 
 class ResourceListPullTask(BackgroundListPullTask):
@@ -600,10 +581,86 @@ def reconcile_resource_end_dates():
     resources = (
         models.Resource.objects.filter(offering__type=REMOTE_OFFERING)
         .exclude(backend_id="")
-        .exclude(state__in=[ResourceStates.CREATING, ResourceStates.TERMINATING])
+        .exclude(
+            state__in=[
+                ResourceStates.CREATING,
+                ResourceStates.TERMINATING,
+                ResourceStates.TERMINATED,
+            ]
+        )
     )
     for resource in resources:
         utils.reconcile_resource_end_date(resource)
+
+
+@shared_task(
+    name="waldur_mastermind.marketplace_remote.notify_resource_end_date_pulled_from_remote"
+)
+def notify_resource_end_date_pulled_from_remote(
+    resource_uuid, old_end_date, new_end_date, remote_events=None
+):
+    """Send notification when a resource's end date is pulled from remote.
+
+    This happens when the local end_date was in the past and the remote
+    has a valid future date, so we sync from remote instead of pushing.
+    """
+    from waldur_core.logging import event_logger
+
+    try:
+        resource = models.Resource.objects.get(uuid=resource_uuid)
+    except models.Resource.DoesNotExist:
+        logger.warning("Resource %s not found for end date notification", resource_uuid)
+        return
+
+    # Emit audit log event
+    event_logger.emit(
+        "End date of marketplace resource %(resource_name)s has been automatically "
+        "updated from %(old_end_date)s to %(new_end_date)s "
+        "(synced from remote allocation)."
+        % {
+            "resource_name": resource.name,
+            "old_end_date": old_end_date,
+            "new_end_date": new_end_date,
+        },
+        event_type=EventType.MARKETPLACE_RESOURCE_UPDATE_END_DATE_SUCCEEDED,
+        event_context={"resource": resource},
+        scopes=[resource, resource.project, resource.project.customer],
+    )
+
+    # Determine recipients: users with APPROVE_ORDER permission on the project/customer
+    recipients = set()
+    for scope in [resource.project, resource.project.customer]:
+        users = get_users_with_permission(scope, PermissionEnum.APPROVE_ORDER)
+        for user in users.exclude(email="").exclude(notifications_enabled=False):
+            recipients.add(user.email)
+
+    if not recipients:
+        logger.info(
+            "No recipients found for end date sync notification for resource %s",
+            resource,
+        )
+        return
+
+    resource_url = format_homeport_link(
+        "project-resource-details/{resource_uuid}/",
+        project_uuid=resource.project.uuid.hex,
+        resource_uuid=resource.uuid.hex,
+    )
+
+    context = {
+        "resource": resource,
+        "old_end_date": old_end_date,
+        "new_end_date": new_end_date,
+        "resource_url": resource_url,
+        "remote_events": remote_events or [],
+    }
+
+    broadcast_mail(
+        "marketplace_remote",
+        "resource_end_date_pulled_from_remote",
+        context,
+        list(recipients),
+    )
 
 
 @shared_task
@@ -622,6 +679,10 @@ def pull_offering_resources(serialized_offering):
 
 class OrderPullTask(BackgroundPullTask):
     def pull(self, local_order: models.Order):
+        from waldur_api_client.api.marketplace_orders import (
+            marketplace_orders_retrieve,
+        )
+
         if not local_order.backend_id:
             return
         client = get_client_for_offering(local_order.offering)
@@ -698,6 +759,10 @@ class ErredOrderPullTask(OrderPullTask):
     """
 
     def pull(self, local_order: models.Order):
+        from waldur_api_client.api.marketplace_orders import (
+            marketplace_orders_retrieve,
+        )
+
         if not local_order.backend_id:
             return
         client = get_client_for_offering(local_order.offering)
@@ -800,6 +865,13 @@ class UsagePullTask(BackgroundPullTask):
         Previously, this method made N+1 API calls per resource (1 for component usages,
         N for user usages per component). Now it makes only 2 API calls total.
         """
+        from waldur_api_client.api.marketplace_component_usages import (
+            marketplace_component_usages_list,
+        )
+        from waldur_api_client.api.marketplace_component_user_usages import (
+            marketplace_component_user_usages_list,
+        )
+
         client = get_client_for_offering(local_resource.offering)
         today = datetime.today()
         if from_creation_date:
@@ -954,119 +1026,19 @@ def pull_offering_usage(serialized_offering):
         UsagePullTask().delay(serialize_instance(resource), from_creation_date=True)
 
 
-class ResourceInvoicePullTask(BackgroundPullTask):
-    def pull(self, local_resource: models.Resource):
-        for date in (get_previous_month(), timezone.now()):
-            self.pull_date(date, local_resource)
-
-    def pull_date(self, date, local_resource: models.Resource):
-        client = get_client_for_offering(local_resource.offering)
-        local_customer: structure_models.Customer = local_resource.project.customer
-        try:
-            remote_invoice_items = invoice_items_list.sync_all(
-                client=client,
-                resource_uuid=local_resource.backend_id,
-                year=date.year,
-                month=date.month,
-            )
-        except (UnexpectedStatus, TimeoutException, KeyError) as e:
-            logger.info(
-                f"Unable to get remote invoice items for resource [id={local_resource.backend_id}]: {e}"
-            )
-            return
-
-        local_invoice, _ = MarketplaceBillingService.get_or_create_invoice(
-            local_customer, date
-        )
-        local_invoice_items = local_invoice.items.filter(resource=local_resource)
-        local_invoice_items.filter(backend_uuid=None).delete()
-
-        local_item_ids = {item.backend_uuid.hex for item in local_invoice_items}
-        remote_item_ids = {item.uuid.hex for item in remote_invoice_items}
-
-        new_item_ids = remote_item_ids - local_item_ids
-        stale_item_ids = local_item_ids - remote_item_ids
-        existing_item_ids = local_item_ids & remote_item_ids
-
-        if len(stale_item_ids) > 0:
-            invoice_models.InvoiceItem.objects.filter(name__in=stale_item_ids).delete()
-            logger.info(
-                f"The following invoice items for resource [uuid={local_resource.uuid}] have been deleted: {stale_item_ids}"
-            )
-
-        new_invoice_items = [
-            item for item in remote_invoice_items if item.uuid.hex in new_item_ids
-        ]
-        for remote_item in new_invoice_items:
-            invoice_models.InvoiceItem.objects.create(
-                backend_uuid=remote_item.uuid.hex,
-                resource=local_resource,
-                invoice=local_invoice,
-                start=remote_item.start,
-                end=remote_item.end,
-                name=remote_item.name,
-                project=local_resource.project,
-                unit=remote_item.unit.value,
-                measured_unit=remote_item.measured_unit,
-                article_code=remote_item.article_code,
-                unit_price=remote_item.unit_price,
-                details=remote_item.details,
-                quantity=remote_item.quantity,
-            )
-
-        existing_invoice_items = [
-            item for item in remote_invoice_items if item.uuid.hex in existing_item_ids
-        ]
-        for remote_item in existing_invoice_items:
-            local_item = local_invoice_items.get(
-                backend_uuid=remote_item.uuid.hex,
-            )
-            local_item.start = remote_item.start
-            local_item.end = remote_item.end
-            local_item.measured_unit = remote_item.measured_unit
-            local_item.details = remote_item.details
-            local_item.quantity = remote_item.quantity
-            local_item.article_code = remote_item.article_code
-            local_item.unit_price = remote_item.unit_price
-            local_item.unit = remote_item.unit.value
-            local_item.save(
-                update_fields=[
-                    "start",
-                    "end",
-                    "measured_unit",
-                    "details",
-                    "quantity",
-                    "article_code",
-                    "unit_price",
-                    "unit",
-                ]
-            )
-
-
-class ResourceInvoiceListPullTask(BackgroundListPullTask):
-    """Pull and synchronize remote marketplace resource invoice data.
-
-    This task synchronizes invoice items for marketplace resources from
-    remote Waldur instances, including current and previous month data.
-    Runs every 60 minutes via celery beat.
-    """
-
-    name = "waldur_mastermind.marketplace_remote.pull_invoices"
-    pull_task = ResourceInvoicePullTask
-
-    def get_pulled_objects(self):
-        return (
-            models.Resource.objects.filter(offering__type=REMOTE_OFFERING)
-            .exclude(state=ResourceStates.TERMINATED)
-            .exclude(backend_id="")
-        )
-
-
 # Monkey-patch the API client's RobotAccountStates to handle different enum versions
 # Some versions use IntEnum with integer values (VALUE_1=1, VALUE_2=2, etc.)
 # Other versions use StrEnum with string values (OK="OK", CREATING="Creating", etc.)
-_original_new = ApiRobotAccountStates.__new__
-_is_int_enum = issubclass(ApiRobotAccountStates, int)
+# The SDK enum is imported and patched lazily (see "Lazy imports for heavy optional
+# backends" in CLAUDE.md) rather than at module import time.
+_original_new = None
+_is_int_enum = False
+_robot_account_states_patched = False
+# Serialise the lazy patch: unlike the previous import-time patch (which ran under
+# the import lock), first-use installation can be reached by two threads at once
+# under a threaded/gevent Celery pool. Without this, the second thread could
+# capture the already-patched __new__ as _original_new and recurse infinitely.
+_patch_lock = threading.Lock()
 
 # Mapping from display strings to both integer and string enum values
 _STATE_DISPLAY_TO_INT = {
@@ -1108,11 +1080,36 @@ def _patched_new(cls, value):
     return _original_new(cls, value)
 
 
-ApiRobotAccountStates.__new__ = _patched_new
+def _patch_robot_account_states():
+    """Lazily install the RobotAccountStates ``__new__`` patch on first use.
+
+    Deferred so importing this module does not pull the SDK enum in at process
+    startup — see "Lazy imports for heavy optional backends" in CLAUDE.md.
+    """
+    global _original_new, _is_int_enum, _robot_account_states_patched
+    if _robot_account_states_patched:
+        return
+    with _patch_lock:
+        # Double-checked: another thread may have installed it while we waited.
+        if _robot_account_states_patched:
+            return
+        from waldur_api_client.models.robot_account_states import (
+            RobotAccountStates as ApiRobotAccountStates,
+        )
+
+        _original_new = ApiRobotAccountStates.__new__
+        _is_int_enum = issubclass(ApiRobotAccountStates, int)
+        ApiRobotAccountStates.__new__ = _patched_new
+        _robot_account_states_patched = True
 
 
 class ResourceRobotAccountPullTask(BackgroundPullTask):
     def pull(self, local_resource: models.Resource):
+        from waldur_api_client.api.marketplace_robot_accounts import (
+            marketplace_robot_accounts_list,
+        )
+
+        _patch_robot_account_states()
         client = get_client_for_offering(local_resource.offering)
         remote_accounts = marketplace_robot_accounts_list.sync_all(
             client=client, resource_uuid=local_resource.backend_id
@@ -1208,24 +1205,6 @@ def pull_offering_robot_accounts(serialized_offering):
         ResourceRobotAccountPullTask().delay(serialize_instance(resource))
 
 
-@shared_task
-def pull_offering_invoices(serialized_offering):
-    """Pull invoice data for a specific offering.
-
-    This task pulls invoice data for all resources associated with a specific
-    offering, excluding terminated resources.
-    Used for targeted synchronization of a single offering's invoice data.
-    """
-    offering = deserialize_instance(serialized_offering)
-    resources = (
-        models.Resource.objects.filter(offering=offering)
-        .exclude(state=ResourceStates.TERMINATED)
-        .exclude(backend_id="")
-    )
-    for resource in resources:
-        ResourceInvoicePullTask().delay(serialize_instance(resource))
-
-
 @shared_task(
     name="waldur_mastermind.marketplace_remote.update_remote_project_permissions"
 )
@@ -1264,44 +1243,6 @@ def update_remote_project_permissions(
 
 
 @shared_task(
-    name="waldur_mastermind.marketplace_remote.update_remote_customer_permissions"
-)
-def update_remote_customer_permissions(
-    serialized_customer,
-    serialized_user,
-    role_name,
-    grant=True,
-    expiration_time=None,
-):
-    """Update customer permissions in remote Waldur instances.
-
-    This task grants or revokes a specific role for a user on all projects
-    belonging to a customer in remote Waldur instances. Used to synchronize
-    customer-level permission changes.
-
-    Args:
-        serialized_customer: Serialized customer instance
-        serialized_user: Serialized user instance
-        role_name: Name of the role to grant/revoke
-        grant: Whether to grant (True) or revoke (False) the permission
-        expiration_time: Optional expiration time for the permission
-    """
-    customer = deserialize_instance(serialized_customer)
-    user = deserialize_instance(serialized_user)
-    new_expiration_time = (
-        dateparse.parse_datetime(expiration_time)
-        if expiration_time
-        else expiration_time
-    )
-
-    # Use iterator for memory efficiency with customers having many projects
-    for project in structure_models.Project.available_objects.filter(
-        customer=customer
-    ).iterator(chunk_size=50):
-        sync_project_permission(grant, project, role_name, user, new_expiration_time)
-
-
-@shared_task(
     name="waldur_mastermind.marketplace_remote.sync_remote_project_permissions"
 )
 def sync_remote_project_permissions():
@@ -1315,6 +1256,23 @@ def sync_remote_project_permissions():
     Optimization: Caches remote user UUIDs per API endpoint to avoid
     redundant lookups when the same user appears across multiple projects/offerings.
     """
+    from waldur_api_client.api.projects import (
+        projects_add_user,
+        projects_delete_user,
+        projects_list_users_list,
+        projects_update_user,
+    )
+    from waldur_api_client.api.remote_eduteams import (
+        remote_eduteams as get_remote_eduteams_user,
+    )
+    from waldur_api_client.errors import UnexpectedStatus
+    from waldur_api_client.models.remote_eduteams_request_request import (
+        RemoteEduteamsRequestRequest as RemoteEduteamsRequest,
+    )
+    from waldur_api_client.models.user_role_create_request import UserRoleCreateRequest
+    from waldur_api_client.models.user_role_delete_request import UserRoleDeleteRequest
+    from waldur_api_client.models.user_role_update_request import UserRoleUpdateRequest
+
     if not settings.WALDUR_AUTH_SOCIAL["ENABLE_EDUTEAMS_SYNC"]:
         return
 
@@ -1334,7 +1292,7 @@ def sync_remote_project_permissions():
             ).uuid.hex
             remote_user_uuid_cache[cache_key] = remote_user_uuid
             return remote_user_uuid
-        except (UnexpectedStatus, TimeoutException):
+        except (UnexpectedStatus, TransportError):
             return None
 
     for project, offerings in utils.get_projects_with_remote_offerings().items():
@@ -1364,7 +1322,7 @@ def sync_remote_project_permissions():
                     f"Unable to fetch remote project {project} in offering {offering}: {e}"
                 )
                 continue
-            except (UnexpectedStatus, TimeoutException) as e:
+            except (UnexpectedStatus, TransportError) as e:
                 logger.warning(
                     f"Unable to create remote project {project} in offering {offering}: {e}"
                 )
@@ -1376,7 +1334,7 @@ def sync_remote_project_permissions():
                 remote_permissions = projects_list_users_list.sync_all(
                     client=client, uuid=remote_project_uuid
                 )
-            except (UnexpectedStatus, TimeoutException) as e:
+            except (UnexpectedStatus, TransportError) as e:
                 logger.warning(
                     f"Unable to get project permissions for project {project} in offering {offering}: {e}"
                 )
@@ -1418,7 +1376,7 @@ def sync_remote_project_permissions():
                                 expiration_time=new_expiration_time,
                             ),
                         )
-                    except (UnexpectedStatus, TimeoutException) as e:
+                    except (UnexpectedStatus, TransportError) as e:
                         logger.warning(
                             f"Unable to create permission for user [{remote_user_uuid}] "
                             f"with role {new_role} (until {new_expiration_time}) "
@@ -1437,7 +1395,7 @@ def sync_remote_project_permissions():
                                 user=remote_user_uuid, role=old_role
                             ),
                         )
-                    except (UnexpectedStatus, TimeoutException) as e:
+                    except (UnexpectedStatus, TransportError) as e:
                         logger.warning(
                             f"Unable to remove permission for user [{remote_user_uuid}] with role {old_role} "
                             f"and project [{remote_project_uuid}] in offering [{offering}]: {e}"
@@ -1452,7 +1410,7 @@ def sync_remote_project_permissions():
                                 expiration_time=new_expiration_time,
                             ),
                         )
-                    except (UnexpectedStatus, TimeoutException) as e:
+                    except (UnexpectedStatus, TransportError) as e:
                         logger.warning(
                             f"Unable to create permission for user [{remote_user_uuid}] "
                             f"with role {new_role} (until {new_expiration_time}) "
@@ -1471,7 +1429,7 @@ def sync_remote_project_permissions():
                                 expiration_time=new_expiration_time,
                             ),
                         )
-                    except (UnexpectedStatus, TimeoutException) as e:
+                    except (UnexpectedStatus, TransportError) as e:
                         logger.warning(
                             f"Unable to update permission for user [{remote_user_uuid}] "
                             f"with role {old_role} (until {new_expiration_time}) "
@@ -1492,7 +1450,7 @@ def sync_remote_project_permissions():
                             role=role_name,
                         ),
                     )
-                except (UnexpectedStatus, TimeoutException) as e:
+                except (UnexpectedStatus, TransportError) as e:
                     logger.warning(
                         f"Unable to remove permission [{role_name}] "
                         f"for user [{username}] in offering [{offering}]: {e}"
@@ -1509,10 +1467,12 @@ def sync_remote_project(serialized_request):
     Args:
         serialized_request: Serialized ProjectUpdateRequest instance
     """
+    from waldur_api_client.errors import UnexpectedStatus
+
     request = deserialize_instance(serialized_request)
     try:
         utils.update_remote_project(request)
-    except (UnexpectedStatus, TimeoutException):
+    except (UnexpectedStatus, TransportError):
         logger.exception(
             f"Unable to update remote project {request.project} in offering {request.offering}"
         )
@@ -1528,6 +1488,9 @@ def delete_remote_project(serialized_project):
     Args:
         serialized_project: Serialized project instance
     """
+    from waldur_api_client.api.projects import projects_destroy, projects_list
+    from waldur_api_client.errors import UnexpectedStatus
+
     _, pk = serialized_project.split(":")
     try:
         local_project = structure_models.Project.objects.get(pk=pk)
@@ -1568,7 +1531,7 @@ def delete_remote_project(serialized_project):
             if len(remote_projects) != 1:
                 continue
 
-        except (UnexpectedStatus, TimeoutException) as e:
+        except (UnexpectedStatus, TransportError) as e:
             logger.debug(
                 f"Unable to get remote project (backend_id: {backend_id}): {e}"
             )
@@ -1577,7 +1540,7 @@ def delete_remote_project(serialized_project):
         try:
             remote_project = remote_projects[0]
             projects_destroy.sync_detailed(client=client, uuid=remote_project.uuid.hex)
-        except (UnexpectedStatus, TimeoutException) as e:
+        except (UnexpectedStatus, TransportError) as e:
             logger.debug(
                 f"Unable to delete remote project {remote_project.uuid} (api_url: {api_url}): {e}"
             )
@@ -1591,6 +1554,9 @@ def clean_remote_projects():
     This task removes projects from remote Waldur instances that correspond
     to locally removed projects, helping maintain consistency.
     """
+    from waldur_api_client.api.projects import projects_destroy, projects_list
+    from waldur_api_client.errors import UnexpectedStatus
+
     clients = {}
     projects_backend_ids = set(
         map(
@@ -1620,7 +1586,7 @@ def clean_remote_projects():
 
         try:
             remote_projects = projects_list.sync_all(client=client)
-        except (UnexpectedStatus, TimeoutException) as e:
+        except (UnexpectedStatus, TransportError) as e:
             logger.debug(f"Unable to get remote projects (api_url: {api_url}): {e}")
             continue
 
@@ -1630,7 +1596,7 @@ def clean_remote_projects():
                     projects_destroy.sync_detailed(
                         client=client, uuid=remote_project.uuid.hex
                     )
-                except (UnexpectedStatus, TimeoutException) as e:
+                except (UnexpectedStatus, TransportError) as e:
                     logger.debug(
                         f"Unable to delete remote project "
                         f"(backend_id: {remote_project.backend_id}, api_url: {api_url}): {e}"
@@ -1742,6 +1708,8 @@ def notify_about_project_details_update(serialized_project_update):
 
 class RemoteProjectDataPushTask(BackgroundPullTask):
     def pull(self, instance: models.Offering):
+        from waldur_api_client.errors import UnexpectedStatus
+
         offering = instance
         project_ids = (
             models.Resource.objects.filter(offering=offering)
@@ -1762,7 +1730,7 @@ class RemoteProjectDataPushTask(BackgroundPullTask):
                     new_is_industry=project.is_industry,
                 )
                 utils.update_remote_project(request)
-            except (UnexpectedStatus, TimeoutException) as exc:
+            except (UnexpectedStatus, TransportError) as exc:
                 logger.error("Unable to push project data: %s", exc)
 
 
@@ -1808,6 +1776,14 @@ class MaintenanceAnnouncementPullTask(BackgroundPullTask):
     """
 
     def pull(self, service_provider: models.ServiceProvider):
+        from waldur_api_client.api.maintenance_announcements import (
+            maintenance_announcements_list,
+        )
+        from waldur_api_client.errors import UnexpectedStatus
+        from waldur_api_client.models.maintenance_announcement_state_enum import (
+            MaintenanceAnnouncementStateEnum,
+        )
+
         try:
             offering = models.Offering.objects.filter(
                 customer=service_provider.customer,
@@ -1826,8 +1802,8 @@ class MaintenanceAnnouncementPullTask(BackgroundPullTask):
             remote_maintenance_list = maintenance_announcements_list.sync_all(
                 client=client,
                 state=[
-                    MaintenanceAnnouncementsListStateItem.SCHEDULED,
-                    MaintenanceAnnouncementsListStateItem.IN_PROGRESS,
+                    MaintenanceAnnouncementStateEnum.SCHEDULED,
+                    MaintenanceAnnouncementStateEnum.IN_PROGRESS,
                 ],
             )
 

@@ -1,10 +1,12 @@
+from django.db import transaction
 from django.utils.translation import gettext_lazy as _
+from drf_spectacular.utils import extend_schema
 from rest_framework import decorators, response, status, viewsets
 
 from waldur_core.core import exceptions as core_exceptions
 from waldur_core.core import validators as core_validators
 from waldur_core.core.enums import CoreStates
-from waldur_core.core.serializers import EmptySerializer
+from waldur_core.core.serializers import StatusSerializer
 from waldur_core.structure import views as structure_views
 
 from . import executors, filters, models, serializers
@@ -46,14 +48,20 @@ class InstanceViewSet(structure_views.ResourceViewSet):
         instance: models.Instance = serializer.save()
         volume = instance.volume_set.first()
 
-        self.create_executor.execute(
-            instance,
-            image=serializer.validated_data.get("image"),
-            size=serializer.validated_data.get("size"),
-            ssh_key=serializer.validated_data.get("ssh_public_key"),
-            volume=volume,
+        # on_commit ensures the executor runs only after the transaction commits.
+        # This prevents a race condition when ATOMIC_REQUESTS=True is enabled,
+        # where an async worker could try to read the object before it is visible in the DB.
+        transaction.on_commit(
+            lambda: self.create_executor.execute(
+                instance,
+                image=serializer.validated_data.get("image"),
+                size=serializer.validated_data.get("size"),
+                ssh_key=serializer.validated_data.get("ssh_public_key"),
+                volume=volume,
+            )
         )
 
+    @extend_schema(request=None, responses={status.HTTP_202_ACCEPTED: StatusSerializer})
     @decorators.action(detail=True, methods=["post"])
     def start(self, request, uuid=None):
         instance: models.Instance = self.get_object()
@@ -66,8 +74,8 @@ class InstanceViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator("stopped"),
     ]
-    start_serializer_class = EmptySerializer
 
+    @extend_schema(request=None, responses={status.HTTP_202_ACCEPTED: StatusSerializer})
     @decorators.action(detail=True, methods=["post"])
     def stop(self, request, uuid=None):
         instance: models.Instance = self.get_object()
@@ -80,8 +88,8 @@ class InstanceViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator("running"),
     ]
-    stop_serializer_class = EmptySerializer
 
+    @extend_schema(request=None, responses={status.HTTP_202_ACCEPTED: StatusSerializer})
     @decorators.action(detail=True, methods=["post"])
     def restart(self, request, uuid=None):
         instance: models.Instance = self.get_object()
@@ -94,8 +102,8 @@ class InstanceViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator("running"),
     ]
-    restart_serializer_class = EmptySerializer
 
+    @extend_schema(responses={status.HTTP_202_ACCEPTED: StatusSerializer})
     @decorators.action(detail=True, methods=["post"])
     def resize(self, request, uuid=None):
         instance: models.Instance = self.get_object()
@@ -125,6 +133,7 @@ class VolumeViewSet(structure_views.ResourceViewSet):
                 _("Volume is already detached.")
             )
 
+    @extend_schema(request=None, responses={status.HTTP_202_ACCEPTED: StatusSerializer})
     @decorators.action(detail=True, methods=["post"])
     def detach(self, request, uuid=None):
         executors.VolumeDetachExecutor.execute(self.get_object())
@@ -133,8 +142,8 @@ class VolumeViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(CoreStates.OK),
         _has_instance,
     ]
-    detach_serializer_class = EmptySerializer
 
+    @extend_schema(responses={status.HTTP_202_ACCEPTED: None})
     @decorators.action(detail=True, methods=["post"])
     def attach(self, request, volume, uuid=None):
         serializer = self.get_serializer(volume, data=request.data)

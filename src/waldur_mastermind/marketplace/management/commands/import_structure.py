@@ -1,12 +1,13 @@
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from uuid import UUID
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.management.base import BaseCommand
 from django.db import transaction
+from django.db.models import F
 from django.utils import timezone
 from rest_framework.authtoken.models import Token
 
@@ -18,20 +19,30 @@ from waldur_core.checklist.models import (
     QuestionDependency,
     QuestionOption,
 )
+from waldur_core.core.features import FEATURES
 from waldur_core.core.middleware import skip_side_effects
-from waldur_core.core.models import SshPublicKey, User
+from waldur_core.core.models import Feature, SshPublicKey, User
 from waldur_core.core.serializers import ConstanceSettingsSerializer
 from waldur_core.logging.models import Event
 from waldur_core.permissions.models import Role, RolePermission, UserRole
 from waldur_core.permissions.tasks import sync_user_deactivation_status
-from waldur_core.structure.models import Customer, Project, UserAgreement
+from waldur_core.structure.models import (
+    Customer,
+    Project,
+    ServiceSettings,
+    UserAgreement,
+)
 from waldur_core.users.models import GroupInvitation, Invitation, PermissionRequest
 from waldur_mastermind.invoices.models import (
+    AffiliateFeeAccrual,
+    CreditTransaction,
+    CustomerAffiliate,
     CustomerCredit,
     Invoice,
     InvoiceItem,
     ProjectCredit,
 )
+from waldur_mastermind.marketplace.enums import LimitPeriods, RobotAccountStates
 from waldur_mastermind.marketplace.models import (
     Category,
     CategoryGroup,
@@ -44,17 +55,26 @@ from waldur_mastermind.marketplace.models import (
     Offering,
     OfferingAccessEndpoint,
     OfferingComponent,
+    OfferingPartition,
+    OfferingSoftwareCatalog,
     OfferingUser,
+    OfferingUserGroup,
     Order,
     Plan,
     PlanComponent,
+    PosixIdPool,
     ProjectServiceAccount,
     Resource,
     ResourcePlanPeriod,
+    ResourceProject,
+    RobotAccount,
     ServiceProvider,
+    SoftwareCatalog,
 )
 from waldur_mastermind.policy.models import (
+    CustomerEstimatedCostPolicy,
     OfferingComponentLimit,
+    ProjectEstimatedCostPolicy,
     SlurmCommandHistory,
     SlurmPeriodicUsagePolicy,
 )
@@ -63,14 +83,18 @@ from waldur_mastermind.proposal.models import (
     AssignmentItem,
     Call,
     CallCOIConfiguration,
+    CallDocument,
     CallManagingOrganisation,
     CallResourceTemplate,
     CallReviewerPool,
+    CallWorkflowStep,
     COIDisclosureForm,
     ConflictOfInterest,
     ExpertiseCategory,
     MatchingConfiguration,
     Proposal,
+    ProposalProjectRoleMapping,
+    ProposalWorkflowStepInstance,
     RequestedOffering,
     RequestedResource,
     Review,
@@ -81,8 +105,10 @@ from waldur_mastermind.proposal.models import (
     ReviewerProposalAffinity,
     ReviewerPublication,
     ReviewerStats,
+    ReviewerSuggestion,
     Round,
 )
+from waldur_openstack.models import Flavor, Image, Instance, Tenant, Volume
 
 
 class Command(BaseCommand):
@@ -109,9 +135,22 @@ class Command(BaseCommand):
         waldur import_structure -i structure.json --skip-rabbitmq-messages --skip-roles
     """
 
+    @staticmethod
+    def _normalize_uuid(uuid_str):
+        """Normalize a UUID string by removing hyphens.
+
+        Waldur uses StringUUID whose __str__ returns hex (no hyphens),
+        but exported data may contain hyphenated UUIDs. This ensures
+        consistent dict key format for pre-fetched lookup maps.
+        """
+        if uuid_str is None:
+            return None
+        return str(uuid_str).replace("-", "")
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.stats = {
+            "features": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
             "users": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
             "auth_tokens": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
             "customers": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
@@ -125,6 +164,18 @@ class Command(BaseCommand):
             "category_groups": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
             "categories": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
             "offerings": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
+            "project_estimated_cost_policies": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
+            "customer_estimated_cost_policies": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
             "slurm_periodic_policies": {
                 "created": 0,
                 "updated": 0,
@@ -145,6 +196,18 @@ class Command(BaseCommand):
                 "errors": 0,
             },
             "user_roles": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
+            "resource_projects": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
+            "posix_id_pools": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
             "project_service_accounts": {
                 "created": 0,
                 "updated": 0,
@@ -184,6 +247,13 @@ class Command(BaseCommand):
             "invoices": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
             "invoice_items": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
             "offering_users": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
+            "robot_accounts": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
+            "offering_user_groups": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
             "checklists": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
             "questions": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
             "question_options": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
@@ -215,6 +285,24 @@ class Command(BaseCommand):
             },
             "customer_credits": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
             "project_credits": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
+            "customer_affiliates": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
+            "credit_transactions": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
+            "affiliate_fee_accruals": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
             "events": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
             "ssh_public_keys": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
             "offering_endpoints": {
@@ -242,6 +330,12 @@ class Command(BaseCommand):
                 "errors": 0,
             },
             "calls": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
+            "call_documents": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
             "requested_offerings": {
                 "created": 0,
                 "updated": 0,
@@ -255,7 +349,19 @@ class Command(BaseCommand):
                 "errors": 0,
             },
             "rounds": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
+            "call_workflow_steps": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
             "proposals": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
+            "proposal_workflow_step_instances": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
             "requested_resources": {
                 "created": 0,
                 "updated": 0,
@@ -331,6 +437,18 @@ class Command(BaseCommand):
                 "errors": 0,
             },
             "reviewer_bids": {"created": 0, "updated": 0, "skipped": 0, "errors": 0},
+            "reviewer_suggestions": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
+            "role_mappings": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
             "assignment_batches": {
                 "created": 0,
                 "updated": 0,
@@ -350,6 +468,60 @@ class Command(BaseCommand):
                 "errors": 0,
             },
             "maintenance_announcement_offerings": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
+            "software_catalogs": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
+            "offering_partitions": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
+            "offering_software_catalogs": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
+            "openstack_service_settings": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
+            "openstack_flavors": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
+            "openstack_images": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
+            "openstack_tenants": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
+            "openstack_instances": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
+            "openstack_volumes": {
                 "created": 0,
                 "updated": 0,
                 "skipped": 0,
@@ -467,6 +639,12 @@ class Command(BaseCommand):
         # Import in dependency order, each operation in its own transaction
         # to prevent one failed import from affecting others
 
+        # Features have no entity dependencies; import first so that the
+        # rest of the load (and the running API) sees the right flags.
+        self._safe_import(
+            "features", lambda: self.import_features(data.get("features", []))
+        )
+
         if not skip_users:
             self._safe_import("users", lambda: self.import_users(data.get("users", [])))
             self._safe_import(
@@ -534,6 +712,27 @@ class Command(BaseCommand):
         self._safe_import(
             "categories", lambda: self.import_categories(data.get("categories", []))
         )
+
+        # Import OpenStack backend models (before offerings, so offering scope linking works)
+        self._safe_import(
+            "openstack_service_settings",
+            lambda: self.import_openstack_service_settings(
+                data.get("openstack_service_settings", [])
+            ),
+        )
+        self._safe_import(
+            "openstack_flavors",
+            lambda: self.import_openstack_flavors(data.get("openstack_flavors", [])),
+        )
+        self._safe_import(
+            "openstack_images",
+            lambda: self.import_openstack_images(data.get("openstack_images", [])),
+        )
+        self._safe_import(
+            "openstack_tenants",
+            lambda: self.import_openstack_tenants(data.get("openstack_tenants", [])),
+        )
+
         self._safe_import(
             "offerings", lambda: self.import_offerings(data.get("offerings", []))
         )
@@ -557,11 +756,47 @@ class Command(BaseCommand):
             ),
         )
 
+        # Import software catalogs
+        self._safe_import(
+            "software_catalogs",
+            lambda: self.import_software_catalogs(data.get("software_catalogs", [])),
+        )
+
+        # Import offering partitions
+        self._safe_import(
+            "offering_partitions",
+            lambda: self.import_offering_partitions(
+                data.get("offering_partitions", [])
+            ),
+        )
+
+        # Import offering-software-catalog links
+        self._safe_import(
+            "offering_software_catalogs",
+            lambda: self.import_offering_software_catalogs(
+                data.get("offering_software_catalogs", [])
+            ),
+        )
+
         # Import SLURM periodic policies (depends on offerings)
         self._safe_import(
             "slurm_periodic_policies",
             lambda: self.import_slurm_periodic_policies(
                 data.get("slurm_periodic_policies", [])
+            ),
+        )
+
+        # Import cost policies (depends on projects and customers)
+        self._safe_import(
+            "project_estimated_cost_policies",
+            lambda: self.import_project_estimated_cost_policies(
+                data.get("project_estimated_cost_policies", [])
+            ),
+        )
+        self._safe_import(
+            "customer_estimated_cost_policies",
+            lambda: self.import_customer_estimated_cost_policies(
+                data.get("customer_estimated_cost_policies", [])
             ),
         )
 
@@ -578,9 +813,33 @@ class Command(BaseCommand):
             lambda: self.import_plan_components(data.get("plan_components", [])),
         )
 
+        # Import OpenStack instances and volumes (before resources, so resource scope linking works)
+        self._safe_import(
+            "openstack_instances",
+            lambda: self.import_openstack_instances(
+                data.get("openstack_instances", [])
+            ),
+        )
+        self._safe_import(
+            "openstack_volumes",
+            lambda: self.import_openstack_volumes(data.get("openstack_volumes", [])),
+        )
+
         # Import resources (depends on offerings, plans, projects)
         self._safe_import(
             "resources", lambda: self.import_resources(data.get("resources", []))
+        )
+
+        # Import resource projects (sub-projects of a resource; depends on resources)
+        self._safe_import(
+            "resource_projects",
+            lambda: self.import_resource_projects(data.get("resource_projects", [])),
+        )
+
+        # Import POSIX ID pools (depends on offerings / service providers)
+        self._safe_import(
+            "posix_id_pools",
+            lambda: self.import_posix_id_pools(data.get("posix_id_pools", [])),
         )
 
         # Import resource plan periods (depends on resources and plans)
@@ -652,6 +911,11 @@ class Command(BaseCommand):
             "calls",
             lambda: self.import_calls(data.get("calls", [])),
         )
+        # Documentation files attached to calls (depends on calls)
+        self._safe_import(
+            "call_documents",
+            lambda: self.import_call_documents(data.get("call_documents", [])),
+        )
 
         # Import call configurations (depends on calls)
         self._safe_import(
@@ -691,6 +955,17 @@ class Command(BaseCommand):
             "rounds",
             lambda: self.import_rounds(data.get("rounds", [])),
         )
+        # Configure the per-call workflow steps. Every call already gets a full
+        # set of CallWorkflowStep rows auto-seeded by a post-save signal on
+        # creation; this overrides their enable/transition/blind-review config
+        # for calls that want a non-default workflow (e.g. enabling the review
+        # steps). Matched by (call, step), not uuid.
+        self._safe_import(
+            "call_workflow_steps",
+            lambda: self.import_call_workflow_steps(
+                data.get("call_workflow_steps", [])
+            ),
+        )
         self._safe_import(
             "proposals",
             lambda: self.import_proposals(data.get("proposals", [])),
@@ -704,6 +979,16 @@ class Command(BaseCommand):
         self._safe_import(
             "reviews",
             lambda: self.import_reviews(data.get("reviews", [])),
+        )
+        # Per-proposal workflow engine state. Created only by the submit action
+        # at runtime, so preset proposals (imported directly into their target
+        # state) have none — seed them here so the engine is demonstrable.
+        # Depends on proposals (FK) and users (completed_by FK).
+        self._safe_import(
+            "proposal_workflow_step_instances",
+            lambda: self.import_proposal_workflow_step_instances(
+                data.get("proposal_workflow_step_instances", [])
+            ),
         )
 
         # Import COI and matching data (depends on reviewer_profiles, proposals, calls)
@@ -729,6 +1014,12 @@ class Command(BaseCommand):
             "reviewer_bids",
             lambda: self.import_reviewer_bids(data.get("reviewer_bids", [])),
         )
+        self._safe_import(
+            "reviewer_suggestions",
+            lambda: self.import_reviewer_suggestions(
+                data.get("reviewer_suggestions", [])
+            ),
+        )
 
         # Import assignment batches and items (Stage 2 of two-stage reviewer workflow)
         # Depends on: call_reviewer_pools, proposals
@@ -744,6 +1035,13 @@ class Command(BaseCommand):
         # Import user_roles AFTER proposal entities (user_roles may scope to Calls)
         self._safe_import(
             "user_roles", lambda: self.import_user_roles(data.get("user_roles", []))
+        )
+
+        # Import role mappings AFTER user_roles (user_roles import triggers
+        # creation of PROPOSAL.MEMBER and other roles via post-save signals)
+        self._safe_import(
+            "role_mappings",
+            lambda: self.import_role_mappings(data.get("role_mappings", [])),
         )
 
         # Import account types
@@ -764,7 +1062,19 @@ class Command(BaseCommand):
             lambda: self.import_course_accounts(data.get("course_accounts", [])),
         )
 
-        # Import invoicing (depends on customers, resources, projects)
+        # Import invoicing (depends on customers, resources, projects).
+        # Credits are imported BEFORE invoice items so that compensation rows
+        # (InvoiceItem.credit_uuid → CustomerCredit) can resolve the FK during
+        # invoice-item creation. Without this order the credit FK ends up null,
+        # which makes the loader misclassify compensations as manual refunds.
+        self._safe_import(
+            "customer_credits",
+            lambda: self.import_customer_credits(data.get("customer_credits", [])),
+        )
+        self._safe_import(
+            "project_credits",
+            lambda: self.import_project_credits(data.get("project_credits", [])),
+        )
         self._safe_import(
             "invoices", lambda: self.import_invoices(data.get("invoices", []))
         )
@@ -773,10 +1083,44 @@ class Command(BaseCommand):
             lambda: self.import_invoice_items(data.get("invoice_items", [])),
         )
 
+        # Affiliate program (depends on customers, credits and invoices).
+        self._safe_import(
+            "customer_affiliates",
+            lambda: self.import_customer_affiliates(
+                data.get("customer_affiliates", [])
+            ),
+        )
+        self._safe_import(
+            "credit_transactions",
+            lambda: self.import_credit_transactions(
+                data.get("credit_transactions", [])
+            ),
+        )
+        self._safe_import(
+            "affiliate_fee_accruals",
+            lambda: self.import_affiliate_fee_accruals(
+                data.get("affiliate_fee_accruals", [])
+            ),
+        )
+
         # Import offering users (depends on offerings and users)
         self._safe_import(
             "offering_users",
             lambda: self.import_offering_users(data.get("offering_users", [])),
+        )
+
+        # Import robot accounts (depends on resources and users)
+        self._safe_import(
+            "robot_accounts",
+            lambda: self.import_robot_accounts(data.get("robot_accounts", [])),
+        )
+
+        # Import offering user groups (depends on offerings and projects)
+        self._safe_import(
+            "offering_user_groups",
+            lambda: self.import_offering_user_groups(
+                data.get("offering_user_groups", [])
+            ),
         )
 
         # Import checklist data (dependency order: checklists -> questions -> completions -> answers)
@@ -821,15 +1165,8 @@ class Command(BaseCommand):
             ),
         )
 
-        # Import credit data (after customers and projects are ready)
-        self._safe_import(
-            "customer_credits",
-            lambda: self.import_customer_credits(data.get("customer_credits", [])),
-        )
-        self._safe_import(
-            "project_credits",
-            lambda: self.import_project_credits(data.get("project_credits", [])),
-        )
+        # (customer_credits / project_credits already imported above so
+        # invoice_items can resolve the credit FK on compensation rows.)
 
         # Import events last (after all entities exist)
         self._safe_import(
@@ -848,6 +1185,38 @@ class Command(BaseCommand):
             "user_agreements",
             lambda: self.import_user_agreements(data.get("user_agreements", [])),
         )
+
+        # Re-apply authored resource state flags LAST. Importing usages and
+        # invoices fires policy re-evaluation, which can clear a resource's
+        # paused/downscaled flag when the mid-import spend snapshot differs
+        # from the fully-loaded state the preset author intended. A signal-
+        # free update at the very end restores the authored values.
+        self._safe_import(
+            "resource_state_flags",
+            lambda: self._apply_resource_state_flags(data.get("resources", [])),
+        )
+
+    def _apply_resource_state_flags(self, resources_data):
+        """Force authored paused/downscaled/restrict_member_access onto resources.
+
+        Uses queryset ``.update()`` so no post_save signals fire (no policy
+        re-evaluation). Only touches resources whose preset entry actually
+        carries one of the flags.
+        """
+        if self.dry_run:
+            return
+        for resource_data in resources_data:
+            uuid = resource_data.get("uuid")
+            if not uuid:
+                continue
+            flags = {
+                key: resource_data[key]
+                for key in ("paused", "downscaled", "restrict_member_access")
+                if key in resource_data
+            }
+            if not flags:
+                continue
+            Resource.objects.filter(uuid=uuid).update(**flags)
 
     def _parse_datetime(self, value):
         """Parse a datetime string, supporting both ISO format and relative offsets.
@@ -911,9 +1280,66 @@ class Command(BaseCommand):
                     self.style.WARNING(f"Import of {import_type} failed: {e}")
                 )
 
+    def import_features(self, features_data):
+        """Import feature flag values into the Feature model.
+
+        Each entry is ``{"key": "<section>.<feature>", "value": <bool>}``.
+        Unknown keys are reported and skipped. After writes, the cached
+        ``/api/configuration/`` payload is invalidated so a running API
+        picks up the new values immediately.
+        """
+        if not features_data:
+            return
+
+        self.stdout.write("Importing features...")
+
+        valid_keys = {
+            f"{section['key']}.{feature['key']}"
+            for section in FEATURES
+            for feature in section["items"]
+        }
+        touched = False
+        for entry in features_data:
+            key = entry.get("key")
+            if key is None or "value" not in entry:
+                self.stdout.write(
+                    self.style.WARNING("Skipping feature without key/value")
+                )
+                self.stats["features"]["errors"] += 1
+                continue
+            if key not in valid_keys:
+                self.stdout.write(self.style.WARNING(f"Unknown feature key: {key}"))
+                self.stats["features"]["errors"] += 1
+                continue
+            value = bool(entry["value"])
+            obj, created = Feature.objects.get_or_create(
+                key=key, defaults={"value": value}
+            )
+            if created:
+                self.stats["features"]["created"] += 1
+                touched = True
+            elif obj.value != value:
+                obj.value = value
+                obj.save(update_fields=["value"])
+                self.stats["features"]["updated"] += 1
+                touched = True
+            else:
+                self.stats["features"]["skipped"] += 1
+
+        if touched:
+            # Drop the cached public configuration so consumers see the new
+            # flag values without a backend restart.
+            from django.core.cache import cache
+
+            cache.delete("API_CONFIGURATION")
+
     def import_users(self, users_data):
         """Import user data including system_robot."""
         self.stdout.write("Importing users...")
+
+        # Pre-fetch lookup maps to avoid N+1 queries
+        user_by_uuid = {str(u.uuid): u for u in User.all_objects.all()}
+        user_by_username = {u.username: u for u in user_by_uuid.values()}
 
         for user_data in users_data:
             try:
@@ -933,14 +1359,12 @@ class Command(BaseCommand):
                     self.stats["users"]["errors"] += 1
                     continue
 
-                # Use all_objects to include inactive users to avoid unique constraint violations
-                existing_user = User.all_objects.filter(uuid=uuid).first()
+                # Use pre-fetched maps instead of per-item DB queries
+                existing_user = user_by_uuid.get(self._normalize_uuid(uuid))
 
                 # Also check if username already exists (even with different UUID)
                 if not existing_user:
-                    username_conflict = User.all_objects.filter(
-                        username=username
-                    ).first()
+                    username_conflict = user_by_username.get(username)
                     if username_conflict:
                         # For system_robot, use the existing one if UUID matches or update it
                         if username == "system_robot":
@@ -974,11 +1398,15 @@ class Command(BaseCommand):
                         existing_user.is_staff = user_data.get("is_staff", False)
                         existing_user.is_support = user_data.get("is_support", False)
                         existing_user.is_active = user_data.get("is_active", True)
+                        existing_user.deactivation_reason = user_data.get(
+                            "deactivation_reason", ""
+                        )
 
                         # Additional fields
                         if "token_lifetime" in user_data:
-                            existing_user.token_lifetime = user_data.get(
-                                "token_lifetime"
+                            token_lifetime = user_data.get("token_lifetime")
+                            existing_user.token_lifetime = (
+                                None if token_lifetime == -1 else token_lifetime
                             )
                         existing_user.details = user_data.get("details", {})
                         existing_user.notifications_enabled = user_data.get(
@@ -987,6 +1415,7 @@ class Command(BaseCommand):
                         existing_user.is_identity_manager = user_data.get(
                             "is_identity_manager", False
                         )
+                        existing_user.managed_isds = user_data.get("managed_isds", [])
                         existing_user.registration_method = user_data.get(
                             "registration_method", "default"
                         )
@@ -1019,6 +1448,15 @@ class Command(BaseCommand):
                         )
                         existing_user.organization_type = user_data.get(
                             "organization_type", ""
+                        )
+                        existing_user.organization_registry_code = user_data.get(
+                            "organization_registry_code", ""
+                        )
+                        existing_user.organization_vat_code = user_data.get(
+                            "organization_vat_code", ""
+                        )
+                        existing_user.organization_address = user_data.get(
+                            "organization_address", ""
                         )
                         existing_user.eduperson_assurance = user_data.get(
                             "eduperson_assurance", []
@@ -1053,7 +1491,8 @@ class Command(BaseCommand):
                                 pass
 
                         if not self.dry_run:
-                            existing_user.save()
+                            with transaction.atomic():
+                                existing_user.save()
 
                         self.stats["users"]["updated"] += 1
                     else:
@@ -1095,12 +1534,14 @@ class Command(BaseCommand):
                         is_staff=user_data.get("is_staff", False),
                         is_support=user_data.get("is_support", False),
                         is_active=user_data.get("is_active", True),
+                        deactivation_reason=user_data.get("deactivation_reason", ""),
                         # Additional fields
                         details=user_data.get("details", {}),
                         notifications_enabled=user_data.get(
                             "notifications_enabled", True
                         ),
                         is_identity_manager=user_data.get("is_identity_manager", False),
+                        managed_isds=user_data.get("managed_isds", []),
                         registration_method=user_data.get(
                             "registration_method", "default"
                         ),
@@ -1122,15 +1563,25 @@ class Command(BaseCommand):
                         nationalities=user_data.get("nationalities", []),
                         organization_country=user_data.get("organization_country", ""),
                         organization_type=user_data.get("organization_type", ""),
+                        organization_registry_code=user_data.get(
+                            "organization_registry_code", ""
+                        ),
+                        organization_vat_code=user_data.get(
+                            "organization_vat_code", ""
+                        ),
+                        organization_address=user_data.get("organization_address", ""),
                         eduperson_assurance=user_data.get("eduperson_assurance", []),
                     )
                     if user_data.get("civil_number"):
                         user.civil_number = user_data.get("civil_number")
 
                     # Handle token_lifetime - only set if provided in data
-                    # Mark the instance to prevent signal handler from overriding
+                    # -1 means endless (None in DB), mark instance to prevent signal override
                     if "token_lifetime" in user_data:
-                        user.token_lifetime = user_data.get("token_lifetime")
+                        token_lifetime = user_data.get("token_lifetime")
+                        user.token_lifetime = (
+                            None if token_lifetime == -1 else token_lifetime
+                        )
                         user._token_lifetime_explicitly_set = True
 
                     # Set password if provided, otherwise set unusable password
@@ -1141,7 +1592,12 @@ class Command(BaseCommand):
                         user.set_unusable_password()
 
                     if not self.dry_run:
-                        user.save()
+                        with transaction.atomic():
+                            user.save()
+
+                    # Update maps for subsequent lookups
+                    user_by_uuid[self._normalize_uuid(uuid)] = user
+                    user_by_username[username] = user
 
                     self.stats["users"]["created"] += 1
 
@@ -1157,6 +1613,11 @@ class Command(BaseCommand):
         """Import user authentication tokens."""
         self.stdout.write("Importing auth tokens...")
 
+        # Pre-fetch lookup maps to avoid N+1 queries
+        user_map = {str(u.uuid): u for u in User.all_objects.all()}
+        token_by_key = {t.key: t for t in Token.objects.all()}
+        token_by_user_id = {t.user_id: t for t in token_by_key.values()}
+
         for token_data in tokens_data:
             try:
                 key = token_data.get("key")
@@ -1170,7 +1631,7 @@ class Command(BaseCommand):
                     continue
 
                 # Find user
-                user = User.all_objects.filter(uuid=user_uuid).first()
+                user = user_map.get(self._normalize_uuid(user_uuid))
                 if not user:
                     self.stdout.write(
                         self.style.WARNING(
@@ -1191,7 +1652,7 @@ class Command(BaseCommand):
                         pass
 
                 if not self.dry_run:
-                    existing_token = Token.objects.filter(key=key).first()
+                    existing_token = token_by_key.get(key)
 
                     if existing_token:
                         if self.update_existing:
@@ -1199,52 +1660,57 @@ class Command(BaseCommand):
                             existing_token.user = user
                             if created:
                                 existing_token.created = created
-                            existing_token.save()
+                            with transaction.atomic():
+                                existing_token.save()
                             self.stats["auth_tokens"]["updated"] += 1
                         else:
                             self.stats["auth_tokens"]["skipped"] += 1
                     else:
-                        # Check if user already has a token
-                        user_token = Token.objects.filter(user=user).first()
+                        # Check if user already has a token. Importing users
+                        # auto-creates a token for each of them, so a token
+                        # explicitly declared in the input is authoritative
+                        # and replaces the auto-generated one even without
+                        # the update flag.
+                        user_token = token_by_user_id.get(user.id)
                         if user_token:
-                            if self.update_existing:
-                                # Replace existing token
+                            with transaction.atomic():
                                 user_token.delete()
+                                # Remove old token from maps
+                                token_by_key.pop(user_token.key, None)
+                                token_by_user_id.pop(user.id, None)
                                 token = Token(key=key, user=user)
                                 if created:
                                     token.created = created
                                 token.save()
-                                self.stats["auth_tokens"]["updated"] += 1
-                            else:
-                                self.stdout.write(
-                                    self.style.WARNING(
-                                        f"Skipping token {key}: user already has token {user_token.key}"
-                                    )
-                                )
-                                self.stats["auth_tokens"]["skipped"] += 1
+                            # Update maps
+                            token_by_key[key] = token
+                            token_by_user_id[user.id] = token
+                            self.stats["auth_tokens"]["updated"] += 1
                         else:
                             # Create new token
                             token = Token(key=key, user=user)
                             if created:
                                 token.created = created
-                            token.save()
+                            with transaction.atomic():
+                                token.save()
+                            # Update maps
+                            token_by_key[key] = token
+                            token_by_user_id[user.id] = token
                             self.stats["auth_tokens"]["created"] += 1
                 else:
                     # Dry run
-                    existing = Token.objects.filter(key=key).exists()
+                    existing = key in token_by_key
                     if existing:
                         if self.update_existing:
                             self.stats["auth_tokens"]["updated"] += 1
                         else:
                             self.stats["auth_tokens"]["skipped"] += 1
                     else:
-                        # Check for user token conflict
-                        user_has_token = Token.objects.filter(user=user).exists()
+                        # Check for user token conflict; explicitly declared
+                        # tokens replace the user's existing token
+                        user_has_token = user.id in token_by_user_id
                         if user_has_token:
-                            if self.update_existing:
-                                self.stats["auth_tokens"]["updated"] += 1
-                            else:
-                                self.stats["auth_tokens"]["skipped"] += 1
+                            self.stats["auth_tokens"]["updated"] += 1
                         else:
                             self.stats["auth_tokens"]["created"] += 1
 
@@ -1298,12 +1764,16 @@ class Command(BaseCommand):
 
                     if existing_key:
                         if self.update_existing:
-                            SshPublicKey.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                SshPublicKey.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["ssh_public_keys"]["updated"] += 1
                         else:
                             self.stats["ssh_public_keys"]["skipped"] += 1
                     else:
-                        SshPublicKey.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            SshPublicKey.objects.create(uuid=uuid, **defaults)
                         self.stats["ssh_public_keys"]["created"] += 1
                 else:
                     # Dry run
@@ -1425,12 +1895,14 @@ class Command(BaseCommand):
 
                     if existing_customer:
                         if self.update_existing:
-                            Customer.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                Customer.objects.filter(uuid=uuid).update(**defaults)
                             self.stats["customers"]["updated"] += 1
                         else:
                             self.stats["customers"]["skipped"] += 1
                     else:
-                        Customer.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            Customer.objects.create(uuid=uuid, **defaults)
                         self.stats["customers"]["created"] += 1
                 else:
                     # Dry run
@@ -1510,12 +1982,16 @@ class Command(BaseCommand):
 
                     if existing_sp:
                         if self.update_existing:
-                            ServiceProvider.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                ServiceProvider.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["service_providers"]["updated"] += 1
                         else:
                             self.stats["service_providers"]["skipped"] += 1
                     else:
-                        ServiceProvider.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            ServiceProvider.objects.create(uuid=uuid, **defaults)
                         self.stats["service_providers"]["created"] += 1
                 else:
                     # Dry run
@@ -1622,14 +2098,18 @@ class Command(BaseCommand):
                     existing = MaintenanceAnnouncement.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            MaintenanceAnnouncement.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                MaintenanceAnnouncement.objects.filter(
+                                    uuid=uuid
+                                ).update(**defaults)
                             self.stats["maintenance_announcements"]["updated"] += 1
                         else:
                             self.stats["maintenance_announcements"]["skipped"] += 1
                     else:
-                        MaintenanceAnnouncement.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            MaintenanceAnnouncement.objects.create(
+                                uuid=uuid, **defaults
+                            )
                         self.stats["maintenance_announcements"]["created"] += 1
                 else:
                     existing = MaintenanceAnnouncement.objects.filter(
@@ -1707,9 +2187,10 @@ class Command(BaseCommand):
                     ).first()
                     if existing:
                         if self.update_existing:
-                            MaintenanceAnnouncementOffering.objects.filter(
-                                uuid=uuid
-                            ).update(**defaults)
+                            with transaction.atomic():
+                                MaintenanceAnnouncementOffering.objects.filter(
+                                    uuid=uuid
+                                ).update(**defaults)
                             self.stats["maintenance_announcement_offerings"][
                                 "updated"
                             ] += 1
@@ -1718,9 +2199,10 @@ class Command(BaseCommand):
                                 "skipped"
                             ] += 1
                     else:
-                        MaintenanceAnnouncementOffering.objects.create(
-                            uuid=uuid, **defaults
-                        )
+                        with transaction.atomic():
+                            MaintenanceAnnouncementOffering.objects.create(
+                                uuid=uuid, **defaults
+                            )
                         self.stats["maintenance_announcement_offerings"]["created"] += 1
                 else:
                     existing = MaintenanceAnnouncementOffering.objects.filter(
@@ -1745,6 +2227,240 @@ class Command(BaseCommand):
                     )
                 )
                 self.stats["maintenance_announcement_offerings"]["errors"] += 1
+
+    def import_software_catalogs(self, catalogs_data):
+        """Import software catalog definitions (not package content)."""
+        self.stdout.write("Importing software catalogs...")
+
+        for catalog_data in catalogs_data:
+            try:
+                uuid = catalog_data.get("uuid")
+                name = catalog_data.get("name")
+                catalog_type = catalog_data.get("catalog_type")
+
+                if not uuid or not name:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            "Skipping software catalog without UUID or name"
+                        )
+                    )
+                    self.stats["software_catalogs"]["errors"] += 1
+                    continue
+
+                defaults = {
+                    "name": name,
+                    "version": catalog_data.get("version", ""),
+                    "catalog_type": catalog_type or "binary_runtime",
+                    "source_url": catalog_data.get("source_url", ""),
+                    "description": catalog_data.get("description", ""),
+                    "metadata": catalog_data.get("metadata", {}),
+                    "auto_update_enabled": catalog_data.get(
+                        "auto_update_enabled", True
+                    ),
+                    "update_errors": catalog_data.get("update_errors", ""),
+                }
+
+                if not self.dry_run:
+                    existing = SoftwareCatalog.objects.filter(uuid=uuid).first()
+                    if existing:
+                        if self.update_existing:
+                            with transaction.atomic():
+                                SoftwareCatalog.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
+                            self.stats["software_catalogs"]["updated"] += 1
+                        else:
+                            self.stats["software_catalogs"]["skipped"] += 1
+                    else:
+                        with transaction.atomic():
+                            SoftwareCatalog.objects.create(uuid=uuid, **defaults)
+                        self.stats["software_catalogs"]["created"] += 1
+                else:
+                    existing = SoftwareCatalog.objects.filter(uuid=uuid).exists()
+                    if existing:
+                        if self.update_existing:
+                            self.stats["software_catalogs"]["updated"] += 1
+                        else:
+                            self.stats["software_catalogs"]["skipped"] += 1
+                    else:
+                        self.stats["software_catalogs"]["created"] += 1
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import software catalog {catalog_data.get('uuid')}: {e}"
+                    )
+                )
+                self.stats["software_catalogs"]["errors"] += 1
+
+    def import_offering_partitions(self, partitions_data):
+        """Import offering partition data (SLURM partitions)."""
+        self.stdout.write("Importing offering partitions...")
+
+        for partition_data in partitions_data:
+            try:
+                uuid = partition_data.get("uuid")
+                offering_uuid = partition_data.get("offering_uuid")
+                partition_name = partition_data.get("partition_name")
+
+                if not uuid or not offering_uuid or not partition_name:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            "Skipping offering partition without UUID, offering_uuid, or partition_name"
+                        )
+                    )
+                    self.stats["offering_partitions"]["errors"] += 1
+                    continue
+
+                # Find offering
+                offering = Offering.objects.filter(uuid=offering_uuid).first()
+                if not offering:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping partition {uuid}: Offering {offering_uuid} not found"
+                        )
+                    )
+                    self.stats["offering_partitions"]["errors"] += 1
+                    continue
+
+                defaults = {
+                    "offering": offering,
+                    "partition_name": partition_name,
+                    "cpu_arch": partition_data.get("cpu_arch", ""),
+                    "gpu_arch": partition_data.get("gpu_arch", ""),
+                    "cpu_bind": partition_data.get("cpu_bind"),
+                    "def_cpu_per_gpu": partition_data.get("def_cpu_per_gpu"),
+                    "max_cpus_per_node": partition_data.get("max_cpus_per_node"),
+                }
+
+                if not self.dry_run:
+                    existing = OfferingPartition.objects.filter(uuid=uuid).first()
+                    if existing:
+                        if self.update_existing:
+                            with transaction.atomic():
+                                OfferingPartition.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
+                            self.stats["offering_partitions"]["updated"] += 1
+                        else:
+                            self.stats["offering_partitions"]["skipped"] += 1
+                    else:
+                        with transaction.atomic():
+                            OfferingPartition.objects.create(uuid=uuid, **defaults)
+                        self.stats["offering_partitions"]["created"] += 1
+                else:
+                    existing = OfferingPartition.objects.filter(uuid=uuid).exists()
+                    if existing:
+                        if self.update_existing:
+                            self.stats["offering_partitions"]["updated"] += 1
+                        else:
+                            self.stats["offering_partitions"]["skipped"] += 1
+                    else:
+                        self.stats["offering_partitions"]["created"] += 1
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import offering partition {partition_data.get('uuid')}: {e}"
+                    )
+                )
+                self.stats["offering_partitions"]["errors"] += 1
+
+    def import_offering_software_catalogs(self, links_data):
+        """Import offering-to-software-catalog links."""
+        self.stdout.write("Importing offering software catalog links...")
+
+        for link_data in links_data:
+            try:
+                uuid = link_data.get("uuid")
+                offering_uuid = link_data.get("offering_uuid")
+                catalog_uuid = link_data.get("catalog_uuid")
+
+                if not uuid or not offering_uuid or not catalog_uuid:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            "Skipping offering software catalog link without UUID, offering_uuid, or catalog_uuid"
+                        )
+                    )
+                    self.stats["offering_software_catalogs"]["errors"] += 1
+                    continue
+
+                # Find offering
+                offering = Offering.objects.filter(uuid=offering_uuid).first()
+                if not offering:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping link {uuid}: Offering {offering_uuid} not found"
+                        )
+                    )
+                    self.stats["offering_software_catalogs"]["errors"] += 1
+                    continue
+
+                # Find catalog
+                catalog = SoftwareCatalog.objects.filter(uuid=catalog_uuid).first()
+                if not catalog:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping link {uuid}: SoftwareCatalog {catalog_uuid} not found"
+                        )
+                    )
+                    self.stats["offering_software_catalogs"]["errors"] += 1
+                    continue
+
+                # Find partition if specified
+                partition = None
+                partition_uuid = link_data.get("partition_uuid")
+                if partition_uuid:
+                    partition = OfferingPartition.objects.filter(
+                        uuid=partition_uuid
+                    ).first()
+
+                defaults = {
+                    "offering": offering,
+                    "catalog": catalog,
+                    "enabled_cpu_family": link_data.get("enabled_cpu_family", []),
+                    "enabled_cpu_microarchitectures": link_data.get(
+                        "enabled_cpu_microarchitectures", []
+                    ),
+                    "partition": partition,
+                }
+
+                if not self.dry_run:
+                    existing = OfferingSoftwareCatalog.objects.filter(uuid=uuid).first()
+                    if existing:
+                        if self.update_existing:
+                            with transaction.atomic():
+                                OfferingSoftwareCatalog.objects.filter(
+                                    uuid=uuid
+                                ).update(**defaults)
+                            self.stats["offering_software_catalogs"]["updated"] += 1
+                        else:
+                            self.stats["offering_software_catalogs"]["skipped"] += 1
+                    else:
+                        with transaction.atomic():
+                            OfferingSoftwareCatalog.objects.create(
+                                uuid=uuid, **defaults
+                            )
+                        self.stats["offering_software_catalogs"]["created"] += 1
+                else:
+                    existing = OfferingSoftwareCatalog.objects.filter(
+                        uuid=uuid
+                    ).exists()
+                    if existing:
+                        if self.update_existing:
+                            self.stats["offering_software_catalogs"]["updated"] += 1
+                        else:
+                            self.stats["offering_software_catalogs"]["skipped"] += 1
+                    else:
+                        self.stats["offering_software_catalogs"]["created"] += 1
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import offering software catalog link {link_data.get('uuid')}: {e}"
+                    )
+                )
+                self.stats["offering_software_catalogs"]["errors"] += 1
 
     def import_projects(self, projects_data):
         """Import project data."""
@@ -1814,12 +2530,14 @@ class Command(BaseCommand):
 
                     if existing_project:
                         if self.update_existing:
-                            Project.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                Project.objects.filter(uuid=uuid).update(**defaults)
                             self.stats["projects"]["updated"] += 1
                         else:
                             self.stats["projects"]["skipped"] += 1
                     else:
-                        Project.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            Project.objects.create(uuid=uuid, **defaults)
                         self.stats["projects"]["created"] += 1
                 else:
                     existing = Project.available_objects.filter(uuid=uuid).exists()
@@ -1867,12 +2585,16 @@ class Command(BaseCommand):
 
                     if existing_group:
                         if self.update_existing:
-                            CategoryGroup.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                CategoryGroup.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["category_groups"]["updated"] += 1
                         else:
                             self.stats["category_groups"]["skipped"] += 1
                     else:
-                        CategoryGroup.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            CategoryGroup.objects.create(uuid=uuid, **defaults)
                         self.stats["category_groups"]["created"] += 1
                 else:
                     existing = CategoryGroup.objects.filter(uuid=uuid).exists()
@@ -1941,12 +2663,14 @@ class Command(BaseCommand):
 
                     if existing_category:
                         if self.update_existing:
-                            Category.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                Category.objects.filter(uuid=uuid).update(**defaults)
                             self.stats["categories"]["updated"] += 1
                         else:
                             self.stats["categories"]["skipped"] += 1
                     else:
-                        Category.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            Category.objects.create(uuid=uuid, **defaults)
                         self.stats["categories"]["created"] += 1
                 else:
                     existing = Category.objects.filter(uuid=uuid).exists()
@@ -2054,6 +2778,8 @@ class Command(BaseCommand):
                     "getting_started": offering_data.get("getting_started", ""),
                     "integration_guide": offering_data.get("integration_guide", ""),
                     "privacy_policy_link": offering_data.get("privacy_policy_link", ""),
+                    "helpdesk_url": offering_data.get("helpdesk_url", ""),
+                    "documentation_url": offering_data.get("documentation_url", ""),
                     "access_url": offering_data.get("access_url", ""),
                     "country": offering_data.get("country", ""),
                     "paused_reason": offering_data.get("paused_reason", ""),
@@ -2066,6 +2792,28 @@ class Command(BaseCommand):
                     "compliance_checklist": compliance_checklist,
                 }
 
+                # Resolve scope (for offerings linked to backend objects)
+                scope_type = offering_data.get("scope_type")
+                scope_uuid = offering_data.get("scope_uuid")
+                if scope_type and scope_uuid:
+                    try:
+                        app_label, model_name = scope_type.split(".")
+                        ct = ContentType.objects.get(
+                            app_label=app_label, model=model_name
+                        )
+                        scope_obj = (
+                            ct.model_class().objects.filter(uuid=scope_uuid).first()
+                        )
+                        if scope_obj:
+                            defaults["content_type"] = ct
+                            defaults["object_id"] = scope_obj.id
+                    except Exception as e:
+                        self.stdout.write(
+                            self.style.WARNING(
+                                f"Could not resolve scope for offering {uuid}: {e}"
+                            )
+                        )
+
                 if category:
                     defaults["category"] = category
 
@@ -2074,12 +2822,14 @@ class Command(BaseCommand):
 
                     if existing_offering:
                         if self.update_existing:
-                            Offering.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                Offering.objects.filter(uuid=uuid).update(**defaults)
                             self.stats["offerings"]["updated"] += 1
                         else:
                             self.stats["offerings"]["skipped"] += 1
                     else:
-                        Offering.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            Offering.objects.create(uuid=uuid, **defaults)
                         self.stats["offerings"]["created"] += 1
                 else:
                     existing = Offering.objects.filter(uuid=uuid).exists()
@@ -2143,14 +2893,16 @@ class Command(BaseCommand):
 
                     if existing_endpoint:
                         if self.update_existing:
-                            OfferingAccessEndpoint.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                OfferingAccessEndpoint.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["offering_endpoints"]["updated"] += 1
                         else:
                             self.stats["offering_endpoints"]["skipped"] += 1
                     else:
-                        OfferingAccessEndpoint.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            OfferingAccessEndpoint.objects.create(uuid=uuid, **defaults)
                         self.stats["offering_endpoints"]["created"] += 1
                 else:
                     # Dry run
@@ -2170,6 +2922,174 @@ class Command(BaseCommand):
                     )
                 )
                 self.stats["offering_endpoints"]["errors"] += 1
+
+    def import_project_estimated_cost_policies(self, policies_data):
+        """Import project estimated cost policies."""
+        self.stdout.write("Importing project estimated cost policies...")
+
+        for policy_data in policies_data:
+            try:
+                uuid = policy_data.get("uuid")
+                project_uuid = policy_data.get("project_uuid")
+
+                if not uuid or not project_uuid:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            "Skipping project cost policy without UUID or project_uuid"
+                        )
+                    )
+                    self.stats["project_estimated_cost_policies"]["errors"] += 1
+                    continue
+
+                project = Project.objects.filter(uuid=project_uuid).first()
+                if not project:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping project cost policy {uuid}: project {project_uuid} not found"
+                        )
+                    )
+                    self.stats["project_estimated_cost_policies"]["errors"] += 1
+                    continue
+
+                defaults = {
+                    "scope": project,
+                    "limit_cost": policy_data.get("limit_cost", 0),
+                    "period": policy_data.get("period", 2),
+                    "actions": policy_data.get("actions", "notify_project_team"),
+                    "options": policy_data.get("options", {}),
+                    "has_fired": policy_data.get("has_fired", False),
+                }
+
+                if not self.dry_run:
+                    existing = ProjectEstimatedCostPolicy.objects.filter(
+                        uuid=uuid
+                    ).first()
+                    if existing:
+                        if self.update_existing:
+                            with transaction.atomic():
+                                ProjectEstimatedCostPolicy.objects.filter(
+                                    uuid=uuid
+                                ).update(**defaults)
+                            self.stats["project_estimated_cost_policies"][
+                                "updated"
+                            ] += 1
+                        else:
+                            self.stats["project_estimated_cost_policies"][
+                                "skipped"
+                            ] += 1
+                    else:
+                        with transaction.atomic():
+                            ProjectEstimatedCostPolicy.objects.create(
+                                uuid=uuid, **defaults
+                            )
+                        self.stats["project_estimated_cost_policies"]["created"] += 1
+                else:
+                    existing = ProjectEstimatedCostPolicy.objects.filter(
+                        uuid=uuid
+                    ).exists()
+                    if existing:
+                        if self.update_existing:
+                            self.stats["project_estimated_cost_policies"][
+                                "updated"
+                            ] += 1
+                        else:
+                            self.stats["project_estimated_cost_policies"][
+                                "skipped"
+                            ] += 1
+                    else:
+                        self.stats["project_estimated_cost_policies"]["created"] += 1
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import project cost policy {policy_data.get('uuid')}: {e}"
+                    )
+                )
+                self.stats["project_estimated_cost_policies"]["errors"] += 1
+
+    def import_customer_estimated_cost_policies(self, policies_data):
+        """Import customer estimated cost policies."""
+        self.stdout.write("Importing customer estimated cost policies...")
+
+        for policy_data in policies_data:
+            try:
+                uuid = policy_data.get("uuid")
+                customer_uuid = policy_data.get("customer_uuid")
+
+                if not uuid or not customer_uuid:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            "Skipping customer cost policy without UUID or customer_uuid"
+                        )
+                    )
+                    self.stats["customer_estimated_cost_policies"]["errors"] += 1
+                    continue
+
+                customer = Customer.objects.filter(uuid=customer_uuid).first()
+                if not customer:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping customer cost policy {uuid}: customer {customer_uuid} not found"
+                        )
+                    )
+                    self.stats["customer_estimated_cost_policies"]["errors"] += 1
+                    continue
+
+                defaults = {
+                    "scope": customer,
+                    "limit_cost": policy_data.get("limit_cost", 0),
+                    "period": policy_data.get("period", 2),
+                    "actions": policy_data.get("actions", "notify_organization_owners"),
+                    "options": policy_data.get("options", {}),
+                    "has_fired": policy_data.get("has_fired", False),
+                }
+
+                if not self.dry_run:
+                    existing = CustomerEstimatedCostPolicy.objects.filter(
+                        uuid=uuid
+                    ).first()
+                    if existing:
+                        if self.update_existing:
+                            with transaction.atomic():
+                                CustomerEstimatedCostPolicy.objects.filter(
+                                    uuid=uuid
+                                ).update(**defaults)
+                            self.stats["customer_estimated_cost_policies"][
+                                "updated"
+                            ] += 1
+                        else:
+                            self.stats["customer_estimated_cost_policies"][
+                                "skipped"
+                            ] += 1
+                    else:
+                        with transaction.atomic():
+                            CustomerEstimatedCostPolicy.objects.create(
+                                uuid=uuid, **defaults
+                            )
+                        self.stats["customer_estimated_cost_policies"]["created"] += 1
+                else:
+                    existing = CustomerEstimatedCostPolicy.objects.filter(
+                        uuid=uuid
+                    ).exists()
+                    if existing:
+                        if self.update_existing:
+                            self.stats["customer_estimated_cost_policies"][
+                                "updated"
+                            ] += 1
+                        else:
+                            self.stats["customer_estimated_cost_policies"][
+                                "skipped"
+                            ] += 1
+                    else:
+                        self.stats["customer_estimated_cost_policies"]["created"] += 1
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import customer cost policy {policy_data.get('uuid')}: {e}"
+                    )
+                )
+                self.stats["customer_estimated_cost_policies"]["errors"] += 1
 
     def import_slurm_periodic_policies(self, policies_data):
         """Import SLURM periodic usage policies."""
@@ -2223,31 +3143,33 @@ class Command(BaseCommand):
 
                     if existing_policy:
                         if self.update_existing:
-                            SlurmPeriodicUsagePolicy.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                SlurmPeriodicUsagePolicy.objects.filter(
+                                    uuid=uuid
+                                ).update(**defaults)
                             self.stats["slurm_periodic_policies"]["updated"] += 1
                         else:
                             self.stats["slurm_periodic_policies"]["skipped"] += 1
                     else:
-                        policy = SlurmPeriodicUsagePolicy.objects.create(
-                            uuid=uuid, **defaults
-                        )
+                        with transaction.atomic():
+                            policy = SlurmPeriodicUsagePolicy.objects.create(
+                                uuid=uuid, **defaults
+                            )
 
-                        # Handle component limits if provided
-                        component_limits = policy_data.get("component_limits", [])
-                        for limit_data in component_limits:
-                            component_type = limit_data.get("type")
-                            limit_value = limit_data.get("limit")
-                            component = offering.components.filter(
-                                type=component_type
-                            ).first()
-                            if component and limit_value is not None:
-                                OfferingComponentLimit.objects.update_or_create(
-                                    policy=policy,
-                                    component=component,
-                                    defaults={"limit": limit_value},
-                                )
+                            # Handle component limits if provided
+                            component_limits = policy_data.get("component_limits", [])
+                            for limit_data in component_limits:
+                                component_type = limit_data.get("type")
+                                limit_value = limit_data.get("limit")
+                                component = offering.components.filter(
+                                    type=component_type
+                                ).first()
+                                if component and limit_value is not None:
+                                    OfferingComponentLimit.objects.update_or_create(
+                                        policy=policy,
+                                        component=component,
+                                        defaults={"limit": limit_value},
+                                    )
 
                         self.stats["slurm_periodic_policies"]["created"] += 1
                 else:
@@ -2350,20 +3272,22 @@ class Command(BaseCommand):
 
                     if existing:
                         if self.update_existing:
-                            SlurmCommandHistory.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                SlurmCommandHistory.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["slurm_command_history"]["updated"] += 1
                         else:
                             self.stats["slurm_command_history"]["skipped"] += 1
                     else:
-                        # Create with specific executed_at (can't use auto_now_add)
-                        history = SlurmCommandHistory(uuid=uuid, **defaults)
-                        history.save()
-                        # Update executed_at since auto_now_add overrides it
-                        SlurmCommandHistory.objects.filter(uuid=uuid).update(
-                            executed_at=executed_at
-                        )
+                        with transaction.atomic():
+                            # Create with specific executed_at (can't use auto_now_add)
+                            history = SlurmCommandHistory(uuid=uuid, **defaults)
+                            history.save()
+                            # Update executed_at since auto_now_add overrides it
+                            SlurmCommandHistory.objects.filter(uuid=uuid).update(
+                                executed_at=executed_at
+                            )
                         self.stats["slurm_command_history"]["created"] += 1
                 else:
                     # Dry run
@@ -2444,12 +3368,14 @@ class Command(BaseCommand):
 
                     if existing_role:
                         if self.update_existing:
-                            Role.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                Role.objects.filter(uuid=uuid).update(**defaults)
                             self.stats["roles"]["updated"] += 1
                         else:
                             self.stats["roles"]["skipped"] += 1
                     else:
-                        Role.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            Role.objects.create(uuid=uuid, **defaults)
                         self.stats["roles"]["created"] += 1
                 else:
                     # Dry run
@@ -2515,13 +3441,18 @@ class Command(BaseCommand):
                     new_permissions = set(permissions)
 
                     # Remove permissions not in new set
-                    RolePermission.objects.filter(
-                        role=role, permission__in=current_permissions - new_permissions
-                    ).delete()
+                    with transaction.atomic():
+                        RolePermission.objects.filter(
+                            role=role,
+                            permission__in=current_permissions - new_permissions,
+                        ).delete()
 
                     # Add new permissions
                     for permission in new_permissions - current_permissions:
-                        RolePermission.objects.create(role=role, permission=permission)
+                        with transaction.atomic():
+                            RolePermission.objects.create(
+                                role=role, permission=permission
+                            )
                         self.stats["role_permissions"]["created"] += 1
 
                     # Count unchanged
@@ -2539,9 +3470,118 @@ class Command(BaseCommand):
                 )
                 self.stats["role_permissions"]["errors"] += len(permissions)
 
+    def import_posix_id_pools(self, pools_data):
+        """Import POSIX ID pools (offering- or service-provider-scoped), by uuid."""
+        if not pools_data:
+            return
+        self.stdout.write("Importing POSIX ID pools...")
+        offering_map = {str(o.uuid): o for o in Offering.objects.all()}
+        sp_map = {str(sp.uuid): sp for sp in ServiceProvider.objects.all()}
+        for item in pools_data:
+            try:
+                uuid = item.get("uuid")
+                if not uuid:
+                    self.stats["posix_id_pools"]["errors"] += 1
+                    continue
+                offering = (
+                    offering_map.get(self._normalize_uuid(item["offering_uuid"]))
+                    if item.get("offering_uuid")
+                    else None
+                )
+                service_provider = (
+                    sp_map.get(self._normalize_uuid(item["service_provider_uuid"]))
+                    if item.get("service_provider_uuid")
+                    else None
+                )
+                if not offering and not service_provider:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping POSIX ID pool {uuid}: scope not found"
+                        )
+                    )
+                    self.stats["posix_id_pools"]["errors"] += 1
+                    continue
+                _, created = PosixIdPool.objects.update_or_create(
+                    uuid=self._normalize_uuid(uuid),
+                    defaults={
+                        "offering": offering,
+                        "service_provider": service_provider,
+                        "min_uid": item.get("min_uid"),
+                        "max_uid": item.get("max_uid"),
+                        "next_uid": item.get("next_uid"),
+                        "min_gid": item.get("min_gid"),
+                        "max_gid": item.get("max_gid"),
+                        "next_gid": item.get("next_gid"),
+                        "description": item.get("description", ""),
+                    },
+                )
+                self.stats["posix_id_pools"]["created" if created else "updated"] += 1
+            except Exception as e:
+                self.stats["posix_id_pools"]["errors"] += 1
+                self.stdout.write(
+                    self.style.ERROR(f"Error importing POSIX ID pool: {e}")
+                )
+
+    def import_resource_projects(self, resource_projects_data):
+        """Import resource projects (sub-projects of a resource), matched by uuid."""
+        if not resource_projects_data:
+            return
+        self.stdout.write("Importing resource projects...")
+        resource_map = {str(r.uuid): r for r in Resource.objects.all()}
+        for item in resource_projects_data:
+            try:
+                uuid = item.get("uuid")
+                resource_uuid = item.get("resource_uuid")
+                if not uuid or not resource_uuid:
+                    self.stats["resource_projects"]["errors"] += 1
+                    continue
+                resource = resource_map.get(self._normalize_uuid(resource_uuid))
+                if not resource:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping resource project {uuid}: "
+                            f"resource {resource_uuid} not found"
+                        )
+                    )
+                    self.stats["resource_projects"]["errors"] += 1
+                    continue
+                _, created = ResourceProject.objects.update_or_create(
+                    uuid=self._normalize_uuid(uuid),
+                    defaults={"resource": resource, "name": item.get("name", "")},
+                )
+                self.stats["resource_projects"][
+                    "created" if created else "updated"
+                ] += 1
+            except Exception as e:
+                self.stats["resource_projects"]["errors"] += 1
+                self.stdout.write(
+                    self.style.ERROR(f"Error importing resource project: {e}")
+                )
+
     def import_user_roles(self, user_roles_data):
         """Import user role assignments."""
         self.stdout.write("Importing user roles...")
+
+        # Pre-fetch lookup maps to avoid N+1 queries
+        # Note: str(obj.uuid) may return non-hyphenated hex (StringUUID),
+        # but data UUIDs may have hyphens, so we normalize all keys by removing hyphens.
+        user_map = {str(u.uuid): u for u in User.all_objects.all()}
+        role_by_uuid = {str(r.uuid): r for r in Role.objects.all()}
+        role_by_name = {r.name: r for r in role_by_uuid.values()}
+        existing_user_roles = {str(ur.uuid): ur for ur in UserRole.objects.all()}
+
+        # Pre-fetch ContentType map
+        content_type_map = {
+            (ct.app_label, ct.model): ct for ct in ContentType.objects.all()
+        }
+
+        # Pre-fetch common scope objects (Customer and Project cover >95% of scopes)
+        customer_by_uuid = {str(c.uuid): c for c in Customer.objects.all()}
+        project_by_uuid = {str(p.uuid): p for p in Project.objects.all()}
+        scope_cache = {
+            ("structure", "customer"): customer_by_uuid,
+            ("structure", "project"): project_by_uuid,
+        }
 
         for user_role_data in user_roles_data:
             try:
@@ -2562,7 +3602,7 @@ class Command(BaseCommand):
                     continue
 
                 # Find user
-                user = User.all_objects.filter(uuid=user_uuid).first()
+                user = user_map.get(self._normalize_uuid(user_uuid))
                 if not user:
                     self.stdout.write(
                         self.style.WARNING(
@@ -2579,9 +3619,9 @@ class Command(BaseCommand):
                 if scope_type and scope_uuid:
                     try:
                         app_label, model = scope_type.split(".")
-                        content_type = ContentType.objects.get(
-                            app_label=app_label, model=model
-                        )
+                        content_type = content_type_map.get((app_label, model))
+                        if not content_type:
+                            raise ContentType.DoesNotExist
                     except (ValueError, ContentType.DoesNotExist):
                         self.stdout.write(
                             self.style.WARNING(
@@ -2594,12 +3634,15 @@ class Command(BaseCommand):
                 # Find role by UUID or by name (create system role if needed)
                 role = None
                 if role_uuid:
-                    role = Role.objects.filter(uuid=role_uuid).first()
+                    role = role_by_uuid.get(self._normalize_uuid(role_uuid))
                 if not role and role_name:
-                    role = Role.objects.filter(name=role_name).first()
+                    role = role_by_name.get(role_name)
                     # If role not found and we have a content_type, create it as a system role
                     if not role and content_type:
                         role = Role.objects.get_system_role(role_name, content_type)
+                        # Cache the newly created/fetched role
+                        role_by_uuid[str(role.uuid)] = role
+                        role_by_name[role.name] = role
                 if not role:
                     self.stdout.write(
                         self.style.WARNING(
@@ -2621,7 +3664,15 @@ class Command(BaseCommand):
                         )
                         self.stats["user_roles"]["errors"] += 1
                         continue
-                    scope_object = model_class.objects.filter(uuid=scope_uuid).first()
+                    # Use pre-fetched scope maps for common types, fall back to DB for rare ones
+                    app_label, model = scope_type.split(".")
+                    scope_map = scope_cache.get((app_label, model))
+                    if scope_map is not None:
+                        scope_object = scope_map.get(self._normalize_uuid(scope_uuid))
+                    else:
+                        scope_object = model_class.objects.filter(
+                            uuid=scope_uuid
+                        ).first()
                     if not scope_object:
                         self.stdout.write(
                             self.style.WARNING(
@@ -2656,21 +3707,25 @@ class Command(BaseCommand):
 
                 if not self.dry_run:
                     # Check if already exists
-                    existing = UserRole.objects.filter(uuid=uuid).first()
+                    normalized_uuid = self._normalize_uuid(uuid)
+                    existing = existing_user_roles.get(normalized_uuid)
 
                     if existing:
                         if self.update_existing:
                             for key, value in defaults.items():
                                 setattr(existing, key, value)
-                            existing.save()
+                            with transaction.atomic():
+                                existing.save()
                             self.stats["user_roles"]["updated"] += 1
                         else:
                             self.stats["user_roles"]["skipped"] += 1
                     else:
-                        UserRole.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            obj = UserRole.objects.create(uuid=uuid, **defaults)
+                        existing_user_roles[normalized_uuid] = obj
                         self.stats["user_roles"]["created"] += 1
                 else:
-                    existing = UserRole.objects.filter(uuid=uuid).exists()
+                    existing = self._normalize_uuid(uuid) in existing_user_roles
                     if existing:
                         if self.update_existing:
                             self.stats["user_roles"]["updated"] += 1
@@ -2734,16 +3789,18 @@ class Command(BaseCommand):
 
                     if existing_account:
                         if self.update_existing:
-                            ProjectServiceAccount.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                ProjectServiceAccount.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["project_service_accounts"]["updated"] += 1
                         else:
                             self.stats["project_service_accounts"]["skipped"] += 1
                     else:
-                        ProjectServiceAccount.objects.create(
-                            uuid=UUID(uuid), **defaults
-                        )
+                        with transaction.atomic():
+                            ProjectServiceAccount.objects.create(
+                                uuid=UUID(uuid), **defaults
+                            )
                         self.stats["project_service_accounts"]["created"] += 1
                 else:
                     existing = ProjectServiceAccount.objects.filter(uuid=uuid).exists()
@@ -2810,14 +3867,16 @@ class Command(BaseCommand):
 
                     if existing_account:
                         if self.update_existing:
-                            CustomerServiceAccount.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                CustomerServiceAccount.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["customer_service_accounts"]["updated"] += 1
                         else:
                             self.stats["customer_service_accounts"]["skipped"] += 1
                     else:
-                        CustomerServiceAccount.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            CustomerServiceAccount.objects.create(uuid=uuid, **defaults)
                         self.stats["customer_service_accounts"]["created"] += 1
                 else:
                     existing = CustomerServiceAccount.objects.filter(uuid=uuid).exists()
@@ -2894,12 +3953,16 @@ class Command(BaseCommand):
 
                     if existing_account:
                         if self.update_existing:
-                            CourseAccount.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                CourseAccount.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["course_accounts"]["updated"] += 1
                         else:
                             self.stats["course_accounts"]["skipped"] += 1
                     else:
-                        CourseAccount.objects.create(uuid=UUID(uuid), **defaults)
+                        with transaction.atomic():
+                            CourseAccount.objects.create(uuid=UUID(uuid), **defaults)
                         self.stats["course_accounts"]["created"] += 1
                 else:
                     existing = CourseAccount.objects.filter(uuid=uuid).exists()
@@ -2966,12 +4029,14 @@ class Command(BaseCommand):
 
                     if existing_plan:
                         if self.update_existing:
-                            Plan.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                Plan.objects.filter(uuid=uuid).update(**defaults)
                             self.stats["plans"]["updated"] += 1
                         else:
                             self.stats["plans"]["skipped"] += 1
                     else:
-                        Plan.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            Plan.objects.create(uuid=uuid, **defaults)
                         self.stats["plans"]["created"] += 1
                 else:
                     existing = Plan.objects.filter(uuid=uuid).exists()
@@ -3028,12 +4093,21 @@ class Command(BaseCommand):
                     "description": component_data.get("description", ""),
                     "billing_type": component_data.get("billing_type", "fixed"),
                     "measured_unit": component_data.get("measured_unit", ""),
-                    "limit_period": component_data.get("limit_period"),
+                    "limit_period": component_data.get("limit_period")
+                    or LimitPeriods.MONTH,
                     "limit_amount": component_data.get("limit_amount"),
                     "min_value": component_data.get("min_value"),
                     "max_value": component_data.get("max_value"),
                     "min_prepaid_duration": component_data.get("min_prepaid_duration"),
                     "max_prepaid_duration": component_data.get("max_prepaid_duration"),
+                    "prepaid_duration_step": component_data.get(
+                        "prepaid_duration_step"
+                    ),
+                    "min_renewal_duration": component_data.get("min_renewal_duration"),
+                    "max_renewal_duration": component_data.get("max_renewal_duration"),
+                    "renewal_duration_step": component_data.get(
+                        "renewal_duration_step"
+                    ),
                     "is_prepaid": component_data.get("is_prepaid", False),
                     "article_code": component_data.get("article_code", ""),
                     "backend_id": component_data.get("backend_id", ""),
@@ -3046,14 +4120,16 @@ class Command(BaseCommand):
 
                     if existing_component:
                         if self.update_existing:
-                            OfferingComponent.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                OfferingComponent.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["offering_components"]["updated"] += 1
                         else:
                             self.stats["offering_components"]["skipped"] += 1
                     else:
-                        OfferingComponent.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            OfferingComponent.objects.create(uuid=uuid, **defaults)
                         self.stats["offering_components"]["created"] += 1
                 else:
                     existing = OfferingComponent.objects.filter(uuid=uuid).exists()
@@ -3119,6 +4195,10 @@ class Command(BaseCommand):
                     "amount": pc_data.get("amount", 0),
                     "price": pc_data.get("price", 0),
                     "future_price": pc_data.get("future_price"),
+                    "discount_formula": pc_data.get("discount_formula", ""),
+                    "discount_aggregation": pc_data.get(
+                        "discount_aggregation", "customer"
+                    ),
                 }
 
                 if not self.dry_run:
@@ -3128,16 +4208,18 @@ class Command(BaseCommand):
 
                     if existing_pc:
                         if self.update_existing:
-                            PlanComponent.objects.filter(
-                                plan=plan, component=component
-                            ).update(**defaults)
+                            with transaction.atomic():
+                                PlanComponent.objects.filter(
+                                    plan=plan, component=component
+                                ).update(**defaults)
                             self.stats["plan_components"]["updated"] += 1
                         else:
                             self.stats["plan_components"]["skipped"] += 1
                     else:
-                        PlanComponent.objects.create(
-                            plan=plan, component=component, **defaults
-                        )
+                        with transaction.atomic():
+                            PlanComponent.objects.create(
+                                plan=plan, component=component, **defaults
+                            )
                         self.stats["plan_components"]["created"] += 1
                 else:
                     existing = PlanComponent.objects.filter(
@@ -3226,6 +4308,36 @@ class Command(BaseCommand):
                     except (ValueError, TypeError):
                         pass
 
+                # Resolve scope (generic FK to backend object)
+                scope_content_type = None
+                scope_object_id = None
+                scope_type = resource_data.get("scope_type")
+                scope_uuid = resource_data.get("scope_uuid")
+                if scope_type and scope_uuid:
+                    try:
+                        app_label, model_name = scope_type.split(".")
+                        ct = ContentType.objects.get(
+                            app_label=app_label, model=model_name
+                        )
+                        scope_obj = (
+                            ct.model_class().objects.filter(uuid=scope_uuid).first()
+                        )
+                        if scope_obj:
+                            scope_content_type = ct
+                            scope_object_id = scope_obj.id
+                        else:
+                            self.stdout.write(
+                                self.style.WARNING(
+                                    f"Resource {uuid}: scope {scope_type}:{scope_uuid} not found"
+                                )
+                            )
+                    except (ValueError, ContentType.DoesNotExist):
+                        self.stdout.write(
+                            self.style.WARNING(
+                                f"Resource {uuid}: invalid scope_type '{scope_type}'"
+                            )
+                        )
+
                 defaults = {
                     "name": resource_data.get("name", ""),
                     "state": resource_data.get("state", 1),
@@ -3240,27 +4352,58 @@ class Command(BaseCommand):
                     "description": resource_data.get("description", ""),
                     "slug": resource_data.get("slug", ""),
                     "end_date": end_date,
+                    "paused": resource_data.get("paused", False),
+                    "downscaled": resource_data.get("downscaled", False),
+                    "restrict_member_access": resource_data.get(
+                        "restrict_member_access", False
+                    ),
                 }
+
+                if scope_content_type and scope_object_id:
+                    defaults["content_type"] = scope_content_type
+                    defaults["object_id"] = scope_object_id
 
                 if not self.dry_run:
                     existing_resource = Resource.objects.filter(uuid=uuid).first()
 
                     if existing_resource:
                         if self.update_existing:
-                            Resource.objects.filter(uuid=uuid).update(**defaults)
-                            # Update created date if provided (requires separate update)
-                            if created:
-                                Resource.objects.filter(uuid=uuid).update(
-                                    created=created
-                                )
+                            with transaction.atomic():
+                                Resource.objects.filter(uuid=uuid).update(**defaults)
+                                # Update created date if provided (requires separate update)
+                                if created:
+                                    Resource.objects.filter(uuid=uuid).update(
+                                        created=created
+                                    )
                             self.stats["resources"]["updated"] += 1
                         else:
                             self.stats["resources"]["skipped"] += 1
                     else:
-                        Resource.objects.create(uuid=uuid, **defaults)
-                        # Update created date if provided (auto_now_add prevents setting during create)
-                        if created:
-                            Resource.objects.filter(uuid=uuid).update(created=created)
+                        # Check if a resource with same scope was auto-created by signals
+                        if scope_content_type and scope_object_id:
+                            existing_by_scope = Resource.objects.filter(
+                                content_type=scope_content_type,
+                                object_id=scope_object_id,
+                            ).first()
+                            if existing_by_scope:
+                                with transaction.atomic():
+                                    Resource.objects.filter(
+                                        pk=existing_by_scope.pk
+                                    ).update(uuid=uuid, **defaults)
+                                    if created:
+                                        Resource.objects.filter(uuid=uuid).update(
+                                            created=created
+                                        )
+                                self.stats["resources"]["updated"] += 1
+                                continue
+
+                        with transaction.atomic():
+                            Resource.objects.create(uuid=uuid, **defaults)
+                            # Update created date if provided (auto_now_add prevents setting during create)
+                            if created:
+                                Resource.objects.filter(uuid=uuid).update(
+                                    created=created
+                                )
                         self.stats["resources"]["created"] += 1
                 else:
                     existing = Resource.objects.filter(uuid=uuid).exists()
@@ -3355,14 +4498,16 @@ class Command(BaseCommand):
 
                     if existing_period:
                         if self.update_existing:
-                            ResourcePlanPeriod.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                ResourcePlanPeriod.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["resource_plan_periods"]["updated"] += 1
                         else:
                             self.stats["resource_plan_periods"]["skipped"] += 1
                     else:
-                        ResourcePlanPeriod.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            ResourcePlanPeriod.objects.create(uuid=uuid, **defaults)
                         self.stats["resource_plan_periods"]["created"] += 1
                 else:
                     existing = ResourcePlanPeriod.objects.filter(uuid=uuid).exists()
@@ -3386,6 +4531,17 @@ class Command(BaseCommand):
         """Import component usage data."""
         self.stdout.write("Importing component usages...")
 
+        # Pre-fetch lookup maps to avoid N+1 queries
+        resource_map = {str(r.uuid): r for r in Resource.objects.all()}
+        component_map = {str(c.uuid): c for c in OfferingComponent.objects.all()}
+        plan_period_map = {str(pp.uuid): pp for pp in ResourcePlanPeriod.objects.all()}
+        existing_usages = {str(cu.uuid): cu for cu in ComponentUsage.objects.all()}
+        # Build duplicate check set: (resource_id, component_id, billing_period) for null plan_period
+        duplicate_keys = set()
+        for cu in existing_usages.values():
+            if cu.plan_period_id is None:
+                duplicate_keys.add((cu.resource_id, cu.component_id, cu.billing_period))
+
         for usage_data in usages_data:
             try:
                 uuid = usage_data.get("uuid")
@@ -3402,7 +4558,7 @@ class Command(BaseCommand):
                     continue
 
                 # Find resource
-                resource = Resource.objects.filter(uuid=resource_uuid).first()
+                resource = resource_map.get(self._normalize_uuid(resource_uuid))
                 if not resource:
                     self.stdout.write(
                         self.style.WARNING(
@@ -3413,9 +4569,7 @@ class Command(BaseCommand):
                     continue
 
                 # Find component
-                component = OfferingComponent.objects.filter(
-                    uuid=component_uuid
-                ).first()
+                component = component_map.get(self._normalize_uuid(component_uuid))
                 if not component:
                     self.stdout.write(
                         self.style.WARNING(
@@ -3448,9 +4602,9 @@ class Command(BaseCommand):
                 plan_period = None
                 plan_period_uuid = usage_data.get("plan_period")
                 if plan_period_uuid:
-                    plan_period = ResourcePlanPeriod.objects.filter(
-                        uuid=plan_period_uuid
-                    ).first()
+                    plan_period = plan_period_map.get(
+                        self._normalize_uuid(plan_period_uuid)
+                    )
                     if not plan_period:
                         self.stdout.write(
                             self.style.WARNING(
@@ -3471,43 +4625,62 @@ class Command(BaseCommand):
                 }
 
                 if not self.dry_run:
-                    existing_usage = ComponentUsage.objects.filter(uuid=uuid).first()
+                    normalized_uuid = self._normalize_uuid(uuid)
+                    existing_usage = existing_usages.get(normalized_uuid)
 
                     if existing_usage:
                         if self.update_existing:
-                            ComponentUsage.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                ComponentUsage.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["component_usages"]["updated"] += 1
                         else:
                             self.stats["component_usages"]["skipped"] += 1
                     else:
                         # Check if a record with the same business key exists
                         # (unique constraint on resource, component, billing_period when plan_period is NULL)
-                        duplicate_usage = ComponentUsage.objects.filter(
-                            resource=resource,
-                            component=component,
-                            billing_period=billing_period or timezone.now().date(),
-                            plan_period__isnull=True,
-                        ).first()
+                        biz_key = (
+                            resource.id,
+                            component.id,
+                            billing_period or timezone.now().date(),
+                        )
+                        duplicate_exists = biz_key in duplicate_keys
 
-                        if duplicate_usage:
+                        if duplicate_exists:
                             if self.update_existing:
-                                # Update the existing record with the new UUID and data
-                                ComponentUsage.objects.filter(
-                                    pk=duplicate_usage.pk
-                                ).update(uuid=uuid, **defaults)
+                                # Fall back to DB query to get the actual duplicate for update
+                                duplicate_usage = ComponentUsage.objects.filter(
+                                    resource=resource,
+                                    component=component,
+                                    billing_period=billing_period
+                                    or timezone.now().date(),
+                                    plan_period__isnull=True,
+                                ).first()
+                                if duplicate_usage:
+                                    with transaction.atomic():
+                                        ComponentUsage.objects.filter(
+                                            pk=duplicate_usage.pk
+                                        ).update(uuid=uuid, **defaults)
                                 self.stats["component_usages"]["updated"] += 1
                             else:
                                 self.stdout.write(
                                     self.style.WARNING(
-                                        f"Skipping component usage {uuid}: duplicate exists with UUID {duplicate_usage.uuid}"
+                                        f"Skipping component usage {uuid}: duplicate exists"
                                     )
                                 )
                                 self.stats["component_usages"]["skipped"] += 1
                         else:
-                            ComponentUsage.objects.create(uuid=uuid, **defaults)
+                            with transaction.atomic():
+                                obj = ComponentUsage.objects.create(
+                                    uuid=uuid, **defaults
+                                )
+                            existing_usages[normalized_uuid] = obj
+                            if plan_period is None:
+                                duplicate_keys.add(biz_key)
                             self.stats["component_usages"]["created"] += 1
                 else:
-                    existing = ComponentUsage.objects.filter(uuid=uuid).exists()
+                    existing = self._normalize_uuid(uuid) in existing_usages
                     if existing:
                         if self.update_existing:
                             self.stats["component_usages"]["updated"] += 1
@@ -3515,12 +4688,12 @@ class Command(BaseCommand):
                             self.stats["component_usages"]["skipped"] += 1
                     else:
                         # Check for duplicate by business key
-                        duplicate_exists = ComponentUsage.objects.filter(
-                            resource=resource,
-                            component=component,
-                            billing_period=billing_period or timezone.now().date(),
-                            plan_period__isnull=True,
-                        ).exists()
+                        biz_key = (
+                            resource.id,
+                            component.id,
+                            billing_period or timezone.now().date(),
+                        )
+                        duplicate_exists = biz_key in duplicate_keys
 
                         if duplicate_exists:
                             if self.update_existing:
@@ -3592,9 +4765,10 @@ class Command(BaseCommand):
 
                     if existing_user_usage:
                         if self.update_existing:
-                            ComponentUserUsage.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                ComponentUserUsage.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["component_user_usages"]["updated"] += 1
                         else:
                             self.stats["component_user_usages"]["skipped"] += 1
@@ -3607,9 +4781,10 @@ class Command(BaseCommand):
 
                         if duplicate:
                             if self.update_existing:
-                                ComponentUserUsage.objects.filter(
-                                    pk=duplicate.pk
-                                ).update(uuid=uuid, **defaults)
+                                with transaction.atomic():
+                                    ComponentUserUsage.objects.filter(
+                                        pk=duplicate.pk
+                                    ).update(uuid=uuid, **defaults)
                                 self.stats["component_user_usages"]["updated"] += 1
                             else:
                                 self.stdout.write(
@@ -3619,7 +4794,8 @@ class Command(BaseCommand):
                                 )
                                 self.stats["component_user_usages"]["skipped"] += 1
                         else:
-                            ComponentUserUsage.objects.create(uuid=uuid, **defaults)
+                            with transaction.atomic():
+                                ComponentUserUsage.objects.create(uuid=uuid, **defaults)
                             self.stats["component_user_usages"]["created"] += 1
                 else:
                     existing = ComponentUserUsage.objects.filter(uuid=uuid).exists()
@@ -3716,12 +4892,14 @@ class Command(BaseCommand):
 
                     if existing_invoice:
                         if self.update_existing:
-                            Invoice.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                Invoice.objects.filter(uuid=uuid).update(**defaults)
                             self.stats["invoices"]["updated"] += 1
                         else:
                             self.stats["invoices"]["skipped"] += 1
                     else:
-                        Invoice.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            Invoice.objects.create(uuid=uuid, **defaults)
                         self.stats["invoices"]["created"] += 1
                 else:
                     existing = Invoice.objects.filter(uuid=uuid).exists()
@@ -3745,6 +4923,13 @@ class Command(BaseCommand):
         """Import invoice item data."""
         self.stdout.write("Importing invoice items...")
 
+        # Pre-fetch lookup maps to avoid N+1 queries
+        invoice_map = {str(i.uuid): i for i in Invoice.objects.all()}
+        resource_map = {str(r.uuid): r for r in Resource.objects.all()}
+        project_map = {str(p.uuid): p for p in Project.available_objects.all()}
+        plan_component_map = {pc.id: pc for pc in PlanComponent.objects.all()}
+        existing_items = {str(ii.uuid): ii for ii in InvoiceItem.objects.all()}
+
         for item_data in invoice_items_data:
             try:
                 uuid = item_data.get("uuid")
@@ -3760,7 +4945,7 @@ class Command(BaseCommand):
                     continue
 
                 # Find invoice
-                invoice = Invoice.objects.filter(uuid=invoice_uuid).first()
+                invoice = invoice_map.get(self._normalize_uuid(invoice_uuid))
                 if not invoice:
                     self.stdout.write(
                         self.style.WARNING(
@@ -3774,15 +4959,13 @@ class Command(BaseCommand):
                 resource = None
                 resource_uuid = item_data.get("resource_uuid")
                 if resource_uuid:
-                    resource = Resource.objects.filter(uuid=resource_uuid).first()
+                    resource = resource_map.get(self._normalize_uuid(resource_uuid))
 
                 # Find project (optional)
                 project = None
                 project_uuid = item_data.get("project_uuid")
                 if project_uuid:
-                    project = Project.available_objects.filter(
-                        uuid=project_uuid
-                    ).first()
+                    project = project_map.get(self._normalize_uuid(project_uuid))
 
                 # Parse dates
                 start = None
@@ -3807,9 +4990,7 @@ class Command(BaseCommand):
                 plan_component = None
                 plan_component_id = item_data.get("plan_component")
                 if plan_component_id:
-                    plan_component = PlanComponent.objects.filter(
-                        id=plan_component_id
-                    ).first()
+                    plan_component = plan_component_map.get(plan_component_id)
 
                 # Parse backend_uuid
                 backend_uuid = None
@@ -3818,6 +4999,15 @@ class Command(BaseCommand):
                         backend_uuid = UUID(item_data["backend_uuid"])
                     except (ValueError, TypeError):
                         pass
+
+                # Find optional credit FK (set on credit-compensation rows;
+                # null on regular charges and manual cost adjustments).
+                credit = None
+                credit_uuid = item_data.get("credit_uuid")
+                if credit_uuid:
+                    credit = CustomerCredit.objects.filter(
+                        uuid=self._normalize_uuid(credit_uuid)
+                    ).first()
 
                 defaults = {
                     "invoice": invoice,
@@ -3831,6 +5021,7 @@ class Command(BaseCommand):
                     "backend_uuid": backend_uuid,
                     "details": item_data.get("details", {}),
                     "plan_component": plan_component,
+                    "credit": credit,
                 }
 
                 # Only set start/end if provided, otherwise let model use defaults
@@ -3840,19 +5031,23 @@ class Command(BaseCommand):
                     defaults["end"] = end
 
                 if not self.dry_run:
-                    existing_item = InvoiceItem.objects.filter(uuid=uuid).first()
+                    normalized_uuid = self._normalize_uuid(uuid)
+                    existing_item = existing_items.get(normalized_uuid)
 
                     if existing_item:
                         if self.update_existing:
-                            InvoiceItem.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                InvoiceItem.objects.filter(uuid=uuid).update(**defaults)
                             self.stats["invoice_items"]["updated"] += 1
                         else:
                             self.stats["invoice_items"]["skipped"] += 1
                     else:
-                        InvoiceItem.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            obj = InvoiceItem.objects.create(uuid=uuid, **defaults)
+                        existing_items[normalized_uuid] = obj
                         self.stats["invoice_items"]["created"] += 1
                 else:
-                    existing = InvoiceItem.objects.filter(uuid=uuid).exists()
+                    existing = self._normalize_uuid(uuid) in existing_items
                     if existing:
                         if self.update_existing:
                             self.stats["invoice_items"]["updated"] += 1
@@ -3872,6 +5067,14 @@ class Command(BaseCommand):
     def import_orders(self, orders_data):
         """Import order data."""
         self.stdout.write("Importing orders...")
+
+        # Pre-fetch lookup maps to avoid N+1 queries
+        project_map = {str(p.uuid): p for p in Project.available_objects.all()}
+        resource_map = {str(r.uuid): r for r in Resource.objects.all()}
+        offering_map = {str(o.uuid): o for o in Offering.objects.all()}
+        user_map = {str(u.uuid): u for u in User.all_objects.all()}
+        plan_map = {str(p.uuid): p for p in Plan.objects.all()}
+        existing_orders = {str(o.uuid): o for o in Order.objects.all()}
 
         for order_data in orders_data:
             try:
@@ -3897,7 +5100,7 @@ class Command(BaseCommand):
                     continue
 
                 # Find project
-                project = Project.available_objects.filter(uuid=project_uuid).first()
+                project = project_map.get(self._normalize_uuid(project_uuid))
                 if not project:
                     self.stdout.write(
                         self.style.WARNING(
@@ -3908,7 +5111,7 @@ class Command(BaseCommand):
                     continue
 
                 # Find resource
-                resource = Resource.objects.filter(uuid=resource_uuid).first()
+                resource = resource_map.get(self._normalize_uuid(resource_uuid))
                 if not resource:
                     self.stdout.write(
                         self.style.WARNING(
@@ -3919,7 +5122,7 @@ class Command(BaseCommand):
                     continue
 
                 # Find offering
-                offering = Offering.objects.filter(uuid=offering_uuid).first()
+                offering = offering_map.get(self._normalize_uuid(offering_uuid))
                 if not offering:
                     self.stdout.write(
                         self.style.WARNING(
@@ -3930,7 +5133,7 @@ class Command(BaseCommand):
                     continue
 
                 # Find created_by user
-                created_by = User.all_objects.filter(uuid=created_by_uuid).first()
+                created_by = user_map.get(self._normalize_uuid(created_by_uuid))
                 if not created_by:
                     self.stdout.write(
                         self.style.WARNING(
@@ -3944,29 +5147,29 @@ class Command(BaseCommand):
                 plan = None
                 plan_uuid = order_data.get("plan_uuid")
                 if plan_uuid:
-                    plan = Plan.objects.filter(uuid=plan_uuid).first()
+                    plan = plan_map.get(self._normalize_uuid(plan_uuid))
 
                 # Find old_plan (optional)
                 old_plan = None
                 old_plan_uuid = order_data.get("old_plan_uuid")
                 if old_plan_uuid:
-                    old_plan = Plan.objects.filter(uuid=old_plan_uuid).first()
+                    old_plan = plan_map.get(self._normalize_uuid(old_plan_uuid))
 
                 # Find consumer_reviewed_by (optional)
                 consumer_reviewed_by = None
                 consumer_reviewed_by_uuid = order_data.get("consumer_reviewed_by_uuid")
                 if consumer_reviewed_by_uuid:
-                    consumer_reviewed_by = User.all_objects.filter(
-                        uuid=consumer_reviewed_by_uuid
-                    ).first()
+                    consumer_reviewed_by = user_map.get(
+                        self._normalize_uuid(consumer_reviewed_by_uuid)
+                    )
 
                 # Find provider_reviewed_by (optional)
                 provider_reviewed_by = None
                 provider_reviewed_by_uuid = order_data.get("provider_reviewed_by_uuid")
                 if provider_reviewed_by_uuid:
-                    provider_reviewed_by = User.all_objects.filter(
-                        uuid=provider_reviewed_by_uuid
-                    ).first()
+                    provider_reviewed_by = user_map.get(
+                        self._normalize_uuid(provider_reviewed_by_uuid)
+                    )
 
                 # Parse datetime fields
                 consumer_reviewed_at = None
@@ -4049,25 +5252,33 @@ class Command(BaseCommand):
                 }
 
                 if not self.dry_run:
-                    existing_order = Order.objects.filter(uuid=uuid).first()
+                    normalized_uuid = self._normalize_uuid(uuid)
+                    existing_order = existing_orders.get(normalized_uuid)
 
                     if existing_order:
                         if self.update_existing:
-                            Order.objects.filter(uuid=uuid).update(**defaults)
-                            # Update created timestamp if provided
-                            if created:
-                                Order.objects.filter(uuid=uuid).update(created=created)
+                            with transaction.atomic():
+                                Order.objects.filter(uuid=uuid).update(**defaults)
+                                # Update created timestamp if provided
+                                if created:
+                                    Order.objects.filter(uuid=uuid).update(
+                                        created=created
+                                    )
                             self.stats["orders"]["updated"] += 1
                         else:
                             self.stats["orders"]["skipped"] += 1
                     else:
-                        order = Order.objects.create(uuid=uuid, **defaults)
-                        # Update created timestamp if provided
-                        if created:
-                            Order.objects.filter(pk=order.pk).update(created=created)
+                        with transaction.atomic():
+                            order = Order.objects.create(uuid=uuid, **defaults)
+                            # Update created timestamp if provided
+                            if created:
+                                Order.objects.filter(pk=order.pk).update(
+                                    created=created
+                                )
+                        existing_orders[normalized_uuid] = order
                         self.stats["orders"]["created"] += 1
                 else:
-                    existing = Order.objects.filter(uuid=uuid).exists()
+                    existing = self._normalize_uuid(uuid) in existing_orders
                     if existing:
                         if self.update_existing:
                             self.stats["orders"]["updated"] += 1
@@ -4091,6 +5302,11 @@ class Command(BaseCommand):
         """Import offering user data."""
         self.stdout.write("Importing offering users...")
 
+        # Pre-fetch lookup maps to avoid N+1 queries
+        offering_map = {str(o.uuid): o for o in Offering.objects.all()}
+        user_map = {str(u.uuid): u for u in User.all_objects.all()}
+        existing_map = {str(ou.uuid): ou for ou in OfferingUser.objects.all()}
+
         for offering_user_data in offering_users_data:
             try:
                 uuid = offering_user_data.get("uuid")
@@ -4107,7 +5323,7 @@ class Command(BaseCommand):
                     continue
 
                 # Find offering
-                offering = Offering.objects.filter(uuid=offering_uuid).first()
+                offering = offering_map.get(self._normalize_uuid(offering_uuid))
                 if not offering:
                     self.stdout.write(
                         self.style.WARNING(
@@ -4118,7 +5334,7 @@ class Command(BaseCommand):
                     continue
 
                 # Find user
-                user = User.all_objects.filter(uuid=user_uuid).first()
+                user = user_map.get(self._normalize_uuid(user_uuid))
                 if not user:
                     self.stdout.write(
                         self.style.WARNING(
@@ -4134,6 +5350,7 @@ class Command(BaseCommand):
                     "username": offering_user_data.get("username", ""),
                     "is_restricted": offering_user_data.get("is_restricted", False),
                     "state": offering_user_data.get("state", 1),
+                    "backend_metadata": offering_user_data.get("backend_metadata", {}),
                     "service_provider_comment": offering_user_data.get(
                         "service_provider_comment", ""
                     ),
@@ -4143,21 +5360,41 @@ class Command(BaseCommand):
                 }
 
                 if not self.dry_run:
-                    existing_offering_user = OfferingUser.objects.filter(
-                        uuid=uuid
-                    ).first()
+                    normalized_uuid = self._normalize_uuid(uuid)
+                    existing_offering_user = existing_map.get(normalized_uuid)
 
                     if existing_offering_user:
                         if self.update_existing:
-                            OfferingUser.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                OfferingUser.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["offering_users"]["updated"] += 1
                         else:
                             self.stats["offering_users"]["skipped"] += 1
                     else:
-                        OfferingUser.objects.create(uuid=UUID(uuid), **defaults)
-                        self.stats["offering_users"]["created"] += 1
+                        # Check if an OfferingUser with the same (offering, user) already exists
+                        existing_by_pair = OfferingUser.objects.filter(
+                            offering=offering, user=user
+                        ).first()
+                        if existing_by_pair:
+                            if self.update_existing:
+                                with transaction.atomic():
+                                    OfferingUser.objects.filter(
+                                        pk=existing_by_pair.pk
+                                    ).update(**defaults)
+                                self.stats["offering_users"]["updated"] += 1
+                            else:
+                                self.stats["offering_users"]["skipped"] += 1
+                        else:
+                            with transaction.atomic():
+                                obj = OfferingUser.objects.create(
+                                    uuid=UUID(uuid), **defaults
+                                )
+                            existing_map[normalized_uuid] = obj
+                            self.stats["offering_users"]["created"] += 1
                 else:
-                    existing = OfferingUser.objects.filter(uuid=uuid).exists()
+                    existing = self._normalize_uuid(uuid) in existing_map
                     if existing:
                         if self.update_existing:
                             self.stats["offering_users"]["updated"] += 1
@@ -4173,6 +5410,187 @@ class Command(BaseCommand):
                     )
                 )
                 self.stats["offering_users"]["errors"] += 1
+
+    def import_robot_accounts(self, robot_accounts_data):
+        """Import robot account data."""
+        self.stdout.write("Importing robot accounts...")
+
+        # Pre-fetch lookup maps to avoid N+1 queries
+        resource_map = {str(r.uuid): r for r in Resource.objects.all()}
+        user_map = {str(u.uuid): u for u in User.all_objects.all()}
+        existing_map = {str(ra.uuid): ra for ra in RobotAccount.objects.all()}
+
+        for robot_account_data in robot_accounts_data:
+            try:
+                uuid = robot_account_data.get("uuid")
+                resource_uuid = robot_account_data.get("resource_uuid")
+
+                if not uuid or not resource_uuid:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            "Skipping robot account without UUID or resource_uuid"
+                        )
+                    )
+                    self.stats["robot_accounts"]["errors"] += 1
+                    continue
+
+                # Find resource
+                resource = resource_map.get(self._normalize_uuid(resource_uuid))
+                if not resource:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping robot account {uuid}: resource {resource_uuid} not found"
+                        )
+                    )
+                    self.stats["robot_accounts"]["errors"] += 1
+                    continue
+
+                defaults = {
+                    "resource": resource,
+                    "username": robot_account_data.get("username", ""),
+                    "description": robot_account_data.get("description", ""),
+                    "type": robot_account_data.get("type", ""),
+                    "keys": robot_account_data.get("keys", []),
+                    "state": robot_account_data.get(
+                        "state", RobotAccountStates.REQUESTED
+                    ),
+                    "backend_metadata": robot_account_data.get("backend_metadata", {}),
+                    "backend_id": robot_account_data.get("backend_id", ""),
+                }
+
+                responsible_user_uuid = robot_account_data.get("responsible_user_uuid")
+                if responsible_user_uuid:
+                    defaults["responsible_user"] = user_map.get(
+                        self._normalize_uuid(responsible_user_uuid)
+                    )
+
+                users = [
+                    user_map[self._normalize_uuid(user_uuid)]
+                    for user_uuid in robot_account_data.get("user_uuids", [])
+                    if self._normalize_uuid(user_uuid) in user_map
+                ]
+
+                if not self.dry_run:
+                    normalized_uuid = self._normalize_uuid(uuid)
+                    existing_robot_account = existing_map.get(normalized_uuid)
+
+                    if existing_robot_account:
+                        if self.update_existing:
+                            with transaction.atomic():
+                                RobotAccount.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
+                                existing_robot_account.users.set(users)
+                            self.stats["robot_accounts"]["updated"] += 1
+                        else:
+                            self.stats["robot_accounts"]["skipped"] += 1
+                    else:
+                        with transaction.atomic():
+                            obj = RobotAccount.objects.create(
+                                uuid=UUID(uuid), **defaults
+                            )
+                            obj.users.set(users)
+                        existing_map[normalized_uuid] = obj
+                        self.stats["robot_accounts"]["created"] += 1
+                else:
+                    existing = self._normalize_uuid(uuid) in existing_map
+                    if existing:
+                        if self.update_existing:
+                            self.stats["robot_accounts"]["updated"] += 1
+                        else:
+                            self.stats["robot_accounts"]["skipped"] += 1
+                    else:
+                        self.stats["robot_accounts"]["created"] += 1
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import robot account {robot_account_data.get('uuid')}: {e}"
+                    )
+                )
+                self.stats["robot_accounts"]["errors"] += 1
+
+    def import_offering_user_groups(self, offering_user_groups_data):
+        """Import offering user group data.
+
+        OfferingUserGroup has no UUID field, so groups are matched by the
+        natural key (offering, backend_metadata.gid).
+        """
+        self.stdout.write("Importing offering user groups...")
+
+        # Pre-fetch lookup maps to avoid N+1 queries
+        offering_map = {str(o.uuid): o for o in Offering.objects.all()}
+        project_map = {str(p.uuid): p for p in Project.objects.all()}
+
+        for group_data in offering_user_groups_data:
+            try:
+                offering_uuid = group_data.get("offering_uuid")
+                backend_metadata = group_data.get("backend_metadata", {})
+                gid = backend_metadata.get("gid")
+
+                if not offering_uuid or gid is None:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            "Skipping offering user group without offering_uuid or backend_metadata.gid"
+                        )
+                    )
+                    self.stats["offering_user_groups"]["errors"] += 1
+                    continue
+
+                # Find offering
+                offering = offering_map.get(self._normalize_uuid(offering_uuid))
+                if not offering:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping offering user group with gid {gid}: offering {offering_uuid} not found"
+                        )
+                    )
+                    self.stats["offering_user_groups"]["errors"] += 1
+                    continue
+
+                projects = [
+                    project_map[self._normalize_uuid(project_uuid)]
+                    for project_uuid in group_data.get("project_uuids", [])
+                    if self._normalize_uuid(project_uuid) in project_map
+                ]
+
+                existing_group = OfferingUserGroup.objects.filter(
+                    offering=offering, backend_metadata__gid=gid
+                ).first()
+
+                if not self.dry_run:
+                    if existing_group:
+                        if self.update_existing:
+                            with transaction.atomic():
+                                existing_group.backend_metadata = backend_metadata
+                                existing_group.save(update_fields=["backend_metadata"])
+                                existing_group.projects.set(projects)
+                            self.stats["offering_user_groups"]["updated"] += 1
+                        else:
+                            self.stats["offering_user_groups"]["skipped"] += 1
+                    else:
+                        with transaction.atomic():
+                            group = OfferingUserGroup.objects.create(
+                                offering=offering, backend_metadata=backend_metadata
+                            )
+                            group.projects.set(projects)
+                        self.stats["offering_user_groups"]["created"] += 1
+                else:
+                    if existing_group:
+                        if self.update_existing:
+                            self.stats["offering_user_groups"]["updated"] += 1
+                        else:
+                            self.stats["offering_user_groups"]["skipped"] += 1
+                    else:
+                        self.stats["offering_user_groups"]["created"] += 1
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import offering user group for offering {group_data.get('offering_uuid')}: {e}"
+                    )
+                )
+                self.stats["offering_user_groups"]["errors"] += 1
 
     def import_checklists(self, checklists_data):
         """Import checklist data."""
@@ -4222,21 +5640,23 @@ class Command(BaseCommand):
 
                     if existing_checklist:
                         if self.update_existing:
-                            Checklist.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                Checklist.objects.filter(uuid=uuid).update(**defaults)
                             self.stats["checklists"]["updated"] += 1
                         else:
                             self.stats["checklists"]["skipped"] += 1
                     else:
-                        checklist = Checklist.objects.create(
-                            uuid=UUID(uuid), **defaults
-                        )
-                        # Set timestamps after creation
-                        if created:
-                            checklist.created = created
-                        if modified:
-                            checklist.modified = modified
-                        if created or modified:
-                            checklist.save()
+                        with transaction.atomic():
+                            checklist = Checklist.objects.create(
+                                uuid=UUID(uuid), **defaults
+                            )
+                            # Set timestamps after creation
+                            if created:
+                                checklist.created = created
+                            if modified:
+                                checklist.modified = modified
+                            if created or modified:
+                                checklist.save()
                         self.stats["checklists"]["created"] += 1
                 else:
                     existing = Checklist.objects.filter(uuid=uuid).exists()
@@ -4307,12 +5727,14 @@ class Command(BaseCommand):
 
                     if existing_question:
                         if self.update_existing:
-                            Question.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                Question.objects.filter(uuid=uuid).update(**defaults)
                             self.stats["questions"]["updated"] += 1
                         else:
                             self.stats["questions"]["skipped"] += 1
                     else:
-                        Question.objects.create(uuid=UUID(uuid), **defaults)
+                        with transaction.atomic():
+                            Question.objects.create(uuid=UUID(uuid), **defaults)
                         self.stats["questions"]["created"] += 1
                 else:
                     existing = Question.objects.filter(uuid=uuid).exists()
@@ -4372,12 +5794,16 @@ class Command(BaseCommand):
 
                     if existing_option:
                         if self.update_existing:
-                            QuestionOption.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                QuestionOption.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["question_options"]["updated"] += 1
                         else:
                             self.stats["question_options"]["skipped"] += 1
                     else:
-                        QuestionOption.objects.create(uuid=UUID(uuid), **defaults)
+                        with transaction.atomic():
+                            QuestionOption.objects.create(uuid=UUID(uuid), **defaults)
                         self.stats["question_options"]["created"] += 1
                 else:
                     existing = QuestionOption.objects.filter(uuid=uuid).exists()
@@ -4448,14 +5874,18 @@ class Command(BaseCommand):
 
                     if existing_dep:
                         if self.update_existing:
-                            QuestionDependency.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                QuestionDependency.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["question_dependencies"]["updated"] += 1
                         else:
                             self.stats["question_dependencies"]["skipped"] += 1
                     else:
-                        QuestionDependency.objects.create(uuid=UUID(uuid), **defaults)
+                        with transaction.atomic():
+                            QuestionDependency.objects.create(
+                                uuid=UUID(uuid), **defaults
+                            )
                         self.stats["question_dependencies"]["created"] += 1
                 else:
                     existing = QuestionDependency.objects.filter(uuid=uuid).exists()
@@ -4586,9 +6016,10 @@ class Command(BaseCommand):
 
                     if existing_completion:
                         if self.update_existing:
-                            ChecklistCompletion.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                ChecklistCompletion.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["checklist_completions"]["updated"] += 1
                         else:
                             self.stats["checklist_completions"]["skipped"] += 1
@@ -4608,19 +6039,21 @@ class Command(BaseCommand):
                                 existing_by_scope.created = created
                             if modified:
                                 existing_by_scope.modified = modified
-                            existing_by_scope.save()
+                            with transaction.atomic():
+                                existing_by_scope.save()
                             self.stats["checklist_completions"]["updated"] += 1
                         else:
-                            completion = ChecklistCompletion.objects.create(
-                                uuid=UUID(uuid), **defaults
-                            )
-                            # Set timestamps after creation
-                            if created:
-                                completion.created = created
-                            if modified:
-                                completion.modified = modified
-                            if created or modified:
-                                completion.save()
+                            with transaction.atomic():
+                                completion = ChecklistCompletion.objects.create(
+                                    uuid=UUID(uuid), **defaults
+                                )
+                                # Set timestamps after creation
+                                if created:
+                                    completion.created = created
+                                if modified:
+                                    completion.modified = modified
+                                if created or modified:
+                                    completion.save()
                             self.stats["checklist_completions"]["created"] += 1
                 else:
                     existing = ChecklistCompletion.objects.filter(uuid=uuid).exists()
@@ -4737,19 +6170,21 @@ class Command(BaseCommand):
 
                     if existing_answer:
                         if self.update_existing:
-                            Answer.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                Answer.objects.filter(uuid=uuid).update(**defaults)
                             self.stats["answers"]["updated"] += 1
                         else:
                             self.stats["answers"]["skipped"] += 1
                     else:
-                        answer = Answer.objects.create(uuid=UUID(uuid), **defaults)
-                        # Set timestamps after creation
-                        if created:
-                            answer.created = created
-                        if modified:
-                            answer.modified = modified
-                        if created or modified:
-                            answer.save()
+                        with transaction.atomic():
+                            answer = Answer.objects.create(uuid=UUID(uuid), **defaults)
+                            # Set timestamps after creation
+                            if created:
+                                answer.created = created
+                            if modified:
+                                answer.modified = modified
+                            if created or modified:
+                                answer.save()
                         self.stats["answers"]["created"] += 1
                 else:
                     existing = Answer.objects.filter(uuid=uuid).exists()
@@ -4933,21 +6368,25 @@ class Command(BaseCommand):
                     ).first()
                     if existing_group_invitation:
                         if self.update_existing:
-                            GroupInvitation.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                GroupInvitation.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["group_invitations"]["updated"] += 1
                         else:
                             self.stats["group_invitations"]["skipped"] += 1
                     else:
-                        group_invitation = GroupInvitation.objects.create(
-                            uuid=UUID(uuid), **defaults
-                        )
-                        # Set timestamps after creation
-                        if created:
-                            group_invitation.created = created
-                        if modified:
-                            group_invitation.modified = modified
-                        if created or modified:
-                            group_invitation.save()
+                        with transaction.atomic():
+                            group_invitation = GroupInvitation.objects.create(
+                                uuid=UUID(uuid), **defaults
+                            )
+                            # Set timestamps after creation
+                            if created:
+                                group_invitation.created = created
+                            if modified:
+                                group_invitation.modified = modified
+                            if created or modified:
+                                group_invitation.save()
                         self.stats["group_invitations"]["created"] += 1
                 else:
                     existing = GroupInvitation.objects.filter(uuid=uuid).exists()
@@ -4970,6 +6409,26 @@ class Command(BaseCommand):
     def import_invitations(self, invitations_data):
         """Import invitation data."""
         self.stdout.write("Importing invitations...")
+
+        # Pre-fetch lookup maps to avoid N+1 queries
+        customer_map = {str(c.uuid): c for c in Customer.objects.all()}
+        role_by_uuid = {str(r.uuid): r for r in Role.objects.all()}
+        role_by_name = {r.name: r for r in role_by_uuid.values()}
+        user_map = {str(u.uuid): u for u in User.all_objects.all()}
+        existing_invitations = {str(inv.uuid): inv for inv in Invitation.objects.all()}
+
+        # Pre-fetch ContentType map
+        content_type_map = {
+            (ct.app_label, ct.model): ct for ct in ContentType.objects.all()
+        }
+
+        # Pre-fetch common scope objects for scope resolution
+        project_by_uuid = {str(p.uuid): p for p in Project.objects.all()}
+        scope_cache = {
+            ("structure", "customer"): customer_map,
+            ("structure", "project"): project_by_uuid,
+        }
+
         for invitation_data in invitations_data:
             try:
                 uuid = invitation_data.get("uuid")
@@ -4992,7 +6451,7 @@ class Command(BaseCommand):
                     continue
 
                 # Find customer
-                customer = Customer.objects.filter(uuid=customer_uuid).first()
+                customer = customer_map.get(self._normalize_uuid(customer_uuid))
                 if not customer:
                     self.stdout.write(
                         self.style.WARNING(
@@ -5005,25 +6464,28 @@ class Command(BaseCommand):
                 # Find role by UUID or by name (create system role if needed)
                 role = None
                 if role_uuid:
-                    role = Role.objects.filter(uuid=role_uuid).first()
+                    role = role_by_uuid.get(self._normalize_uuid(role_uuid))
                 if not role and role_name:
-                    role = Role.objects.filter(name=role_name).first()
+                    role = role_by_name.get(role_name)
                     # If role not found, create it as a system role
                     if not role:
                         # Determine content_type from role name prefix
                         role_content_type = None
                         if role_name.startswith("CUSTOMER."):
-                            role_content_type = ContentType.objects.get(
-                                app_label="structure", model="customer"
+                            role_content_type = content_type_map.get(
+                                ("structure", "customer")
                             )
                         elif role_name.startswith("PROJECT."):
-                            role_content_type = ContentType.objects.get(
-                                app_label="structure", model="project"
+                            role_content_type = content_type_map.get(
+                                ("structure", "project")
                             )
                         if role_content_type:
                             role = Role.objects.get_system_role(
                                 role_name, role_content_type
                             )
+                            # Cache the newly created/fetched role
+                            role_by_uuid[str(role.uuid)] = role
+                            role_by_name[role.name] = role
                 if not role:
                     self.stdout.write(
                         self.style.WARNING(
@@ -5037,13 +6499,13 @@ class Command(BaseCommand):
                 created_by = None
                 created_by_uuid = invitation_data.get("created_by_uuid")
                 if created_by_uuid:
-                    created_by = User.all_objects.filter(uuid=created_by_uuid).first()
+                    created_by = user_map.get(self._normalize_uuid(created_by_uuid))
 
                 # Find approved_by (optional)
                 approved_by = None
                 approved_by_uuid = invitation_data.get("approved_by_uuid")
                 if approved_by_uuid:
-                    approved_by = User.all_objects.filter(uuid=approved_by_uuid).first()
+                    approved_by = user_map.get(self._normalize_uuid(approved_by_uuid))
 
                 # Parse dates
                 created = None
@@ -5072,9 +6534,9 @@ class Command(BaseCommand):
                 if scope_content_type:
                     try:
                         app_label, model = scope_content_type.split(".")
-                        content_type = ContentType.objects.get(
-                            app_label=app_label, model=model
-                        )
+                        content_type = content_type_map.get((app_label, model))
+                        if not content_type:
+                            raise ContentType.DoesNotExist
                     except (ValueError, ContentType.DoesNotExist):
                         self.stdout.write(
                             self.style.WARNING(
@@ -5088,9 +6550,16 @@ class Command(BaseCommand):
                     if scope_uuid and content_type:
                         model_class = content_type.model_class()
                         if model_class:
-                            scope_object = model_class.objects.filter(
-                                uuid=scope_uuid
-                            ).first()
+                            # Use pre-fetched scope maps for common types, fall back to DB for rare ones
+                            scope_map = scope_cache.get((app_label, model))
+                            if scope_map is not None:
+                                scope_object = scope_map.get(
+                                    self._normalize_uuid(scope_uuid)
+                                )
+                            else:
+                                scope_object = model_class.objects.filter(
+                                    uuid=scope_uuid
+                                ).first()
                             if scope_object:
                                 object_id = scope_object.id
                             else:
@@ -5124,27 +6593,31 @@ class Command(BaseCommand):
                 }
 
                 if not self.dry_run:
-                    existing_invitation = Invitation.objects.filter(uuid=uuid).first()
+                    normalized_uuid = self._normalize_uuid(uuid)
+                    existing_invitation = existing_invitations.get(normalized_uuid)
                     if existing_invitation:
                         if self.update_existing:
-                            Invitation.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                Invitation.objects.filter(uuid=uuid).update(**defaults)
                             self.stats["invitations"]["updated"] += 1
                         else:
                             self.stats["invitations"]["skipped"] += 1
                     else:
-                        invitation = Invitation.objects.create(
-                            uuid=UUID(uuid), **defaults
-                        )
-                        # Set timestamps after creation
-                        if created:
-                            invitation.created = created
-                        if modified:
-                            invitation.modified = modified
-                        if created or modified:
-                            invitation.save()
+                        with transaction.atomic():
+                            invitation = Invitation.objects.create(
+                                uuid=UUID(uuid), **defaults
+                            )
+                            # Set timestamps after creation
+                            if created:
+                                invitation.created = created
+                            if modified:
+                                invitation.modified = modified
+                            if created or modified:
+                                invitation.save()
+                        existing_invitations[normalized_uuid] = invitation
                         self.stats["invitations"]["created"] += 1
                 else:
-                    existing = Invitation.objects.filter(uuid=uuid).exists()
+                    existing = self._normalize_uuid(uuid) in existing_invitations
                     if existing:
                         if self.update_existing:
                             self.stats["invitations"]["updated"] += 1
@@ -5259,23 +6732,25 @@ class Command(BaseCommand):
                     ).first()
                     if existing_permission_request:
                         if self.update_existing:
-                            PermissionRequest.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                PermissionRequest.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["permission_requests"]["updated"] += 1
                         else:
                             self.stats["permission_requests"]["skipped"] += 1
                     else:
-                        permission_request = PermissionRequest.objects.create(
-                            uuid=UUID(uuid), **defaults
-                        )
-                        # Set timestamps after creation
-                        if created:
-                            permission_request.created = created
-                        if modified:
-                            permission_request.modified = modified
-                        if created or modified:
-                            permission_request.save()
+                        with transaction.atomic():
+                            permission_request = PermissionRequest.objects.create(
+                                uuid=UUID(uuid), **defaults
+                            )
+                            # Set timestamps after creation
+                            if created:
+                                permission_request.created = created
+                            if modified:
+                                permission_request.modified = modified
+                            if created or modified:
+                                permission_request.save()
                         self.stats["permission_requests"]["created"] += 1
                 else:
                     existing = PermissionRequest.objects.filter(uuid=uuid).exists()
@@ -5329,6 +6804,21 @@ class Command(BaseCommand):
                         end_date = datetime.fromisoformat(
                             credit_data["end_date"]
                         ).date()
+                        if end_date.day != 1:
+                            original = end_date
+                            if end_date.month == 12:
+                                end_date = end_date.replace(
+                                    year=end_date.year + 1, month=1, day=1
+                                )
+                            else:
+                                end_date = end_date.replace(
+                                    month=end_date.month + 1, day=1
+                                )
+                            self.stdout.write(
+                                self.style.WARNING(
+                                    f"Customer credit {uuid}: end_date adjusted from {original} to {end_date} (must be first day of month)"
+                                )
+                            )
                     except (ValueError, TypeError):
                         self.stdout.write(
                             self.style.WARNING(
@@ -5342,7 +6832,7 @@ class Command(BaseCommand):
                     try:
                         created = datetime.fromisoformat(
                             credit_data["created"]
-                        ).replace(tzinfo=timezone.utc)
+                        ).replace(tzinfo=UTC)
                     except (ValueError, TypeError):
                         pass
 
@@ -5351,7 +6841,7 @@ class Command(BaseCommand):
                     try:
                         modified = datetime.fromisoformat(
                             credit_data["modified"]
-                        ).replace(tzinfo=timezone.utc)
+                        ).replace(tzinfo=UTC)
                     except (ValueError, TypeError):
                         pass
 
@@ -5383,8 +6873,26 @@ class Command(BaseCommand):
                     existing_credit = CustomerCredit.objects.filter(uuid=uuid).first()
                     if existing_credit:
                         if self.update_existing:
-                            CustomerCredit.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                CustomerCredit.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
+
+                                # Handle many-to-many offerings relationship
+                                offering_uuids = credit_data.get("offering_uuids", [])
+                                if offering_uuids:
+                                    offerings = Offering.objects.filter(
+                                        uuid__in=offering_uuids
+                                    )
+                                    existing_credit.offerings.set(offerings)
                             self.stats["customer_credits"]["updated"] += 1
+                        else:
+                            self.stats["customer_credits"]["skipped"] += 1
+                    else:
+                        with transaction.atomic():
+                            credit = CustomerCredit.objects.create(
+                                uuid=uuid, **defaults
+                            )
 
                             # Handle many-to-many offerings relationship
                             offering_uuids = credit_data.get("offering_uuids", [])
@@ -5392,17 +6900,7 @@ class Command(BaseCommand):
                                 offerings = Offering.objects.filter(
                                     uuid__in=offering_uuids
                                 )
-                                existing_credit.offerings.set(offerings)
-                        else:
-                            self.stats["customer_credits"]["skipped"] += 1
-                    else:
-                        credit = CustomerCredit.objects.create(uuid=uuid, **defaults)
-
-                        # Handle many-to-many offerings relationship
-                        offering_uuids = credit_data.get("offering_uuids", [])
-                        if offering_uuids:
-                            offerings = Offering.objects.filter(uuid__in=offering_uuids)
-                            credit.offerings.set(offerings)
+                                credit.offerings.set(offerings)
 
                         self.stats["customer_credits"]["created"] += 1
                 else:
@@ -5421,6 +6919,141 @@ class Command(BaseCommand):
                     )
                 )
                 self.stats["customer_credits"]["errors"] += 1
+
+    @staticmethod
+    def _parse_iso_date(value):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value).date()
+        except (ValueError, TypeError):
+            return None
+
+    def import_customer_affiliates(self, affiliates_data):
+        """Import affiliate links (CustomerAffiliate)."""
+        self.stdout.write("Importing customer affiliates...")
+        for item in affiliates_data:
+            uuid = item.get("uuid")
+            try:
+                customer = Customer.objects.filter(
+                    uuid=item.get("customer_uuid")
+                ).first()
+                affiliate = Customer.objects.filter(
+                    uuid=item.get("affiliate_uuid")
+                ).first()
+                if not uuid or not customer or not affiliate:
+                    self.stats["customer_affiliates"]["errors"] += 1
+                    continue
+                defaults = {
+                    "customer": customer,
+                    "affiliate": affiliate,
+                    "fee_percent": Decimal(str(item.get("fee_percent", "0"))),
+                    "is_active": item.get("is_active", True),
+                    "start_date": self._parse_iso_date(item.get("start_date")),
+                    "end_date": self._parse_iso_date(item.get("end_date")),
+                }
+                if self.dry_run:
+                    exists = CustomerAffiliate.objects.filter(uuid=uuid).exists()
+                    key = (
+                        "updated"
+                        if exists and self.update_existing
+                        else ("skipped" if exists else "created")
+                    )
+                    self.stats["customer_affiliates"][key] += 1
+                    continue
+                existing = CustomerAffiliate.objects.filter(uuid=uuid).first()
+                if existing:
+                    if self.update_existing:
+                        CustomerAffiliate.objects.filter(uuid=uuid).update(**defaults)
+                        self.stats["customer_affiliates"]["updated"] += 1
+                    else:
+                        self.stats["customer_affiliates"]["skipped"] += 1
+                else:
+                    CustomerAffiliate.objects.create(uuid=uuid, **defaults)
+                    self.stats["customer_affiliates"]["created"] += 1
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(f"Failed to import affiliate {uuid}: {e}")
+                )
+                self.stats["customer_affiliates"]["errors"] += 1
+
+    def import_credit_transactions(self, transactions_data):
+        """Import credit-ledger transactions (CreditTransaction)."""
+        self.stdout.write("Importing credit transactions...")
+        for item in transactions_data:
+            uuid = item.get("uuid")
+            try:
+                credit = CustomerCredit.objects.filter(
+                    uuid=item.get("credit_uuid")
+                ).first()
+                if not uuid or not credit:
+                    self.stats["credit_transactions"]["errors"] += 1
+                    continue
+                if self.dry_run or CreditTransaction.objects.filter(uuid=uuid).exists():
+                    self.stats["credit_transactions"]["skipped"] += 1
+                    continue
+                amount = Decimal(str(item.get("amount", "0")))
+                tx = CreditTransaction.objects.create(
+                    uuid=uuid,
+                    credit=credit,
+                    amount=amount,
+                    transaction_type=item.get("transaction_type", "staff_grant"),
+                    comment=item.get("comment", ""),
+                )
+                # Each transaction is a signed delta to the credit value. Apply it
+                # via a queryset update so the post_save ledger handler does not
+                # record a second (auto staff-grant) transaction for the change.
+                CustomerCredit.objects.filter(pk=credit.pk).update(
+                    value=F("value") + amount
+                )
+                created = item.get("created")
+                if created:
+                    try:
+                        CreditTransaction.objects.filter(pk=tx.pk).update(
+                            created=datetime.fromisoformat(created).replace(tzinfo=UTC)
+                        )
+                    except (ValueError, TypeError):
+                        pass
+                self.stats["credit_transactions"]["created"] += 1
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import credit transaction {uuid}: {e}"
+                    )
+                )
+                self.stats["credit_transactions"]["errors"] += 1
+
+    def import_affiliate_fee_accruals(self, accruals_data):
+        """Import affiliate fee accruals (AffiliateFeeAccrual)."""
+        self.stdout.write("Importing affiliate fee accruals...")
+        for item in accruals_data:
+            uuid = item.get("uuid")
+            try:
+                link = CustomerAffiliate.objects.filter(
+                    uuid=item.get("affiliate_link_uuid")
+                ).first()
+                invoice = Invoice.objects.filter(uuid=item.get("invoice_uuid")).first()
+                if not uuid or not link or not invoice:
+                    self.stats["affiliate_fee_accruals"]["errors"] += 1
+                    continue
+                if (
+                    self.dry_run
+                    or AffiliateFeeAccrual.objects.filter(uuid=uuid).exists()
+                ):
+                    self.stats["affiliate_fee_accruals"]["skipped"] += 1
+                    continue
+                AffiliateFeeAccrual.objects.create(
+                    uuid=uuid,
+                    affiliate_link=link,
+                    invoice=invoice,
+                    amount=Decimal(str(item.get("amount", "0"))),
+                )
+                self.stats["affiliate_fee_accruals"]["created"] += 1
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(f"Failed to import accrual {uuid}: {e}")
+                )
+                self.stats["affiliate_fee_accruals"]["errors"] += 1
 
     def import_project_credits(self, project_credits_data):
         """Import project credit data."""
@@ -5456,6 +7089,21 @@ class Command(BaseCommand):
                         end_date = datetime.fromisoformat(
                             credit_data["end_date"]
                         ).date()
+                        if end_date.day != 1:
+                            original = end_date
+                            if end_date.month == 12:
+                                end_date = end_date.replace(
+                                    year=end_date.year + 1, month=1, day=1
+                                )
+                            else:
+                                end_date = end_date.replace(
+                                    month=end_date.month + 1, day=1
+                                )
+                            self.stdout.write(
+                                self.style.WARNING(
+                                    f"Project credit {uuid}: end_date adjusted from {original} to {end_date} (must be first day of month)"
+                                )
+                            )
                     except (ValueError, TypeError):
                         self.stdout.write(
                             self.style.WARNING(
@@ -5469,7 +7117,7 @@ class Command(BaseCommand):
                     try:
                         created = datetime.fromisoformat(
                             credit_data["created"]
-                        ).replace(tzinfo=timezone.utc)
+                        ).replace(tzinfo=UTC)
                     except (ValueError, TypeError):
                         pass
 
@@ -5478,7 +7126,7 @@ class Command(BaseCommand):
                     try:
                         modified = datetime.fromisoformat(
                             credit_data["modified"]
-                        ).replace(tzinfo=timezone.utc)
+                        ).replace(tzinfo=UTC)
                     except (ValueError, TypeError):
                         pass
 
@@ -5513,12 +7161,16 @@ class Command(BaseCommand):
                     existing_credit = ProjectCredit.objects.filter(uuid=uuid).first()
                     if existing_credit:
                         if self.update_existing:
-                            ProjectCredit.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                ProjectCredit.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["project_credits"]["updated"] += 1
                         else:
                             self.stats["project_credits"]["skipped"] += 1
                     else:
-                        ProjectCredit.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            ProjectCredit.objects.create(uuid=uuid, **defaults)
                         self.stats["project_credits"]["created"] += 1
                 else:
                     existing = ProjectCredit.objects.filter(uuid=uuid).exists()
@@ -5530,9 +7182,14 @@ class Command(BaseCommand):
                     else:
                         self.stats["project_credits"]["created"] += 1
             except Exception as e:
+                customer_name = project.customer.name if project else "N/A"
                 self.stdout.write(
                     self.style.WARNING(
                         f"Failed to import project credit {credit_data.get('uuid')}: {e}"
+                        f" | customer: {customer_name}"
+                        f" | project: {project.name if project else 'N/A'}"
+                        f" | value: {credit_data.get('value')}"
+                        f" | end_date: {credit_data.get('end_date')}"
                     )
                 )
                 self.stats["project_credits"]["errors"] += 1
@@ -5575,15 +7232,19 @@ class Command(BaseCommand):
                     existing_event = Event.objects.filter(uuid=uuid).first()
                     if existing_event:
                         if self.update_existing:
-                            Event.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                Event.objects.filter(uuid=uuid).update(**defaults)
                             self.stats["events"]["updated"] += 1
                         else:
                             self.stats["events"]["skipped"] += 1
                     else:
-                        event = Event.objects.create(uuid=uuid, **defaults)
-                        # Update created timestamp if provided
-                        if created:
-                            Event.objects.filter(pk=event.pk).update(created=created)
+                        with transaction.atomic():
+                            event = Event.objects.create(uuid=uuid, **defaults)
+                            # Update created timestamp if provided
+                            if created:
+                                Event.objects.filter(pk=event.pk).update(
+                                    created=created
+                                )
                         self.stats["events"]["created"] += 1
                 else:
                     existing = Event.objects.filter(uuid=uuid).exists()
@@ -5628,7 +7289,8 @@ class Command(BaseCommand):
             serializer = ConstanceSettingsSerializer(data=normalized_settings)
             if serializer.is_valid():
                 if not self.dry_run:
-                    serializer.save()
+                    with transaction.atomic():
+                        serializer.save()
 
                 for key in normalized_settings:
                     # Count each setting as updated (constance always overwrites)
@@ -5652,7 +7314,8 @@ class Command(BaseCommand):
                     retry_serializer = ConstanceSettingsSerializer(data=valid_settings)
                     if retry_serializer.is_valid():
                         if not self.dry_run:
-                            retry_serializer.save()
+                            with transaction.atomic():
+                                retry_serializer.save()
 
                         for key in valid_settings:
                             self.stats["constance_settings"]["updated"] += 1
@@ -5716,9 +7379,10 @@ class Command(BaseCommand):
                     ).first()
                     if existing:
                         if self.update_existing:
-                            CallManagingOrganisation.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                CallManagingOrganisation.objects.filter(
+                                    uuid=uuid
+                                ).update(**defaults)
                             self.stats["call_managing_organisations"]["updated"] += 1
                         else:
                             self.stats["call_managing_organisations"]["skipped"] += 1
@@ -5729,9 +7393,10 @@ class Command(BaseCommand):
                         ).first()
                         if existing_by_customer:
                             if self.update_existing:
-                                CallManagingOrganisation.objects.filter(
-                                    customer=customer
-                                ).update(**defaults)
+                                with transaction.atomic():
+                                    CallManagingOrganisation.objects.filter(
+                                        customer=customer
+                                    ).update(**defaults)
                                 self.stats["call_managing_organisations"][
                                     "updated"
                                 ] += 1
@@ -5740,9 +7405,10 @@ class Command(BaseCommand):
                                     "skipped"
                                 ] += 1
                         else:
-                            CallManagingOrganisation.objects.create(
-                                uuid=uuid, **defaults
-                            )
+                            with transaction.atomic():
+                                CallManagingOrganisation.objects.create(
+                                    uuid=uuid, **defaults
+                                )
                             self.stats["call_managing_organisations"]["created"] += 1
                 else:
                     existing = CallManagingOrganisation.objects.filter(
@@ -5826,12 +7492,14 @@ class Command(BaseCommand):
                     existing = Call.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            Call.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                Call.objects.filter(uuid=uuid).update(**defaults)
                             self.stats["calls"]["updated"] += 1
                         else:
                             self.stats["calls"]["skipped"] += 1
                     else:
-                        Call.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            Call.objects.create(uuid=uuid, **defaults)
                         self.stats["calls"]["created"] += 1
                 else:
                     existing = Call.objects.filter(uuid=uuid).exists()
@@ -5920,14 +7588,16 @@ class Command(BaseCommand):
                     existing = RequestedOffering.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            RequestedOffering.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                RequestedOffering.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["requested_offerings"]["updated"] += 1
                         else:
                             self.stats["requested_offerings"]["skipped"] += 1
                     else:
-                        RequestedOffering.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            RequestedOffering.objects.create(uuid=uuid, **defaults)
                         self.stats["requested_offerings"]["created"] += 1
                 else:
                     existing = RequestedOffering.objects.filter(uuid=uuid).exists()
@@ -6008,14 +7678,16 @@ class Command(BaseCommand):
                     existing = CallResourceTemplate.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            CallResourceTemplate.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                CallResourceTemplate.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["call_resource_templates"]["updated"] += 1
                         else:
                             self.stats["call_resource_templates"]["skipped"] += 1
                     else:
-                        CallResourceTemplate.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            CallResourceTemplate.objects.create(uuid=uuid, **defaults)
                         self.stats["call_resource_templates"]["created"] += 1
                 else:
                     existing = CallResourceTemplate.objects.filter(uuid=uuid).exists()
@@ -6076,30 +7748,13 @@ class Command(BaseCommand):
                     self.stats["rounds"]["errors"] += 1
                     continue
 
-                # Parse minimal_average_scoring
-                minimal_average_scoring = None
-                if round_data.get("minimal_average_scoring") is not None:
-                    try:
-                        minimal_average_scoring = Decimal(
-                            str(round_data["minimal_average_scoring"])
-                        )
-                    except (InvalidOperation, TypeError):
-                        pass
-
                 defaults = {
                     "call": call,
                     "start_time": start_time,
                     "cutoff_time": cutoff_time,
-                    "review_strategy": round_data.get("review_strategy", "after_round"),
-                    "deciding_entity": round_data.get("deciding_entity", "automatic"),
-                    "allocation_time": round_data.get("allocation_time", "on_decision"),
                     "review_duration_in_days": round_data.get(
                         "review_duration_in_days"
                     ),
-                    "minimum_number_of_reviewers": round_data.get(
-                        "minimum_number_of_reviewers"
-                    ),
-                    "minimal_average_scoring": minimal_average_scoring,
                     "allocation_date": allocation_date,
                 }
 
@@ -6107,12 +7762,14 @@ class Command(BaseCommand):
                     existing = Round.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            Round.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                Round.objects.filter(uuid=uuid).update(**defaults)
                             self.stats["rounds"]["updated"] += 1
                         else:
                             self.stats["rounds"]["skipped"] += 1
                     else:
-                        Round.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            Round.objects.create(uuid=uuid, **defaults)
                         self.stats["rounds"]["created"] += 1
                 else:
                     existing = Round.objects.filter(uuid=uuid).exists()
@@ -6202,12 +7859,14 @@ class Command(BaseCommand):
                     existing = Proposal.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            Proposal.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                Proposal.objects.filter(uuid=uuid).update(**defaults)
                             self.stats["proposals"]["updated"] += 1
                         else:
                             self.stats["proposals"]["skipped"] += 1
                     else:
-                        Proposal.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            Proposal.objects.create(uuid=uuid, **defaults)
                         self.stats["proposals"]["created"] += 1
                 else:
                     existing = Proposal.objects.filter(uuid=uuid).exists()
@@ -6301,14 +7960,16 @@ class Command(BaseCommand):
                     existing = RequestedResource.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            RequestedResource.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                RequestedResource.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["requested_resources"]["updated"] += 1
                         else:
                             self.stats["requested_resources"]["skipped"] += 1
                     else:
-                        RequestedResource.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            RequestedResource.objects.create(uuid=uuid, **defaults)
                         self.stats["requested_resources"]["created"] += 1
                 else:
                     existing = RequestedResource.objects.filter(uuid=uuid).exists()
@@ -6327,6 +7988,64 @@ class Command(BaseCommand):
                     )
                 )
                 self.stats["requested_resources"]["errors"] += 1
+
+    def import_call_documents(self, documents_data):
+        """Import documentation files attached to calls, seeding a placeholder
+        file so the document (and the public-call Documents tab) is shown."""
+        from django.core.files.base import ContentFile
+
+        self.stdout.write("Importing call documents...")
+        for item in documents_data:
+            try:
+                uuid = item.get("uuid")
+                call_uuid = item.get("call_uuid")
+                if not uuid or not call_uuid:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            "Skipping call document without UUID or call_uuid"
+                        )
+                    )
+                    self.stats["call_documents"]["errors"] += 1
+                    continue
+
+                call = Call.objects.filter(uuid=call_uuid).first()
+                if not call:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping call document {uuid}: call {call_uuid} not found"
+                        )
+                    )
+                    self.stats["call_documents"]["errors"] += 1
+                    continue
+
+                document, created = CallDocument.objects.update_or_create(
+                    uuid=uuid,
+                    defaults={
+                        "call": call,
+                        "description": item.get("description", ""),
+                    },
+                )
+                if not document.file:
+                    content = item.get(
+                        "content",
+                        f"{item.get('description') or 'Call document'}\n\n"
+                        "Sample document for this call for proposals.\n",
+                    ).encode()
+                    document.file.save(
+                        item.get("file_name", "document.txt"),
+                        ContentFile(content),
+                        save=True,
+                    )
+                # The call exposes documents via the M2M relation (what the
+                # serializer/UI read), in addition to the CallDocument.call FK.
+                call.documents.add(document)
+
+                self.stats["call_documents"]["created" if created else "updated"] += 1
+            except Exception as e:
+                self.stdout.write(
+                    self.style.ERROR(f"Error importing call document: {e}")
+                )
+                self.stats["call_documents"]["errors"] += 1
 
     def import_reviews(self, reviews_data):
         """Import review data."""
@@ -6406,12 +8125,14 @@ class Command(BaseCommand):
                     existing = Review.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            Review.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                Review.objects.filter(uuid=uuid).update(**defaults)
                             self.stats["reviews"]["updated"] += 1
                         else:
                             self.stats["reviews"]["skipped"] += 1
                     else:
-                        Review.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            Review.objects.create(uuid=uuid, **defaults)
                         self.stats["reviews"]["created"] += 1
                 else:
                     existing = Review.objects.filter(uuid=uuid).exists()
@@ -6430,6 +8151,205 @@ class Command(BaseCommand):
                     )
                 )
                 self.stats["reviews"]["errors"] += 1
+
+    def import_call_workflow_steps(self, steps_data):
+        """Configure per-call workflow steps.
+
+        Every call auto-seeds a full set of ``CallWorkflowStep`` rows via a
+        post-save signal on creation, so the rows this configures already
+        exist; matched by ``(call, step)`` it overrides their enable /
+        transition / review settings for calls that want a non-default
+        workflow (e.g. enabling the review steps). A missing ``(call, step)``
+        (such as ``award_response``, which the signal skips) is created.
+        The configuration is always applied — unlike most entities these are
+        never "skipped" on re-import, since the point is to override defaults.
+        """
+        self.stdout.write("Importing call workflow steps...")
+        config_fields = (
+            "is_enabled",
+            "duration_in_days",
+            "blind_review",
+            "requires_coi_confirmation",
+            "checklist_required",
+            "min_reviewers",
+            "min_score_threshold",
+            "applicant_visible",
+            "responsible_role",
+            "transition_mode",
+            "display_order",
+            "include_award_response",
+            "allocation_time",
+        )
+        for step_data in steps_data:
+            try:
+                call_uuid = step_data.get("call_uuid")
+                step = step_data.get("step")
+                if not call_uuid or not step:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            "Skipping call workflow step without call_uuid or step"
+                        )
+                    )
+                    self.stats["call_workflow_steps"]["errors"] += 1
+                    continue
+
+                call = Call.objects.filter(uuid=call_uuid).first()
+                if not call:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping call workflow step {step}: call {call_uuid} not found"
+                        )
+                    )
+                    self.stats["call_workflow_steps"]["errors"] += 1
+                    continue
+
+                defaults = {
+                    field: step_data[field]
+                    for field in config_fields
+                    if field in step_data
+                }
+
+                # Resolve the optional workflow-step checklist (a WORKFLOW_STEP
+                # checklist the responsible role fills in during the step).
+                checklist_uuid = step_data.get("checklist_uuid")
+                if checklist_uuid:
+                    checklist = Checklist.objects.filter(uuid=checklist_uuid).first()
+                    if checklist:
+                        defaults["checklist"] = checklist
+                    else:
+                        self.stdout.write(
+                            self.style.WARNING(
+                                f"Call workflow step {step}: "
+                                f"checklist {checklist_uuid} not found"
+                            )
+                        )
+
+                if self.dry_run:
+                    exists = CallWorkflowStep.objects.filter(
+                        call=call, step=step
+                    ).exists()
+                    self.stats["call_workflow_steps"][
+                        "updated" if exists else "created"
+                    ] += 1
+                    continue
+
+                with transaction.atomic():
+                    _, created = CallWorkflowStep.objects.update_or_create(
+                        call=call, step=step, defaults=defaults
+                    )
+                self.stats["call_workflow_steps"][
+                    "created" if created else "updated"
+                ] += 1
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import call workflow step {step_data.get('step')}: {e}"
+                    )
+                )
+                self.stats["call_workflow_steps"]["errors"] += 1
+
+    def import_proposal_workflow_step_instances(self, instances_data):
+        """Seed per-proposal workflow step instances (engine state).
+
+        These are normally created only by the ``submit`` action at runtime, so
+        preset proposals — imported directly into their target state — have
+        none, leaving the workflow engine invisible. This mirrors the shape
+        ``submit`` / ``workflow_service`` produce: exactly one ``active``
+        instance per proposal (enforced by a DB constraint), ``pending`` for
+        enabled-but-not-yet-reached steps, ``skipped`` for disabled steps, and
+        ``completed`` (with an ``outcome``) for finished ones. When an instance
+        is ``active`` the parent proposal's ``workflow_step`` is set to match.
+        """
+        self.stdout.write("Importing proposal workflow step instances...")
+        for inst in instances_data:
+            try:
+                uuid = inst.get("uuid")
+                proposal_uuid = inst.get("proposal_uuid")
+                step = inst.get("step")
+                if not uuid or not proposal_uuid or not step:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            "Skipping workflow step instance without uuid, proposal_uuid, or step"
+                        )
+                    )
+                    self.stats["proposal_workflow_step_instances"]["errors"] += 1
+                    continue
+
+                proposal = Proposal.objects.filter(uuid=proposal_uuid).first()
+                if not proposal:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping workflow step instance {uuid}: proposal {proposal_uuid} not found"
+                        )
+                    )
+                    self.stats["proposal_workflow_step_instances"]["errors"] += 1
+                    continue
+
+                completed_by = None
+                if inst.get("completed_by_uuid"):
+                    completed_by = User.objects.filter(
+                        uuid=inst["completed_by_uuid"]
+                    ).first()
+
+                status = inst.get("status", "pending")
+                defaults = {
+                    "proposal": proposal,
+                    "step": step,
+                    "status": status,
+                    "outcome": inst.get("outcome"),
+                    "outcome_reason": inst.get("outcome_reason", ""),
+                    "started_at": self._parse_datetime(inst.get("started_at")),
+                    "completed_at": self._parse_datetime(inst.get("completed_at")),
+                    "completed_by": completed_by,
+                    "internal_notes": inst.get("internal_notes", ""),
+                }
+
+                if not self.dry_run:
+                    existing = ProposalWorkflowStepInstance.objects.filter(
+                        uuid=uuid
+                    ).first()
+                    if existing and not self.update_existing:
+                        self.stats["proposal_workflow_step_instances"]["skipped"] += 1
+                        continue
+                    with transaction.atomic():
+                        if existing:
+                            ProposalWorkflowStepInstance.objects.filter(
+                                uuid=uuid
+                            ).update(**defaults)
+                            self.stats["proposal_workflow_step_instances"][
+                                "updated"
+                            ] += 1
+                        else:
+                            ProposalWorkflowStepInstance.objects.create(
+                                uuid=uuid, **defaults
+                            )
+                            self.stats["proposal_workflow_step_instances"][
+                                "created"
+                            ] += 1
+                        # Keep the proposal's pointer consistent with its
+                        # active step (the submit/advance actions do this).
+                        if status == "active" and proposal.workflow_step != step:
+                            proposal.workflow_step = step
+                            proposal.save(update_fields=["workflow_step"])
+                else:
+                    existing = ProposalWorkflowStepInstance.objects.filter(
+                        uuid=uuid
+                    ).exists()
+                    if existing and not self.update_existing:
+                        self.stats["proposal_workflow_step_instances"]["skipped"] += 1
+                    else:
+                        self.stats["proposal_workflow_step_instances"][
+                            "updated" if existing else "created"
+                        ] += 1
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import workflow step instance {inst.get('uuid')}: {e}"
+                    )
+                )
+                self.stats["proposal_workflow_step_instances"]["errors"] += 1
 
     def import_user_agreements(self, user_agreements_data):
         """Import user agreement data (Terms of Service, Privacy Policy)."""
@@ -6476,21 +8396,26 @@ class Command(BaseCommand):
 
                     if existing_by_uuid:
                         if self.update_existing:
-                            UserAgreement.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                UserAgreement.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["user_agreements"]["updated"] += 1
                         else:
                             self.stats["user_agreements"]["skipped"] += 1
                     elif existing_by_type:
                         # Agreement type already exists with different UUID
                         if self.update_existing:
-                            UserAgreement.objects.filter(
-                                agreement_type=agreement_type
-                            ).update(**defaults)
+                            with transaction.atomic():
+                                UserAgreement.objects.filter(
+                                    agreement_type=agreement_type
+                                ).update(**defaults)
                             self.stats["user_agreements"]["updated"] += 1
                         else:
                             self.stats["user_agreements"]["skipped"] += 1
                     else:
-                        UserAgreement.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            UserAgreement.objects.create(uuid=uuid, **defaults)
                         self.stats["user_agreements"]["created"] += 1
                 else:
                     existing = UserAgreement.objects.filter(uuid=uuid).exists()
@@ -6547,14 +8472,16 @@ class Command(BaseCommand):
                     existing = ExpertiseCategory.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            ExpertiseCategory.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                ExpertiseCategory.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["expertise_categories"]["updated"] += 1
                         else:
                             self.stats["expertise_categories"]["skipped"] += 1
                     else:
-                        ExpertiseCategory.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            ExpertiseCategory.objects.create(uuid=uuid, **defaults)
                         self.stats["expertise_categories"]["created"] += 1
                 else:
                     existing = ExpertiseCategory.objects.filter(uuid=uuid).exists()
@@ -6622,12 +8549,16 @@ class Command(BaseCommand):
                     existing = ReviewerProfile.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            ReviewerProfile.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                ReviewerProfile.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["reviewer_profiles"]["updated"] += 1
                         else:
                             self.stats["reviewer_profiles"]["skipped"] += 1
                     else:
-                        ReviewerProfile.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            ReviewerProfile.objects.create(uuid=uuid, **defaults)
                         self.stats["reviewer_profiles"]["created"] += 1
                 else:
                     existing = ReviewerProfile.objects.filter(uuid=uuid).exists()
@@ -6698,14 +8629,16 @@ class Command(BaseCommand):
                     existing = ReviewerAffiliation.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            ReviewerAffiliation.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                ReviewerAffiliation.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["reviewer_affiliations"]["updated"] += 1
                         else:
                             self.stats["reviewer_affiliations"]["skipped"] += 1
                     else:
-                        ReviewerAffiliation.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            ReviewerAffiliation.objects.create(uuid=uuid, **defaults)
                         self.stats["reviewer_affiliations"]["created"] += 1
                 else:
                     existing = ReviewerAffiliation.objects.filter(uuid=uuid).exists()
@@ -6770,14 +8703,16 @@ class Command(BaseCommand):
                     existing = ReviewerExpertise.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            ReviewerExpertise.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                ReviewerExpertise.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["reviewer_expertise"]["updated"] += 1
                         else:
                             self.stats["reviewer_expertise"]["skipped"] += 1
                     else:
-                        ReviewerExpertise.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            ReviewerExpertise.objects.create(uuid=uuid, **defaults)
                         self.stats["reviewer_expertise"]["created"] += 1
                 else:
                     existing = ReviewerExpertise.objects.filter(uuid=uuid).exists()
@@ -6843,14 +8778,16 @@ class Command(BaseCommand):
                     existing = ReviewerPublication.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            ReviewerPublication.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                ReviewerPublication.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["reviewer_publications"]["updated"] += 1
                         else:
                             self.stats["reviewer_publications"]["skipped"] += 1
                     else:
-                        ReviewerPublication.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            ReviewerPublication.objects.create(uuid=uuid, **defaults)
                         self.stats["reviewer_publications"]["created"] += 1
                 else:
                     existing = ReviewerPublication.objects.filter(uuid=uuid).exists()
@@ -6919,12 +8856,16 @@ class Command(BaseCommand):
                     existing = ReviewerStats.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            ReviewerStats.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                ReviewerStats.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["reviewer_stats"]["updated"] += 1
                         else:
                             self.stats["reviewer_stats"]["skipped"] += 1
                     else:
-                        ReviewerStats.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            ReviewerStats.objects.create(uuid=uuid, **defaults)
                         self.stats["reviewer_stats"]["created"] += 1
                 else:
                     existing = ReviewerStats.objects.filter(uuid=uuid).exists()
@@ -7012,14 +8953,16 @@ class Command(BaseCommand):
                     existing = CallCOIConfiguration.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            CallCOIConfiguration.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                CallCOIConfiguration.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["call_coi_configurations"]["updated"] += 1
                         else:
                             self.stats["call_coi_configurations"]["skipped"] += 1
                     else:
-                        CallCOIConfiguration.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            CallCOIConfiguration.objects.create(uuid=uuid, **defaults)
                         self.stats["call_coi_configurations"]["created"] += 1
                 else:
                     existing = CallCOIConfiguration.objects.filter(uuid=uuid).exists()
@@ -7095,14 +9038,16 @@ class Command(BaseCommand):
                     existing = MatchingConfiguration.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            MatchingConfiguration.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                MatchingConfiguration.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["matching_configurations"]["updated"] += 1
                         else:
                             self.stats["matching_configurations"]["skipped"] += 1
                     else:
-                        MatchingConfiguration.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            MatchingConfiguration.objects.create(uuid=uuid, **defaults)
                         self.stats["matching_configurations"]["created"] += 1
                 else:
                     existing = MatchingConfiguration.objects.filter(uuid=uuid).exists()
@@ -7207,9 +9152,10 @@ class Command(BaseCommand):
                     existing = CallReviewerPool.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            CallReviewerPool.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                CallReviewerPool.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["call_reviewer_pools"]["updated"] += 1
                         else:
                             self.stats["call_reviewer_pools"]["skipped"] += 1
@@ -7217,7 +9163,8 @@ class Command(BaseCommand):
                         pool = CallReviewerPool(uuid=uuid, **defaults)
                         if invitation_token:
                             pool.invitation_token = invitation_token
-                        pool.save()
+                        with transaction.atomic():
+                            pool.save()
                         self.stats["call_reviewer_pools"]["created"] += 1
                 else:
                     existing = CallReviewerPool.objects.filter(uuid=uuid).exists()
@@ -7314,14 +9261,16 @@ class Command(BaseCommand):
                     existing = ConflictOfInterest.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            ConflictOfInterest.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                ConflictOfInterest.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["conflicts_of_interest"]["updated"] += 1
                         else:
                             self.stats["conflicts_of_interest"]["skipped"] += 1
                     else:
-                        ConflictOfInterest.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            ConflictOfInterest.objects.create(uuid=uuid, **defaults)
                         self.stats["conflicts_of_interest"]["created"] += 1
                 else:
                     existing = ConflictOfInterest.objects.filter(uuid=uuid).exists()
@@ -7402,14 +9351,16 @@ class Command(BaseCommand):
                     existing = COIDisclosureForm.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            COIDisclosureForm.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                COIDisclosureForm.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["coi_disclosure_forms"]["updated"] += 1
                         else:
                             self.stats["coi_disclosure_forms"]["skipped"] += 1
                     else:
-                        COIDisclosureForm.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            COIDisclosureForm.objects.create(uuid=uuid, **defaults)
                         self.stats["coi_disclosure_forms"]["created"] += 1
                 else:
                     existing = COIDisclosureForm.objects.filter(uuid=uuid).exists()
@@ -7491,14 +9442,18 @@ class Command(BaseCommand):
                     ).first()
                     if existing:
                         if self.update_existing:
-                            ReviewerProposalAffinity.objects.filter(uuid=uuid).update(
-                                **defaults
-                            )
+                            with transaction.atomic():
+                                ReviewerProposalAffinity.objects.filter(
+                                    uuid=uuid
+                                ).update(**defaults)
                             self.stats["reviewer_proposal_affinities"]["updated"] += 1
                         else:
                             self.stats["reviewer_proposal_affinities"]["skipped"] += 1
                     else:
-                        ReviewerProposalAffinity.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            ReviewerProposalAffinity.objects.create(
+                                uuid=uuid, **defaults
+                            )
                         self.stats["reviewer_proposal_affinities"]["created"] += 1
                 else:
                     existing = ReviewerProposalAffinity.objects.filter(
@@ -7581,12 +9536,14 @@ class Command(BaseCommand):
                     existing = ReviewerBid.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            ReviewerBid.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                ReviewerBid.objects.filter(uuid=uuid).update(**defaults)
                             self.stats["reviewer_bids"]["updated"] += 1
                         else:
                             self.stats["reviewer_bids"]["skipped"] += 1
                     else:
-                        ReviewerBid.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            ReviewerBid.objects.create(uuid=uuid, **defaults)
                         self.stats["reviewer_bids"]["created"] += 1
                 else:
                     existing = ReviewerBid.objects.filter(uuid=uuid).exists()
@@ -7605,6 +9562,156 @@ class Command(BaseCommand):
                     )
                 )
                 self.stats["reviewer_bids"]["errors"] += 1
+
+    def import_reviewer_suggestions(self, suggestions_data):
+        """Import reviewer suggestions (algorithm-generated matches)."""
+        self.stdout.write("Importing reviewer suggestions...")
+        for item in suggestions_data:
+            try:
+                uuid = item.get("uuid")
+                call_uuid = item.get("call_uuid")
+                reviewer_uuid = item.get("reviewer_uuid")
+
+                if not uuid or not call_uuid or not reviewer_uuid:
+                    self.stats["reviewer_suggestions"]["errors"] += 1
+                    continue
+
+                call = Call.objects.filter(uuid=call_uuid).first()
+                if not call:
+                    self.stats["reviewer_suggestions"]["errors"] += 1
+                    continue
+
+                reviewer = ReviewerProfile.objects.filter(uuid=reviewer_uuid).first()
+                if not reviewer:
+                    self.stats["reviewer_suggestions"]["errors"] += 1
+                    continue
+
+                reviewed_by = None
+                reviewed_by_uuid = item.get("reviewed_by_uuid")
+                if reviewed_by_uuid:
+                    from django.contrib.auth import get_user_model
+
+                    User = get_user_model()
+                    reviewed_by = User.objects.filter(uuid=reviewed_by_uuid).first()
+
+                defaults = {
+                    "call": call,
+                    "reviewer": reviewer,
+                    "affinity_score": item.get("affinity_score", 0),
+                    "keyword_score": item.get("keyword_score"),
+                    "text_score": item.get("text_score"),
+                    "status": item.get("status", "pending"),
+                    "reviewed_by": reviewed_by,
+                    "rejection_reason": item.get("rejection_reason", ""),
+                    "matched_keywords": item.get("matched_keywords", []),
+                    "top_matching_proposals": item.get("top_matching_proposals", []),
+                }
+                if item.get("reviewed_at"):
+                    defaults["reviewed_at"] = item["reviewed_at"]
+
+                if not self.dry_run:
+                    existing = ReviewerSuggestion.objects.filter(uuid=uuid).first()
+                    if existing:
+                        if self.update_existing:
+                            with transaction.atomic():
+                                ReviewerSuggestion.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
+                            self.stats["reviewer_suggestions"]["updated"] += 1
+                        else:
+                            self.stats["reviewer_suggestions"]["skipped"] += 1
+                    else:
+                        with transaction.atomic():
+                            ReviewerSuggestion.objects.create(uuid=uuid, **defaults)
+                        self.stats["reviewer_suggestions"]["created"] += 1
+                else:
+                    self.stats["reviewer_suggestions"]["created"] += 1
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import reviewer suggestion {item.get('uuid')}: {e}"
+                    )
+                )
+                self.stats["reviewer_suggestions"]["errors"] += 1
+
+    def import_role_mappings(self, mappings_data):
+        """Import proposal-to-project role mappings."""
+        self.stdout.write("Importing role mappings...")
+        for item in mappings_data:
+            try:
+                uuid = item.get("uuid")
+                call_uuid = item.get("call_uuid")
+                proposal_role_name = item.get("proposal_role")
+                project_role_name = item.get("project_role")
+
+                if (
+                    not uuid
+                    or not call_uuid
+                    or not proposal_role_name
+                    or not project_role_name
+                ):
+                    self.stats["role_mappings"]["errors"] += 1
+                    continue
+
+                call = Call.objects.filter(uuid=call_uuid).first()
+                if not call:
+                    self.stats["role_mappings"]["errors"] += 1
+                    continue
+
+                proposal_role = Role.objects.filter(
+                    name=proposal_role_name, is_active=True
+                ).first()
+                project_role = Role.objects.filter(
+                    name=project_role_name, is_active=True
+                ).first()
+
+                if not proposal_role or not project_role:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping role mapping {uuid}: role not found "
+                            f"(proposal={proposal_role_name}={proposal_role}, "
+                            f"project={project_role_name}={project_role})"
+                        )
+                    )
+                    self.stats["role_mappings"]["errors"] += 1
+                    continue
+
+                defaults = {
+                    "call": call,
+                    "proposal_role": proposal_role,
+                    "project_role": project_role,
+                }
+
+                if not self.dry_run:
+                    existing = ProposalProjectRoleMapping.objects.filter(
+                        uuid=uuid
+                    ).first()
+                    if existing:
+                        if self.update_existing:
+                            with transaction.atomic():
+                                ProposalProjectRoleMapping.objects.filter(
+                                    uuid=uuid
+                                ).update(**defaults)
+                            self.stats["role_mappings"]["updated"] += 1
+                        else:
+                            self.stats["role_mappings"]["skipped"] += 1
+                    else:
+                        with transaction.atomic():
+                            ProposalProjectRoleMapping.objects.create(
+                                uuid=uuid, **defaults
+                            )
+                        self.stats["role_mappings"]["created"] += 1
+                else:
+                    self.stats["role_mappings"]["created"] += 1
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import role mapping {item.get('uuid')}: {e}"
+                    )
+                )
+                self.stats["role_mappings"]["errors"] += 1
 
     def import_assignment_batches(self, batches_data):
         """Import assignment batch data (Stage 2 of two-stage reviewer workflow)."""
@@ -7682,12 +9789,16 @@ class Command(BaseCommand):
                     existing = AssignmentBatch.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            AssignmentBatch.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                AssignmentBatch.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["assignment_batches"]["updated"] += 1
                         else:
                             self.stats["assignment_batches"]["skipped"] += 1
                     else:
-                        AssignmentBatch.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            AssignmentBatch.objects.create(uuid=uuid, **defaults)
                         self.stats["assignment_batches"]["created"] += 1
                 else:
                     existing = AssignmentBatch.objects.filter(uuid=uuid).exists()
@@ -7781,12 +9892,16 @@ class Command(BaseCommand):
                     existing = AssignmentItem.objects.filter(uuid=uuid).first()
                     if existing:
                         if self.update_existing:
-                            AssignmentItem.objects.filter(uuid=uuid).update(**defaults)
+                            with transaction.atomic():
+                                AssignmentItem.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
                             self.stats["assignment_items"]["updated"] += 1
                         else:
                             self.stats["assignment_items"]["skipped"] += 1
                     else:
-                        AssignmentItem.objects.create(uuid=uuid, **defaults)
+                        with transaction.atomic():
+                            AssignmentItem.objects.create(uuid=uuid, **defaults)
                         self.stats["assignment_items"]["created"] += 1
                 else:
                     existing = AssignmentItem.objects.filter(uuid=uuid).exists()
@@ -7825,6 +9940,456 @@ class Command(BaseCommand):
             self.stdout.write(
                 self.style.WARNING(f"⚠ Failed to sync user activation status: {e}")
             )
+
+    def import_openstack_service_settings(self, settings_data):
+        """Import OpenStack service settings."""
+        self.stdout.write("Importing OpenStack service settings...")
+
+        for item in settings_data:
+            try:
+                uuid = item.get("uuid")
+                if not uuid:
+                    self.stats["openstack_service_settings"]["errors"] += 1
+                    continue
+
+                customer_uuid = item.get("customer_uuid")
+                customer = None
+                if customer_uuid:
+                    customer = Customer.objects.filter(uuid=customer_uuid).first()
+                    if not customer:
+                        self.stdout.write(
+                            self.style.WARNING(
+                                f"Skipping service settings {uuid}: customer {customer_uuid} not found"
+                            )
+                        )
+                        self.stats["openstack_service_settings"]["errors"] += 1
+                        continue
+
+                defaults = {
+                    "name": item.get("name", ""),
+                    "type": item.get("type", "OpenStack"),
+                    "backend_url": item.get("backend_url", ""),
+                    "username": item.get("username", ""),
+                    "password": item.get("password", ""),
+                    "domain": item.get("domain", ""),
+                    "token": item.get("token", ""),
+                    "shared": item.get("shared", False),
+                    "options": item.get("options", {}),
+                    "is_active": item.get("is_active", True),
+                    "state": item.get("state", 2),
+                    "customer": customer,
+                }
+
+                if not self.dry_run:
+                    existing = ServiceSettings.objects.filter(uuid=uuid).first()
+                    if existing:
+                        if self.update_existing:
+                            with transaction.atomic():
+                                ServiceSettings.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
+                            self.stats["openstack_service_settings"]["updated"] += 1
+                        else:
+                            self.stats["openstack_service_settings"]["skipped"] += 1
+                    else:
+                        with transaction.atomic():
+                            ServiceSettings.objects.create(uuid=uuid, **defaults)
+                        self.stats["openstack_service_settings"]["created"] += 1
+                else:
+                    existing = ServiceSettings.objects.filter(uuid=uuid).exists()
+                    if existing:
+                        if self.update_existing:
+                            self.stats["openstack_service_settings"]["updated"] += 1
+                        else:
+                            self.stats["openstack_service_settings"]["skipped"] += 1
+                    else:
+                        self.stats["openstack_service_settings"]["created"] += 1
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import service settings {item.get('uuid')}: {e}"
+                    )
+                )
+                self.stats["openstack_service_settings"]["errors"] += 1
+
+    def import_openstack_flavors(self, flavors_data):
+        """Import OpenStack flavors."""
+        self.stdout.write("Importing OpenStack flavors...")
+
+        for item in flavors_data:
+            try:
+                settings_uuid = item.get("settings_uuid")
+                settings = ServiceSettings.objects.filter(uuid=settings_uuid).first()
+                if not settings:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping flavor: settings {settings_uuid} not found"
+                        )
+                    )
+                    self.stats["openstack_flavors"]["errors"] += 1
+                    continue
+
+                backend_id = item.get("backend_id", "")
+                defaults = {
+                    "name": item.get("name", ""),
+                    "cores": item.get("cores", 0),
+                    "ram": item.get("ram", 0),
+                    "disk": item.get("disk", 0),
+                }
+
+                if not self.dry_run:
+                    existing = Flavor.objects.filter(
+                        settings=settings, backend_id=backend_id
+                    ).first()
+                    if existing:
+                        if self.update_existing:
+                            with transaction.atomic():
+                                Flavor.objects.filter(
+                                    settings=settings, backend_id=backend_id
+                                ).update(**defaults)
+                            self.stats["openstack_flavors"]["updated"] += 1
+                        else:
+                            self.stats["openstack_flavors"]["skipped"] += 1
+                    else:
+                        with transaction.atomic():
+                            Flavor.objects.create(
+                                settings=settings, backend_id=backend_id, **defaults
+                            )
+                        self.stats["openstack_flavors"]["created"] += 1
+                else:
+                    existing = Flavor.objects.filter(
+                        settings=settings, backend_id=backend_id
+                    ).exists()
+                    if existing:
+                        if self.update_existing:
+                            self.stats["openstack_flavors"]["updated"] += 1
+                        else:
+                            self.stats["openstack_flavors"]["skipped"] += 1
+                    else:
+                        self.stats["openstack_flavors"]["created"] += 1
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import flavor {item.get('name')}: {e}"
+                    )
+                )
+                self.stats["openstack_flavors"]["errors"] += 1
+
+    def import_openstack_images(self, images_data):
+        """Import OpenStack images."""
+        self.stdout.write("Importing OpenStack images...")
+
+        for item in images_data:
+            try:
+                settings_uuid = item.get("settings_uuid")
+                settings = ServiceSettings.objects.filter(uuid=settings_uuid).first()
+                if not settings:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping image: settings {settings_uuid} not found"
+                        )
+                    )
+                    self.stats["openstack_images"]["errors"] += 1
+                    continue
+
+                backend_id = item.get("backend_id", "")
+                defaults = {
+                    "name": item.get("name", ""),
+                    "min_disk": item.get("min_disk", 0),
+                    "min_ram": item.get("min_ram", 0),
+                }
+
+                if not self.dry_run:
+                    # Use all_objects to bypass custom manager filtering
+                    existing = Image.all_objects.filter(
+                        settings=settings, backend_id=backend_id
+                    ).first()
+                    if existing:
+                        if self.update_existing:
+                            with transaction.atomic():
+                                Image.all_objects.filter(
+                                    settings=settings, backend_id=backend_id
+                                ).update(**defaults)
+                            self.stats["openstack_images"]["updated"] += 1
+                        else:
+                            self.stats["openstack_images"]["skipped"] += 1
+                    else:
+                        with transaction.atomic():
+                            Image(
+                                settings=settings, backend_id=backend_id, **defaults
+                            ).save()
+                        self.stats["openstack_images"]["created"] += 1
+                else:
+                    existing = Image.all_objects.filter(
+                        settings=settings, backend_id=backend_id
+                    ).exists()
+                    if existing:
+                        if self.update_existing:
+                            self.stats["openstack_images"]["updated"] += 1
+                        else:
+                            self.stats["openstack_images"]["skipped"] += 1
+                    else:
+                        self.stats["openstack_images"]["created"] += 1
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import image {item.get('name')}: {e}"
+                    )
+                )
+                self.stats["openstack_images"]["errors"] += 1
+
+    def import_openstack_tenants(self, tenants_data):
+        """Import OpenStack tenants."""
+        self.stdout.write("Importing OpenStack tenants...")
+
+        for item in tenants_data:
+            try:
+                uuid = item.get("uuid")
+                if not uuid:
+                    self.stats["openstack_tenants"]["errors"] += 1
+                    continue
+
+                settings_uuid = item.get("service_settings_uuid")
+                settings = ServiceSettings.objects.filter(uuid=settings_uuid).first()
+                if not settings:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping tenant {uuid}: settings {settings_uuid} not found"
+                        )
+                    )
+                    self.stats["openstack_tenants"]["errors"] += 1
+                    continue
+
+                project_uuid = item.get("project_uuid")
+                project = Project.available_objects.filter(uuid=project_uuid).first()
+                if not project:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping tenant {uuid}: project {project_uuid} not found"
+                        )
+                    )
+                    self.stats["openstack_tenants"]["errors"] += 1
+                    continue
+
+                defaults = {
+                    "name": item.get("name", ""),
+                    "description": item.get("description", ""),
+                    "backend_id": item.get("backend_id", ""),
+                    "state": item.get("state", 2),
+                    "runtime_state": item.get("runtime_state", ""),
+                    "service_settings": settings,
+                    "project": project,
+                    "internal_network_id": item.get("internal_network_id", ""),
+                    "external_network_id": item.get("external_network_id", ""),
+                    "availability_zone": item.get("availability_zone", ""),
+                    "user_username": item.get("user_username", ""),
+                    "user_password": item.get("user_password", ""),
+                }
+
+                if not self.dry_run:
+                    existing = Tenant.objects.filter(uuid=uuid).first()
+                    tenant = None
+                    if existing:
+                        if self.update_existing:
+                            with transaction.atomic():
+                                Tenant.objects.filter(uuid=uuid).update(**defaults)
+                            tenant = Tenant.objects.get(uuid=uuid)
+                            self.stats["openstack_tenants"]["updated"] += 1
+                        else:
+                            self.stats["openstack_tenants"]["skipped"] += 1
+                    else:
+                        with transaction.atomic():
+                            tenant = Tenant.objects.create(uuid=uuid, **defaults)
+                        self.stats["openstack_tenants"]["created"] += 1
+
+                    if tenant is not None:
+                        self.import_tenant_quotas(tenant, item.get("quotas", []))
+                else:
+                    existing = Tenant.objects.filter(uuid=uuid).exists()
+                    if existing:
+                        if self.update_existing:
+                            self.stats["openstack_tenants"]["updated"] += 1
+                        else:
+                            self.stats["openstack_tenants"]["skipped"] += 1
+                    else:
+                        self.stats["openstack_tenants"]["created"] += 1
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import tenant {item.get('uuid')}: {e}"
+                    )
+                )
+                self.stats["openstack_tenants"]["errors"] += 1
+
+    def import_tenant_quotas(self, tenant, quotas_data):
+        """Apply preset quota limits and usages to an imported tenant.
+
+        Without this the quota table is only populated by asynchronous backend
+        sync, so UI tests that read quota values immediately after import race
+        the sync. Both setters are idempotent (update_or_create for limits,
+        delta-to-target for usages), so re-importing is safe.
+        """
+        for quota in quotas_data:
+            name = quota.get("name")
+            if not name:
+                continue
+            if "limit" in quota:
+                tenant.set_quota_limit(name, quota["limit"])
+            if "usage" in quota:
+                tenant.set_quota_usage(name, quota["usage"])
+
+    def import_openstack_instances(self, instances_data):
+        """Import OpenStack instances."""
+        self.stdout.write("Importing OpenStack instances...")
+
+        for item in instances_data:
+            try:
+                uuid = item.get("uuid")
+                if not uuid:
+                    self.stats["openstack_instances"]["errors"] += 1
+                    continue
+
+                tenant_uuid = item.get("tenant_uuid")
+                tenant = Tenant.objects.filter(uuid=tenant_uuid).first()
+                if not tenant:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping instance {uuid}: tenant {tenant_uuid} not found"
+                        )
+                    )
+                    self.stats["openstack_instances"]["errors"] += 1
+                    continue
+
+                defaults = {
+                    "name": item.get("name", ""),
+                    "description": item.get("description", ""),
+                    "backend_id": item.get("backend_id", ""),
+                    "state": item.get("state", 2),
+                    "runtime_state": item.get("runtime_state", ""),
+                    "tenant": tenant,
+                    "service_settings": tenant.service_settings,
+                    "project": tenant.project,
+                    "cores": item.get("cores", 0),
+                    "ram": item.get("ram", 0),
+                    "disk": item.get("disk", 0),
+                    "image_name": item.get("image_name", ""),
+                    "flavor_name": item.get("flavor_name", ""),
+                    "flavor_disk": item.get("flavor_disk", 0),
+                    "hypervisor_hostname": item.get("hypervisor_hostname", ""),
+                    "key_name": item.get("key_name", ""),
+                    "key_fingerprint": item.get("key_fingerprint", ""),
+                    "directly_connected_ips": item.get("directly_connected_ips", ""),
+                }
+
+                if not self.dry_run:
+                    existing = Instance.objects.filter(uuid=uuid).first()
+                    if existing:
+                        if self.update_existing:
+                            with transaction.atomic():
+                                Instance.objects.filter(uuid=uuid).update(**defaults)
+                            self.stats["openstack_instances"]["updated"] += 1
+                        else:
+                            self.stats["openstack_instances"]["skipped"] += 1
+                    else:
+                        with transaction.atomic():
+                            Instance.objects.create(uuid=uuid, **defaults)
+                        self.stats["openstack_instances"]["created"] += 1
+                else:
+                    existing = Instance.objects.filter(uuid=uuid).exists()
+                    if existing:
+                        if self.update_existing:
+                            self.stats["openstack_instances"]["updated"] += 1
+                        else:
+                            self.stats["openstack_instances"]["skipped"] += 1
+                    else:
+                        self.stats["openstack_instances"]["created"] += 1
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import instance {item.get('uuid')}: {e}"
+                    )
+                )
+                self.stats["openstack_instances"]["errors"] += 1
+
+    def import_openstack_volumes(self, volumes_data):
+        """Import OpenStack volumes."""
+        self.stdout.write("Importing OpenStack volumes...")
+
+        for item in volumes_data:
+            try:
+                uuid = item.get("uuid")
+                if not uuid:
+                    self.stats["openstack_volumes"]["errors"] += 1
+                    continue
+
+                tenant_uuid = item.get("tenant_uuid")
+                tenant = Tenant.objects.filter(uuid=tenant_uuid).first()
+                if not tenant:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping volume {uuid}: tenant {tenant_uuid} not found"
+                        )
+                    )
+                    self.stats["openstack_volumes"]["errors"] += 1
+                    continue
+
+                # Resolve optional instance FK
+                instance = None
+                instance_uuid = item.get("instance_uuid")
+                if instance_uuid:
+                    instance = Instance.objects.filter(uuid=instance_uuid).first()
+
+                defaults = {
+                    "name": item.get("name", ""),
+                    "description": item.get("description", ""),
+                    "backend_id": item.get("backend_id", ""),
+                    "state": item.get("state", 2),
+                    "runtime_state": item.get("runtime_state", ""),
+                    "tenant": tenant,
+                    "service_settings": tenant.service_settings,
+                    "project": tenant.project,
+                    "instance": instance,
+                    "size": item.get("size", 0),
+                    "bootable": item.get("bootable", False),
+                    "device": item.get("device", ""),
+                    "image_name": item.get("image_name", ""),
+                }
+
+                if not self.dry_run:
+                    existing = Volume.objects.filter(uuid=uuid).first()
+                    if existing:
+                        if self.update_existing:
+                            with transaction.atomic():
+                                Volume.objects.filter(uuid=uuid).update(**defaults)
+                            self.stats["openstack_volumes"]["updated"] += 1
+                        else:
+                            self.stats["openstack_volumes"]["skipped"] += 1
+                    else:
+                        with transaction.atomic():
+                            Volume.objects.create(uuid=uuid, **defaults)
+                        self.stats["openstack_volumes"]["created"] += 1
+                else:
+                    existing = Volume.objects.filter(uuid=uuid).exists()
+                    if existing:
+                        if self.update_existing:
+                            self.stats["openstack_volumes"]["updated"] += 1
+                        else:
+                            self.stats["openstack_volumes"]["skipped"] += 1
+                    else:
+                        self.stats["openstack_volumes"]["created"] += 1
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import volume {item.get('uuid')}: {e}"
+                    )
+                )
+                self.stats["openstack_volumes"]["errors"] += 1
 
     def print_summary(self):
         """Print import summary statistics."""

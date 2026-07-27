@@ -1,20 +1,31 @@
+from __future__ import annotations
+
 import logging
 import time
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
-import kubernetes as k8s
 import yaml
 from django.core import exceptions as django_exceptions
 
 from waldur_kubernetes.exceptions import KubernetesException
 
+if TYPE_CHECKING:
+    import kubernetes as k8s
+
 logger = logging.getLogger(__name__)
+
+# The kubernetes client SDK (~27 MB resident at import) is imported lazily inside
+# the methods that use it, so it is not loaded at Django startup for deployments
+# that never provision Kubernetes. See CLAUDE.md, "Lazy imports for heavy
+# optional backends".
 
 
 class KubernetesBackend:
     def __init__(
         self, kubeconfig_str: str | None = None, kubeconfig_file_path: str | None = None
     ):
+        import kubernetes as k8s
+
         if not kubeconfig_str and not kubeconfig_file_path:
             raise KubernetesException(
                 "Either kubeconfig_str or kubeconfig_file_path should be provided"
@@ -23,7 +34,20 @@ class KubernetesBackend:
             kubeconfig_dict = yaml.safe_load(kubeconfig_str)
             k8s.config.load_kube_config_from_dict(config_dict=kubeconfig_dict)
         else:
-            k8s.config.load_kube_config(config_file=kubeconfig_file_path)
+            try:
+                k8s.config.load_kube_config(config_file=kubeconfig_file_path)
+            except k8s.config.config_exception.ConfigException:
+                logger.info(
+                    "Failed to load kubeconfig from %s, trying in-cluster config",
+                    kubeconfig_file_path,
+                )
+                try:
+                    k8s.config.load_incluster_config()
+                except k8s.config.config_exception.ConfigException as e:
+                    raise KubernetesException(
+                        f"Failed to load Kubernetes config from {kubeconfig_file_path} "
+                        f"and in-cluster config: {e}"
+                    )
         self.core_api = k8s.client.CoreV1Api()
         self.batch_v1_api = k8s.client.BatchV1Api()
 
@@ -32,6 +56,8 @@ class KubernetesBackend:
         name: str,
         namespace: str,
     ):
+        import kubernetes as k8s
+
         try:
             existing_secret = self.core_api.read_namespaced_secret(
                 name=name,
@@ -54,6 +80,8 @@ class KubernetesBackend:
         data: dict | None = None,
         string_data: dict | None = None,
     ):
+        import kubernetes as k8s
+
         secret = k8s.client.V1Secret(
             api_version="v1",
             kind="Secret",
@@ -70,6 +98,8 @@ class KubernetesBackend:
         data: dict | None = None,
         labels: dict | None = None,
     ):
+        import kubernetes as k8s
+
         secret_object = cast(
             k8s.client.V1Secret | None, self.get_k8s_secret(name, namespace)
         )
@@ -90,6 +120,8 @@ class KubernetesBackend:
         )
 
     def create_or_update_k8s_secret(self, name, namespace, data, labels):
+        import kubernetes as k8s
+
         existing_secret: k8s.client.V1Secret | None = cast(
             k8s.client.V1Secret | None, self.get_k8s_secret(name, namespace)
         )
@@ -98,11 +130,13 @@ class KubernetesBackend:
         else:
             self.create_k8s_secret(name, namespace, data, labels)
 
-    def create_k8s_config_map(self, name, namespace, data):
+    def create_k8s_config_map(self, name, namespace, data, labels=None):
+        import kubernetes as k8s
+
         config_map = k8s.client.V1ConfigMap(
             api_version="v1",
             kind="ConfigMap",
-            metadata=k8s.client.V1ObjectMeta(name=name),
+            metadata=k8s.client.V1ObjectMeta(name=name, labels=labels),
             data=data,
         )
         try:
@@ -126,11 +160,13 @@ class KubernetesBackend:
             )
 
     def delete_config_map_from_k8s(self, name: str, namespace: str):
+        import kubernetes as k8s
+
         try:
             self.core_api.delete_namespaced_config_map(name, namespace)
         except k8s.client.ApiException as e:
             logger.error(
-                "Unable to credeleteate a ConfigMap %s in the Kubernetes namespace %s. Reason: %s",
+                "Unable to delete a ConfigMap %s in the Kubernetes namespace %s. Reason: %s",
                 name,
                 namespace,
                 e,
@@ -143,11 +179,55 @@ class KubernetesBackend:
                 namespace,
             )
 
-    def create_k8s_job(self, name: str, namespace: str, spec: k8s.client.V1JobSpec):
+    def list_k8s_jobs(self, namespace: str, label_selector: str | None = None) -> list:
+        import kubernetes as k8s
+
+        try:
+            response = self.batch_v1_api.list_namespaced_job(
+                namespace,
+                label_selector=label_selector,
+            )
+            return response.items
+        except k8s.client.ApiException as e:
+            logger.error(
+                "Unable to list Jobs in the Kubernetes namespace %s. Reason: %s",
+                namespace,
+                e,
+            )
+            raise KubernetesException(e)
+
+    def list_k8s_config_maps(
+        self, namespace: str, label_selector: str | None = None
+    ) -> list:
+        import kubernetes as k8s
+
+        try:
+            response = self.core_api.list_namespaced_config_map(
+                namespace,
+                label_selector=label_selector,
+            )
+            return response.items
+        except k8s.client.ApiException as e:
+            logger.error(
+                "Unable to list ConfigMaps in the Kubernetes namespace %s. Reason: %s",
+                namespace,
+                e,
+            )
+            raise KubernetesException(e)
+
+    def create_k8s_job(
+        self,
+        name: str,
+        namespace: str,
+        spec: k8s.client.V1JobSpec,
+        labels: dict | None = None,
+    ):
+        import kubernetes as k8s
+
         job = k8s.client.V1Job(
             api_version="batch/v1",
             kind="Job",
-            metadata=k8s.client.V1ObjectMeta(name=name),
+            metadata=k8s.client.V1ObjectMeta(name=name, labels=labels),
             spec=spec,
         )
         try:
@@ -168,6 +248,8 @@ class KubernetesBackend:
             )
 
     def delete_job_from_k8s(self, name: str, namespace: str):
+        import kubernetes as k8s
+
         try:
             self.batch_v1_api.delete_namespaced_job(
                 name=name, namespace=namespace, propagation_policy="Background"
@@ -184,6 +266,8 @@ class KubernetesBackend:
             logger.info("Job %s has been deleted from namespace %s", name, namespace)
 
     def get_k8s_job_result(self, name: str, namespace: str):
+        import kubernetes as k8s
+
         try:
             pods = self.core_api.list_namespaced_pod(
                 namespace, label_selector=f"job-name={name}"
@@ -206,6 +290,8 @@ class KubernetesBackend:
     def wait_for_k8s_job_completion(
         self, name: str, namespace: str, timeout: int = 600
     ):
+        import kubernetes as k8s
+
         job_succeeded = None
         waited = 0
         while True:

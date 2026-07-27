@@ -366,6 +366,23 @@ def update_openstack_tenant_usages(
     transaction.on_commit(lambda: utils.import_usage(resource))
 
 
+def import_usage_on_tenant_quotas_pulled(
+    sender, instance: openstack_models.Tenant, **kwargs
+):
+    tenant = instance
+    try:
+        resource = marketplace_models.Resource.objects.get(scope=tenant)
+    except ObjectDoesNotExist:
+        logger.debug(
+            "Skipping usages synchronization for tenant because "
+            "resource does not exist. OpenStack tenant ID: %s",
+            tenant.id,
+        )
+        return
+
+    utils.import_usage(resource)
+
+
 def create_offering_component_for_volume_type(
     sender, instance: VolumeType, created=False, **kwargs
 ):
@@ -472,16 +489,9 @@ def import_instances_and_volumes_if_tenant_has_been_imported(
 ):
     tenant = instance
 
-    if not (
-        marketplace_models.Category.objects.filter(default_vm_category=True).exists()
-        and marketplace_models.Category.objects.filter(
-            default_volume_category=True
-        ).exists()
-    ):
-        logger.info(
-            "An import of instances and volumes is impossible because categories for them are not setted."
-        )
-        return
+    # Ensure default categories exist before importing
+    utils.get_offering_category_for_instance()
+    utils.get_offering_category_for_volume()
 
     serialized_resource = core_utils.serialize_instance(tenant)
     transaction.on_commit(
@@ -580,8 +590,15 @@ def set_mtu_when_network_has_been_created(
 def update_floating_ip_external_addresses(
     sender, instance: FloatingIP, created=False, **kwargs
 ):
-    # Process if address changed OR if this is a newly created IP with an address
-    if not (instance.tracker.has_changed("address") or (created and instance.address)):
+    # Recompute when the address OR the port association changes. A floating IP
+    # is often attached to an instance port in a later save that leaves the
+    # address untouched, so triggering on address alone leaves external_address
+    # (the 1:1 NAT public IP) unset and the VM looks like it has no public IP.
+    if not (
+        instance.tracker.has_changed("address")
+        or instance.tracker.has_changed("port_id")
+        or (created and instance.address)
+    ):
         return
 
     utils.update_external_addresses_of_floating_ip(instance)

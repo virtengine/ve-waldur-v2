@@ -407,7 +407,7 @@ class OnboardingVerificationViewSet(UserChecklistMixin, core_views.ActionsViewSe
 
                 # Get questions for this checklist
                 questions = checklist.questions.all().order_by("order")
-                questions_data = checklist_serializers.QuestionAdminSerializer(
+                questions_data = checklist_serializers.QuestionWithAnswerSerializer(
                     questions, many=True, context={"request": request}
                 ).data
 
@@ -591,6 +591,15 @@ class OnboardingVerificationViewSet(UserChecklistMixin, core_views.ActionsViewSe
             raise exceptions.APIException(f"Failed to create customer: {str(e)}")
 
     create_customer_serializer_class = structure_serializers.CustomerSerializer
+
+    def perform_destroy(self, instance):
+        """
+        Mark the verification with deletion metadata before destroying.
+        This allows the pre_delete signal handler to log who deleted it.
+        """
+        instance._deleted_by = self.request.user
+        instance._deleted_by_task = False
+        return super().perform_destroy(instance)
 
 
 class OnboardingJustificationViewSet(core_views.ActionsViewSet):

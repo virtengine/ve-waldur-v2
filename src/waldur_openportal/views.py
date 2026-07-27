@@ -5,6 +5,7 @@ from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view
+from rest_framework import filters as rf_filters
 from rest_framework import permissions, response, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
@@ -17,7 +18,7 @@ from waldur_core.core import utils as core_utils
 from waldur_core.core import views as core_views
 from waldur_core.core.enums import ReviewStates
 from waldur_core.core.permissions import IsAdminOrReadOnly
-from waldur_core.core.serializers import EmptySerializer, ReviewCommentSerializer
+from waldur_core.core.serializers import ReviewCommentSerializer, StatusSerializer
 from waldur_core.core.validators import StateValidator
 from waldur_core.permissions.fixtures import ServiceProviderRole
 from waldur_core.structure import filters as structure_filters
@@ -30,6 +31,10 @@ from waldur_core.structure.permissions import IsAdminOrOwner, _has_owner_access
 from . import executors, filters, models, serializers, tasks
 
 logger = logging.getLogger(__name__)
+
+
+class ShortOrderingFilter(rf_filters.OrderingFilter):
+    ordering_param = "o"
 
 
 class AllocationViewSet(structure_views.ResourceViewSet):
@@ -47,6 +52,9 @@ class AllocationViewSet(structure_views.ResourceViewSet):
     set_limits_permissions = [structure_permissions.is_staff]
     set_limits_serializer_class = serializers.AllocationSetLimitsSerializer
 
+    @extend_schema(
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
+    )
     @action(detail=True, methods=["post"])
     def set_limits(self, request, uuid=None):
         instance = self.get_object()
@@ -76,6 +84,9 @@ class RemoteAllocationViewSet(structure_views.ResourceViewSet):
     set_limits_permissions = [structure_permissions.is_staff]
     set_limits_serializer_class = serializers.RemoteAllocationSetLimitsSerializer
 
+    @extend_schema(
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
+    )
     @action(detail=True, methods=["post"])
     def set_limits(self, request, uuid=None):
         instance = self.get_object()
@@ -100,6 +111,131 @@ class AllocationUserUsageViewSet(viewsets.ReadOnlyModelViewSet):
     )
     filter_backends = (structure_filters.GenericRoleFilter, DjangoFilterBackend)
     filterset_class = filters.AllocationUserUsageFilter
+
+
+class CachedProjectUsageReportViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = models.CachedProjectUsageReport.objects.none()
+    serializer_class = serializers.CachedProjectUsageReportSerializer
+    permission_classes = (permissions.IsAuthenticated,)
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.CachedProjectUsageReportFilter
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return models.CachedProjectUsageReport.objects.none()
+        user = self.request.user
+        qs = models.CachedProjectUsageReport.objects.all().order_by(
+            "year", "month", "project_identifier", "resource"
+        )
+        if user.is_staff or user.is_support:
+            return qs
+        # Restrict to project_identifiers reachable via allocations on projects
+        # the user has any role in, including projects in customers where the user
+        # is an organisation viewer.
+        import openportal
+
+        from waldur_core.structure.managers import get_visible_projects
+
+        from . import config
+
+        config.ensure_config_loaded()
+        accessible_project_ids = list(get_visible_projects(user))
+        portal = str(openportal.get_portal())
+        # Identifiers from allocations (covers active projects with existing allocations)
+        allocation_identifiers = set(
+            models.Allocation.objects.filter(
+                project_id__in=accessible_project_ids,
+                backend_id__isnull=False,
+            )
+            .exclude(backend_id="")
+            .values_list("backend_id", flat=True)
+        )
+        # Identifiers from remote allocations (local portal: projects on a remote cluster)
+        remote_allocation_identifiers = set(
+            models.RemoteAllocation.objects.filter(
+                project_id__in=accessible_project_ids,
+                backend_id__isnull=False,
+            )
+            .exclude(backend_id="")
+            .values_list("backend_id", flat=True)
+        )
+        # Identifiers from ProjectInfo shortnames (covers all projects)
+        shortnames = (
+            models.ProjectInfo.objects.filter(
+                project_id__in=accessible_project_ids,
+                shortname__isnull=False,
+            )
+            .exclude(shortname="")
+            .values_list("shortname", flat=True)
+        )
+        shortname_identifiers = {f"{sn}.{portal}" for sn in shortnames}
+        accessible_identifiers = (
+            allocation_identifiers
+            | remote_allocation_identifiers
+            | shortname_identifiers
+        )
+        return qs.filter(project_identifier__in=accessible_identifiers)
+
+
+class CachedProjectStorageReportViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = models.CachedProjectStorageReport.objects.none()
+    serializer_class = serializers.CachedProjectStorageReportSerializer
+    permission_classes = (permissions.IsAuthenticated,)
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.CachedProjectStorageReportFilter
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return models.CachedProjectStorageReport.objects.none()
+        user = self.request.user
+        qs = models.CachedProjectStorageReport.objects.all().order_by(
+            "year", "month", "project_identifier", "resource"
+        )
+        if user.is_staff or user.is_support:
+            return qs
+        import openportal
+
+        from waldur_core.structure.managers import get_visible_projects
+
+        from . import config
+
+        config.ensure_config_loaded()
+        accessible_project_ids = list(get_visible_projects(user))
+        portal = str(openportal.get_portal())
+        # Identifiers from allocations (covers active projects with existing allocations)
+        allocation_identifiers = set(
+            models.Allocation.objects.filter(
+                project_id__in=accessible_project_ids,
+                backend_id__isnull=False,
+            )
+            .exclude(backend_id="")
+            .values_list("backend_id", flat=True)
+        )
+        # Identifiers from remote allocations (local portal: projects on a remote cluster)
+        remote_allocation_identifiers = set(
+            models.RemoteAllocation.objects.filter(
+                project_id__in=accessible_project_ids,
+                backend_id__isnull=False,
+            )
+            .exclude(backend_id="")
+            .values_list("backend_id", flat=True)
+        )
+        # Identifiers from ProjectInfo shortnames (covers all projects)
+        shortnames = (
+            models.ProjectInfo.objects.filter(
+                project_id__in=accessible_project_ids,
+                shortname__isnull=False,
+            )
+            .exclude(shortname="")
+            .values_list("shortname", flat=True)
+        )
+        shortname_identifiers = {f"{sn}.{portal}" for sn in shortnames}
+        accessible_identifiers = (
+            allocation_identifiers
+            | remote_allocation_identifiers
+            | shortname_identifiers
+        )
+        return qs.filter(project_identifier__in=accessible_identifiers)
 
 
 class AssociationViewSet(viewsets.ReadOnlyModelViewSet):
@@ -167,6 +303,7 @@ class UserInfoViewSet(core_views.ActionsViewSet):
 
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    @extend_schema(responses={status.HTTP_200_OK: serializers.UserInfoSerializer})
     @action(detail=False, methods=["get"])
     def me(self, request):
         logger.info(f"Retrieving UserInfo for 'me'=user {request.user}")
@@ -183,6 +320,7 @@ class UserInfoViewSet(core_views.ActionsViewSet):
 
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    @extend_schema(responses={status.HTTP_200_OK: serializers.UserInfoSerializer})
     @action(detail=True, methods=["PUT"])
     def set_shortname(self, request, user=None):
         try:
@@ -257,6 +395,7 @@ class ProjectInfoViewSet(core_views.ActionsViewSet):
 
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    @extend_schema(responses={status.HTTP_200_OK: serializers.ProjectInfoSerializer})
     @action(detail=True, methods=["PUT"])
     def set_shortname(self, request, project=None):
         try:
@@ -292,6 +431,7 @@ class ProjectInfoViewSet(core_views.ActionsViewSet):
 
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    @extend_schema(responses={status.HTTP_200_OK: serializers.ProjectInfoSerializer})
     @action(detail=True, methods=["PUT"])
     def set_allowed_destinations(self, request, project=None):
         try:
@@ -657,15 +797,23 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
 
     serializer_class = serializers.ManagedProjectSerializer
     attach_serializer_class = serializers.ProjectAttachSerializer
-    detach_serializer_class = EmptySerializer
     approve_serializer_class = reject_serializer_class = ReviewCommentSerializer
 
     approve_validators = reject_validators = [
         StateValidator(ReviewStates.PENDING, state_enum=ReviewStates)
     ]
 
-    filter_backends = [GenericRoleFilter, DjangoFilterBackend]
+    filter_backends = [GenericRoleFilter, DjangoFilterBackend, ShortOrderingFilter]
     filterset_class = filters.ManagedProjectFilter
+    ordering_fields = (
+        "created",
+        "state",
+        "identifier",
+        "details__name",
+        "project_template__name",
+        "project__customer__name",
+        "project_template__offering",
+    )
 
     disabled_actions = ["create", "update", "partial_update", "retrieve", "destroy"]
 
@@ -858,6 +1006,12 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         serializer.is_valid(raise_exception=True)
         comment = serializer.validated_data.get("comment")
         project.reject(request.user, comment)
+
+        # notify project admins and managers about the rejection
+        tasks.notify_users_about_rejected_allocation.delay(
+            core_utils.serialize_instance(project)
+        )
+
         return Response(status=status.HTTP_200_OK)
 
     @extend_schema(
@@ -958,6 +1112,7 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
             )
 
     @extend_schema(
+        request=None,
         parameters=[
             OpenApiParameter(
                 name="identifier",
@@ -1004,6 +1159,42 @@ class ManagedProjectViewSet(core_views.ActionsViewSet):
         return Response(
             {"message": "Project detached successfully"}, status=status.HTTP_200_OK
         )
+
+
+class ProjectAccountingSummaryViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Read-only endpoint returning accounting summaries for projects.
+
+    Each summary contains project start/end dates, total lifetime credits,
+    total historical spend (excluding the current month), and current month spend.
+    Data is derived from invoice items and project credits via get_project_spend_info.
+
+    Staff and support users see all projects. Regular users see only projects they
+    have a membership role in (directly or via their organisation/customer).
+
+    Filterable by:
+      - project_uuid: return summary for a single project
+      - customer_uuid: return summaries for all projects in an organisation
+    """
+
+    queryset = structure_models.Project.objects.none()
+    serializer_class = serializers.ProjectAccountingSummarySerializer
+    permission_classes = (permissions.IsAuthenticated,)
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.ProjectAccountingSummaryFilter
+    lookup_field = "uuid"
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return structure_models.Project.objects.none()
+        from waldur_core.structure.managers import get_visible_projects
+
+        user = self.request.user
+        qs = structure_models.Project.objects.all().select_related("customer")
+        if user.is_staff or user.is_support:
+            return qs
+        accessible_project_ids = list(get_visible_projects(user))
+        return qs.filter(id__in=accessible_project_ids)
 
 
 class UnmanagedProjectViewSet(structure_views.ProjectViewSet):

@@ -3,14 +3,17 @@ import logging
 import requests
 from constance import config
 from django.conf import settings
+from django.contrib.contenttypes.models import ContentType
 from django.core.signing import BadSignature, TimestampSigner
 from django.db import transaction
+from django.db.models import Q
 from python_freeipa import exceptions as freeipa_exceptions
 from rest_framework import serializers
 
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
 from waldur_core.core.utils import pwgen
+from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.utils import (
     get_create_permission,
     get_customer,
@@ -165,6 +168,8 @@ def get_scope_link(scope_type, scope_uuid):
         "project": "projects",
         "organization": "organizations",
         "call": "calls",
+        "resource": "resources",
+        "resource project": "resource-projects",
     }
     api_suffix = scope_to_homeport_prefix_map.get(scope_type, "unknown")
     return core_utils.format_homeport_link(
@@ -187,9 +192,24 @@ def can_manage_invitation_with(request, scope):
     if has_permission(request, permission, scope):
         return True
 
+    # Walk up to the parent project (e.g. Resource → Project) so project
+    # admins/managers can invite into resources within their project.
+    project = getattr(scope, "project", None)
+    if project is not None and has_permission(request, permission, project):
+        return True
+
     customer = get_customer(scope)
     if has_permission(request, permission, customer):
         return True
+
+    # Also allow users who have authority over the customer org itself (e.g. CUSTOMER.OWNER)
+    # to manage invitations for any nested scope (project, offering, etc.).
+    if customer is not scope:
+        customer_permission = get_create_permission(customer)
+        if customer_permission and has_permission(
+            request, customer_permission, customer
+        ):
+            return True
 
     # In the call scope, to allow call_organizer role to manage invitation, we have to set permission scope to callmanagingorganisation
     if scope._meta.model_name == "call" and customer.callmanagingorganisation:
@@ -199,29 +219,129 @@ def can_manage_invitation_with(request, scope):
     return False
 
 
+def can_manage_permission_request(request, invitation):
+    # Approving an auto_create_project invitation creates a project and grants a
+    # PROJECT role on it (see PermissionRequest.approve), so the relevant authority
+    # is project creation within the customer rather than customer membership
+    # management. Without this, a customer role that has CREATE_PROJECT_PERMISSION
+    # but not CREATE_CUSTOMER_PERMISSION is offered the approve action in the UI
+    # yet receives a 404 from the API.
+    if invitation.auto_create_project:
+        if request.user.is_staff:
+            return True
+        return has_permission(
+            request,
+            PermissionEnum.CREATE_PROJECT_PERMISSION,
+            invitation.customer,
+        )
+    return can_manage_invitation_with(request, invitation.scope)
+
+
+def get_invitation_duplicates(scope, invitations):
+    if not invitations:
+        return []
+
+    pair_conditions = Q()
+    for item in invitations:
+        pair_conditions |= Q(email__iexact=item["email"], role=item["role"])
+
+    pending_states = [
+        InvitationState.PENDING,
+        InvitationState.PENDING_PROJECT,
+        InvitationState.REQUESTED,
+    ]
+    existing_invitations = (
+        models.Invitation.objects.filter(
+            content_type=ContentType.objects.get_for_model(scope),
+            object_id=scope.id,
+            state__in=pending_states,
+        )
+        .filter(pair_conditions)
+        .order_by("created")
+    )
+
+    existing_by_pair = {}
+    for invitation in existing_invitations:
+        key = (invitation.email.lower(), invitation.role.uuid)
+        if key not in existing_by_pair:
+            existing_by_pair[key] = invitation
+
+    duplicates = []
+    added = set()
+    seen = set()
+    for item in invitations:
+        key = (item["email"].lower(), item["role"].uuid)
+        is_request_duplicate = key in seen
+        seen.add(key)
+        if key in added:
+            continue
+        if key in existing_by_pair or is_request_duplicate:
+            existing = existing_by_pair.get(key)
+            duplicates.append(
+                {
+                    "email": item["email"],
+                    "role": item["role"].uuid,
+                    "existing_invitation_uuid": (
+                        existing.uuid if existing is not None else None
+                    ),
+                }
+            )
+            added.add(key)
+
+    return duplicates
+
+
 def get_users_for_notification_about_request_has_been_submitted(
     permission_request: models.PermissionRequest,
 ):
-    staff_users = (
+    invitation = permission_request.invitation
+
+    # Notify the users who are actually authorized to approve the request. This
+    # must mirror can_manage_permission_request: for an auto_create_project
+    # invitation approval creates a project and grants a project role within the
+    # customer, so the relevant authority is project creation within the customer
+    # (typically the customer owners), NOT customer creation. Resolving the
+    # permission from the scope type via get_create_permission() would yield
+    # CREATE_CUSTOMER_PERMISSION for a customer-scoped invitation, which no owner
+    # holds, leaving the recipient list empty.
+    if invitation.auto_create_project:
+        users = get_users_with_permission(
+            invitation.customer, PermissionEnum.CREATE_PROJECT_PERMISSION
+        )
+    else:
+        scope = invitation.scope
+        permission = get_create_permission(scope)
+        if not permission:
+            return core_models.User.objects.none()
+
+        users = get_users_with_permission(scope, permission)
+        customer = get_customer(scope)
+        if customer != scope:
+            users |= get_users_with_permission(customer, permission)
+
+    return users.exclude(email="").exclude(notifications_enabled=False)
+
+
+def get_staff_users_for_notification():
+    return (
         core_models.User.objects.filter(is_staff=True, is_active=True)
         .exclude(email="")
         .exclude(notifications_enabled=False)
     )
 
-    scope = permission_request.invitation.scope
 
-    permission = get_create_permission(scope)
-    if not permission:
-        return staff_users
-
-    users = get_users_with_permission(scope, permission)
-    customer = get_customer(scope)
-    if customer != scope:
-        users |= get_users_with_permission(customer, permission)
-
-    users = users.exclude(email="").exclude(notifications_enabled=False)
-
-    return users or staff_users
+def get_customer_notification_emails(customer):
+    """Return the customer's contact email plus its configured notification emails."""
+    emails = []
+    if customer.email:
+        emails.append(customer.email)
+    if customer.notification_emails:
+        emails += [
+            email.strip()
+            for email in customer.notification_emails.split(",")
+            if email.strip()
+        ]
+    return emails
 
 
 def post_invitation_to_url(url: str, context):

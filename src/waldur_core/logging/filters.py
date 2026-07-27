@@ -2,18 +2,23 @@ import django_filters
 from django.contrib.contenttypes.models import ContentType
 from django.db.models import Q
 from django_filters.widgets import BooleanWidget
+from drf_spectacular.plumbing import build_parameter_type
+from drf_spectacular.utils import OpenApiParameter
 from rest_framework import filters
-from rest_framework.filters import BaseFilterBackend
 
 from waldur_core.core import filters as core_filters
 from waldur_core.core import serializers as core_serializers
+from waldur_core.core import utils as core_utils
 from waldur_core.core.mixins import ScopeMixin
+from waldur_core.core.models import User
 from waldur_core.logging import models, utils
 from waldur_core.logging.event_logger import expand_event_groups
 
 
 class BaseHookFilter(django_filters.FilterSet):
-    author_uuid = django_filters.UUIDFilter(field_name="user__uuid")
+    author_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail", field_name="user__uuid"
+    )
     author_fullname = django_filters.CharFilter(
         method="filter_by_full_name", label="User full name contains"
     )
@@ -25,6 +30,10 @@ class BaseHookFilter(django_filters.FilterSet):
     author_email = django_filters.CharFilter(field_name="user__email")
     is_active = django_filters.BooleanFilter(widget=BooleanWidget)
     last_published = django_filters.DateTimeFilter()
+
+    class Meta:
+        model = models.BaseHook
+        fields = []
 
     def filter_by_full_name(self, queryset, name, value):
         return core_filters.filter_by_full_name(queryset, value, "user")
@@ -50,39 +59,21 @@ class EmailHookFilter(BaseHookFilter):
         fields = ("email",)
 
 
-class HookSummaryFilterBackend(BaseFilterBackend):
-    def filter_queryset(self, request, queryset, view):
-        """Filter each resource separately using its own filter"""
-        summary_queryset = queryset
-        filtered_querysets = []
-        for queryset in summary_queryset.querysets:
-            filter_class = self.get_queryset_filter(queryset)
-            queryset = filter_class(request.query_params, queryset=queryset).qs
-            filtered_querysets.append(queryset)
-
-        summary_queryset.querysets = filtered_querysets
-        return summary_queryset
-
-    def get_queryset_filter(self, queryset):
-        if queryset.model == models.WebHook:
-            return WebHookFilter
-        elif queryset.model == models.EmailHook:
-            return EmailHookFilter
-
-        return BaseHookFilter
-
-
 class EventFilter(django_filters.FilterSet):
     created_from = core_filters.TimestampFilter(field_name="created", lookup_expr="gte")
     created_to = core_filters.TimestampFilter(field_name="created", lookup_expr="lt")
     message = django_filters.CharFilter(lookup_expr="icontains")
-    customer_uuid = django_filters.UUIDFilter(
-        method="filter_customer_uuid", label="Customer UUID"
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        method="filter_customer_uuid",
+        label="Customer UUID",
     )
-    project_uuid = django_filters.UUIDFilter(
-        method="filter_project_uuid", label="Project UUID"
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", method="filter_project_uuid", label="Project UUID"
     )
-    user_uuid = django_filters.UUIDFilter(method="filter_user_uuid", label="User UUID")
+    user_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail", method="filter_user_uuid", label="User UUID"
+    )
     o = django_filters.OrderingFilter(fields=("created",))
 
     class Meta:
@@ -109,7 +100,16 @@ class EventFilterBackend(filters.BaseFilterBackend):
         if features:
             queryset = queryset.filter(event_type__in=expand_event_groups(features))
 
+        has_scope_filter = False
+
+        if "related_user_uuid" in request.query_params:
+            has_scope_filter = True
+            queryset = self._filter_related_user(
+                request, queryset, request.query_params["related_user_uuid"]
+            )
+
         if "scope" in request.query_params:
+            has_scope_filter = True
             field = core_serializers.GenericRelatedField(
                 related_models=utils.get_loggable_models()
             )
@@ -133,12 +133,83 @@ class EventFilterBackend(filters.BaseFilterBackend):
 
             queryset = queryset.filter(subquery)
 
-        elif not request.user.is_staff and not request.user.is_support:
+        if (
+            not has_scope_filter
+            and not request.user.is_staff
+            and not request.user.is_support
+        ):
             # If user is not staff nor support, he is allowed to see
             # events related to particular scope only.
             queryset = queryset.none()
 
         return queryset
+
+    def _filter_related_user(self, request, queryset, related_user_uuid):
+        """
+        List of events linked to the user via Feed, user_uuid, or
+        affected_user_uuid.
+        """
+        if not core_utils.is_uuid_like(related_user_uuid):
+            return queryset.none()
+
+        try:
+            related_user = User.objects.get(uuid=related_user_uuid)
+        except User.DoesNotExist:
+            return queryset.none()
+
+        requester = request.user
+        if not (
+            requester.is_staff
+            or requester.is_support
+            or related_user.pk == requester.pk
+        ):
+            return queryset.none()
+
+        content_type = ContentType.objects.get_for_model(User)
+        uuid_hex = related_user.uuid.hex
+        return queryset.filter(
+            Q(feed__content_type=content_type, feed__object_id=related_user.id)
+            | Q(context__user_uuid=uuid_hex)
+            | Q(context__affected_user_uuid=uuid_hex)
+        ).distinct()
+
+    def get_schema_operation_parameters(self, view):
+        return [
+            build_parameter_type(
+                name="event_type",
+                schema={"type": "array", "items": {"type": "string"}},
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Filter by event type. Can be specified multiple times.",
+            ),
+            build_parameter_type(
+                name="feature",
+                schema={"type": "array", "items": {"type": "string"}},
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Filter by feature (event group). Can be specified multiple times.",
+            ),
+            build_parameter_type(
+                name="scope",
+                schema={"type": "string", "format": "uri"},
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Filter by scope URL.",
+            ),
+            build_parameter_type(
+                name="related_user_uuid",
+                schema={"type": "string", "format": "uuid"},
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description=(
+                    "Filter events related to a user: Feed scope, actor "
+                    "(context.user_uuid), or affected user "
+                    "(context.affected_user_uuid). Combined with OR. "
+                    "Staff/support may target any user; others only themselves."
+                ),
+                extensions={"x-waldur-operation-id": "users_retrieve"},
+            ),
+        ]
 
 
 class EventSubscriptionFilter(django_filters.FilterSet):
@@ -153,10 +224,12 @@ class EventSubscriptionFilter(django_filters.FilterSet):
 
 class EventSubscriptionQueueFilter(django_filters.FilterSet):
     o = django_filters.OrderingFilter(fields=["created"])
-    event_subscription_uuid = django_filters.UUIDFilter(
-        field_name="event_subscription__uuid"
+    event_subscription_uuid = core_filters.RelatedUUIDFilter(
+        view_name="event-subscription-detail", field_name="event_subscription__uuid"
     )
-    offering_uuid = django_filters.UUIDFilter(field_name="offering_uuid")
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail", field_name="offering_uuid"
+    )
     object_type = django_filters.CharFilter(field_name="object_type")
 
     class Meta:
@@ -181,6 +254,33 @@ class EmailLogFilter(django_filters.FilterSet):
         ]
 
 
+class SystemLogFilter(django_filters.FilterSet):
+    source = django_filters.ChoiceFilter(choices=models.SystemLog.SourceChoices.choices)
+    instance = django_filters.CharFilter(lookup_expr="exact")
+    level = django_filters.ChoiceFilter(
+        choices=[
+            ("INFO", "INFO"),
+            ("WARNING", "WARNING"),
+            ("ERROR", "ERROR"),
+            ("CRITICAL", "CRITICAL"),
+        ]
+    )
+    level_gte = django_filters.NumberFilter(
+        field_name="level_number",
+        lookup_expr="gte",
+        help_text="Min level: 20=INFO, 30=WARNING, 40=ERROR, 50=CRITICAL",
+    )
+    created_from = core_filters.TimestampFilter(field_name="created", lookup_expr="gte")
+    created_to = core_filters.TimestampFilter(field_name="created", lookup_expr="lt")
+    logger_name = django_filters.CharFilter(lookup_expr="istartswith")
+    message = django_filters.CharFilter(lookup_expr="icontains")
+    o = django_filters.OrderingFilter(fields=["created", "level_number", "instance"])
+
+    class Meta:
+        model = models.SystemLog
+        fields = ["source", "instance", "level", "logger_name"]
+
+
 class UserDataAccessLogFilter(django_filters.FilterSet):
     """Filter for global data access logs endpoint (staff/support only)."""
 
@@ -193,8 +293,12 @@ class UserDataAccessLogFilter(django_filters.FilterSet):
     accessor_type = django_filters.ChoiceFilter(
         choices=models.UserDataAccessLog.AccessorType.CHOICES
     )
-    user_uuid = django_filters.UUIDFilter(field_name="target_user__uuid")
-    accessor_uuid = django_filters.UUIDFilter(field_name="accessor__uuid")
+    user_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail", field_name="target_user__uuid"
+    )
+    accessor_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail", field_name="accessor__uuid"
+    )
     query = django_filters.CharFilter(method="filter_by_query")
     o = django_filters.OrderingFilter(
         fields=[

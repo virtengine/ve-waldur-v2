@@ -46,6 +46,9 @@ class CustomerSection(FeatureSection):
 
     show_banking_data = Feature("Display banking related data under customer profile.")
     show_onboarding = Feature("Enable onboarding functionality.")
+    show_project_digest = Feature(
+        "Enable display of project digest configuration in organization settings."
+    )
 
 
 class ProjectSection(FeatureSection):
@@ -56,6 +59,8 @@ class ProjectSection(FeatureSection):
     estimated_cost = Feature("Render estimated cost column in projects list.")
 
     oecd_fos_2007_code = Feature("Enable OECD code.")
+
+    science_domain = Feature("Enable science domain/sub-domain selection for projects.")
 
     show_industry_flag = Feature("Show industry flag.")
 
@@ -81,13 +86,16 @@ class ProjectSection(FeatureSection):
 
     mandatory_start_date = Feature("Make the project start date mandatory.")
 
-    mandatory_end_date = Feature("Make the project end date mandatory.")
-
     show_permission_reviews = Feature(
         "Allows to show permission reviews tab and popups for projects."
     )
 
     show_kind_in_create_dialog = Feature("Show kind field in project create dialog.")
+
+    show_matrix_chat = Feature(
+        "Render the project Matrix chat UI. Backend access is gated "
+        "separately on the MATRIX_ENABLED Constance setting."
+    )
 
 
 class UserSection(FeatureSection):
@@ -113,6 +121,22 @@ class UserSection(FeatureSection):
 
     show_data_access = Feature(
         "Enable Data Access tab showing who can access user profile data."
+    )
+
+    show_identity_bridge = Feature(
+        "Show identity bridge information in user profiles and admin views."
+    )
+
+    conceal_api_token = Feature(
+        "Hide API token management tab from non-staff and non-support users."
+    )
+
+    conceal_permission_requests = Feature(
+        "Hide permission requests tab from non-staff and non-support users."
+    )
+
+    conceal_remote_accounts = Feature(
+        "Hide remote accounts tab from non-staff and non-support users."
     )
 
 
@@ -149,6 +173,10 @@ class MarketplaceSection(FeatureSection):
         "Show resource end date as a non optional column in resources list."
     )
 
+    show_posix_id_pools = Feature(
+        "Render POSIX ID pool management UI for service providers."
+    )
+
     allow_display_of_images_in_markdown = Feature(
         "Allow display of images in markdown format."
     )
@@ -156,8 +184,35 @@ class MarketplaceSection(FeatureSection):
 
     display_software_catalog = Feature("Enable display of software catalog in UI.")
 
+    show_openstack_duplicate_offerings = Feature(
+        "Show the staff diagnostics page listing tenants with duplicate "
+        "per-tenant OpenStack offerings."
+    )
+
     display_offering_partitions = Feature(
         "Enable display of offering partitions in UI."
+    )
+
+    conceal_resource_metadata = Feature(
+        "Conceal resource metadata from non-staff users in resource detail view."
+    )
+
+    hide_marketplace_from_end_users = Feature(
+        "Hide marketplace functionality from end users but allow staff access."
+    )
+    hide_organization_information_from_project_members = Feature(
+        "Hide organization information from project-level users. Organization owners, managers, and staff retain full access."
+    )
+    conceal_audit_log_from_end_users = Feature(
+        "Hide audit log tab from non-staff and non-support users."
+    )
+
+    conceal_pending_provider_orders = Feature(
+        "Hide pending provider orders section from the pending confirmations drawer."
+    )
+
+    conceal_pending_consumer_orders = Feature(
+        "Hide pending consumer orders section from the pending confirmations drawer."
     )
 
 
@@ -176,7 +231,7 @@ class SupportSection(FeatureSection):
         'Conceal "Change request" from a selection of issue types for non-staff/non-support users.'
     )
 
-    enable_llm_assistant = Feature("Enable LLM Assistant")
+    enable_llm_assistant = Feature("Enable AI Assistant")
 
 
 class InvitationsSection(FeatureSection):
@@ -206,16 +261,6 @@ class RancherSection(FeatureSection):
     apps = Feature("Render Rancher apps as a separate tab in resource details page.")
 
 
-class SlurmSection(FeatureSection):
-    class Meta:
-        key = "slurm"
-        description = "SLURM resources provisioning"
-
-    jobs = Feature(
-        "Render list of SLURM jobs as a separate tab in allocation details page."
-    )
-
-
 class OpenstackSection(FeatureSection):
     class Meta:
         key = "openstack"
@@ -234,6 +279,7 @@ class WaldurDeploymentSection(FeatureSection):
 
     send_metrics = Feature("Send telemetry metrics.")
     enable_cookie_notice = Feature("Enable cookie notice in marketplace.")
+    enable_disclaimer_area = Feature("Enable disclaimer area below the footer.")
 
 
 class ResellerSection(FeatureSection):
@@ -242,3 +288,7 @@ class ResellerSection(FeatureSection):
         description = "Reseller integrations"
 
     arrow = Feature("Enable Arrow integration menu in administration.")
+    affiliates = Feature(
+        "Show affiliate program menus and pages. Backend enforcement is "
+        "controlled separately by the AFFILIATES_ENABLED Constance setting."
+    )

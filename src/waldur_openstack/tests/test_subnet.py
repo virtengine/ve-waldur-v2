@@ -6,9 +6,23 @@ from rest_framework import status, test
 from . import factories, fixtures
 
 
-class BaseSubNetTest(test.APITransactionTestCase):
+class BaseSubNetTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
+
+
+class SubNetPortSecurityFieldTest(BaseSubNetTest):
+    def test_subnet_list_exposes_port_security_enabled_from_parent_network(self):
+        self.fixture.network.port_security_enabled = False
+        self.fixture.network.save(update_fields=["port_security_enabled"])
+        subnet = self.fixture.subnet
+        self.client.force_authenticate(self.fixture.admin)
+        url = factories.SubNetFactory.get_list_url()
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        matching = [s for s in response.data if s["uuid"] == subnet.uuid.hex]
+        self.assertEqual(len(matching), 1)
+        self.assertFalse(matching[0]["port_security_enabled"])
 
 
 @mock.patch("waldur_openstack.executors.SubNetDeleteExecutor.execute")
@@ -207,7 +221,7 @@ class SubNetUpdateActionTest(BaseSubNetTest):
 
 
 @ddt
-class SubNetRBACTest(test.APITransactionTestCase):
+class SubNetRBACTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OpenStackFixture()
         self.subnet = self.fixture.subnet

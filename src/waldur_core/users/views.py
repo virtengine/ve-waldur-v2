@@ -29,7 +29,12 @@ from waldur_core.structure import serializers as structure_serializers
 from waldur_core.structure.models import Customer, Project
 from waldur_core.users import filters, models, serializers, tasks
 from waldur_core.users.enums import InvitationState
-from waldur_core.users.utils import can_manage_invitation_with, parse_invitation_token
+from waldur_core.users.utils import (
+    can_manage_invitation_with,
+    can_manage_permission_request,
+    get_invitation_duplicates,
+    parse_invitation_token,
+)
 
 
 @extend_schema_view(
@@ -174,6 +179,38 @@ class InvitationViewSet(viewsets.ModelViewSet):
             transaction.on_commit(
                 lambda: tasks.process_invitation.delay(invitation.uuid.hex, sender)
             )
+
+    @extend_schema(
+        summary="Check for duplicate invitations",
+        description=(
+            "Returns pending invitations that already exist for the same email and role "
+            "within the given scope."
+        ),
+        request=serializers.InvitationDuplicateCheckSerializer,
+        responses=serializers.InvitationDuplicateCheckResponseSerializer,
+    )
+    @action(detail=False, methods=["post"], url_path="check-duplicates")
+    def check_duplicates(self, request):
+        serializer = serializers.InvitationDuplicateCheckSerializer(
+            data=request.data, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+
+        scope = serializer.validated_data["scope"]
+        if not can_manage_invitation_with(request, scope):
+            # Raise NotFound instead of PermissionDenied to hide invitation existence
+            raise NotFound()
+
+        invitations = serializer.validated_data["invitations"]
+        if not invitations:
+            return Response({"duplicates": []})
+
+        duplicates = get_invitation_duplicates(scope, invitations)
+
+        response_serializer = serializers.InvitationDuplicateCheckResponseSerializer(
+            {"duplicates": duplicates}
+        )
+        return Response(response_serializer.data)
 
     @extend_schema(
         summary="Approve a requested invitation",
@@ -421,6 +458,14 @@ class InvitationViewSet(viewsets.ModelViewSet):
         summary="Create group invitation",
         description="Create a new group invitation, which acts as a template for users to request permissions.",
     ),
+    update=extend_schema(
+        summary="Update a group invitation",
+        description="Update an active group invitation. Only active invitations can be edited.",
+    ),
+    partial_update=extend_schema(
+        summary="Partially update a group invitation",
+        description="Partially update an active group invitation. Only active invitations can be edited.",
+    ),
     destroy=extend_schema(
         summary="Delete a group invitation",
         description="Deletes an inactive group invitation. Only invitations that have been canceled (is_active=False) can be deleted.",
@@ -437,13 +482,40 @@ class GroupInvitationViewSet(ActionsViewSet):
     permission_classes = (rf_permissions.IsAuthenticated,)
     filterset_class = filters.GroupInvitationFilter
     lookup_field = "uuid"
-    disabled_actions = ["update", "partial_update"]
 
     def get_permissions(self):
         """Allow unauthenticated access for list and retrieve of public invitations."""
         if self.action in ("list", "retrieve"):
             return []
         return super().get_permissions()
+
+    def get_serializer_class(self):
+        if self.action in ["update", "partial_update"]:
+            return serializers.GroupInvitationUpdateSerializer
+        return super().get_serializer_class()
+
+    def perform_update(self, serializer):
+        invitation = self.get_object()
+        if not can_manage_invitation_with(self.request, invitation.scope):
+            raise NotFound()
+
+        if not invitation.is_active:
+            raise ValidationError(_("Only active invitations can be edited."))
+
+        serializer.save()
+
+        event_logger.emit(
+            "Group invitation for {scope_name} has been updated by {user_username}.",
+            event_type=EventType.USER_GROUP_INVITATION_UPDATED,
+            event_context={
+                "scope_name": invitation.scope.name,
+                "user_username": self.request.user.username,
+                "invitation": invitation,
+                "user": self.request.user,
+                "scope": invitation.scope,
+            },
+            scopes=[invitation.scope],
+        )
 
     @extend_schema(
         summary="List projects for a customer-scoped group invitation",
@@ -507,27 +579,44 @@ class GroupInvitationViewSet(ActionsViewSet):
     @extend_schema(
         summary="Submit a permission request",
         description="Creates a permission request based on a group invitation for the currently authenticated user. If the invitation has auto_approve enabled and the user matches the required patterns, the request is automatically approved.",
-        request=None,
-        responses=serializers.SubmitRequestResponseSerializer,
+        request=serializers.SubmitRequestSerializer,
+        responses={200: serializers.SubmitRequestResponseSerializer},
     )
     @action(detail=True, methods=["post"], filter_backends=[])
     def submit_request(self, request, uuid=None):
         invitation: models.GroupInvitation = self.get_object()
         user = request.user
 
+        request_serializer = serializers.SubmitRequestSerializer(data=request.data)
+        request_serializer.is_valid(raise_exception=True)
+
         if not invitation.is_active:
             raise ValidationError(_("Only pending invitation can be requested."))
 
-        # Authentication is required for submitting requests (handled by permission classes)
+        # Check if user already has the requested role in the scope
+        if has_user(invitation.scope, user, invitation.role):
+            raise ValidationError(_("User already has this role in the scope."))
 
-        if (
-            models.PermissionRequest.objects.filter(
-                invitation=invitation, created_by=user
-            )
-            .exclude(state__in=(ReviewStates.REJECTED, ReviewStates.CANCELED))
-            .exists()
-        ):
-            raise ValidationError(_("Request has been created already."))
+        # Check if multiple roles are disabled for this scope
+        if config.INVITATION_DISABLE_MULTIPLE_ROLES:
+            if UserRole.objects.filter(
+                user=user,
+                is_active=True,
+                content_type=invitation.content_type,
+                object_id=invitation.object_id,
+            ).exists():
+                raise ValidationError(_("User already has role within this scope."))
+
+        if not invitation.allow_multiple_requests:
+            if models.PermissionRequest.objects.filter(
+                invitation__content_type=invitation.content_type,
+                invitation__object_id=invitation.object_id,
+                created_by=user,
+                state__in=[ReviewStates.PENDING, ReviewStates.APPROVED],
+            ).exists():
+                raise ValidationError(
+                    _("Permission request already exists for this scope.")
+                )
 
         allowed = invitation in models.GroupInvitation.get_objects_by_user_patterns(
             user, required=False
@@ -542,18 +631,34 @@ class GroupInvitationViewSet(ActionsViewSet):
         # Validate user against scope's email/affiliation restrictions
         validate_user_restrictions(invitation.scope, user)
 
+        # Only use custom project details if the invitation allows it
+        project_name = ""
+        project_description = ""
+        if invitation.allow_custom_project_details:
+            project_name = request_serializer.validated_data.get("project_name", "")
+            project_description = request_serializer.validated_data.get(
+                "project_description", ""
+            )
+
         permission_request = models.PermissionRequest.objects.create(
             invitation=invitation,
             created_by=request.user,
+            project_name=project_name,
+            project_description=project_description,
         )
 
         permission_request.submit()
 
         # Auto-approve if invitation is configured for auto-approval
         auto_approved = False
+        project_uuid = None
+        project_created = None
         if invitation.auto_approve:
-            permission_request.approve(request.user)
+            result = permission_request.approve(request.user)
             auto_approved = True
+            if result and result.get("project") is not None:
+                project_uuid = result["project"].uuid.hex
+                project_created = bool(result.get("project_created"))
 
         # Get scope details safely
         scope_name = ""
@@ -569,6 +674,8 @@ class GroupInvitationViewSet(ActionsViewSet):
                 "scope_name": scope_name,
                 "scope_uuid": scope_uuid,
                 "auto_approved": auto_approved,
+                "project_uuid": project_uuid,
+                "project_created": project_created,
             }
         )
         response_serializer.is_valid(raise_exception=True)
@@ -596,6 +703,10 @@ class GroupInvitationViewSet(ActionsViewSet):
         summary="Retrieve permission request",
         description="Retrieve details of a specific permission request.",
     ),
+    destroy=extend_schema(
+        summary="Delete a permission request (staff only)",
+        description="Deletes a permission request. This action is restricted to staff users.",
+    ),
 )
 class PermissionRequestViewSet(ReadOnlyActionsViewSet):
     queryset = models.PermissionRequest.objects.all().order_by("-created")
@@ -611,8 +722,8 @@ class PermissionRequestViewSet(ReadOnlyActionsViewSet):
     def perform_action(self, request, uuid, action_name):
         permission_request: models.PermissionRequest = self.get_object()
 
-        if not can_manage_invitation_with(
-            self.request, permission_request.invitation.scope
+        if not can_manage_permission_request(
+            self.request, permission_request.invitation
         ):
             # Raise NotFound instead of PermissionDenied to hide invitation existence
             raise NotFound()
@@ -689,6 +800,22 @@ class PermissionRequestViewSet(ReadOnlyActionsViewSet):
             response_serializer.data,
             status=status.HTTP_200_OK,
         )
+
+    disabled_actions = ["create", "update", "partial_update"]
+
+    @extend_schema(
+        summary="Delete a permission request (staff only)",
+        description="Deletes a permission request. This action is restricted to staff users.",
+        responses={204: None},
+    )
+    def destroy(self, request, uuid=None):
+        permission_request = self.get_object()
+
+        if not request.user.is_staff:
+            raise PermissionDenied()
+
+        permission_request.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     approve_serializer_class = reject_serializer_class = (
         core_serializers.ReviewCommentSerializer

@@ -31,7 +31,6 @@ from waldur_openstack.models import (
 )
 from waldur_openstack.serializers import (
     _generate_subnet_allocation_pool,
-    can_create_tenant,
     validate_private_subnet_cidr,
 )
 from waldur_openstack.utils import (
@@ -87,7 +86,7 @@ class MigrationDetailsSerializer(serializers.ModelSerializer):
         )
 
     mappings = MappingSerializer()
-    state = serializers.ReadOnlyField(source="get_state_display")
+    state = serializers.CharField(read_only=True, source="get_state_display")
 
     created_by_uuid = serializers.UUIDField(read_only=True, source="created_by.uuid")
     created_by_full_name = serializers.ReadOnlyField(source="created_by.full_name")
@@ -109,8 +108,8 @@ class MigrationDetailsSerializer(serializers.ModelSerializer):
         read_only=True, source="dst_resource.uuid"
     )
     dst_resource_name = serializers.ReadOnlyField(source="dst_resource.name")
-    dst_resource_state = serializers.ReadOnlyField(
-        source="dst_resource.get_state_display"
+    dst_resource_state = serializers.CharField(
+        read_only=True, source="dst_resource.get_state_display"
     )
 
 
@@ -182,7 +181,6 @@ class MigrationCreateSerializer(serializers.ModelSerializer):
             validate_plan(dst_plan)
 
         user = self.context["request"].user
-        can_create_tenant(user, dst_project)
         order = Order(
             project=dst_project,
             offering=dst_offering,

@@ -1,6 +1,7 @@
 import datetime
 
 from ddt import data, ddt
+from django.test import override_settings
 from freezegun import freeze_time
 from rest_framework import status, test
 
@@ -12,7 +13,7 @@ from waldur_mastermind.policy.tests import factories, fixtures
 
 
 @ddt
-class GetPolicyTest(test.APITransactionTestCase):
+class GetPolicyTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OfferingUsagePolicyFixture()
         self.offering = self.fixture.offering
@@ -35,7 +36,7 @@ class GetPolicyTest(test.APITransactionTestCase):
 
 
 @ddt
-class CreatePolicyTest(test.APITransactionTestCase):
+class CreatePolicyTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OfferingUsagePolicyFixture()
         self.offering = self.fixture.offering
@@ -89,7 +90,7 @@ class CreatePolicyTest(test.APITransactionTestCase):
 
 
 @ddt
-class DeletePolicyTest(test.APITransactionTestCase):
+class DeletePolicyTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OfferingUsagePolicyFixture()
         self.policy = self.fixture.policy
@@ -111,7 +112,7 @@ class DeletePolicyTest(test.APITransactionTestCase):
 
 
 @ddt
-class UpdatePolicyTest(test.APITransactionTestCase):
+class UpdatePolicyTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OfferingUsagePolicyFixture()
         self.policy = self.fixture.policy
@@ -143,7 +144,8 @@ class UpdatePolicyTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
-class OfferingUsagePolicyTriggerTest(test.APITransactionTestCase):
+@override_settings(task_always_eager=True)
+class OfferingUsagePolicyTriggerTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.OfferingUsagePolicyFixture()
         self.customer = self.fixture.customer

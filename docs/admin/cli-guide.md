@@ -7,9 +7,9 @@ AI Assistant management commands.
   Available subcommands:
 
 ```yaml
-health       - Check LLM infrastructure health
+health       - Check AI Assistant infrastructure health
 validate_scenarios - Validate scenario YAML files
-test_evaluation   - Test evaluation with real LLM responses
+test_evaluation   - Test evaluation with real AI Assistant responses
 run_all       - Run all checks (health, validate, test)
 ```
 
@@ -25,18 +25,43 @@ waldur ai_assistant run_all
 
 ```bash
 
-usage: waldur ai_assistant {health,validate_scenarios,test_evaluation,run_all}
-                           ...
+usage: waldur ai_assistant
+                           {health,validate_scenarios,test_evaluation,run_all} ...
 
 positional arguments:
   {health,validate_scenarios,test_evaluation,run_all}
                         Available subcommands
-    health              Check LLM infrastructure health
+    health              Check AI Assistant infrastructure health
     validate_scenarios  Validate scenario YAML files
-    test_evaluation     Test evaluation with real LLM responses
+    test_evaluation     Test evaluation with real AI Assistant responses
     run_all             Run all checks (health, validate, test)
 
 ```
+
+## archive_offering
+
+Archive an offering and terminate all its resources (including child offerings' resources), or clean up invoice items for already-terminated resources.
+
+```bash
+
+usage: waldur archive_offering [--dry-run]
+                               {terminate,cleanup-invoices} offering_uuid
+
+positional arguments:
+  {terminate,cleanup-invoices}
+                        terminate: archive offering(s) and terminate all non-
+                        terminated resources. cleanup-invoices: remove current
+                        month invoice items for terminated resources.
+  offering_uuid         UUID of the parent offering to process.
+
+options:
+  --dry-run             List affected resources/items without making changes.
+
+```
+
+## audit_broker_config
+
+Audit Celery / RabbitMQ broker configuration for common publisher-reliability misconfigurations.
 
 ## axes_list_attempts
 
@@ -112,6 +137,38 @@ positional arguments:
 
 ```
 
+## backfill_plan_periods
+
+Backfill plan_period on ComponentUsage records where it is NULL. This fixes incorrect quarterly/annual/total usage calculations caused by ComponentUsage records created without a plan_period.
+
+```bash
+
+usage: waldur backfill_plan_periods [--dry-run] [--offering OFFERING_UUID]
+                                    [--resource RESOURCE_UUID]
+                                    [--start-date START_DATE]
+                                    [--end-date END_DATE]
+
+options:
+  --dry-run             Only show what would be done without making changes.
+  --offering OFFERING_UUID
+                        Only process resources belonging to the offering with
+                        this UUID.
+  --resource RESOURCE_UUID
+                        Only process the resource with this UUID.
+  --start-date START_DATE
+                        Only backfill ComponentUsage records whose
+                        billing_period is on or after this date (format: YYYY-
+                        MM-DD).
+  --end-date END_DATE   Only backfill ComponentUsage records whose
+                        billing_period is on or before this date (format:
+                        YYYY-MM-DD).
+
+```
+
+## check_provider_helpdesks
+
+Check connectivity of all active provider helpdesks.
+
 ## clean_celery_results
 
 Clean up old Celery task results from the database to prevent bloat.
@@ -184,6 +241,22 @@ options:
 
 ```
 
+## cleanup_usage_poll_records
+
+Delete ComponentUsagePollRecord entries.
+
+```bash
+
+usage: waldur cleanup_usage_poll_records
+                                         [--older-than-months OLDER_THAN_MONTHS]
+
+options:
+  --older-than-months OLDER_THAN_MONTHS
+                        Only delete records older than N months (0 = delete
+                        all).
+
+```
+
 ## copy_category
 
 Copy structure of categories for the Marketplace
@@ -221,9 +294,29 @@ Create a user with a specified username and password. User will be created as st
 usage: waldur createstaffuser -u USERNAME -p PASSWORD -e EMAIL
 
 options:
-  -u USERNAME, --username USERNAME
-  -p PASSWORD, --password PASSWORD
-  -e EMAIL, --email EMAIL
+  -u, --username USERNAME
+  -p, --password PASSWORD
+  -e, --email EMAIL
+
+```
+
+## dedupe_tenant_offerings
+
+Report and optionally resolve tenants that have more than one per-tenant OpenStack.Instance/Volume offering.
+
+```bash
+
+usage: waldur dedupe_tenant_offerings [--tenant TENANT_ID] [--apply] [--merge]
+
+options:
+  --tenant TENANT_ID  Restrict to a single OpenStack tenant (by numeric id).
+                      Matches the tenant id printed in the self-heal ERROR
+                      log.
+  --apply             Delete empty duplicate offerings. Without this flag the
+                      command only reports (dry-run).
+  --merge             Also resolve duplicates that still own resources/orders
+                      by re-pointing them onto the keeper before deletion.
+                      Requires --apply.
 
 ```
 
@@ -331,9 +424,8 @@ Dumps information about users, their organizations and projects.
 usage: waldur dumpusers [-o OUTPUT]
 
 options:
-  -o OUTPUT, --output OUTPUT
-                        Specifies file to which the output is written. The
-                        output will be printed to stdout by default.
+  -o, --output OUTPUT  Specifies file to which the output is written. The
+                       output will be printed to stdout by default.
 
 ```
 
@@ -347,9 +439,9 @@ usage: waldur evaluate_slurm_policy -p POLICY_UUID [-r RESOURCE_UUID] [--sync]
                                     [--dry-run]
 
 options:
-  -p POLICY_UUID, --policy POLICY_UUID
+  -p, --policy POLICY_UUID
                         UUID of the SlurmPeriodicUsagePolicy to evaluate.
-  -r RESOURCE_UUID, --resource RESOURCE_UUID
+  -r, --resource RESOURCE_UUID
                         UUID of a specific resource to evaluate. If omitted,
                         evaluates all resources in the policy's offering.
   --sync                Run evaluation synchronously (blocking) instead of
@@ -372,9 +464,8 @@ Export OIDC auth configuration as YAML format
 usage: waldur export_auth_social [-o OUTPUT]
 
 options:
-  -o OUTPUT, --output OUTPUT
-                        Specifies file to which the output is written. The
-                        output will be printed to stdout by default.
+  -o, --output OUTPUT  Specifies file to which the output is written. The
+                       output will be printed to stdout by default.
 
 ```
 
@@ -391,9 +482,9 @@ Export an offering from Waldur. Export data includes JSON file with an offering 
 usage: waldur export_offering -o OFFERING -p PATH
 
 options:
-  -o OFFERING, --offering OFFERING
+  -o, --offering OFFERING
                         An offering UUID.
-  -p PATH, --path PATH  Path to the folder where the export data will be
+  -p, --path PATH       Path to the folder where the export data will be
                         saved.
 
 ```
@@ -458,12 +549,30 @@ waldur export_structure --output /path/to/structure.json
 
 ```bash
 
-usage: waldur export_structure -o OUTPUT [--verbose]
+usage: waldur export_structure -o OUTPUT [--verbose] [--include-events]
 
 options:
-  -o OUTPUT, --output OUTPUT
-                        Path to the output JSON file.
-  --verbose             Enable verbose logging output
+  -o, --output OUTPUT  Path to the output JSON file.
+  --verbose            Enable verbose logging output
+  --include-events     Include audit log events related to invoicing, credits
+                       and policies.
+
+```
+
+## generate_appservice_registration
+
+Generate a Matrix Application Service registration YAML for the homeserver.
+
+```bash
+
+usage: waldur generate_appservice_registration [--url URL]
+                                               [--as-token AS_TOKEN]
+                                               [--hs-token HS_TOKEN]
+
+options:
+  --url URL            Base URL of the Waldur instance.
+  --as-token AS_TOKEN  Override as_token (default: read from constance).
+  --hs-token HS_TOKEN  Override hs_token (default: read from constance).
 
 ```
 
@@ -485,12 +594,12 @@ positional arguments:
   app_label             Name of the application or applications.
 
 options:
-  --output OUTPUT_FILE, -o OUTPUT_FILE
+  --output, -o OUTPUT_FILE
                         Save the diagram to a file.
-  --include-models INCLUDE_MODELS, -i INCLUDE_MODELS
+  --include-models, -i INCLUDE_MODELS
                         Models to include (comma-separated, wildcards
                         supported).
-  --exclude-models EXCLUDE_MODELS, -e EXCLUDE_MODELS
+  --exclude-models, -e EXCLUDE_MODELS
                         Models to exclude (comma-separated, wildcards
                         supported).
   --exclude-field-types EXCLUDE_FIELD_TYPES
@@ -498,11 +607,15 @@ options:
                         'TranslationCharField,JsonField').
   --verbose-names       Use model and field verbose_names.
   --no-inheritance      Don't draw inheritance arrows.
-  --direction {TB,BT,LR,RL}, -d {TB,BT,LR,RL}
+  --direction, -d {TB,BT,LR,RL}
                         Direction of the diagram layout.
   --disable-fields      Don't show fields, only model names and relationships.
 
 ```
+
+## helpdesk_stats
+
+Display helpdesk statistics summary.
 
 ## import_ami_catalog
 
@@ -575,12 +688,12 @@ usage: waldur import_offering -p PATH [-c CUSTOMER] [-ct CATEGORY]
                               [-o OFFERING]
 
 options:
-  -p PATH, --path PATH  File path to offering data.
-  -c CUSTOMER, --customer CUSTOMER
+  -p, --path PATH       File path to offering data.
+  -c, --customer CUSTOMER
                         Customer UUID.
-  -ct CATEGORY, --category CATEGORY
+  -ct, --category CATEGORY
                         Category UUID.
-  -o OFFERING, --offering OFFERING
+  -o, --offering OFFERING
                         Updated offering UUID.
 
 ```
@@ -597,9 +710,8 @@ usage: waldur import_reppu_usages [-m MONTH] [-y YEAR]
                                   [--dry-run | --no-dry-run]
 
 options:
-  -m MONTH, --month MONTH
-                        Month for which data is imported.
-  -y YEAR, --year YEAR  Year for which data is imported.
+  -m, --month MONTH     Month for which data is imported.
+  -y, --year YEAR       Year for which data is imported.
   --reppu-api-url REPPU_API_URL
                         Reppu API URL.
   --reppu-api-token REPPU_API_TOKEN
@@ -655,8 +767,7 @@ usage: waldur import_structure -i INPUT [--update] [--skip-users]
                                [--skip-rabbitmq-messages] [--skip-user-sync]
 
 options:
-  -i INPUT, --input INPUT
-                        Path to the input JSON file.
+  -i, --input INPUT     Path to the input JSON file.
   --update              Update existing objects instead of skipping them.
   --skip-users          Skip importing users.
   --skip-roles          Skip importing roles and role permissions.
@@ -679,6 +790,22 @@ usage: waldur import_tenant_quotas [--dry-run]
 options:
   --dry-run  Don't make any changes, instead show what objects would be
              created.
+
+```
+
+## init_component_usage_reporting
+
+Backfills the ComponentUsageMonthly reporting table with historical data. Safe to run multiple times (idempotent).
+
+```bash
+
+usage: waldur init_component_usage_reporting [--months MONTHS] [--all-time]
+
+options:
+  --months MONTHS  Number of months to look back (default: 12). Use 0 for
+                   current month only.
+  --all-time       Calculate from the oldest invoice in the database to the
+                   current month.
 
 ```
 
@@ -743,14 +870,15 @@ options:
 
 ## load_notifications
 
-Import notifications to DB
+Sync notifications and their templates from a JSON/YAML config file to the DB.
 
 ```bash
 
 usage: waldur load_notifications notifications_file
 
 positional arguments:
-  notifications_file  Specifies location of notifications file.
+  notifications_file  Path to a JSON or YAML file mapping notification keys to
+                      their enabled status (bool).
 
 ```
 
@@ -785,9 +913,9 @@ Imports privacy policy and terms of service into DB
 usage: waldur load_user_agreements [-tos TOS] [-pp PP] [-l LANGUAGE] [-f]
 
 options:
-  -tos TOS, --tos TOS   Path to a Terms of service file
-  -pp PP, --pp PP       Path to a Privacy policy file
-  -l LANGUAGE, --language LANGUAGE
+  -tos, --tos TOS       Path to a Terms of service file
+  -pp, --pp PP          Path to a Privacy policy file
+  -l, --language LANGUAGE
                         ISO 639-1 language code (e.g., 'en', 'de', 'et').
                         Leave empty for the default version.
   -f, --force           Force loading agreements even if they are already
@@ -827,9 +955,9 @@ usage: waldur move_project -p PROJECT_UUID -c CUSTOMER_UUID
                            [--preserve-user-permissions]
 
 options:
-  -p PROJECT_UUID, --project PROJECT_UUID
+  -p, --project PROJECT_UUID
                         UUID of a project to move.
-  -c CUSTOMER_UUID, --customer CUSTOMER_UUID
+  -c, --customer CUSTOMER_UUID
                         Target organization UUID
   --preserve-user-permissions
                         Preserve user permissions
@@ -845,9 +973,9 @@ Move a marketplace resource to a different project.
 usage: waldur move_resource -p PROJECT_UUID -r RESOURCE_UUID
 
 options:
-  -p PROJECT_UUID, --project PROJECT_UUID
+  -p, --project PROJECT_UUID
                         Target project UUID
-  -r RESOURCE_UUID, --resource RESOURCE_UUID
+  -r, --resource RESOURCE_UUID
                         UUID of a marketplace resource to move.
 
 ```
@@ -861,10 +989,9 @@ Dumps information about organization access subnets, merging adjacent or overlap
 usage: waldur organization_access_subnets [-o OUTPUT]
 
 options:
-  -o OUTPUT, --output OUTPUT
-                        Specifies file to which the merged subnets will be
-                        written. The output will be printed to stdout by
-                        default.
+  -o, --output OUTPUT  Specifies file to which the merged subnets will be
+                       written. The output will be printed to stdout by
+                       default.
 
 ```
 
@@ -921,19 +1048,18 @@ positional arguments:
 
 ## override_templates
 
-Override templates
+Override dbtemplates content from a YAML file. Use --clean to remove DB templates not present in the file.
 
 ```bash
 
-usage: waldur override_templates [-c CLEAN] templates_file
+usage: waldur override_templates [-c] templates_file
 
 positional arguments:
-  templates_file        Specifies location of templates file.
+  templates_file  Path to a YAML file mapping template names to their content.
 
 options:
-  -c CLEAN, --clean CLEAN
-                        This flag means total synchronization with the
-                        template file you pass.
+  -c, --clean     Remove DB templates whose names are not present in the file
+                  (full sync mode).
 
 ```
 
@@ -946,7 +1072,7 @@ Load data with disabled signals.
 usage: waldur pgmigrate [--path PATH]
 
 options:
-  --path PATH, -p PATH  Path to dumped database.
+  --path, -p PATH  Path to dumped database.
 
 ```
 
@@ -1023,6 +1149,42 @@ options:
 
 Prints all Waldur feature description as typescript code.
 
+## probe_broker_latency
+
+Publish N no-op messages and report publish-confirm RTT percentiles. Safe on production; messages have no effect.
+
+```bash
+
+usage: waldur probe_broker_latency [--samples SAMPLES] [--countdown COUNTDOWN]
+                                   [--p99-threshold-ms P99_THRESHOLD_MS]
+                                   [--policy-class POLICY_CLASS] [--json]
+
+options:
+  --samples SAMPLES     Number of publishes to attempt (default: 100).
+  --countdown COUNTDOWN
+                        Celery countdown in seconds. The probe payload lands
+                        in a celery_delayed_* bucket sized for this delay and
+                        never executes within the probe's lifetime (default:
+                        86400).
+  --p99-threshold-ms P99_THRESHOLD_MS
+                        If set, exit non-zero when p99 publish-confirm RTT
+                        exceeds this many milliseconds. Useful for CI
+                        alerting.
+  --policy-class POLICY_CLASS
+                        Dotted path of a policy class for the no-op payload
+                        (default: waldur_mastermind.policy.models.OfferingEsti
+                        matedCostPolicy). Any class that
+                        evaluate_policies_async can import will work; the task
+                        body short-circuits because scope_id=-1 matches no
+                        rows.
+  --json                Emit results as a single JSON object on stdout.
+
+```
+
+## pull_openstack_usage
+
+Trigger OpenStack usage billing poll synchronously.
+
 ## pull_openstack_volume_metadata
 
 Pull OpenStack volumes metadata to marketplace.
@@ -1067,6 +1229,58 @@ Create or update price estimates based on invoices.
 
 Remove Django event log records with stale content types.
 
+## resource_access_subnets
+
+Dumps per-resource access subnets for consumption by external firewalls, merging adjacent or overlapping networks. Only resources of offerings that opt in via the enable_resource_access_subnets plugin option have subnets.
+
+```bash
+
+usage: waldur resource_access_subnets [-r OFFERING] [-o OUTPUT]
+
+options:
+  -r, --offering OFFERING
+                        Limit the dump to resources of the offering with the
+                        given UUID.
+  -o, --output OUTPUT   Specifies file to which the merged subnets will be
+                        written. The output will be printed to stdout by
+                        default.
+
+```
+
+## retry_failed_routing
+
+Retry routing for issues that failed to be routed to a provider.
+
+```bash
+
+usage: waldur retry_failed_routing [--dry-run]
+
+options:
+  --dry-run  Only list issues that would be retried, without actually
+             retrying.
+
+```
+
+## scim_pull_user
+
+Pull user attributes from a remote SCIM 2.0 directory.
+
+```bash
+
+usage: waldur scim_pull_user (--username USERNAME | --all) [--rate RATE]
+                             [--source SOURCE]
+
+options:
+  --username USERNAME  Pull a single user identified by their Waldur username.
+  --all                Pull every active user. Rate-limited (see --rate).
+  --rate RATE          Maximum requests per second when using --all (default:
+                       5).
+  --source SOURCE      Override the source label written to attribute_sources.
+                       Defaults to the SCIM_PULL_SOURCE_NAME Constance
+                       setting.
+
+```
+
 ## set_constance_image
 
 A custom command to set Constance image configs with CLI
@@ -1090,9 +1304,9 @@ Set or remove language-specific login logos
 usage: waldur set_login_logo_language -l LANGUAGE [-f FILE] [-r]
 
 options:
-  -l LANGUAGE, --language LANGUAGE
+  -l, --language LANGUAGE
                         ISO 639-1 language code (e.g., 'de', 'et', 'fr')
-  -f FILE, --file FILE  Path to the logo image file
+  -f, --file FILE       Path to the logo image file
   -r, --remove          Remove the language-specific logo
 
 ```
@@ -1107,10 +1321,10 @@ usage: waldur slurm_policy_status [-p POLICY_UUID] [-r RESOURCE_UUID]
                                   [--logs LOGS] [--commands COMMANDS]
 
 options:
-  -p POLICY_UUID, --policy POLICY_UUID
+  -p, --policy POLICY_UUID
                         UUID of a specific policy. If omitted, shows all SLURM
                         policies.
-  -r RESOURCE_UUID, --resource RESOURCE_UUID
+  -r, --resource RESOURCE_UUID
                         Filter output to a specific resource UUID.
   --logs LOGS           Number of recent evaluation logs to display (default:
                         10).
@@ -1160,6 +1374,31 @@ options:
 ## sync_saml2_providers
 
 Synchronize SAML2 identity providers.
+
+## validate_openstack_billing
+
+Audit OpenStack instance flavor-derived billing against Placement allocations. Read-only: reports drift, changes nothing.
+
+```bash
+
+usage: waldur validate_openstack_billing [--month MONTH]
+                                         [--service-settings SERVICE_SETTINGS]
+                                         [--flag-untracked] [--quiet]
+
+options:
+  --month MONTH         Reporting period as YYYY-MM. Defaults to the current
+                        month. Instances created after the end of the month
+                        are excluded.
+  --service-settings SERVICE_SETTINGS
+                        Limit the audit to a single OpenStack ServiceSettings
+                        UUID.
+  --flag-untracked      Also report Placement resource classes (e.g. VGPU)
+                        that have no matching OfferingComponent on the plan —
+                        i.e. silent under-billing.
+  --quiet               Only print drift rows and the summary, suppress
+                        progress output.
+
+```
 
 ## validate_openstack_services
 

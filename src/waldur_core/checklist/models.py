@@ -2,7 +2,6 @@ import base64
 import datetime
 import uuid
 
-import magic
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
@@ -177,6 +176,60 @@ class Question(core_models.UuidMixin, core_models.DescribableMixin):
         ),
     )
 
+    # Likert scale validation fields
+    likert_scale_length = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        choices=enums.LikertScaleLengths.CHOICES,
+        help_text=_(
+            "Number of points on the Likert scale (3, 5, or 7). "
+            "Required for LIKERT type questions."
+        ),
+    )
+    likert_low_label = models.CharField(
+        max_length=200,
+        blank=True,
+        default="",
+        help_text=_(
+            "Label for the lowest point on the Likert scale "
+            "(e.g. 'Strongly disagree'). Optional."
+        ),
+    )
+    likert_high_label = models.CharField(
+        max_length=200,
+        blank=True,
+        default="",
+        help_text=_(
+            "Label for the highest point on the Likert scale "
+            "(e.g. 'Strongly agree'). Optional."
+        ),
+    )
+    likert_allow_na = models.BooleanField(
+        default=False,
+        help_text=_(
+            "Allow respondents to choose 'N/A' as an answer for LIKERT type questions."
+        ),
+    )
+
+    # Rich text validation fields
+    rich_text_char_limit = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=_(
+            "Maximum number of characters allowed in RICH_TEXT type answers. "
+            "If not set, no limit is enforced."
+        ),
+    )
+    rich_text_toolbar_level = models.CharField(
+        max_length=10,
+        blank=True,
+        default=enums.RichTextToolbarLevels.STANDARD,
+        choices=enums.RichTextToolbarLevels.CHOICES,
+        help_text=_(
+            "Toolbar level for the rich text editor: 'minimal', 'standard', or 'extended'."
+        ),
+    )
+
     class Meta:
         ordering = (
             "checklist",
@@ -241,6 +294,28 @@ class Question(core_models.UuidMixin, core_models.DescribableMixin):
         if self.question_type in ["file", "multiple_files"] and answer_data is not None:
             return self.is_valid_file_answer(answer_data)
 
+        # Additional validation for LIKERT type with scale length constraint
+        if self.question_type == enums.QuestionTypes.LIKERT and answer_data is not None:
+            if answer_data == "na":
+                return bool(self.likert_allow_na)
+            if not isinstance(answer_data, int) or isinstance(answer_data, bool):
+                return False
+            scale_length = self.likert_scale_length or enums.LikertScaleLengths.FIVE
+            return 0 <= answer_data < scale_length
+
+        # Additional validation for RICH_TEXT type with character limit
+        if (
+            self.question_type == enums.QuestionTypes.RICH_TEXT
+            and answer_data is not None
+        ):
+            if not isinstance(answer_data, str):
+                return False
+            if (
+                self.rich_text_char_limit is not None
+                and len(answer_data) > self.rich_text_char_limit
+            ):
+                return False
+
         return True
 
     def _process_single_file(self, file_data, validate_only=False):
@@ -267,6 +342,8 @@ class Question(core_models.UuidMixin, core_models.DescribableMixin):
             raise ValueError("Empty file content after decoding")
 
         # Detect MIME type from actual content for security
+        import magic
+
         detected_mime_type = magic.from_buffer(file_content[:1024], mime=True)
 
         # Check file extension if restrictions are set
@@ -330,6 +407,13 @@ class Question(core_models.UuidMixin, core_models.DescribableMixin):
         # Validate each file using the helper method
         try:
             for file_data in files:
+                # Skip already-processed files (have stored_file_id, no raw content)
+                if (
+                    isinstance(file_data, dict)
+                    and "stored_file_id" in file_data
+                    and "content" not in file_data
+                ):
+                    continue
                 self._process_single_file(file_data, validate_only=True)
             return True
         except Exception:
@@ -348,6 +432,15 @@ class Question(core_models.UuidMixin, core_models.DescribableMixin):
         processed_files = []
 
         for file_data in files:
+            # Skip already-processed files (have stored_file_id, no raw content)
+            if (
+                isinstance(file_data, dict)
+                and "stored_file_id" in file_data
+                and "content" not in file_data
+            ):
+                processed_files.append(file_data)
+                continue
+
             try:
                 # Use the helper method to process and validate the file
                 processed_data = self._process_single_file(
@@ -540,6 +633,9 @@ class QuestionDependency(core_models.UuidMixin, TimeStampedModel):
 
     def question_is_visible(self, completion):
         """Check if dependency condition is satisfied in the completion context"""
+        if not completion.pk:
+            return False
+
         answer_to_base_question = completion.answers.filter(
             question=self.depends_on_question
         ).first()
@@ -707,11 +803,13 @@ class Answer(core_models.UuidMixin, TimeStampedModel):
 
     def save(self, *args, **kwargs):
         """Auto-check if review is required and process file content when saving"""
-        if not self.pk:
-            # Process file content if this is a file question
-            if self.question.question_type in ["file", "multiple_files"]:
-                self.answer_data = self.question.process_file_answer(self.answer_data)
+        # Process file content on both create and update.
+        # process_file_answer is idempotent: already-processed files (with stored_file_id)
+        # are skipped, so re-saving a processed answer is safe.
+        if self.question.question_type in ["file", "multiple_files"]:
+            self.answer_data = self.question.process_file_answer(self.answer_data)
 
+        if not self.pk:
             self.requires_review = self.question.should_trigger_review(self.answer_data)
 
         super().save(*args, **kwargs)

@@ -28,10 +28,10 @@ class ReviewerDashboardViewSet(ReviewerChecklistMixin, ReadOnlyActionsViewSet):
 from drf_spectacular.plumbing import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import decorators, response, status
-from rest_framework import permissions as rf_permissions
 
 from waldur_core.checklist import models as checklist_models
 from waldur_core.checklist import serializers as checklist_serializers
+from waldur_core.core.permissions import PATScopeAwareIsAdminUser
 
 
 class BaseChecklistMixin:
@@ -81,9 +81,9 @@ class UserChecklistMixin(BaseChecklistMixin):
     """
 
     # Default permissions - should be overridden by inheriting viewsets
-    checklist_permissions = [rf_permissions.IsAdminUser]
-    completion_status_permissions = [rf_permissions.IsAdminUser]
-    submit_answers_permissions = [rf_permissions.IsAdminUser]
+    checklist_permissions = [PATScopeAwareIsAdminUser]
+    completion_status_permissions = [PATScopeAwareIsAdminUser]
+    submit_answers_permissions = [PATScopeAwareIsAdminUser]
 
     @extend_schema(
         description="Get checklist with questions and existing answers.",
@@ -208,7 +208,9 @@ class UserChecklistMixin(BaseChecklistMixin):
                     user=request.user,
                 ).delete()
             else:
-                # Create or update answer using direct foreign key
+                # Create or update answer using direct foreign key.
+                # File processing (for file/multiple_files questions) is handled
+                # inside Answer.save() via process_file_answer(), which is idempotent.
                 checklist_models.Answer.objects.update_or_create(
                     completion=completion,
                     question=question,
@@ -363,8 +365,8 @@ class ReviewerChecklistMixin(BaseChecklistMixin):
     """
 
     # Default permissions - MUST be overridden by inheriting viewsets with reviewer permissions
-    checklist_review_permissions = [rf_permissions.IsAdminUser]
-    completion_review_status_permissions = [rf_permissions.IsAdminUser]
+    checklist_review_permissions = [PATScopeAwareIsAdminUser]
+    completion_review_status_permissions = [PATScopeAwareIsAdminUser]
 
     @extend_schema(
         description="Get checklist with questions and existing answers including review logic (reviewers only).",

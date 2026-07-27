@@ -2,9 +2,15 @@ import fnmatch
 import logging
 
 import rest_framework
-from django.db.models import Count
+from django.db import connection, transaction
+from django.db.models import Count, Max
 from django_filters.rest_framework import DjangoFilterBackend
-from drf_spectacular.utils import OpenApiExample, extend_schema, extend_schema_view
+from drf_spectacular.utils import (
+    OpenApiExample,
+    extend_schema,
+    extend_schema_view,
+    inline_serializer,
+)
 from rest_framework import (
     decorators,
     generics,
@@ -19,14 +25,17 @@ from waldur_core.core import filters as core_filters
 from waldur_core.core import models as core_models
 from waldur_core.core import permissions as core_permissions
 from waldur_core.core import utils as core_utils
-from waldur_core.core.managers import SummaryQuerySet
-from waldur_core.logging import backend, filters, models, serializers, utils
+from waldur_core.core.serializers import StatusSerializer
+from waldur_core.logging import backend, enums, filters, models, serializers, utils
 from waldur_core.logging.event_logger import get_event_groups
 from waldur_core.structure.serializers_data_access import (
     GlobalUserDataAccessLogSerializer,
 )
 
 logger = logging.getLogger(__name__)
+
+# Legacy pub/sub surface — see "The legacy path" in docs/design/pubsub-architecture.md.
+_LEGACY_SUBSCRIPTION_DEPRECATION = "DEPRECATED: superseded by the unified EventConsumer path (POST /api/event-consumers/register/). Removal tracked in WAL-10111."
 
 
 class EventViewSet(viewsets.ReadOnlyModelViewSet):
@@ -40,6 +49,12 @@ class EventViewSet(viewsets.ReadOnlyModelViewSet):
     filterset_class = filters.EventFilter
 
     @extend_schema(
+        responses={
+            status.HTTP_200_OK: inline_serializer(
+                "EventCount",
+                fields={"count": rest_framework.serializers.IntegerField()},
+            )
+        },
         examples=[
             OpenApiExample(
                 name="Valid example",
@@ -55,11 +70,13 @@ class EventViewSet(viewsets.ReadOnlyModelViewSet):
             {"count": self.queryset.count()}, status=status.HTTP_200_OK
         )
 
+    @extend_schema(responses={status.HTTP_200_OK: list[str]})
     @decorators.action(detail=False)
     def scope_types(self, request, *args, **kwargs):
         """Returns a list of scope types acceptable by events filter."""
         return response.Response(utils.get_scope_types_mapping().keys())
 
+    @extend_schema(responses={status.HTTP_200_OK: dict[str, list[str]]})
     @decorators.action(detail=False)
     def event_groups(self, request, *args, **kwargs):
         """
@@ -164,10 +181,11 @@ class HookSummary(mixins.ListModelMixin, viewsets.GenericViewSet):
     """
 
     serializer_class = serializers.SummaryHookSerializer
-    filter_backends = (core_filters.StaffOrUserFilter, filters.HookSummaryFilterBackend)
+    filter_backends = (core_filters.StaffOrUserFilter, DjangoFilterBackend)
+    filterset_class = filters.BaseHookFilter
 
     def get_queryset(self):
-        return SummaryQuerySet(models.BaseHook.get_all_models())
+        return models.BaseHook.objects.select_related("webhook", "emailhook")
 
 
 class EventsStatsViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
@@ -195,6 +213,12 @@ class EventsStatsViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
         return self.get_paginated_response(final_result)
 
 
+@extend_schema_view(
+    create=extend_schema(deprecated=True, description=_LEGACY_SUBSCRIPTION_DEPRECATION),
+    retrieve=extend_schema(deprecated=True),
+    list=extend_schema(deprecated=True),
+    destroy=extend_schema(deprecated=True),
+)
 class EventSubscriptionViewSet(
     mixins.CreateModelMixin,
     mixins.RetrieveModelMixin,
@@ -314,6 +338,13 @@ class EventSubscriptionViewSet(
         return response.Response(output_serializer.data, status=status.HTTP_201_CREATED)
 
 
+@extend_schema_view(
+    retrieve=extend_schema(
+        deprecated=True, description=_LEGACY_SUBSCRIPTION_DEPRECATION
+    ),
+    list=extend_schema(deprecated=True),
+    destroy=extend_schema(deprecated=True),
+)
 class EventSubscriptionQueueViewSet(
     mixins.RetrieveModelMixin,
     mixins.ListModelMixin,
@@ -447,6 +478,85 @@ class EmailLogView(viewsets.ReadOnlyModelViewSet):
     serializer_class = serializers.EmailLogSerializer
 
 
+class SystemLogViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Staff and support endpoint to view system logs from API, Worker, and Beat processes.
+
+    Supports multi-pod Kubernetes deployments - each pod identified by `instance`.
+
+    Filters:
+    - source: 'api', 'worker', or 'beat'
+    - instance: pod name (K8s) or container name (Docker)
+    - level: 'INFO', 'WARNING', 'ERROR', 'CRITICAL'
+    - level_gte: minimum level number (20=INFO, 30=WARNING, 40=ERROR, 50=CRITICAL)
+    - created_from/created_to: timestamp range
+    - logger_name: partial match
+    - message: partial match
+    """
+
+    queryset = models.SystemLog.objects.all()
+    permission_classes = (
+        permissions.IsAuthenticated,
+        core_permissions.IsSupport,
+    )
+    serializer_class = serializers.SystemLogSerializer
+    filterset_class = filters.SystemLogFilter
+
+    @extend_schema(
+        summary="Get system log statistics",
+        responses={200: serializers.SystemLogStatsResponseSerializer},
+    )
+    @decorators.action(detail=False)
+    def stats(self, request, *args, **kwargs):
+        """Return log count statistics per source and instance, plus total table size."""
+        # Row counts per source/instance — uses composite index, no heap scan
+        rows = (
+            models.SystemLog.objects.values("source", "instance")
+            .annotate(count=Count("id"))
+            .order_by("source", "instance")
+        )
+
+        # Total table size from pg catalog — O(1), no per-row computation
+        table_name = models.SystemLog._meta.db_table
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_total_relation_size(%s)", [table_name])
+            total_size_bytes = cursor.fetchone()[0]
+
+        stats = [
+            {
+                "source": row["source"],
+                "instance": row["instance"],
+                "count": row["count"],
+            }
+            for row in rows
+        ]
+        return response.Response(
+            {
+                "instances": stats,
+                "total_size_bytes": total_size_bytes,
+                "total_size_mb": round(total_size_bytes / (1024 * 1024), 2),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @extend_schema(
+        summary="List system log instances",
+        responses={200: serializers.SystemLogInstanceSerializer(many=True)},
+    )
+    @decorators.action(detail=False)
+    def instances(self, request, *args, **kwargs):
+        """List all known instances (pods/containers) with their last activity."""
+        instances = list(
+            models.SystemLog.objects.values("source", "instance")
+            .annotate(last_seen=Max("created"), count=Count("id"))
+            .order_by("source", "instance")
+        )
+        paginated = self.paginate_queryset(instances)
+        if paginated is not None:
+            return self.get_paginated_response(paginated)
+        return response.Response(instances, status=status.HTTP_200_OK)
+
+
 class RabbitMQStatsViewSet(generics.GenericAPIView):
     """
     API endpoint for viewing and managing RabbitMQ subscription queues.
@@ -516,6 +626,7 @@ Requires support user permissions.""",
             enriched_queues = []
             for queue in vhost_data["queues"]:
                 parsed = utils.parse_subscription_queue_name(queue["name"])
+                consumer_uuid = utils.parse_consumer_queue_name(queue["name"])
                 enriched_queue = {
                     **queue,
                     "subscription_uuid": parsed["subscription_uuid"]
@@ -523,6 +634,10 @@ Requires support user permissions.""",
                     else None,
                     "offering_uuid": parsed["offering_uuid"] if parsed else None,
                     "object_type": parsed["object_type"] if parsed else None,
+                    "consumer_uuid": consumer_uuid,
+                    "queue_type": "consumer"
+                    if consumer_uuid
+                    else ("legacy" if parsed else "unknown"),
                 }
                 enriched_queues.append(enriched_queue)
 
@@ -810,6 +925,7 @@ Requires staff permissions.""",
         return response.Response(stomp_circuit_breaker.get_status())
 
     @extend_schema(
+        request=None,
         summary="Reset circuit breaker",
         description="""Manually reset the STOMP circuit breaker to CLOSED state.
 
@@ -855,12 +971,13 @@ Requires staff permissions.""",
         return response.Response(PublishingMetrics.get_metrics())
 
     @extend_schema(
+        request=None,
         summary="Reset publishing metrics",
         description="""Reset all publishing metrics counters to zero.
 
 Requires staff permissions.""",
         responses={
-            status.HTTP_200_OK: serializers.MetricsResetSerializer,
+            status.HTTP_200_OK: StatusSerializer,
         },
     )
     @decorators.action(detail=False, methods=["post"])
@@ -1033,7 +1150,9 @@ class UserDataAccessLogViewSet(
     Only staff users can delete log entries.
     """
 
-    queryset = models.UserDataAccessLog.objects.all().order_by("-timestamp")
+    queryset = models.UserDataAccessLog.objects.select_related(
+        "target_user", "accessor"
+    ).order_by("-timestamp")
     lookup_field = "uuid"
     serializer_class = GlobalUserDataAccessLogSerializer
     permission_classes = (
@@ -1047,3 +1166,178 @@ class UserDataAccessLogViewSet(
         if self.action == "destroy":
             return [permissions.IsAuthenticated(), core_permissions.IsStaff()]
         return super().get_permissions()
+
+
+class EventConsumerViewSet(
+    mixins.ListModelMixin,
+    mixins.DestroyModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Event consumers: one unified queue per consumer, scoped by bindings.
+
+    A consumer is bound to a list of entities (projects, customers, offerings…)
+    and receives the events whose scope-keys intersect those bindings. Binding
+    is guarded: you may only subscribe to what you already hold a role on.
+
+    **An empty binding list means GLOBAL** — every event, including all-user
+    PII (profiles, SSH keys, role changes) — and is therefore restricted to
+    staff/support. That guard is the PII boundary, re-checked again at delivery.
+    """
+
+    lookup_field = "uuid"
+    queryset = models.EventConsumer.objects.all().order_by("-created")
+    serializer_class = serializers.EventConsumerSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        # Consumers owned by a site agent are excluded platform-wide: they are
+        # lifecycle-managed by marketplace_site_agent (register_queue /
+        # AgentIdentity delete), and exposing them here would let a plain API
+        # call retune a running agent's object_types or — via DELETE — tear
+        # down its live RabbitMQ queue, since AgentIdentity.event_consumer is
+        # only SET_NULL. Manage those through the site-agent endpoints.
+        queryset = super().get_queryset().filter(agent_identity__isnull=True)
+        user = self.request.user
+        if user.is_staff or user.is_support:
+            return queryset
+        return queryset.filter(user=user)
+
+    @extend_schema(
+        description="Register (or refresh) an event-consumer queue for the "
+        "calling user. Pass `scopes` to bind the queue to entities you hold a "
+        "role on; an EMPTY `scopes` list requests a GLOBAL queue (all events, "
+        "including all-user PII) and requires staff/support. Idempotent per "
+        "binding set.",
+        request=serializers.EventConsumerRegistrationSerializer,
+        responses={
+            status.HTTP_200_OK: serializers.EventConsumerRegistrationResponseSerializer,
+            status.HTTP_201_CREATED: serializers.EventConsumerRegistrationResponseSerializer,
+        },
+    )
+    @decorators.action(detail=False, methods=["post"])
+    def register(self, request):
+        input_serializer = serializers.EventConsumerRegistrationSerializer(
+            data=request.data, context={"request": request}
+        )
+        input_serializer.is_valid(raise_exception=True)
+        # None = field omitted = keep whatever the consumer already has;
+        # [] = explicitly "all types". See the serializer for why this matters.
+        requested_object_types = input_serializer.validated_data.get("object_types")
+        # Already resolved + permission-checked by the serializer.
+        resolved_scopes = input_serializer.validated_data.get("scopes", [])
+        all_object_types = [m.value for m in enums.ObservableObjectType]
+        vhost = request.user.uuid.hex
+
+        # Empty bindings == global == the all-user PII firehose. Same guard as
+        # IsSupport and as the delivery-time re-auth in event_dispatch, so the
+        # two can never disagree.
+        if not resolved_scopes and not (
+            request.user.is_staff or request.user.is_support
+        ):
+            raise rest_framework.exceptions.PermissionDenied(
+                "A global event consumer (empty scopes) is restricted to "
+                "staff/support. Pass `scopes` to bind the queue to entities you "
+                "hold a role on."
+            )
+
+        # Idempotent per binding set: reuse the caller's consumer whose bindings
+        # match exactly, else create a new one. The match and the create must
+        # happen inside ONE transaction with the caller's rows locked — two
+        # concurrent registrations (an agent retrying, two workers booting) would
+        # otherwise both miss and each create a consumer + RMQ queue, and the
+        # client only keeps the last response's credentials. The orphan queue
+        # then fills to x-max-length while every event is published twice.
+        # Site-agent-owned consumers are never reused here (see get_queryset).
+        wanted = {(s["content_type_id"], s["object_id"]) for s in resolved_scopes}
+        with transaction.atomic():
+            # Serialize this user's registrations. select_for_update below cannot
+            # lock rows that do not exist yet, so on a FIRST registration two
+            # concurrent requests would both find no candidate and both create a
+            # consumer (+ RMQ queue). A per-user advisory lock closes that window
+            # for the first-time case; the row lock still guards re-registration.
+            utils.lock_user_registration(request.user.id)
+            consumer = None
+            candidates = (
+                # of=("self",): the agent_identity__isnull filter is a LEFT JOIN
+                # and Postgres refuses FOR UPDATE on the nullable side of one.
+                # We only need the consumer rows locked anyway.
+                models.EventConsumer.objects.select_for_update(of=("self",))
+                .filter(user=request.user, agent_identity__isnull=True)
+                .prefetch_related("scopes")
+            )
+            for candidate in candidates:
+                existing = {
+                    (s.content_type_id, s.object_id) for s in candidate.scopes.all()
+                }
+                if existing == wanted:
+                    consumer = candidate
+                    break
+
+            if consumer is None:
+                # Consumer + bindings in ONE transaction: a consumer left without
+                # bindings IS a global consumer, i.e. a fail-open PII exposure.
+                consumer = models.EventConsumer.objects.create(
+                    user=request.user, object_types=requested_object_types or []
+                )
+                models.EventConsumerScope.objects.bulk_create(
+                    [
+                        models.EventConsumerScope(
+                            consumer=consumer,
+                            content_type_id=scope["content_type_id"],
+                            object_id=scope["object_id"],
+                        )
+                        for scope in resolved_scopes
+                    ]
+                )
+            elif (
+                requested_object_types is not None
+                and consumer.object_types != requested_object_types
+            ):
+                consumer.object_types = requested_object_types
+                consumer.save(update_fields=["object_types"])
+
+        effective_object_types = consumer.object_types or all_object_types
+
+        rmq_backend = backend.RabbitMQManagementBackend()
+
+        # Fast path: already provisioned and valid — refresh the password.
+        # Verify BOTH the RMQ user and its vhost permissions, mirroring
+        # register_queue. The vhost (user.uuid.hex) is shared with any legacy
+        # EventSubscription; EventSubscriptionViewSet.perform_destroy deletes it
+        # when the user's subscription count drops to <=1 (a count that ignores
+        # EventConsumer rows), which wipes this consumer's queue + permissions
+        # while its distinct rmq_username survives. Checking get_user alone would
+        # then wrongly report 200 and hand back credentials for a queue whose
+        # vhost no longer exists.
+        if consumer.rmq_username and consumer.queue_created:
+            if (
+                rmq_backend.get_user(consumer.rmq_username) is not None
+                and consumer.rmq_username
+                in rmq_backend.list_rabbitmq_vhost_permissions(vhost)
+                and rmq_backend.create_rabbitmq_user(
+                    consumer.rmq_username,
+                    utils.resolve_consumer_rmq_password(request),
+                )
+            ):
+                data = {
+                    "rmq_username": consumer.rmq_username,
+                    "queue_name": consumer.queue_name,
+                    "vhost": vhost,
+                    "observable_object_types": effective_object_types,
+                }
+                out = serializers.EventConsumerRegistrationResponseSerializer(data=data)
+                out.is_valid(raise_exception=True)
+                return response.Response(out.data, status=status.HTTP_200_OK)
+            # Stale RMQ state — clean up and recreate.
+            rmq_backend.delete_rabbitmq_user(consumer.rmq_username)
+            consumer.rmq_username = ""
+            consumer.queue_created = False
+            consumer.save(update_fields=["rmq_username", "queue_created"])
+
+        result = utils.provision_consumer_queue(
+            consumer, utils.resolve_consumer_rmq_password(request)
+        )
+        result["observable_object_types"] = effective_object_types
+        out = serializers.EventConsumerRegistrationResponseSerializer(data=result)
+        out.is_valid(raise_exception=True)
+        return response.Response(out.data, status=status.HTTP_201_CREATED)

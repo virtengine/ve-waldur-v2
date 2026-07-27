@@ -40,11 +40,27 @@ def pull_remote_eduteams_ssh_keys():
     if not user_ssh_keys:
         return
 
-    for cuid, ssh_keys_map in user_ssh_keys.items():
-        user = User.objects.filter(username=cuid).first()
-        if user is None:
-            logger.warning("There is no user with username %s", cuid)
-            continue
+    remote_user_usernames = set(user_ssh_keys.keys())
+    users_by_username = {
+        user.username: user
+        for user in User.objects.filter(username__in=remote_user_usernames)
+    }
+    missing_users = remote_user_usernames - set(users_by_username.keys())
+    logger.info("Number of missing users in SSH key sync: %s", len(missing_users))
+    for username, user in users_by_username.items():
+        keys = user_ssh_keys[username]["ssh_keys"]
+        sync_user_ssh_keys(user, keys, username)
 
-        keys = ssh_keys_map["ssh_keys"]
-        sync_user_ssh_keys(user, keys, cuid)
+
+@shared_task(name="waldur_auth_social.rotate_remote_eduteams_token")
+def rotate_remote_eduteams_token():
+    if not settings.WALDUR_AUTH_SOCIAL["REMOTE_EDUTEAMS_ENABLED"]:
+        return
+    try:
+        utils.refresh_remote_eduteams_token(force=True)
+        logger.info("Proactive eduTEAMS token rotation completed successfully.")
+    except Exception:
+        logger.exception(
+            "Failed to rotate eduTEAMS refresh token. "
+            "The token may expire if this persists."
+        )

@@ -14,12 +14,15 @@ from django.utils import timezone
 from waldur_core.core import utils as core_utils
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
+from waldur_core.logging.middleware import set_current_user
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.invoices.utils import get_previous_month
+from waldur_mastermind.marketplace import billing_discount
 from waldur_mastermind.marketplace.billing import MarketplaceBillingService
 from waldur_mastermind.marketplace.tasks import copy_future_price_to_current_price
 
-from ..invoices import compensations, models, serializers, utils
+from ..invoices import compensations, ledger, models, serializers, utils
+from ..invoices.audit import skip_credit_audit
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +31,15 @@ logger = logging.getLogger(__name__)
 def create_monthly_invoices():
     """
     - For every customer change state of the invoices for previous months from "pending" to "billed"
-      and freeze their items.
+      and freeze their items (or transition to "pending_finalization" if grace period is configured).
     - Create new invoice for every customer in current month if not created yet.
     """
+    set_current_user(core_utils.get_system_robot())
     copy_future_price_to_current_price()
+
+    grace_hours = settings.WALDUR_INVOICES.get(
+        "INVOICE_FINALIZATION_GRACE_PERIOD_HOURS", 0
+    )
 
     local_date = timezone.localtime(timezone.now())
     old_invoices = models.Invoice.objects.filter(
@@ -42,21 +50,35 @@ def create_monthly_invoices():
             month__lt=local_date.month,
         )
     )
-    set_to_zero_overdue_credits()
-    for invoice in old_invoices:
-        try:
-            with transaction.atomic():
-                process_invoice_credits(invoice)
-                invoice.set_created()
-        except Exception:
-            logger.exception("Unable to process invoice %s", invoice)
-            continue
+
+    if grace_hours == 0:
+        # Backward compatible: finalize immediately
+        set_to_zero_overdue_credits(local_date.date())
+        for invoice in old_invoices:
+            try:
+                with transaction.atomic():
+                    billing_discount.apply_aggregated_volume_discounts(invoice)
+                    process_invoice_credits(invoice)
+                    invoice.set_created()
+            except Exception:
+                logger.exception("Unable to process invoice %s", invoice)
+                continue
+    else:
+        # Grace period: transition to PENDING_FINALIZATION
+        for invoice in old_invoices:
+            try:
+                invoice.set_pending_finalization()
+            except Exception:
+                logger.exception(
+                    "Unable to set pending_finalization for invoice %s", invoice
+                )
+                continue
 
     customers = structure_models.Customer.objects.exclude(archived=True)
     if settings.WALDUR_CORE["ENABLE_ACCOUNTING_START_DATE"]:
         customers = customers.filter(accounting_start_date__lt=timezone.now())
 
-    for customer in customers.iterator():
+    for customer in customers:
         try:
             MarketplaceBillingService.get_or_create_invoice(
                 customer, core_utils.month_start(local_date)
@@ -67,11 +89,80 @@ def create_monthly_invoices():
                 "Unable to create monthly invoice for customer %s", customer
             )
 
-    if settings.WALDUR_INVOICES["INVOICE_REPORTING"]["ENABLE"]:
-        send_invoice_report.delay()
+    # Reports/notifications only if finalized immediately (grace_period=0)
+    if grace_hours == 0:
+        if settings.WALDUR_INVOICES["INVOICE_REPORTING"]["ENABLE"]:
+            send_invoice_report.delay()
+            send_monthly_invoicing_reports_about_customers.delay()
 
-    if settings.WALDUR_INVOICES["SEND_CUSTOMER_INVOICES"]:
-        send_new_invoices_notification.delay()
+        if settings.WALDUR_INVOICES["SEND_CUSTOMER_INVOICES"]:
+            send_new_invoices_notification.delay()
+
+
+@shared_task(name="invoices.finalize_previous_invoices")
+def finalize_previous_invoices():
+    """
+    Finalize invoices that are in PENDING_FINALIZATION state.
+
+    Runs hourly on the 1st-3rd of each month. Checks whether the configured
+    grace period has elapsed since midnight on the 1st before finalizing.
+    No-op when there are no PENDING_FINALIZATION invoices or when the
+    grace period has not yet elapsed.
+    """
+    set_current_user(core_utils.get_system_robot())
+    pending_invoices = models.Invoice.objects.filter(
+        state=models.Invoice.States.PENDING_FINALIZATION,
+    )
+    if not pending_invoices.exists():
+        return
+
+    grace_hours = settings.WALDUR_INVOICES.get(
+        "INVOICE_FINALIZATION_GRACE_PERIOD_HOURS", 0
+    )
+    local_now = timezone.localtime(timezone.now())
+    if grace_hours > 0:
+        # Grace period is measured from midnight on the 1st of the current month
+        month_start = local_now.replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+        hours_since_month_start = (local_now - month_start).total_seconds() / 3600
+        if hours_since_month_start < grace_hours:
+            logger.info(
+                "Grace period not yet elapsed (%.1f / %d hours). "
+                "Skipping invoice finalization.",
+                hours_since_month_start,
+                grace_hours,
+            )
+            return
+
+    # Use the 1st of current month as effective date, not today.
+    # When grace period delays finalization (e.g. to Feb 2), credits with
+    # end_date on the 1st must not be zeroed before compensations are applied.
+    effective_date = local_now.replace(day=1).date()
+    set_to_zero_overdue_credits(effective_date)
+    for invoice in pending_invoices:
+        try:
+            with transaction.atomic():
+                billing_discount.apply_aggregated_volume_discounts(invoice)
+                process_invoice_credits(invoice)
+                invoice.set_created()
+        except Exception:
+            logger.exception("Unable to finalize invoice %s", invoice)
+            continue
+
+    # Only send reports/notifications when all invoices have been finalized.
+    # If some failed above, the next hourly run will finalize them and send them.
+    remaining = models.Invoice.objects.filter(
+        state=models.Invoice.States.PENDING_FINALIZATION,
+    ).exists()
+
+    if not remaining:
+        if settings.WALDUR_INVOICES["INVOICE_REPORTING"]["ENABLE"]:
+            send_invoice_report.delay()
+            send_monthly_invoicing_reports_about_customers.delay()
+
+        if settings.WALDUR_INVOICES["SEND_CUSTOMER_INVOICES"]:
+            send_new_invoices_notification.delay()
 
 
 @shared_task(name="invoices.send_invoice_notification")
@@ -283,25 +374,103 @@ def send_monthly_invoicing_reports_about_customers():
         )
 
 
-def set_to_zero_overdue_credits():
-    for credit in models.CustomerCredit.objects.filter(
-        end_date__lt=datetime.date.today()
-    ).exclude(value=0):
-        credit.value = 0
-        credit.save()
-        event_logger.emit(
-            "Credit has been set to zero due as the end date {credit_end_date} has arrived.",
-            event_type=EventType.SET_TO_ZERO_OVERDUE_CREDIT,
-            event_context={
-                "customer": credit.customer,
-                "credit_end_date": credit.end_date,
-            },
+def set_to_zero_overdue_credits(effective_date=None):
+    set_current_user(core_utils.get_system_robot())
+    today = timezone.localtime(timezone.now()).date()
+    if effective_date is None:
+        effective_date = today
+    # Reject future effective_date: filtering by end_date < effective_date with a
+    # date in the future would zero out credits whose end_date has not actually
+    # arrived yet. Manual invocations with an off-by-many date have caused this
+    # in production.
+    if effective_date > today:
+        raise ValueError(
+            f"set_to_zero_overdue_credits refuses to run with a future "
+            f"effective_date={effective_date} (today={today}). "
+            f"This would zero credits whose end_date has not arrived yet."
         )
+    with (
+        transaction.atomic(),
+        skip_credit_audit(),
+        ledger.credit_transaction_type(models.CreditTransaction.Types.EXPIRY),
+    ):
+        for credit in (
+            models.CustomerCredit.objects.select_for_update()
+            .filter(end_date__lt=effective_date)
+            .exclude(value=0)
+        ):
+            # A savepoint per credit so that one broken row does not abort
+            # zeroing of the remaining credits or the calling invoice task.
+            try:
+                with transaction.atomic():
+                    old_value = int(credit.value)
+                    credit.value = 0
+                    credit.save(update_fields=["value"])
+                    event_logger.emit(
+                        "Credit has been set to zero due as the end date {credit_end_date} has arrived.",
+                        event_type=EventType.SET_TO_ZERO_OVERDUE_CREDIT,
+                        event_context={
+                            "customer": credit.customer,
+                            "credit_end_date": credit.end_date,
+                            "old_value": old_value,
+                            "new_value": 0,
+                        },
+                    )
+            except Exception:
+                logger.exception(
+                    "Unable to set overdue customer credit %s to zero", credit.uuid
+                )
+                continue
+        for project_credit in (
+            models.ProjectCredit.objects.select_for_update()
+            .filter(end_date__lt=effective_date)
+            .exclude(value=0)
+        ):
+            try:
+                with transaction.atomic():
+                    old_value = int(project_credit.value)
+                    project_credit.value = 0
+                    project_credit.save(update_fields=["value"])
+                    event_logger.emit(
+                        "Project credit has been set to zero as the end date {credit_end_date} has arrived.",
+                        event_type=EventType.SET_TO_ZERO_OVERDUE_CREDIT,
+                        event_context={
+                            "customer": project_credit.project.customer,
+                            "project": project_credit.project,
+                            "credit_end_date": project_credit.end_date,
+                            "old_value": old_value,
+                            "new_value": 0,
+                        },
+                    )
+            except Exception:
+                logger.exception(
+                    "Unable to set overdue project credit %s to zero",
+                    project_credit.uuid,
+                )
+                continue
 
 
 def process_invoice_credits(invoice: models.Invoice):
-    """Process credits for a given invoice"""
+    """Process credits for a given invoice.
+
+    Uses select_for_update() to lock credit rows before reading,
+    preventing lost updates when concurrent workers process invoices
+    for the same customer. See WAL-9806.
+    """
     with transaction.atomic():
-        monthly_compensation = compensations.MonthlyCompensation(invoice.customer)
+        # Lock the customer credit row to prevent concurrent modifications.
+        # The MonthlyCompensation will re-read the credit, but the lock
+        # ensures no other transaction can modify it until we commit.
+        models.CustomerCredit.objects.select_for_update().filter(
+            customer=invoice.customer
+        ).exists()
+        # Also lock project credits that might be consumed.
+        models.ProjectCredit.objects.select_for_update().filter(
+            project__customer=invoice.customer
+        ).exists()
+
+        monthly_compensation = compensations.MonthlyCompensation(
+            invoice.customer, invoice=invoice
+        )
         monthly_compensation.apply_compensations()
         monthly_compensation.update_linear_expected_consumption()

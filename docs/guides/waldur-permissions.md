@@ -60,6 +60,40 @@ destroy_permissions = [check_destroy_permissions]
 - Custom validation that requires dynamic permission targets
 - Legacy code not yet refactored to declarative patterns
 
+## Adding New Permissions
+
+### 1. Define the Permission Enum
+
+Add the new permission to `PermissionEnum` in `src/waldur_core/permissions/enums.py`:
+
+```python
+class PermissionEnum(StrEnum):
+    MY_NEW_PERMISSION = "RESOURCE.MY_ACTION"
+```
+
+If the permission is for managing team members (creating/updating/deleting roles) on a scope type, also add it to the `CREATE_PERMISSIONS`, `UPDATE_PERMISSIONS`, and `DELETE_PERMISSIONS` dicts in the same file.
+
+### 2. Assign to Roles via permissions.yaml
+
+**Do NOT use data migrations to assign permissions to roles.** Instead, add the permission to the appropriate roles in `docker/rootfs/etc/waldur/permissions.yaml`:
+
+```yaml
+- role: CUSTOMER.OWNER
+  scope: customer
+  permissions:
+    - RESOURCE.MY_ACTION   # Add here
+```
+
+This file is loaded by the `import_roles` management command, which runs on deployment. The command creates roles and syncs their permissions from the YAML definition.
+
+### 3. Use in ViewSets
+
+```python
+my_action_permissions = [
+    permission_factory(PermissionEnum.MY_NEW_PERMISSION, ["project.customer"])
+]
+```
+
 ## Permission System Behavior
 
 ### Expiration Handling
@@ -89,3 +123,96 @@ destroy_permissions = [check_destroy_permissions]
 - Use `distinct()` for deduplication instead of manual logic
 - Accept 20-30 queries for complex operations rather than approximations
 - Verify permission checks use reasonable query counts (≤3 for most operations)
+
+## Personal Access Tokens — entity scoping
+
+`PersonalAccessToken` has two scope layers:
+
+1. `scopes` — the permission allowlist (subset of `PermissionEnum`). A PAT
+   can only ever exercise permissions that the user holds *and* that are
+   listed here.
+2. `allowed_scopes` — optional list of entity bindings restricting *where*
+   the PAT can act. Stored as `[{content_type_id, object_id}, …]`. Created
+   from `[{type, uuid}, …]` where `type` is a key of
+   `permissions.enums.TYPE_MAP` (e.g. `customer`, `project`, `offering`,
+   `resource`, `resource_project`, `call`, `proposal`, `service_provider`,
+   `call_organizer`).
+
+### Enforcement
+
+`_pat_scope_check` (and the `_pat_entity_check` helper in
+`waldur_core.permissions.utils`) runs ahead of the `is_staff` bypass so a
+scoped PAT narrows even staff users. The rules:
+
+- Empty `allowed_scopes` → no entity restriction (legacy behaviour).
+- `scope=None` request + non-empty bindings → denied. A scoped PAT cannot
+  perform scope-less / global actions.
+- Otherwise → allowed iff the request scope, or any of its ancestors per
+  `get_scope_ancestors`, matches one of the PAT's bindings. The walk is
+  upward-only: a PAT bound to a child entity does **not** authorise actions
+  on its parent.
+
+### Restrictions
+
+- `STAFF.ACCESS` / `SUPPORT.ACCESS` cannot be combined with `allowed_scopes` —
+  those scopes are global by design.
+- Non-staff users may only bind a PAT to entities where they hold at least
+  one of the requested permissions (directly or via an ancestor) — this
+  guard prevents privilege escalation through binding.
+- Bindings are immutable. `rotate` preserves them; there is no PATCH
+  endpoint. To change bindings, create a new PAT.
+- Bindings do **not** auto-revoke when the granting role is removed. The
+  stored `allowed_scopes` continue to surface entity names in the PAT
+  list/detail response, but enforcement falls through to the user's
+  current roles — the binding can only narrow access, never grant it.
+  If a user is removed from a customer, their PAT may still display the
+  customer's name (a minor info-leak about an entity they used to have
+  access to); to scrub it, revoke and recreate the PAT.
+
+### List-endpoint result filtering
+
+`PATScopeListFilter` in `waldur_core.permissions.pat_filtering` narrows
+both list and detail querysets so a scoped PAT only sees entities reachable
+from its bindings. It is installed once at app ready by
+monkey-patching `GenericAPIView.filter_queryset` — viewsets that override
+`filter_backends` are still covered, since the patch wraps the original
+implementation and applies the PAT filter after the viewset's own
+backends. Detail endpoints inherit the same narrowing because DRF's
+`get_object` calls `filter_queryset` before `get_object_or_404`.
+
+**Coverage**: the nine `TYPE_MAP` entity models are filtered:
+
+| Model | Reachable from binding type |
+|---|---|
+| `structure.Customer` | `customer` |
+| `structure.Project` | `customer`, `project` |
+| `marketplace.Offering` | `customer`, `offering` |
+| `marketplace.Resource` | `customer`, `project`, `offering`, `resource` |
+| `marketplace.ResourceProject` | `customer`, `project`, `offering`, `resource`, `resource_project` |
+| `marketplace.ServiceProvider` | `customer`, `service_provider` |
+| `proposal.CallManagingOrganisation` | `customer`, `call_organizer` |
+| `proposal.Call` | `call` (no ancestor inheritance) |
+| `proposal.Proposal` | `proposal` (no ancestor inheritance) |
+
+Endpoints whose model does not appear above (e.g. `/api/marketplace-orders/`,
+`/api/invoices/`) currently pass through unfiltered. Add a builder via
+`register_pat_filter` in `pat_filtering.py` to extend coverage.
+
+**Codepath limit**: the install only wraps `GenericAPIView.filter_queryset`.
+Views that bypass that codepath — `APIView` subclasses, custom actions
+that call `Model.objects.filter(...)` directly without going through
+`self.filter_queryset(self.get_queryset())`, or bespoke CSV/export
+endpoints — are **not** filtered. If you add such a view and it returns
+data for an entity in `TYPE_MAP`, call `PATScopeListFilter().filter_queryset(...)`
+on the queryset yourself before serialising.
+
+### Performance notes for scoped-PAT hot paths
+
+`_pat_entity_check` calls `get_scope_ancestors(scope)`, which dereferences
+foreign-key attributes on the request scope. If the view's queryset
+doesn't `select_related` those FKs, each scoped-PAT permission check
+incurs an extra DB round-trip per ancestor. Views that are hot under
+PAT auth should `select_related("customer", "project__customer",
+"offering")` (or whichever ancestors apply) — scoped PATs walk the
+ancestor chain on every permission check, so each missed `select_related`
+multiplies into one query per ancestor per check.

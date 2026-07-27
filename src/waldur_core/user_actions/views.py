@@ -7,6 +7,9 @@ from rest_framework import decorators, filters, permissions, status, viewsets
 from rest_framework.exceptions import NotFound
 from rest_framework.response import Response
 
+from waldur_core.core.permissions import PATScopeAwareIsAdminUser
+from waldur_core.core.serializers import StatusSerializer
+
 from . import filters as user_action_filters
 from . import models, serializers, tasks
 
@@ -28,8 +31,13 @@ class UserActionViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         queryset = super().get_queryset()
 
-        # SECURITY: Filter by current user - users can only see their own actions
-        queryset = queryset.filter(user=self.request.user)
+        user_uuid = self.request.query_params.get("user_uuid")
+        if user_uuid and self.request.user.is_staff:
+            # Staff can view actions for a specific user
+            queryset = queryset.filter(user__uuid=user_uuid)
+        else:
+            # Non-staff users can only see their own actions
+            queryset = queryset.filter(user=self.request.user)
 
         # Only show non-silenced by default unless explicitly requested
         if self.request.query_params.get("include_silenced") != "true":
@@ -44,7 +52,10 @@ class UserActionViewSet(viewsets.ReadOnlyModelViewSet):
         """Override to ensure users can only access their own actions"""
         obj = super().get_object()
 
-        # Double-check that the action belongs to the current user
+        user_uuid = self.request.query_params.get("user_uuid")
+        if user_uuid and self.request.user.is_staff:
+            return obj
+
         if obj.user != self.request.user:
             from rest_framework.exceptions import PermissionDenied
 
@@ -78,7 +89,7 @@ class UserActionViewSet(viewsets.ReadOnlyModelViewSet):
 
     @extend_schema(
         request=None,
-        responses={200: serializers.UnsilenceActionResponseSerializer},
+        responses={200: StatusSerializer},
         description="Remove silence from an action",
     )
     @decorators.action(detail=True, methods=["post"])
@@ -99,9 +110,7 @@ class UserActionViewSet(viewsets.ReadOnlyModelViewSet):
         logger.info(f"User {request.user.username} unsilenced action {action.uuid}")
 
         response_data = {"status": "unsilenced"}
-        response_serializer = serializers.UnsilenceActionResponseSerializer(
-            response_data
-        )
+        response_serializer = StatusSerializer(response_data)
         return Response(response_serializer.data)
 
     @extend_schema(
@@ -376,7 +385,7 @@ class UserActionProviderViewSet(viewsets.ReadOnlyModelViewSet):
 
     queryset = models.UserActionProvider.objects.all()
     serializer_class = serializers.UserActionProviderSerializer
-    permission_classes = [permissions.IsAuthenticated, permissions.IsAdminUser]
+    permission_classes = [permissions.IsAuthenticated, PATScopeAwareIsAdminUser]
     filter_backends = [DjangoFilterBackend]
 
     def get_queryset(self):

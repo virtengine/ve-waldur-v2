@@ -4,9 +4,7 @@ import os
 import tempfile
 from enum import Enum
 
-import kubernetes as k8s
 from constance import config
-from kubernetes.client.rest import ApiException
 from rest_framework import serializers as rf_serializers
 
 import docker
@@ -18,10 +16,21 @@ from .exceptions import JobFailedException
 
 logger = logging.getLogger(__name__)
 
+# The kubernetes client SDK is imported lazily inside the functions that use it
+# (construct_k8s_job_spec / ContainerExecutorMixin.send_request), so it does not
+# load at Django startup for deployments that never run scripts on Kubernetes.
+# See CLAUDE.md, "Lazy imports for heavy optional backends".
+
 
 class DeploymentOptions(Enum):
     DOCKER = "docker"
     KUBERNETES = "k8s"
+
+
+WALDUR_K8S_LABELS = {
+    "app.kubernetes.io/managed-by": "waldur",
+    "app.kubernetes.io/component": "marketplace-script",
+}
 
 
 def check_docker_socket_access(docker_config):
@@ -79,6 +88,8 @@ def execute_script_in_docker(image, command, src, **kwargs):
 
 
 def construct_k8s_job_spec(image, command, volume_name, config_map_name, environment):
+    import kubernetes as k8s
+
     script_volume = k8s.client.V1Volume(
         name=volume_name,
         config_map=k8s.client.V1ConfigMapVolumeSource(
@@ -139,19 +150,35 @@ def execute_script_in_k8s(image, command, src, dry_run=False, **kwargs):
 
     config_map_data = {"script": src}
     k8s_backend.create_k8s_config_map(
-        config_map_name, config.K8S_NAMESPACE, config_map_data
+        config_map_name, config.K8S_NAMESPACE, config_map_data, labels=WALDUR_K8S_LABELS
     )
 
     job_spec = construct_k8s_job_spec(image, command, volume_name, config_map_name, env)
-    k8s_backend.create_k8s_job(job_name, config.K8S_NAMESPACE, job_spec)
-
-    job_succeeded = k8s_backend.wait_for_k8s_job_completion(
-        job_name, config.K8S_NAMESPACE, timeout=600
+    k8s_backend.create_k8s_job(
+        job_name, config.K8S_NAMESPACE, job_spec, labels=WALDUR_K8S_LABELS
     )
-    pod_log = k8s_backend.get_k8s_job_result(job_name, config.K8S_NAMESPACE)
 
-    k8s_backend.delete_job_from_k8s(job_name, config.K8S_NAMESPACE)
-    k8s_backend.delete_config_map_from_k8s(config_map_name, config.K8S_NAMESPACE)
+    try:
+        job_succeeded = k8s_backend.wait_for_k8s_job_completion(
+            job_name, config.K8S_NAMESPACE, timeout=config.K8S_JOB_TIMEOUT
+        )
+        pod_log = k8s_backend.get_k8s_job_result(job_name, config.K8S_NAMESPACE)
+    finally:
+        try:
+            k8s_backend.delete_job_from_k8s(job_name, config.K8S_NAMESPACE)
+        except Exception:
+            logger.exception(
+                "Failed to delete Kubernetes Job %s during cleanup", job_name
+            )
+        try:
+            k8s_backend.delete_config_map_from_k8s(
+                config_map_name, config.K8S_NAMESPACE
+            )
+        except Exception:
+            logger.exception(
+                "Failed to delete Kubernetes ConfigMap %s during cleanup",
+                config_map_name,
+            )
 
     if not job_succeeded and not dry_run:
         raise JobFailedException(pod_log)
@@ -171,6 +198,8 @@ class ContainerExecutorMixin:
     hook_type = NotImplemented
 
     def send_request(self, user, resource=None, dry_run=False):
+        from kubernetes.client.rest import ApiException
+
         options = self.order.offering.secret_options
 
         serializer = serializers.OrderSerializer(instance=self.order)

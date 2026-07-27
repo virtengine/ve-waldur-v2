@@ -1,3 +1,5 @@
+import os
+import socket
 import warnings
 from datetime import timedelta
 
@@ -34,8 +36,24 @@ CELERY_SEND_EVENTS = True
 # Fix for Celery 6.0 deprecation warning
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 
-# Memory management - restart workers after N tasks to prevent memory leaks
-CELERY_WORKER_MAX_TASKS_PER_CHILD = 100
+# Disable psycopg3 server-side prepared statements for the database result backend.
+# psycopg3 caches prepared statements per-connection; PgBouncer in transaction
+# pooling mode reassigns connections between transactions, so a prepared statement
+# created on connection A is invisible on connection B — causing
+# "prepared statement _pg3_N does not exist" errors.
+CELERY_DATABASE_ENGINE_OPTIONS = {"connect_args": {"prepare_threshold": None}}
+
+# Memory management - restart workers after N tasks to prevent memory leaks.
+# Higher value reduces broker reconnect churn (each fork re-handshakes
+# connections); see broker-resilience block below.
+CELERY_WORKER_MAX_TASKS_PER_CHILD = 2000
+
+# Hard per-child memory ceiling (KB): recycle a child once its resident memory
+# exceeds this, so a single heavy task cannot permanently inflate the worker's
+# high-watermark. 0 disables the limit (default); set via env, e.g. 400000 (~400 MB).
+CELERY_WORKER_MAX_MEMORY_PER_CHILD = int(
+    os.environ.get("CELERY_WORKER_MAX_MEMORY_PER_CHILD") or 0
+)
 
 # Time limits - prevent runaway tasks
 CELERY_TASK_SOFT_TIME_LIMIT = (
@@ -52,6 +70,79 @@ CELERY_RESULT_EXPIRES = 3600
 # Memory optimization for RabbitMQ connection pool
 CELERY_BROKER_POOL_LIMIT = 10
 
+# --- Broker resilience settings (CSCS-4VC / CSCS-4KB follow-up) ---
+#
+# Goal: detect dead/half-open AMQP connections inside gunicorn's worker
+# timeout window so a stuck `recv()` waiting for a publish ACK can't ride out
+# the whole 30s and trip `WORKER TIMEOUT` → `SystemExit`.
+#
+# Three layers of dead-connection detection, in increasing depth:
+#
+# 1. AMQP heartbeat (BROKER_HEARTBEAT). py-amqp sends a heartbeat frame at
+#    half this interval; the broker considers the connection dead after two
+#    missed heartbeats. So heartbeat=30s ⇒ ~30s detection budget on top of
+#    AMQP idle.
+#
+# 2. TCP keepalive (socket_settings). The kernel sends SYN probes after
+#    TCP_KEEPIDLE seconds of socket idle, then probes every TCP_KEEPINTVL
+#    until TCP_KEEPCNT failures ⇒ socket closed at kernel level. This
+#    catches half-open connections that AMQP heartbeats may miss because
+#    they share the same broken socket. ~30s detection budget.
+#
+# 3. Connection-pool turnover (BROKER_POOL_LIMIT existing setting). A pool
+#    of 10 connections per process turns over enough to keep individual
+#    sockets fresh even without per-publish reconnect.
+#
+# We keep `confirm_publish: True` because durable invoice / billing writes
+# need broker durability guarantees; the resilience settings above bound
+# the worst-case wait that confirm-publish can introduce.
+#
+# Heartbeat: py-amqp ticks at half this interval; broker drops the
+# connection after ~30s of missed heartbeats. Without this, kombu
+# negotiates the broker's default (60s) and dead-connection detection
+# takes 120s+ — well after gunicorn's 30s worker timeout.
+#
+# IMPORTANT: the top-level ``CELERY_BROKER_HEARTBEAT`` setting is
+# silently ignored on the publisher path (Celery does not propagate it
+# to ``app.broker_connection()`` / ``app.producer_pool``). It must be
+# set via ``broker_transport_options["heartbeat"]`` to actually reach
+# the kombu Connection.
+#
+# SO_KEEPALIVE is enabled unconditionally by py-amqp
+# (amqp/transport.py:_init_socket). py-amqp also ships defaults of
+# TCP_KEEPIDLE=60s, TCP_KEEPINTVL=10s, TCP_KEEPCNT=9 — too slow to fire
+# before gunicorn's 30s worker timeout. The overrides below tighten the
+# probe schedule to detect a dead socket in ~25s
+# (KEEPIDLE + KEEPINTVL * KEEPCNT = 10 + 5*3 = 25s).
+#
+# ``socket_settings`` keys must be integer constants from the ``socket``
+# module (py-amqp passes them straight to setsockopt(SOL_TCP, opt, val)).
+# Some keys are Linux-only (TCP_KEEPIDLE in particular); we resolve them
+# conditionally so the settings load on macOS dev too, even though the
+# full effect requires Linux.
+#
+# What's NOT here: a per-publish ``confirm_timeout`` kwarg. py-amqp's
+# Channel._basic_publish accepts it but kombu's Producer does not expose
+# it through Celery's app config (see celery#9259). A future MR could
+# add a custom Producer subclass to inject ``confirm_timeout=5`` on
+# every publish; for now the heartbeat + keepalive combo bounds the
+# worst-case wait at the transport layer.
+_BROKER_SOCKET_SETTINGS = {}
+for _opt, _val in (
+    ("TCP_KEEPIDLE", 10),
+    ("TCP_KEEPINTVL", 5),
+    ("TCP_KEEPCNT", 3),
+):
+    _const = getattr(socket, _opt, None)
+    if _const is not None:
+        _BROKER_SOCKET_SETTINGS[_const] = _val
+
+CELERY_BROKER_TRANSPORT_OPTIONS = {
+    "confirm_publish": True,
+    "heartbeat": 30,
+    "socket_settings": _BROKER_SOCKET_SETTINGS,
+}
+
 # Prevent Celery from auto-declaring exchanges/queues to avoid type conflicts
 # Only use explicitly defined queues and exchanges
 CELERY_CREATE_MISSING_QUEUES = False
@@ -63,17 +154,6 @@ DEFAULT_SCIM_RECONCILIATION_SCHEDULE_HOURS = 1
 
 # Regular tasks
 CELERY_BEAT_SCHEDULE = {
-    "pull-service-properties": {
-        "task": "waldur_core.structure.ServicePropertiesListPullTask",
-        "schedule": timedelta(hours=24),
-        "args": (),
-    },
-    "pull-service-resources": {
-        "task": "waldur_core.structure.ServiceResourcesListPullTask",
-        # Pull resources strictly at the beginning of an hour
-        "schedule": crontab(minute=0),
-        "args": (),
-    },
     "check-expired-permissions": {
         "task": "waldur_core.permissions.check_expired_permissions",
         "schedule": timedelta(hours=24),
@@ -82,6 +162,11 @@ CELERY_BEAT_SCHEDULE = {
     "sync-user-deactivation-status": {
         "task": "waldur_core.permissions.sync_user_deactivation_status",
         "schedule": timedelta(hours=3),
+        "args": (),
+    },
+    "reconcile-user-roles-against-availability": {
+        "task": "waldur_core.permissions.reconcile_user_roles_against_availability",
+        "schedule": timedelta(hours=24),
         "args": (),
     },
     "cancel-expired-invitations": {
@@ -208,6 +293,18 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": crontab(hour=3, minute=30),
         "args": (),
     },
+    # Cleanup system logs - enforce ~1MB size limit per source
+    "cleanup-system-logs": {
+        "task": "waldur_core.logging.cleanup_system_logs",
+        "schedule": timedelta(minutes=15),
+        "args": (),
+    },
+    # Cleanup site agent logs - enforce row count limit per agent identity
+    "cleanup-site-agent-logs": {
+        "task": "waldur_mastermind.marketplace_site_agent.cleanup_site_agent_logs",
+        "schedule": timedelta(minutes=15),
+        "args": (),
+    },
     # Table growth monitoring - sample sizes daily at 1 AM
     "sample-table-sizes": {
         "task": "waldur_core.sample_table_sizes",
@@ -218,6 +315,18 @@ CELERY_BEAT_SCHEDULE = {
     "check-table-growth-alerts": {
         "task": "waldur_core.check_table_growth_alerts",
         "schedule": crontab(hour=2, minute=0),
+        "args": (),
+    },
+    # Cleanup expired personal access tokens every 6 hours
+    "cleanup-expired-pats": {
+        "task": "waldur_core.core.cleanup_expired_personal_access_tokens",
+        "schedule": timedelta(hours=6),
+        "args": (),
+    },
+    # Cleanup unredeemed token exchange codes every minute
+    "cleanup-stale-token-exchange-codes": {
+        "task": "waldur_core.core.cleanup_stale_token_exchange_codes",
+        "schedule": timedelta(minutes=1),
         "args": (),
     },
 }

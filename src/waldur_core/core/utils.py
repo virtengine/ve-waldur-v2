@@ -2,23 +2,28 @@ import calendar
 import datetime
 import functools
 import importlib
+import ipaddress
 import logging
 import os
 import re
+import socket
 import time
 import unicodedata
 import uuid
 import warnings
-from itertools import chain
+from itertools import chain, groupby
 from secrets import choice
 from string import ascii_letters, digits
+from urllib.parse import urlsplit
 
 import jwt
 import requests
 import textile
 from constance import config
+from dateutil.relativedelta import relativedelta
 from django.apps import apps
 from django.conf import settings
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.mail import EmailMultiAlternatives
 from django.core.management.base import BaseCommand
 from django.core.serializers.json import DjangoJSONEncoder
@@ -58,6 +63,19 @@ def timestamp_to_datetime(timestamp, replace_tz=True):
 
 def timeshift(**kwargs):
     return timezone.now().replace(microsecond=0) + datetime.timedelta(**kwargs)
+
+
+def calculate_duration_months(start_date, end_date):
+    """Calculate duration in whole months, rounding up partial months.
+
+    Used by prepaid billing, cost estimation, and the site agent.
+    A partial month at the end counts as a full month.
+    """
+    delta = relativedelta(end_date, start_date)
+    months = delta.years * 12 + delta.months
+    if delta.days > 0:
+        months += 1
+    return max(1, months)
 
 
 def month_start(date):
@@ -483,6 +501,16 @@ def format_homeport_link(format_str="", **kwargs):
     return link.format(**kwargs)
 
 
+# Usernames of special accounts acting on behalf of the system rather than
+# a real person. Their email is SITE_EMAIL, so user-facing notifications
+# addressed to them must be skipped.
+ROBOT_USERNAMES = ("system_robot", "openportal_robot")
+
+
+def is_robot_user(user) -> bool:
+    return user.username in ROBOT_USERNAMES
+
+
 def get_system_robot():
     from waldur_core.core import models
 
@@ -511,6 +539,30 @@ def get_ip_address(request: HttpRequest) -> str | None:
     elif "REMOTE_ADDR" in request.META:
         return request.META["REMOTE_ADDR"]
     return None
+
+
+def merge_access_subnets(inet_values):
+    """Collapse CIDR strings into the minimal list of networks.
+
+    Adjacent or overlapping networks are merged (per IP version) using
+    ``ipaddress.collapse_addresses``. Invalid or null values are skipped.
+    Returns a list of ``ip_network`` objects sorted by version and address.
+    """
+    networks = []
+    for value in inet_values:
+        if value is None:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(value))
+        except ValueError:
+            continue
+
+    networks.sort(key=lambda n: (n.version, n.network_address))
+
+    merged = []
+    for _version, version_networks in groupby(networks, key=lambda n: n.version):
+        merged.extend(ipaddress.collapse_addresses(list(version_networks)))
+    return merged
 
 
 def get_user_agent(request):
@@ -694,3 +746,136 @@ def get_full_quarters(start, end):
             current = current.replace(year=current.year + 1, month=current.month - 9)
 
     return quarters
+
+
+# Topological sort (Django removed django.utils.topological_sort in 5.0)
+
+
+class CyclicDependencyError(ValueError):
+    pass
+
+
+def topological_sort_as_sets(dependency_graph):
+    """
+    Variation of Kahn's algorithm (1962) that returns sets.
+
+    Take a dependency graph as a dictionary of node => dependencies.
+
+    Yield sets of items in topological order, where the first set contains
+    all nodes without dependencies, and each following set contains all
+    nodes that may depend on the nodes only in the previously yielded sets.
+    """
+    todo = dependency_graph.copy()
+    while todo:
+        current = {node for node, deps in todo.items() if not deps}
+
+        if not current:
+            raise CyclicDependencyError(
+                "Cyclic dependency in graph: {}".format(
+                    ", ".join(repr(x) for x in todo.items())
+                )
+            )
+
+        yield current
+
+        todo = {
+            node: (dependencies - current)
+            for node, dependencies in todo.items()
+            if node not in current
+        }
+
+
+def stable_topological_sort(nodes, dependency_graph):
+    result = []
+    for layer in topological_sort_as_sets(dependency_graph):
+        for node in nodes:
+            if node in layer:
+                result.append(node)
+    return result
+
+
+def chunked_queryset(queryset, chunk_size=100, max_records=None):
+    """Iterate a queryset in client-side chunks using primary-key pagination.
+
+    Avoids server-side cursors (which ``QuerySet.iterator(chunk_size=...)``
+    uses on psycopg3) — those break with PgBouncer transaction pooling
+    and load-balanced PostgreSQL connections, since a cursor opened on
+    one backend connection may not exist when the next fetch lands on a
+    different one. Each chunk here is a fresh ``LIMIT``-bounded query
+    that any pooled connection can serve.
+
+    Memory stays bounded by ``chunk_size``. When ``max_records`` is
+    set, iteration stops after yielding that many rows and emits a
+    warning — use this as a safety net against accidentally walking
+    a table that has grown unexpectedly large.
+    """
+    queryset = queryset.order_by("pk")
+    last_pk = None
+    yielded = 0
+    while True:
+        chunk_qs = queryset
+        if last_pk is not None:
+            chunk_qs = chunk_qs.filter(pk__gt=last_pk)
+        chunk = list(chunk_qs[:chunk_size])
+        if not chunk:
+            return
+        for obj in chunk:
+            if max_records is not None and yielded >= max_records:
+                logger.warning(
+                    "chunked_queryset reached max_records=%d on %s; "
+                    "iteration truncated",
+                    max_records,
+                    queryset.model.__name__,
+                )
+                return
+            yield obj
+            yielded += 1
+        if len(chunk) < chunk_size:
+            return
+        last_pk = chunk[-1].pk
+
+
+def validate_outbound_url(url: str) -> None:
+    """
+    Reject URLs that resolve to private, loopback, link-local, multicast,
+    reserved, or otherwise non-public addresses. Use as a model field
+    validator on user-supplied destination URLs (webhooks, callbacks,
+    image-import sources) to defeat SSRF.
+
+    Raises django.core.exceptions.ValidationError on rejection. The check
+    is best-effort against DNS rebinding — call this again immediately
+    before connecting (or use IP-pinned outbound HTTP) to defeat
+    time-of-check / time-of-use bypasses.
+    """
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https"):
+        raise DjangoValidationError(
+            f"URL scheme must be http or https, got {parsed.scheme!r}."
+        )
+    if not parsed.hostname:
+        raise DjangoValidationError("URL must include a hostname.")
+
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, None)
+    except socket.gaierror as exc:
+        raise DjangoValidationError(
+            f"Hostname {parsed.hostname!r} could not be resolved: {exc}."
+        )
+
+    for *_, sockaddr in infos:
+        try:
+            ip = ipaddress.ip_address(sockaddr[0])
+        except (ValueError, IndexError):
+            continue
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise DjangoValidationError(
+                f"URL host {parsed.hostname!r} resolves to a non-routable "
+                f"address ({ip}); outbound webhook destinations must be public."
+            )

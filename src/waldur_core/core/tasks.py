@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 import traceback
 from uuid import uuid4
@@ -9,7 +11,8 @@ from celery.local import Proxy
 from celery.result import AsyncResult
 from celery.worker.request import Request
 from constance import config
-from django.db import IntegrityError
+from django.core.cache import cache
+from django.db import IntegrityError, OperationalError, close_old_connections
 from django.db import models as django_models
 from django.db.models import ObjectDoesNotExist
 from django.utils import timezone
@@ -390,47 +393,108 @@ class BackgroundTask(CeleryTask, metaclass=TaskType):
      - all background tasks are scheduled in separate queue "background-durable";
      - by default we do not log background tasks in celery logs. So tasks
        should log themselves explicitly and make sure that they will not
-       spam error messages.
-
-    Implement "is_equal" method to define what tasks are equal and should
-    be executed simultaneously.
+       spam error messages;
+     - prevents queue overflow and eliminates O(N) worker inspection by using cache with TTL.
     """
 
     is_background = True
 
-    def is_equal(self, other_task, *args, **kwargs):
-        """Return True if task do the same operation as other_task.
+    # Safety net: If worker crashes hard (SIGKILL), lock auto-expires after this time.
+    # Set generously above CELERY_TASK_TIME_LIMIT to account for queue wait time
+    # and scheduling delays. Current CELERY_TASK_TIME_LIMIT is 30 min.
+    lock_timeout = 60 * 60 * 2  # 2 hours default
 
-        Note! Other task is represented as serialized celery task - dictionary.
+    def get_unique_key(self, args, kwargs):
         """
-        raise NotImplementedError(
-            'BackgroundTask should implement "is_equal" method to avoid queue overload.'
-        )
+        Generate a unique lock ID.
+        Override this in subclasses to ignore specific args.
+        """
+        # Default: Hash task name + args. Ignore kwargs by default to be safe.
+        # For Waldur resources, usually args[0] (serialized resource) is enough.
+        # Safe JSON serialization
+        try:
+            payload_str = json.dumps(args, sort_keys=True)
+        except (TypeError, ValueError):
+            payload_str = str(args)
 
-    def is_previous_task_processing(self, *args, **kwargs):
-        """Return True if exist task that is equal to current and is uncompleted"""
-        app = self._get_app()
-        inspect = app.control.inspect()
-        active = inspect.active() or {}
-        scheduled = inspect.scheduled() or {}
-        reserved = inspect.reserved() or {}
-        uncompleted = sum(
-            list(active.values()) + list(scheduled.values()) + list(reserved.values()),
-            [],
-        )
-        return any(self.is_equal(task, *args, **kwargs) for task in uncompleted)
+        payload_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
+        return f"celery-lock:{self.name}:{payload_hash}"
 
     def apply_async(self, args=None, kwargs=None, **options):
-        """Do not run background task if previous task is uncompleted"""
-        if self.is_previous_task_processing(*args, **kwargs):
-            message = (
-                "Background task %s was not scheduled, because its predecessor is not completed yet."
-                % self.name
+        args = args or ()
+        kwargs = kwargs or {}
+
+        # 1. Generate Key
+        lock_key = self.get_unique_key(args, kwargs)
+
+        # 2. Check Lock (Atomic ADD)
+        # We store the task_id inside the lock for debugging purposes
+        task_id = options.get("task_id") or str(uuid4())
+
+        # cache.add returns True if key was set, False if key already existed.
+        # celery-beat is long-lived and has no HTTP request boundary, so Django
+        # does not recycle its DB connection. If Postgres drops it (idle
+        # timeout, restart, pgbouncer recycle), DatabaseCache calls raise
+        # OperationalError forever. Recycle once and retry transparently.
+        acquired = self._cache_add_with_retry(lock_key, task_id)
+        if not acquired:
+            logger.info(
+                "Skipping task %s (args=%s) - Lock exists: %s",
+                self.name,
+                args,
+                lock_key,
             )
-            logger.info(message)
-            # It is expected by Celery that apply_async return AsyncResult, otherwise celerybeat dies
-            return self.AsyncResult(options.get("task_id") or str(uuid4()))
-        return super().apply_async(args=args, kwargs=kwargs, **options)
+            # Return dummy result to satisfy Celery Beat
+            return self.AsyncResult(task_id)
+
+        # 3. Schedule Task
+        try:
+            # We inject the lock key into headers so the worker knows what to delete
+            headers = options.get("headers", {})
+            headers["__waldur_lock_key"] = lock_key
+            options["headers"] = headers
+
+            return super().apply_async(args=args, kwargs=kwargs, **options)
+        except Exception:
+            # If connection to Broker fails, release lock immediately
+            cache.delete(lock_key)
+            raise
+
+    def _cache_add_with_retry(self, lock_key, task_id):
+        try:
+            return cache.add(lock_key, task_id, timeout=self.lock_timeout)
+        except OperationalError:
+            logger.warning(
+                "Stale DB connection while acquiring lock for %s; recycling and retrying",
+                self.name,
+            )
+            close_old_connections()
+            return cache.add(lock_key, task_id, timeout=self.lock_timeout)
+
+    def after_return(self, status, retval, task_id, args, kwargs, einfo):
+        """
+        Cleanup handler.
+        Runs on Success, Failure, and SoftTimeLimitExceeded.
+        Does NOT run on SIGKILL (Hard Crash).
+        """
+        lock_key = self.request.headers.get("__waldur_lock_key")
+
+        if lock_key:
+            # Check if we own the lock before deleting
+            # (prevents race condition if lock expired and was re-acquired by another worker)
+            current_lock_holder = cache.get(lock_key)
+            if current_lock_holder == task_id:
+                cache.delete(lock_key)
+                logger.debug("Released lock for task %s: %s", self.name, lock_key)
+            else:
+                logger.debug(
+                    "Lock not owned by task %s (owner: %s), skipping release: %s",
+                    task_id,
+                    current_lock_holder,
+                    lock_key,
+                )
+
+        super().after_return(status, retval, task_id, args, kwargs, einfo)
 
 
 def log_celery_task(request):
@@ -557,8 +621,30 @@ class PollBackendCheckTask(Task):
     def execute(self, instance, backend_check_method):
         # backend_check_method should return True if object does not exist at backend
         backend = self.get_backend(instance)
+        retries = getattr(self.request, "retries", 0) or 0
         if not getattr(backend, backend_check_method)(instance):
+            if retries == 0:
+                logger.info(
+                    "Polling backend check `%s` for `%s` started "
+                    "(interval=%ds, max_retries=%d).",
+                    backend_check_method,
+                    instance,
+                    self.default_retry_delay,
+                    self.max_retries,
+                )
             self.retry()
+        # Approximate elapsed wall time as polls * interval; not exact because
+        # Celery retry scheduling has small jitter and queue delays, but close
+        # enough to distinguish "OpenStack was slow" from "we polled a lot".
+        if retries > 0:
+            logger.info(
+                "Polling backend check `%s` for `%s` completed after %d poll(s) "
+                "(~%ds wall time).",
+                backend_check_method,
+                instance,
+                retries + 1,
+                (retries + 1) * self.default_retry_delay,
+            )
         return instance
 
 
@@ -580,6 +666,41 @@ class ExtensionTaskMixin(CeleryTask, metaclass=TaskType):
             logger.info(message)
             return self.AsyncResult(options.get("task_id") or str(uuid4()))
         return super().apply_async(args=args, kwargs=kwargs, **options)
+
+
+@shared_task(name="waldur_core.core.cleanup_expired_personal_access_tokens")
+def cleanup_expired_personal_access_tokens():
+    """Deactivate expired PATs."""
+    from waldur_core.core.models import PersonalAccessToken
+    from waldur_core.logging import event_logger
+    from waldur_core.logging.enums import EventType
+
+    expired = PersonalAccessToken.objects.filter(
+        expires_at__lte=timezone.now(), is_active=True
+    )
+    for pat in expired.select_related("user"):
+        event_logger.emit(
+            "Personal access token {pat_name} for user {affected_user_username} has expired.",
+            event_type=EventType.PAT_EXPIRED,
+            event_context={"affected_user": pat.user, "pat_name": pat.name},
+            scopes=[pat.user],
+        )
+    count = expired.update(is_active=False)
+    if count:
+        logger.info("Deactivated %d expired personal access tokens.", count)
+
+
+@shared_task(name="waldur_core.core.cleanup_stale_token_exchange_codes")
+def cleanup_stale_token_exchange_codes():
+    """Delete TokenExchangeCode rows that were never redeemed."""
+    from datetime import timedelta
+
+    from waldur_core.core.models import TokenExchangeCode
+
+    cutoff = timezone.now() - timedelta(minutes=5)
+    deleted, _ = TokenExchangeCode.objects.filter(created__lt=cutoff).delete()
+    if deleted:
+        logger.info("Deleted %d stale token exchange codes.", deleted)
 
 
 @shared_task(name="waldur_core.reset_updating_resources")
@@ -619,10 +740,10 @@ def sample_table_sizes():
     # Query PostgreSQL for table sizes and row estimates
     sql = """
     SELECT
-        relname AS table_name,
-        pg_total_relation_size(relid) AS total_size,
-        pg_relation_size(relid) AS data_size,
-        n_live_tup AS row_estimate
+        pg_statio_user_tables.relname AS table_name,
+        pg_total_relation_size(pg_statio_user_tables.relid) AS total_size,
+        pg_relation_size(pg_statio_user_tables.relid) AS data_size,
+        pg_stat_user_tables.n_live_tup AS row_estimate
     FROM
         pg_catalog.pg_statio_user_tables
     LEFT JOIN

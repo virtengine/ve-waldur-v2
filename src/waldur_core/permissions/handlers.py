@@ -1,38 +1,150 @@
 import logging
 
 from constance import config
+from django.contrib.contenttypes.models import ContentType
+from django.db import transaction
 from django.utils import timezone
 
 from waldur_core.core.middleware import get_skip_side_effects
 from waldur_core.core.models import User
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
-from waldur_core.permissions.models import UserRole
+from waldur_core.permissions.models import Role, UserRole
+from waldur_core.permissions.utils import (
+    build_org_role_name,
+    ensure_unique_role_name,
+    get_active_roles,
+)
 from waldur_core.structure.permissions import _get_customer
 
 logger = logging.getLogger(__name__)
 
 
-def should_deactivate_user(user: User) -> bool:
+def stash_customer_slug(sender, instance, **kwargs):
+    """Remember the persisted slug before save so the change can be detected."""
+    if instance.pk:
+        instance._old_slug = (
+            sender.objects.filter(pk=instance.pk).values_list("slug", flat=True).first()
+        )
+
+
+def rename_clones_on_customer_slug_change(sender, instance, created, **kwargs):
+    """Keep an organization's cloned role names in sync with its slug.
+
+    The clone name embeds the owning organization's slug
+    (``CUSTOMER.<slug>.OWNER``); when the slug changes the clones are renamed so
+    the name stays meaningful and cannot collide with a slug later reused by
+    another organization.
+    """
+    if created:
+        return
+    old_slug = getattr(instance, "_old_slug", None)
+    if not old_slug or old_slug == instance.slug:
+        return
+    customer_ct = ContentType.objects.get_for_model(sender)
+    clones = (
+        Role.objects.filter(
+            template__isnull=False,
+            availability__content_type=customer_ct,
+            availability__object_id=instance.id,
+        )
+        .select_related("template")
+        .distinct()
+    )
+    for clone in clones:
+        new_name = ensure_unique_role_name(
+            build_org_role_name(clone.template, instance.slug),
+            exclude_id=clone.id,
+        )
+        if clone.name != new_name:
+            clone.name = new_name
+            clone.save(update_fields=["name"])
+
+
+def get_deactivation_reason(user: User) -> str | None:
     """
     Check if a user should be deactivated based on the current policy.
 
-    Returns True if:
+    Returns a reason string if the user should be deactivated, or None otherwise.
+
+    A user should be deactivated if:
     - DEACTIVATE_USER_IF_NO_ROLES setting is enabled
     - User has no active roles
+    - User has no active course accounts in non-removed projects
     - User is currently active
     - User is not staff or support
     """
     if not config.DEACTIVATE_USER_IF_NO_ROLES:
-        return False
+        return None
 
-    has_active_roles = UserRole.objects.filter(user=user, is_active=True).exists()
-    return (
-        not has_active_roles
-        and user.is_active
-        and not user.is_staff
-        and not user.is_support
+    if not user.is_active or user.is_staff or user.is_support:
+        logger.debug(
+            "User %s (uuid=%s) skipped for deactivation: is_active=%s, is_staff=%s, is_support=%s",
+            user.username,
+            user.uuid,
+            user.is_active,
+            user.is_staff,
+            user.is_support,
+        )
+        return None
+
+    if get_active_roles(user).exists():
+        logger.debug(
+            "User %s (uuid=%s) skipped for deactivation: has active roles",
+            user.username,
+            user.uuid,
+        )
+        return None
+
+    from waldur_mastermind.marketplace.enums import CourseAccountState
+    from waldur_mastermind.marketplace.models import CourseAccount
+
+    ok_course_accounts = CourseAccount.objects.filter(
+        user=user,
+        state=CourseAccountState.OK,
+        project__is_removed=False,
     )
+    if ok_course_accounts.exists():
+        logger.debug(
+            "User %s (uuid=%s) skipped for deactivation: has %d OK course account(s) in active projects",
+            user.username,
+            user.uuid,
+            ok_course_accounts.count(),
+        )
+        return None
+
+    all_course_accounts = CourseAccount.objects.filter(user=user)
+    if all_course_accounts.exists():
+        ca_details = list(
+            all_course_accounts.values_list(
+                "uuid", "state", "project__uuid", "project__is_removed"
+            )
+        )
+        reason = (
+            f"No active roles, {all_course_accounts.count()} course account(s) "
+            f"but none in OK state with active project. Details: {ca_details}"
+        )
+        logger.info(
+            "User %s (uuid=%s) will be deactivated: %s",
+            user.username,
+            user.uuid,
+            reason,
+        )
+        return reason
+
+    reason = "No active roles and no course accounts"
+    logger.info(
+        "User %s (uuid=%s) will be deactivated: %s",
+        user.username,
+        user.uuid,
+        reason,
+    )
+    return reason
+
+
+def should_deactivate_user(user: User) -> bool:
+    """Check if a user should be deactivated based on the current policy."""
+    return get_deactivation_reason(user) is not None
 
 
 def should_reactivate_user(user: User) -> bool:
@@ -41,19 +153,36 @@ def should_reactivate_user(user: User) -> bool:
 
     Returns True if:
     - DEACTIVATE_USER_IF_NO_ROLES setting is enabled
-    - User has active roles
     - User is currently inactive
     - User is not staff or support
+    - User was not administratively deactivated (staff override)
+    - User has active roles OR has OK course accounts in active projects
     """
     if not config.DEACTIVATE_USER_IF_NO_ROLES:
         return False
 
-    return (
-        not user.is_active
-        and not user.is_staff
-        and not user.is_support
-        and UserRole.objects.filter(user=user, is_active=True).exists()
-    )
+    if user.is_active or user.is_staff or user.is_support:
+        return False
+
+    # An administrative deactivation is an explicit staff override that must
+    # not be undone automatically, even if the user regains roles.
+    if user.is_admin_deactivated:
+        return False
+
+    if get_active_roles(user).exists():
+        return True
+
+    from waldur_mastermind.marketplace.enums import CourseAccountState
+    from waldur_mastermind.marketplace.models import CourseAccount
+
+    if CourseAccount.objects.filter(
+        user=user,
+        state=CourseAccountState.OK,
+        project__is_removed=False,
+    ).exists():
+        return True
+
+    return False
 
 
 def deactivate_user_with_logging(user: User, reason: str = "No active roles") -> None:
@@ -61,7 +190,8 @@ def deactivate_user_with_logging(user: User, reason: str = "No active roles") ->
     Deactivate a user and log the action.
     """
     user.is_active = False
-    user.save(update_fields=["is_active"])
+    user.deactivation_reason = reason
+    user.save(update_fields=["is_active", "deactivation_reason"])
 
     logger.info(
         f"User {user} (uuid={user.uuid}) has been deactivated automatically. Reason: {reason}"
@@ -80,7 +210,8 @@ def reactivate_user_with_logging(user: User, reason: str = "Gained new role") ->
     Reactivate a user and log the action.
     """
     user.is_active = True
-    user.save(update_fields=["is_active"])
+    user.deactivation_reason = ""
+    user.save(update_fields=["is_active", "deactivation_reason"])
 
     logger.info(
         f"User {user} (uuid={user.uuid}) has been reactivated automatically. Reason: {reason}"
@@ -229,8 +360,9 @@ def deactivate_user_if_no_roles(sender, instance, current_user=None, **kwargs):
         return
 
     user = instance.user
-    if should_deactivate_user(user):
-        deactivate_user_with_logging(user, "All roles were revoked")
+    reason = get_deactivation_reason(user)
+    if reason:
+        deactivate_user_with_logging(user, reason)
 
 
 def reactivate_user_if_gaining_roles(sender, instance, current_user=None, **kwargs):
@@ -242,3 +374,23 @@ def reactivate_user_if_gaining_roles(sender, instance, current_user=None, **kwar
     user = instance.user
     if should_reactivate_user(user):
         reactivate_user_with_logging(user, "Gained a new role")
+
+
+def revoke_user_roles_on_availability_removal(sender, instance, **kwargs):
+    """Schedule async revocation when a RoleAvailability row is removed.
+
+    The actual scan over ``UserRole`` rows for the affected role lives in
+    :func:`waldur_core.permissions.tasks.reconcile_user_roles_for_role`;
+    handlers should not iterate large querysets synchronously inside the
+    request transaction.
+    """
+    # Function-local: tasks.py imports from handlers.py at top, so a
+    # top-level import here would form a circular dependency.
+    from waldur_core.permissions import tasks as permission_tasks
+
+    role_id = instance.role_id
+    if role_id is None:
+        return
+    transaction.on_commit(
+        lambda: permission_tasks.reconcile_user_roles_for_role.delay(role_id)
+    )

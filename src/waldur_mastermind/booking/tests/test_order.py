@@ -1,6 +1,8 @@
 from freezegun import freeze_time
 from rest_framework import status, test
 
+from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures
 from waldur_mastermind.booking import models as booking_models
@@ -16,7 +18,7 @@ from waldur_mastermind.marketplace.enums import (
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 
 
-class OrderProcessedTest(test.APITransactionTestCase):
+class OrderProcessedTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = fixtures.ProjectFixture()
         self.offering = marketplace_factories.OfferingFactory(type=BOOKING_OFFERING)
@@ -61,7 +63,7 @@ class OrderProcessedTest(test.APITransactionTestCase):
 
 
 @freeze_time("2018-12-01")
-class OrderCreateTest(test.APITransactionTestCase):
+class OrderCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.project = self.fixture.project
@@ -90,6 +92,11 @@ class OrderCreateTest(test.APITransactionTestCase):
             },
             state=OfferingStates.ACTIVE,
         )
+
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_ORDER)
+        ProjectRole.ADMIN.add_permission(PermissionEnum.CREATE_ORDER)
+        ProjectRole.MANAGER.add_permission(PermissionEnum.CREATE_ORDER)
+        ProjectRole.MEMBER.add_permission(PermissionEnum.CREATE_ORDER)
 
     def test_create_order_if_schedule_is_valid(self):
         add_payload = {

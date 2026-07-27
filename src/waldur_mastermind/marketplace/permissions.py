@@ -1,13 +1,22 @@
 from constance import config
+from django.contrib.contenttypes.models import ContentType
+from django.db.models import Q
 from django.utils.translation import gettext_lazy as _
 from rest_framework import exceptions
 
+from waldur_core.core import exceptions as core_exceptions
 from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.permissions.models import UserRole
 from waldur_core.permissions.utils import has_permission, permission_factory
+from waldur_core.structure import models as structure_models
 from waldur_core.structure import permissions as structure_permissions
-from waldur_mastermind.marketplace.enums import OfferingStates, OrderTypes
+from waldur_mastermind.marketplace.enums import (
+    OfferingStates,
+    OrderTypes,
+    ResourceStates,
+)
 
-from . import models
+from . import models, utils
 
 
 def can_register_service_provider(request, customer):
@@ -24,6 +33,82 @@ def has_project_permission(request, permission, project):
     return has_permission(request, permission, project) or has_permission(
         request, permission, project.customer
     )
+
+
+def restricted_offering_roles(offering) -> list:
+    """Role names an offering is restricted to (empty if unrestricted)."""
+    return offering.plugin_options.get("restricted_to_roles") or []
+
+
+def offering_is_restricted(offering) -> bool:
+    """True if the offering limits access to specific roles via
+    plugin_options['restricted_to_roles']."""
+    return bool(restricted_offering_roles(offering))
+
+
+def user_active_role_names(user) -> set:
+    """Names of all active roles held by the user, in any scope."""
+    if user.is_anonymous:
+        return set()
+    return set(
+        UserRole.objects.filter(is_active=True, user=user).values_list(
+            "role__name", flat=True
+        )
+    )
+
+
+def user_holds_role_in_project_scope(user, project, role_names) -> bool:
+    """True if the user holds one of role_names on the given project or its
+    customer. An empty role_names means "no restriction" and returns True."""
+    if not role_names:
+        return True
+    if user.is_anonymous:
+        return False
+    project_ct = ContentType.objects.get_for_model(structure_models.Project)
+    customer_ct = ContentType.objects.get_for_model(structure_models.Customer)
+    return (
+        UserRole.objects.filter(is_active=True, user=user, role__name__in=role_names)
+        .filter(
+            Q(content_type=project_ct, object_id=project.id)
+            | Q(content_type=customer_ct, object_id=project.customer_id)
+        )
+        .exists()
+    )
+
+
+def user_holds_restricted_role(user, project, offering) -> bool:
+    """True if the user holds one of the offering's restricted roles in the
+    given project or its customer. Used for per-project order authorization."""
+    return user_holds_role_in_project_scope(
+        user, project, restricted_offering_roles(offering)
+    )
+
+
+def offering_auto_approve_roles(offering) -> list:
+    """Role names whose orders skip consumer review for this offering
+    (plugin_options['auto_approve_for_roles'], empty if none). Independent of
+    restricted_to_roles: governs approval, not visibility/ordering."""
+    return offering.plugin_options.get("auto_approve_for_roles") or []
+
+
+def user_holds_restricted_role_anywhere(user, offering, held_role_names=None) -> bool:
+    """True if the user holds one of the offering's restricted roles in any
+    scope. Used for the coarse catalog/is_accessible visibility check. Pass
+    held_role_names (from user_active_role_names) to avoid a per-offering query."""
+    role_names = restricted_offering_roles(offering)
+    if not role_names:
+        return True
+    if held_role_names is None:
+        held_role_names = user_active_role_names(user)
+    return bool(set(role_names) & held_role_names)
+
+
+def user_can_approve_order_as_consumer(user, order: models.Order) -> bool:
+    if user.is_staff:
+        return True
+    return has_permission(
+        user, PermissionEnum.APPROVE_ORDER, order.project
+    ) or has_permission(user, PermissionEnum.APPROVE_ORDER, order.project.customer)
 
 
 def order_should_not_be_reviewed_by_consumer(order: models.Order):
@@ -62,6 +147,15 @@ def order_should_not_be_reviewed_by_consumer(order: models.Order):
         order.type == OrderTypes.TERMINATE
         and order.offering.customer
         and structure_permissions._has_owner_access(user, order.offering.customer)
+    ):
+        return True
+
+    # Skip consumer review when the offering designates the creator's role for
+    # auto-approval, held on the target project or its customer. Independent of
+    # the ORDER.APPROVE permission below and configurable per offering by staff.
+    auto_approve_roles = offering_auto_approve_roles(order.offering)
+    if auto_approve_roles and user_holds_role_in_project_scope(
+        user, order.project, auto_approve_roles
     ):
         return True
 
@@ -117,6 +211,31 @@ user_can_terminate_resource = permission_factory(
     ["project", "project.customer", "offering.customer"],
 )
 
+
+def validate_resource_terminate_state(resource: models.Resource) -> None:
+    """Allow terminate on OK/ERRED resources and on TERMINATING with pending approval."""
+    if resource.state in (ResourceStates.OK, ResourceStates.ERRED):
+        return
+    if (
+        resource.state == ResourceStates.TERMINATING
+        and utils.get_pending_consumer_terminate_order(resource)
+    ):
+        return
+
+    states_names = dict(ResourceStates.CHOICES)
+    ok_or_erred = ", ".join(
+        str(states_names[state]) for state in (ResourceStates.OK, ResourceStates.ERRED)
+    )
+    terminating_pending = str(states_names[ResourceStates.TERMINATING])
+    raise core_exceptions.IncorrectStateException(
+        _(
+            "Valid states for operation: %(ok_or_erred)s, or %(terminating)s "
+            "when a termination order is pending consumer approval."
+        )
+        % {"ok_or_erred": ok_or_erred, "terminating": terminating_pending}
+    )
+
+
 user_can_manage_offering_user_group = permission_factory(
     PermissionEnum.MANAGE_OFFERING_USER_GROUP,
     ["offering.customer"],
@@ -135,6 +254,18 @@ def user_can_set_end_date_by_provider(
     ):
         return
     raise exceptions.PermissionDenied()
+
+
+user_can_set_end_date_as_consumer = permission_factory(
+    PermissionEnum.SET_RESOURCE_END_DATE,
+    ["project.customer", "project"],
+)
+
+
+user_can_set_end_date_as_provider = permission_factory(
+    PermissionEnum.SET_RESOURCE_END_DATE,
+    ["offering.customer", "offering"],
+)
 
 
 def user_can_update_thumbnail(request, view, obj: models.Offering | None = None):
@@ -285,3 +416,65 @@ def is_service_provider_or_staff(request, view, obj=None):
     raise exceptions.PermissionDenied(
         _("Only staff and service providers can create tags.")
     )
+
+
+def markdown_image_upload_is_enabled(request, view, obj=None):
+    if not config.ENABLE_MARKDOWN_IMAGE_UPLOAD:
+        raise exceptions.PermissionDenied(_("Markdown image upload is disabled."))
+
+
+def can_manage_offering_lifecycle(request, view, obj=None):
+    """Check if non-staff users are allowed to manage offering lifecycle.
+
+    When ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT is False,
+    only staff can perform offering lifecycle operations.
+    """
+    if request.user.is_staff:
+        return
+    if not config.ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT:
+        raise exceptions.PermissionDenied()
+
+
+def has_maintenance_announcement_permission(request, service_provider) -> bool:
+    """True if the user may manage maintenance announcements for this SP."""
+    return has_permission(
+        request,
+        PermissionEnum.MANAGE_MAINTENANCE_ANNOUNCEMENT,
+        service_provider.customer,
+    ) or has_permission(
+        request,
+        PermissionEnum.MANAGE_MAINTENANCE_ANNOUNCEMENT,
+        service_provider,
+    )
+
+
+def check_maintenance_announcement_create_permissions(request, view, obj=None):
+    serializer = view.get_serializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    service_provider = serializer.validated_data.get("service_provider")
+    if not service_provider or not has_maintenance_announcement_permission(
+        request, service_provider
+    ):
+        raise exceptions.PermissionDenied()
+
+
+def check_maintenance_announcement_offering_create_permissions(request, view, obj=None):
+    serializer = view.get_serializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    maintenance = serializer.validated_data.get("maintenance")
+    if not maintenance or not has_maintenance_announcement_permission(
+        request, maintenance.service_provider
+    ):
+        raise exceptions.PermissionDenied()
+
+
+def check_maintenance_announcement_offering_template_create_permissions(
+    request, view, obj=None
+):
+    serializer = view.get_serializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    maintenance_template = serializer.validated_data.get("maintenance_template")
+    if not maintenance_template or not has_maintenance_announcement_permission(
+        request, maintenance_template.service_provider
+    ):
+        raise exceptions.PermissionDenied()

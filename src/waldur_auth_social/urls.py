@@ -8,6 +8,26 @@ urlpatterns = [
         views.RemoteEduteamsView.as_view(),
         name="auth_remote_eduteams",
     ),
+    path(
+        "api/identity-bridge/",
+        views.IdentityBridgeView.as_view(),
+        name="auth_identity_bridge",
+    ),
+    path(
+        "api/identity-bridge/remove/",
+        views.IdentityBridgeRemoveView.as_view(),
+        name="auth_identity_bridge_remove",
+    ),
+    path(
+        "api/identity-bridge/allowed-fields/",
+        views.IdentityBridgeAllowedFieldsView.as_view(),
+        name="auth_identity_bridge_allowed_fields",
+    ),
+    path(
+        "api/identity-bridge/stats/",
+        views.IdentityBridgeStatsView.as_view(),
+        name="auth_identity_bridge_stats",
+    ),
 ]
 
 for provider in const.ProviderChoices.CHOICES:

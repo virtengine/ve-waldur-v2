@@ -9,7 +9,7 @@ from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
 from waldur_core.structure.tests import factories, fixtures
 
 
-class UserDataAccessPermissionTest(test.APITransactionTestCase):
+class UserDataAccessPermissionTest(test.APITestCase):
     """Test permission checks for data access endpoint."""
 
     def setUp(self):
@@ -52,7 +52,7 @@ class UserDataAccessPermissionTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
 
-class UserDataAccessAdministrativeTest(test.APITransactionTestCase):
+class UserDataAccessAdministrativeTest(test.APITestCase):
     """Test administrative access section of data access endpoint."""
 
     def setUp(self):
@@ -112,7 +112,7 @@ class UserDataAccessAdministrativeTest(test.APITransactionTestCase):
         self.assertIn("users", admin_access)
 
 
-class UserDataAccessOrganizationalTest(test.APITransactionTestCase):
+class UserDataAccessOrganizationalTest(test.APITestCase):
     """Test organizational access section of data access endpoint."""
 
     def setUp(self):
@@ -194,7 +194,7 @@ class UserDataAccessOrganizationalTest(test.APITransactionTestCase):
         self.assertNotIn(str(self.owner.uuid), all_user_uuids)
 
 
-class UserDataAccessSummaryTest(test.APITransactionTestCase):
+class UserDataAccessSummaryTest(test.APITestCase):
     """Test summary section of data access endpoint."""
 
     def setUp(self):
@@ -238,7 +238,7 @@ class UserDataAccessSummaryTest(test.APITransactionTestCase):
         self.assertGreaterEqual(summary["total_provider_access"], 0)
 
 
-class UserDataAccessServiceProviderTest(test.APITransactionTestCase):
+class UserDataAccessServiceProviderTest(test.APITestCase):
     """Test service provider access section of data access endpoint."""
 
     def setUp(self):
@@ -259,7 +259,87 @@ class UserDataAccessServiceProviderTest(test.APITransactionTestCase):
         self.assertEqual(len(provider_access), 0)
 
 
-class UserDataAccessLoggingTest(test.APITransactionTestCase):
+class GetClientIpTest(test.APITestCase):
+    """Test IP address extraction and validation."""
+
+    def test_valid_ipv4_is_returned(self):
+        from waldur_core.structure.utils_data_access import get_client_ip
+
+        request = self.client.get("/").wsgi_request
+        request.META["REMOTE_ADDR"] = "192.168.1.1"
+        request.META.pop("HTTP_X_FORWARDED_FOR", None)
+        self.assertEqual(get_client_ip(request), "192.168.1.1")
+
+    def test_valid_ipv6_is_returned(self):
+        from waldur_core.structure.utils_data_access import get_client_ip
+
+        request = self.client.get("/").wsgi_request
+        request.META["HTTP_X_FORWARDED_FOR"] = "::1"
+        self.assertEqual(get_client_ip(request), "::1")
+
+    def test_hostname_in_x_forwarded_for_returns_none(self):
+        from waldur_core.structure.utils_data_access import get_client_ip
+
+        request = self.client.get("/").wsgi_request
+        request.META["HTTP_X_FORWARDED_FOR"] = "spoofed.example.com"
+        self.assertIsNone(get_client_ip(request))
+
+    def test_garbage_value_returns_none(self):
+        from waldur_core.structure.utils_data_access import get_client_ip
+
+        request = self.client.get("/").wsgi_request
+        request.META["HTTP_X_FORWARDED_FOR"] = "not-an-ip-at-all"
+        self.assertIsNone(get_client_ip(request))
+
+    def test_none_request_returns_none(self):
+        from waldur_core.structure.utils_data_access import get_client_ip
+
+        self.assertIsNone(get_client_ip(None))
+
+    def test_x_forwarded_for_takes_first_ip(self):
+        from waldur_core.structure.utils_data_access import get_client_ip
+
+        request = self.client.get("/").wsgi_request
+        request.META["HTTP_X_FORWARDED_FOR"] = "10.0.0.1, 192.168.1.1"
+        self.assertEqual(get_client_ip(request), "10.0.0.1")
+
+
+class LogUserDataAccessTransactionSafetyTest(test.APITestCase):
+    """Test that data access logging does not corrupt the outer DB transaction."""
+
+    def setUp(self):
+        self.user = factories.UserFactory()
+        self.staff = factories.UserFactory(is_staff=True)
+
+    @override_config(USER_DATA_ACCESS_LOGGING_ENABLED=True)
+    def test_spoofed_ip_does_not_cause_500_on_user_me(self):
+        """Spoofed X-Forwarded-For with a hostname should not crash /api/users/me/."""
+        self.client.force_authenticate(self.staff)
+        response = self.client.get(
+            "/api/users/me/",
+            HTTP_X_FORWARDED_FOR="spoofed.example.com",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    @override_config(USER_DATA_ACCESS_LOGGING_ENABLED=True)
+    def test_spoofed_ip_logs_none_ip_address(self):
+        """When IP is invalid, log entry should be created with ip_address=None."""
+        from waldur_core.logging.models import UserDataAccessLog
+
+        self.client.force_authenticate(self.staff)
+        self.client.get(
+            factories.UserFactory.get_url(self.user),
+            HTTP_X_FORWARDED_FOR="spoofed.example.com",
+        )
+        log_entry = UserDataAccessLog.objects.filter(
+            target_user=self.user,
+            accessor=self.staff,
+        ).first()
+        self.assertIsNotNone(log_entry)
+        self.assertIsNone(log_entry.ip_address)
+
+
+class UserDataAccessLoggingTest(test.APITestCase):
     """Test user data access logging functionality."""
 
     def setUp(self):
@@ -357,7 +437,7 @@ class UserDataAccessLoggingTest(test.APITransactionTestCase):
         self.assertEqual(log_count, 0)
 
 
-class UserDataAccessHistoryTest(test.APITransactionTestCase):
+class UserDataAccessHistoryTest(test.APITestCase):
     """Test user data access history endpoint."""
 
     def setUp(self):
@@ -466,7 +546,7 @@ class UserDataAccessHistoryTest(test.APITransactionTestCase):
             self.assertEqual(entry["accessor_type"], "staff")
 
 
-class GlobalDataAccessLogsPermissionTest(test.APITransactionTestCase):
+class GlobalDataAccessLogsPermissionTest(test.APITestCase):
     """Test permission checks for global data access logs endpoint."""
 
     def setUp(self):
@@ -495,7 +575,7 @@ class GlobalDataAccessLogsPermissionTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
 
-class GlobalDataAccessLogsListTest(test.APITransactionTestCase):
+class GlobalDataAccessLogsListTest(test.APITestCase):
     """Test list functionality for global data access logs endpoint."""
 
     def setUp(self):
@@ -580,7 +660,7 @@ class GlobalDataAccessLogsListTest(test.APITransactionTestCase):
         self.assertIn("context", log_data)
 
 
-class GlobalDataAccessLogsFilterTest(test.APITransactionTestCase):
+class GlobalDataAccessLogsFilterTest(test.APITestCase):
     """Test filtering for global data access logs endpoint."""
 
     def setUp(self):
@@ -674,7 +754,7 @@ class GlobalDataAccessLogsFilterTest(test.APITransactionTestCase):
         self.assertIn(str(self.old_log.uuid), log_uuids)
 
 
-class GlobalDataAccessLogsOrderingTest(test.APITransactionTestCase):
+class GlobalDataAccessLogsOrderingTest(test.APITestCase):
     """Test ordering for global data access logs endpoint."""
 
     def setUp(self):
@@ -730,7 +810,7 @@ class GlobalDataAccessLogsOrderingTest(test.APITransactionTestCase):
         self.assertLess(idx1, idx2)
 
 
-class GlobalDataAccessLogsDeleteTest(test.APITransactionTestCase):
+class GlobalDataAccessLogsDeleteTest(test.APITestCase):
     """Test delete functionality for global data access logs endpoint."""
 
     def setUp(self):

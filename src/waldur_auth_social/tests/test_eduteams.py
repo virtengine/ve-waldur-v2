@@ -1,6 +1,8 @@
 from unittest import mock
 
 import responses
+from constance.test import override_config
+from django.core.cache import cache
 from django.test import override_settings
 from rest_framework import status, test
 from rest_framework.reverse import reverse
@@ -20,7 +22,7 @@ from waldur_core.structure.tests import factories as structure_factories
         "REMOTE_EDUTEAMS_ENABLED": True,
     }
 )
-class RemoteEduteamsTest(test.APITransactionTestCase):
+class RemoteEduteamsTest(test.APITestCase):
     def setUp(self) -> None:
         super().setUp()
         self.url = reverse("auth_remote_eduteams")
@@ -30,13 +32,17 @@ class RemoteEduteamsTest(test.APITransactionTestCase):
         self.user_url = (
             f"https://proxy.acc.researcher-access.org/api/userinfo/{self.valid_cuid}"
         )
+        cache.delete("REMOTE_EDUTEAMS_ACCESS_TOKEN")
+
+    def setup_token_response(self):
         responses.add(
             method="POST",
             url="https://proxy.acc.researcher-access.org/OIDC/token",
-            json={"access_token": "random_token"},
+            json={"access_token": "random_token", "refresh_token": "new_refresh_token"},
         )
 
     def setup_user_info(self):
+        self.setup_token_response()
         responses.add(
             method="GET",
             url=self.user_url,
@@ -52,8 +58,8 @@ class RemoteEduteamsTest(test.APITransactionTestCase):
             },
         )
 
+    @responses.activate
     def test_unauthorized_user_can_not_sync_remote_users(self):
-        self.setup_user_info()
         user = structure_factories.UserFactory()
         self.client.force_login(user)
         response = self.client.post(self.url)
@@ -129,10 +135,12 @@ class RemoteEduteamsTest(test.APITransactionTestCase):
 
         mock_event_logger.assert_any_call(
             (
-                "User {affected_user_username} has been updated. Details:\n"
+                "User {affected_user_username} has been updated."
+                " Source: isd:eduteams. Details:\n"
                 "email: steve@jobs.com -> john@snow.me\n"
                 "first_name: Steve -> John\n"
-                "last_name: Jobs -> Snow"
+                "last_name: Jobs -> Snow\n"
+                "active_isds: [] -> ['isd:eduteams']"
             ),
             event_type=EventType.USER_UPDATE_SUCCEEDED,
             event_context={"affected_user": mock.ANY},
@@ -141,6 +149,7 @@ class RemoteEduteamsTest(test.APITransactionTestCase):
 
     @responses.activate
     def test_when_user_is_not_found_it_is_disabled(self):
+        self.setup_token_response()
         valid_cuid = (
             "17b867ff52768f8c11f1501598c2dd1e526fe7f0@acc.researcher-access.org"
         )
@@ -194,3 +203,89 @@ class RemoteEduteamsTest(test.APITransactionTestCase):
 
         existing_user.refresh_from_db()
         self.assertTrue(existing_user.notifications_enabled)
+
+    @responses.activate
+    @override_config(
+        FEDERATED_IDENTITY_AUTHORITATIVE_ISD="isd:efp",
+        FEDERATED_IDENTITY_LOCKED_FIELDS=["first_name", "last_name"],
+    )
+    def test_locked_fields_not_overwritten_when_authoritative_isd_present(self):
+        # EFP is the authoritative source for names of users federated via both
+        # EFP and eduTEAMS. The eduTEAMS sync must leave the locked fields
+        # (first_name/last_name) intact while still syncing the rest of the
+        # profile, avoiding the periodic name flapping. Pre-existing names differ
+        # from the eduTEAMS payload ("John Snow") so preservation is observable.
+        self.setup_user_info()
+        user = structure_factories.UserFactory(is_staff=True)
+        self.client.force_login(user)
+
+        remote_user = structure_factories.UserFactory(
+            username=self.valid_cuid,
+            first_name="Jane",
+            last_name="Doe",
+            email="foo@example.com",
+            active_isds=["isd:efp"],
+        )
+
+        response = self.client.post(self.url, {"cuid": self.valid_cuid})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        remote_user.refresh_from_db()
+        # Locked fields owned by EFP are preserved ...
+        self.assertEqual(remote_user.first_name, "Jane")
+        self.assertEqual(remote_user.last_name, "Doe")
+        # ... while the rest of the eduTEAMS profile still syncs.
+        self.assertEqual(remote_user.email, "john@snow.me")
+        self.assertIn("isd:efp", remote_user.active_isds)
+        self.assertIn("isd:eduteams", remote_user.active_isds)
+
+    @responses.activate
+    @override_config(
+        FEDERATED_IDENTITY_AUTHORITATIVE_ISD="isd:efp",
+        FEDERATED_IDENTITY_LOCKED_FIELDS=["first_name", "last_name"],
+    )
+    def test_locked_fields_updated_when_authoritative_isd_absent(self):
+        # Protection is enabled, but the user is not asserted by the
+        # authoritative ISD, so eduTEAMS remains the source of truth.
+        self.setup_user_info()
+        user = structure_factories.UserFactory(is_staff=True)
+        self.client.force_login(user)
+
+        remote_user = structure_factories.UserFactory(
+            username=self.valid_cuid,
+            first_name="Jane",
+            last_name="Doe",
+            email="foo@example.com",
+        )
+
+        response = self.client.post(self.url, {"cuid": self.valid_cuid})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        remote_user.refresh_from_db()
+        self.assertEqual(remote_user.first_name, "John")
+        self.assertEqual(remote_user.last_name, "Snow")
+        self.assertEqual(remote_user.email, "john@snow.me")
+
+    @responses.activate
+    def test_locked_fields_updated_when_protection_disabled(self):
+        # Default configuration (no authoritative ISD / no locked fields):
+        # the protection is off and eduTEAMS updates names as before, even for
+        # a user asserted by EFP.
+        self.setup_user_info()
+        user = structure_factories.UserFactory(is_staff=True)
+        self.client.force_login(user)
+
+        remote_user = structure_factories.UserFactory(
+            username=self.valid_cuid,
+            first_name="Jane",
+            last_name="Doe",
+            email="foo@example.com",
+            active_isds=["isd:efp"],
+        )
+
+        response = self.client.post(self.url, {"cuid": self.valid_cuid})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        remote_user.refresh_from_db()
+        self.assertEqual(remote_user.first_name, "John")
+        self.assertEqual(remote_user.last_name, "Snow")

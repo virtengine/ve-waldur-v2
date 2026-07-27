@@ -1,5 +1,6 @@
-from django.contrib import admin
+from django.contrib import admin, messages
 from django.core.exceptions import ValidationError
+from django.db import transaction
 from django.forms.models import ModelForm
 from django.shortcuts import redirect
 from django.urls import resolve, reverse
@@ -118,6 +119,35 @@ class CategoryGroupAdmin(modeltranslation_admin.TranslationAdmin):
         "uuid",
     )
     inlines = [CategoryInline]
+
+
+class OfferingGroupAdmin(admin.ModelAdmin):
+    model = models.OfferingGroup
+    list_display = ("title", "customer", "uuid")
+    list_filter = ("customer",)
+    search_fields = ("title", "description", "customer__name")
+    raw_id_fields = ("customer",)
+
+
+class PosixIdPoolAdmin(admin.ModelAdmin):
+    model = models.PosixIdPool
+    list_display = (
+        "scope",
+        "customer",
+        "min_uid",
+        "max_uid",
+        "next_uid",
+        "min_gid",
+        "max_gid",
+        "next_gid",
+    )
+    raw_id_fields = ("service_provider", "offering")
+
+
+class PosixIdentityAdmin(admin.ModelAdmin):
+    model = models.PosixIdentity
+    list_display = ("uid", "gid", "pool", "offering", "released_at")
+    raw_id_fields = ("pool", "offering")
 
 
 class ScreenshotsInline(admin.StackedInline):
@@ -354,6 +384,8 @@ class OfferingAdmin(VersionAdmin, admin.ModelAdmin):
         "full_description",
         "country",
         "privacy_policy_link",
+        "helpdesk_url",
+        "documentation_url",
         "thumbnail",
         "attributes",
         "options",
@@ -694,7 +726,31 @@ class ResourceAdmin(core_admin.ExtraActionsMixin, VersionAdmin):
                 raise ValidationError(_("Resource has to be in OK state."))
 
     restore_limits = RestoreLimits()
-    actions = ["terminate_resources", "restore_limits"]
+
+    @transaction.atomic
+    def hard_delete_terminated(self, request, queryset):
+        terminated = queryset.filter(state=ResourceStates.TERMINATED)
+        count = terminated.count()
+        if count == 0:
+            self.message_user(
+                request,
+                _("No terminated resources in the selection."),
+                messages.WARNING,
+            )
+            return
+        terminated.delete()
+        message = ngettext(
+            "%(count)d terminated resource has been permanently removed.",
+            "%(count)d terminated resources have been permanently removed.",
+            count,
+        )
+        self.message_user(request, message % {"count": count}, messages.SUCCESS)
+
+    hard_delete_terminated.short_description = _(
+        "Hard delete selected terminated resources"
+    )
+
+    actions = ["terminate_resources", "restore_limits", "hard_delete_terminated"]
 
     def get_extra_actions(self):
         return [
@@ -722,6 +778,9 @@ class CategoryHelpArticleAdmin(admin.ModelAdmin):
 admin.site.register(models.ServiceProvider, ServiceProviderAdmin)
 admin.site.register(models.Category)
 admin.site.register(models.CategoryGroup, CategoryGroupAdmin)
+admin.site.register(models.OfferingGroup, OfferingGroupAdmin)
+admin.site.register(models.PosixIdPool, PosixIdPoolAdmin)
+admin.site.register(models.PosixIdentity, PosixIdentityAdmin)
 admin.site.register(models.Offering, OfferingAdmin)
 admin.site.register(models.Section, SectionAdmin)
 admin.site.register(models.Attribute, AttributeAdmin)
@@ -731,3 +790,59 @@ admin.site.register(models.Plan, PlanAdmin)
 admin.site.register(models.Resource, ResourceAdmin)
 admin.site.register(models.OfferingUser, OfferingUserAdmin)
 admin.site.register(models.CategoryHelpArticle, CategoryHelpArticleAdmin)
+
+
+class ComponentUsagePollRecordAdmin(admin.ModelAdmin):
+    list_display = (
+        "resource",
+        "component_type",
+        "last_poll_time",
+        "raw_usage",
+        "elapsed_hours",
+        "increment",
+        "accumulated_total",
+        "billing_period",
+    )
+    list_filter = ("billing_period",)
+    search_fields = ("resource__name",)
+    readonly_fields = (
+        "resource",
+        "component",
+        "last_poll_time",
+        "raw_usage",
+        "elapsed_hours",
+        "increment",
+        "accumulated_total",
+        "billing_period",
+    )
+
+    def component_type(self, obj):
+        return obj.component.type
+
+    component_type.short_description = "Component"
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+
+admin.site.register(models.ComponentUsagePollRecord, ComponentUsagePollRecordAdmin)
+
+
+class ResourceLimitChangeRequestAdmin(admin.ModelAdmin):
+    list_display = (
+        "resource",
+        "state",
+        "created_by",
+        "created",
+        "reviewed_by",
+        "reviewed_at",
+    )
+    list_filter = ("state",)
+    search_fields = ("resource__name",)
+    readonly_fields = ("uuid", "created", "modified", "reviewed_at")
+
+
+admin.site.register(models.ResourceLimitChangeRequest, ResourceLimitChangeRequestAdmin)

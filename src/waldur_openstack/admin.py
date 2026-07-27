@@ -68,8 +68,8 @@ class TenantAdmin(structure_admin.ResourceAdmin):
         short_description = _("Allocate floating IPs")
 
         def validate(self, tenant):
-            super(TenantAdmin.AllocateFloatingIP, self).validate(tenant)
-            if not tenant.external_network_id:
+            super().validate(tenant)
+            if not tenant.external_network_ref_id and not tenant.external_network_id:
                 raise ValidationError(
                     _("Tenant has to have external network to allocate floating IP.")
                 )

@@ -1156,6 +1156,12 @@ It is used for rendering callback URL in HomePort
 
 Label for the username field in Rancher external user resource access management.
 
+#### DISCLAIMER_AREA_TEXT
+
+**Type:** text_field
+
+Text content rendered in the disclaimer area below the footer.
+
 ### Marketplace Branding
 
 #### SITE_ADDRESS
@@ -1192,6 +1198,22 @@ It is used in marketplace order details and invoices for currency formatting.
 
 Marketplace landing page title.
 
+#### MARKETPLACE_LAYOUT_MODE
+
+**Type:** choice_field
+
+**Default value:** classic
+
+Default marketplace layout mode.
+
+#### MARKETPLACE_CARD_STYLE
+
+**Type:** choice_field
+
+**Default value:** detailed
+
+Default marketplace offering card style.
+
 #### COUNTRIES
 
 **Type:** country_list_field
@@ -1200,15 +1222,7 @@ Marketplace landing page title.
 
 It is used in organization creation dialog in order to limit country choices to predefined set.
 
-### Marketplace
-
-#### THUMBNAIL_SIZE
-
-**Type:** str
-
-**Default value:** 120x120
-
-Size of the thumbnail to generate when screenshot is uploaded for an offering.
+### Marketplace visibility & access
 
 #### ANONYMOUS_USER_CAN_VIEW_OFFERINGS
 
@@ -1228,11 +1242,43 @@ Allow anonymous users to see plans
 
 #### RESTRICTED_OFFERING_VISIBILITY_MODE
 
-**Type:** str
+**Type:** choice_field
 
 **Default value:** show_all
 
 Controls offering visibility for regular users. 'show_all': Show all shared offerings (current behavior). 'show_restricted_disabled': Show all but mark inaccessible as disabled. 'hide_inaccessible': Hide offerings user cannot access. 'require_membership': Hide all unless user belongs to an organization/project.
+
+#### SHOW_OFFERING_COVER_IMAGE
+
+**Type:** bool
+
+Show offering cover image as a banner above the name on the offering page.
+
+#### ENABLE_MARKDOWN_IMAGE_UPLOAD
+
+**Type:** bool
+
+Allow uploading images for embedding in offering markdown descriptions.
+
+#### ENFORCE_USER_CONSENT_FOR_OFFERINGS
+
+**Type:** bool
+
+If True, users must have active consent to access offerings that have active Terms of Service.
+
+#### ENFORCE_OFFERING_USER_PROFILE_COMPLETENESS
+
+**Type:** bool
+
+If True, service providers only see offering users whose profiles have all exposed attributes filled (per OfferingUserAttributeConfig).
+
+#### ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT
+
+**Type:** bool
+
+If true, service provider owners and managers can manage offering lifecycle (activate, pause, unpause, archive, draft, delete) without staff approval.
+
+### Marketplace notifications
 
 #### NOTIFY_STAFF_ABOUT_APPROVALS
 
@@ -1262,6 +1308,44 @@ Disable only resource update events.
 
 Enable reminders to owners about resources of shared offerings that have not generated any cost for the last 3 months.
 
+### Offerings & orders
+
+#### THUMBNAIL_SIZE
+
+**Type:** str
+
+**Default value:** 120x120
+
+Size of the thumbnail to generate when screenshot is uploaded for an offering.
+
+#### ENABLE_MARKDOWN_IMAGE_UPLOAD
+
+**Type:** bool
+
+Allow uploading images for embedding in offering markdown descriptions.
+
+#### MARKDOWN_IMAGE_MAX_SIZE_MB
+
+**Type:** int
+
+**Default value:** 5
+
+Maximum size in megabytes for a markdown image upload.
+
+#### DISABLED_OFFERING_TYPES
+
+**Type:** multiple_choice_field
+
+List of offering types disabled for creation and selection.
+
+#### ENABLE_ORDER_START_DATE
+
+**Type:** bool
+
+Allow setting start date to control when resource creation order is processed.
+
+### Marketplace development
+
 #### ENABLE_MOCK_SERVICE_ACCOUNT_BACKEND
 
 **Type:** bool
@@ -1274,24 +1358,6 @@ Enable mock returns for the service account service
 
 Enable mock returns for the course account service
 
-#### ENFORCE_USER_CONSENT_FOR_OFFERINGS
-
-**Type:** bool
-
-If True, users must have active consent to access offerings that have active Terms of Service.
-
-#### DISABLED_OFFERING_TYPES
-
-**Type:** list_field
-
-List of offering types disabled for creation and selection.
-
-#### ENABLE_ORDER_START_DATE
-
-**Type:** bool
-
-Allow setting start date to control when resource creation order is processed.
-
 ### Project
 
 #### PROJECT_END_DATE_MANDATORY
@@ -1299,6 +1365,24 @@ Allow setting start date to control when resource creation order is processed.
 **Type:** bool
 
 If true, project end date field becomes mandatory when creating or updating projects.
+
+#### AFFILIATION_REQUIRED_AT_PROJECT_CREATION
+
+**Type:** bool
+
+If true, the affiliation field is required when creating or updating projects.
+
+#### PROJECT_NAME_REGEX
+
+**Type:** str
+
+Regular expression that a project name must fully match when creating or renaming a project. The whole name has to match the pattern. Leave empty to disable the check. Examples: '^.{1,32}$' limits the name to at most 32 characters; '^[A-Za-z0-9 _-]{1,32}$' also restricts it to letters, digits, spaces, underscores and hyphens; '^[A-Za-z].{0,31}$' additionally requires it to start with a letter.
+
+#### PROJECT_NAME_REGEX_ERROR_MESSAGE
+
+**Type:** str
+
+Custom validation error shown when a project name does not match PROJECT_NAME_REGEX. Leave empty to use the default message.
 
 ### Telemetry
 
@@ -1318,11 +1402,19 @@ URL for sending telemetry data.
 
 Telemetry service version.
 
+#### CHECK_FOR_UPDATES
+
+**Type:** bool
+
+**Default value:** True
+
+If true, the version endpoint queries GitHub for the latest released Waldur version. Disable in deployments without outbound internet access to avoid failed requests to api.github.com.
+
 ### Custom Scripts
 
 #### SCRIPT_RUN_MODE
 
-**Type:** str
+**Type:** choice_field
 
 **Default value:** docker
 
@@ -1362,7 +1454,7 @@ Remove Docker container after script execution
 
 **Type:** dict_field
 
-**Default value:** {'python': {'image': 'python:3.11-alpine', 'command': 'python'}, 'shell': {'image': 'alpine:3', 'command': 'sh'}, 'ansible': {'image': 'alpine/ansible:2.18.6', 'command': 'ansible-playbook'}}
+**Default value:** {'python': {'image': 'python:3.12-alpine', 'command': 'python'}, 'shell': {'image': 'alpine:3', 'command': 'sh'}, 'ansible': {'image': 'alpine/ansible:2.18.6', 'command': 'ansible-playbook'}}
 
 Key is command to execute script, value is a dictionary of image name and command.
 
@@ -1420,13 +1512,21 @@ Common footer in html format for all emails.
 
 How many minutes before scheduled maintenance users should be notified.
 
+#### MAINTENANCE_ANNOUNCEMENT_TRAILING_BUFFER_MINUTES
+
+**Type:** int
+
+**Default value:** 60
+
+Minutes the announcement banner stays visible after maintenance completes
+
 #### MAINTENANCE_ANNOUNCEMENT_NOTIFY_SYSTEM
 
-**Type:** list_field
+**Type:** multiple_choice_field
 
 **Default value:** ['AdminAnnouncement']
 
-How maintenance notifications are delivered. Choices: AdminAnnouncement or BroadcastMessage.
+How maintenance notifications are delivered.
 
 ### Links
 
@@ -1458,11 +1558,19 @@ Link URL to support portal. Rendered as a shortcut on dashboard
 
 #### SIDEBAR_STYLE
 
-**Type:** str
+**Type:** choice_field
 
 **Default value:** dark
 
-Style of sidebar. Possible values: dark, light, accent.
+Style of sidebar.
+
+#### FONT_FAMILY
+
+**Type:** choice_field
+
+**Default value:** Inter
+
+Font family used in the UI.
 
 #### BRAND_COLOR
 
@@ -1482,11 +1590,11 @@ Toggler to disable dark theme.
 
 #### LOGIN_PAGE_LAYOUT
 
-**Type:** str
+**Type:** choice_field
 
 **Default value:** split-screen
 
-Login page layout style. Options: split-screen, centered-card, minimal, full-hero, gradient, stacked, right-split, glassmorphism, neumorphism, animated-gradient, video-background, bottom-sheet, tabbed, wizard, stats, news, carousel, logo-watermark, brand-pattern, duotone, diagonal, time-based, seasonal, weather.
+Login page layout style.
 
 #### LOGIN_PAGE_VIDEO_URL
 
@@ -1513,12 +1621,6 @@ Carousel slides displayed in the Carousel login page layout. List of objects wit
 News items displayed in the News login page layout. List of objects with 'date', 'title', 'description', and 'tag' keys. Supported tags: Feature, Update, Security, Announcement, Maintenance. Example: [{'date': 'Jan 2025', 'title': 'New Feature', 'description': 'Description here', 'tag': 'Feature'}].
 
 ### Images
-
-#### SITE_LOGO
-
-**Type:** image_field
-
-The image used in marketplace order header.
 
 #### SIDEBAR_LOGO
 
@@ -1592,6 +1694,12 @@ Default logo for offering
 
 A custom PNG icon for Keycloak login button
 
+#### DISCLAIMER_AREA_LOGO
+
+**Type:** image_field
+
+The logo image rendered in the disclaimer area below the footer.
+
 ### Service desk integration settings
 
 #### WALDUR_SUPPORT_ENABLED
@@ -1604,11 +1712,11 @@ Toggler for support plugin.
 
 #### WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE
 
-**Type:** str
+**Type:** choice_field
 
 **Default value:** atlassian
 
-Type of support backend. Possible values: atlassian, zammad, smax.
+Type of support backend. Possible values: basic, atlassian, zammad, smax.
 
 #### WALDUR_SUPPORT_DISPLAY_REQUEST_TYPE
 
@@ -1617,6 +1725,48 @@ Type of support backend. Possible values: atlassian, zammad, smax.
 **Default value:** True
 
 Toggler for request type displaying
+
+#### WALDUR_SUPPORT_PROVIDER_ROUTING_ENABLED
+
+**Type:** bool
+
+Enable automatic routing of tickets to provider helpdesks.
+
+#### WALDUR_SUPPORT_AUTO_ASSIGN
+
+**Type:** bool
+
+Enable automatic assignment of tickets to support users.
+
+#### WALDUR_SUPPORT_AUTO_ASSIGN_STRATEGY
+
+**Type:** str
+
+**Default value:** least_loaded
+
+Strategy for auto-assignment. Possible values: least_loaded, round_robin.
+
+#### WALDUR_SUPPORT_SLA_ENABLED
+
+**Type:** bool
+
+Enable SLA deadline tracking for the basic support backend.
+
+#### WALDUR_SUPPORT_SLA_RESPONSE_HOURS
+
+**Type:** <class 'int'>
+
+**Default value:** 4
+
+SLA deadline for first response in hours.
+
+#### WALDUR_SUPPORT_SLA_RESOLUTION_HOURS
+
+**Type:** <class 'int'>
+
+**Default value:** 24
+
+SLA deadline for issue resolution in hours.
 
 ### Atlassian settings
 
@@ -1842,6 +1992,12 @@ Toggler for legacy API usage.
 
 Toggler for mapping between waldur user and service desk agents.
 
+#### JIRA_WEBHOOK_SHARED_SECRET
+
+**Type:** secret_field
+
+Shared secret expected in the X-Webhook-Secret header of inbound JIRA webhook deliveries. If empty, authentication is not enforced and the receiver accepts unauthenticated requests (legacy behaviour). Configure your JIRA automation/webhook to send the same value to enable authentication.
+
 ### Zammad settings
 
 #### ZAMMAD_API_URL
@@ -1864,11 +2020,11 @@ The name of the group to which the ticket will be added. If not specified, the f
 
 #### ZAMMAD_ARTICLE_TYPE
 
-**Type:** str
+**Type:** choice_field
 
 **Default value:** email
 
-Type of a comment. Default is email because it allows support to reply to tickets directly in Zammad<https://docs.zammad.org/en/latest/api/ticket/articles.html#articles/>
+Type of a comment.
 
 #### ZAMMAD_COMMENT_MARKER
 
@@ -1893,6 +2049,12 @@ Comment prefix with user info.
 **Default value:** 5
 
 Time in minutes. Time in minutes while comment deletion is available <https://github.com/zammad/zammad/issues/2687/>, <https://github.com/zammad/zammad/issues/3086/>
+
+#### ZAMMAD_WEBHOOK_SHARED_SECRET
+
+**Type:** secret_field
+
+Shared secret expected in the X-Webhook-Secret header of inbound Zammad webhook deliveries. If empty, authentication is not enforced and the receiver accepts unauthenticated requests (legacy behaviour).
 
 ### SMAX settings
 
@@ -1973,6 +2135,18 @@ Creation source name.
 **Default value:** True
 
 Toggler for SSL verification
+
+#### SMAX_CERTIFICATE
+
+**Type:** text_field
+
+Custom CA certificate (PEM format) used to verify the TLS connection to the SMAX server. When set, it overrides the default CA bundle. Ignored if SSL verification is disabled.
+
+#### SMAX_WEBHOOK_SHARED_SECRET
+
+**Type:** secret_field
+
+Shared secret expected in the X-Webhook-Secret header of inbound SMAX webhook deliveries. If empty, authentication is not enforced and the receiver accepts unauthenticated requests (legacy behaviour).
 
 ### Proposal settings
 
@@ -2122,7 +2296,7 @@ Mark terms of services as approved for new users.
 
 #### DEFAULT_IDP
 
-**Type:** str
+**Type:** choice_field
 
 Triggers authentication flow at once.
 
@@ -2136,13 +2310,33 @@ Deactivate user if all roles are revoked (except staff/support)
 
 **Type:** bool
 
-If true, block creation of an account on OIDC login if user email is not provided or provided and is not in the list of one of the active invitations.
+If true, block creation of an account on OIDC login if user email is not provided or provided and is not in the list of one of the active invitations or matching active group invitation email patterns.
+
+#### OIDC_BLOCK_CREATION_OF_UNINVITED_USERS_RESPONSE_MESSAGE
+
+**Type:** text_field
+
+**Default value:** Account creation is blocked for uninvited users.
+
+The message to show when OIDC account creation is blocked for uninvited users. URLs are rendered as clickable links; include the scheme (e.g. https://example.com) so bare URLs are linked.
+
+#### OIDC_MATCHMAKING_BY_EMAIL
+
+**Type:** bool
+
+If true, when OIDC login fails to find a user by the primary lookup field, attempt a secondary lookup by email before creating a new user. On successful email match, the user's primary lookup field is updated to the OIDC claim value.
 
 #### OIDC_ACCESS_TOKEN_ENABLED
 
 **Type:** bool
 
 If true, OIDC complete view returns access token instead of Waldur token
+
+#### REMOTE_EDUTEAMS_REFRESH_TOKEN
+
+**Type:** secret_field
+
+Rotating OAuth2 refresh token for remote eduTEAMS API access. Automatically updated by the periodic token rotation task. If empty, falls back to REMOTE_EDUTEAMS_REFRESH_TOKEN from Django settings.
 
 ### Invitation settings
 
@@ -2158,9 +2352,15 @@ If true, user email in Waldur database and in invitatation must strictly match.
 
 Do not allow user to accept multiple roles within the same scope (project or organization) using invitation. When enabled, users can still accept invitations to different scopes but cannot have multiple roles in the same scope.
 
+#### ONLY_ONE_PROJECT_MANAGER
+
+**Type:** bool
+
+If true, a project may have at most one active project manager (PROJECT.MANAGER).
+
 #### INVITATION_ALLOWED_FIELDS
 
-**Type:** list_field
+**Type:** multiple_choice_field
 
 **Default value:** ['full_name', 'organization', 'job_title']
 
@@ -2170,25 +2370,33 @@ Fields that can be provided in invitations for email personalization. These are 
 
 #### DEFAULT_OFFERING_USER_ATTRIBUTES
 
-**Type:** list_field
+**Type:** multiple_choice_field
 
 **Default value:** ['username', 'full_name', 'email']
 
-Default user attributes exposed to service providers (OfferingUser API) when no explicit config exists. Available options: username, full_name, email, phone_number, organization, job_title, affiliations, gender, personal_title, birth_date, place_of_birth, country_of_residence, nationality, nationalities, organization_country, organization_type, eduperson_assurance, civil_number, identity_source.
+Default user attributes exposed to service providers (OfferingUser API) when no explicit config exists.
+
+#### DEFAULT_CALL_USER_ATTRIBUTES
+
+**Type:** multiple_choice_field
+
+**Default value:** ['username', 'full_name', 'email']
+
+Default applicant attributes exposed to call reviewers when no explicit CallApplicantVisibilityConfig exists.
 
 #### ENABLED_USER_PROFILE_ATTRIBUTES
 
-**Type:** list_field
+**Type:** multiple_choice_field
 
 **Default value:** ['phone_number', 'organization', 'job_title', 'affiliations']
 
-List of enabled user profile attributes. Controls IdP sync and UI display. Core attributes (username, email, first_name, last_name, full_name) are always enabled. Available options: phone_number, organization, job_title, affiliations, gender, personal_title, birth_date, place_of_birth, country_of_residence, nationality, nationalities, organization_country, organization_type, eduperson_assurance, civil_number, identity_source.
+List of enabled user profile attributes. Controls IdP sync and UI display.
 
 #### MANDATORY_USER_ATTRIBUTES
 
-**Type:** list_field
+**Type:** multiple_choice_field
 
-List of user profile attributes that are mandatory. Users with missing mandatory attributes will have limited API access until their profile is complete. Available: phone_number, organization, job_title, affiliations, civil_number, first_name, last_name, email, etc.
+List of user profile attributes that are mandatory.
 
 #### ENFORCE_MANDATORY_USER_ATTRIBUTES
 
@@ -2290,7 +2498,7 @@ List of username that users are not allowed to select
 
 Optionally disable creation of user groups in FreeIPA matching Waldur structure
 
-### SCIM settings
+### SCIM Entitlements (outbound push)
 
 #### SCIM_MEMBERSHIP_SYNC_ENABLED
 
@@ -2316,6 +2524,56 @@ SCIM API key for X-API-Key header.
 
 URN namespace for SCIM entitlements.
 
+### SCIM Identity Provider
+
+#### SCIM_INBOUND_ENABLED
+
+**Type:** bool
+
+Enable inbound SCIM 2.0 service provider at /scim/v2/. Allows external identity providers (Okta, Entra ID, Keycloak) to provision users and groups.
+
+#### SCIM_INBOUND_SOURCE_NAME
+
+**Type:** str
+
+**Default value:** scim:default
+
+Source label written to User.attribute_sources for inbound SCIM writes. Used by the multi-source attribute merge to track ownership.
+
+#### SCIM_INBOUND_ALLOWED_ATTRIBUTES
+
+**Type:** multiple_choice_field
+
+**Default value:** ['first_name', 'last_name', 'email', 'organization', 'affiliations']
+
+User attributes settable via inbound SCIM.
+
+#### SCIM_INBOUND_SSH_KEYS_ENABLED
+
+**Type:** bool
+
+Allow inbound SCIM to manage user SSH public keys via the sshPublicKeys attribute of the Waldur User extension. When enabled, SCIM is authoritative: a full-replace (PUT / PATCH replace) that omits a key deletes it, including keys the user added via the UI. Off by default because SSH keys grant access.
+
+#### SCIM_PULL_API_URL
+
+**Type:** str
+
+Base URL for outbound SCIM pull (fetching user attributes from an external IdP).
+
+#### SCIM_PULL_API_KEY
+
+**Type:** secret_field
+
+Bearer token for outbound SCIM pull.
+
+#### SCIM_PULL_SOURCE_NAME
+
+**Type:** str
+
+**Default value:** scim:pull
+
+Source label written to User.attribute_sources for attributes pulled from a remote SCIM directory.
+
 ### API token authentication
 
 #### OIDC_AUTH_URL
@@ -2338,7 +2596,7 @@ Client ID for HTTP Basic authentication when calling the token introspection end
 
 #### OIDC_CLIENT_SECRET
 
-**Type:** str
+**Type:** secret_field
 
 Client secret for HTTP Basic authentication when calling the token introspection endpoint. Required together with OIDC_CLIENT_ID and OIDC_INTROSPECTION_URL.
 
@@ -2358,6 +2616,12 @@ Field name from the introspection response JSON used to identify the Waldur user
 
 Seconds to cache successful token introspection results. Reduces load on the introspection endpoint. Set to 0 to disable caching. Default: 300 (5 minutes).
 
+#### OIDC_DEFAULT_LOGOUT_URL
+
+**Type:** url_field
+
+Default logout URL used as fallback when IdentityProvider does not have a logout_url set. This allows configuring a global logout endpoint for OIDC providers that don't expose end_session_endpoint in their discovery document.
+
 #### WALDUR_AUTH_SOCIAL_ROLE_CLAIM
 
 **Type:** str
@@ -2368,9 +2632,9 @@ OAuth/OIDC token claim name containing user roles for automatic staff/support as
 
 #### ONBOARDING_VALIDATION_METHODS
 
-**Type:** list_field
+**Type:** multiple_choice_field
 
-List of automatic validation methods available for this portal (e.g., ariregister, wirtschaftscompass, bolagsverket). Must match backend method names.
+List of automatic validation methods available for this portal.
 
 #### ONBOARDING_VERIFICATION_EXPIRY_HOURS
 
@@ -2458,73 +2722,251 @@ Sweden Business Register API client secret
 
 Norway Business Register API server URL
 
-### LLM inference settings
-
-#### LLM_CHAT_ENABLED
-
-**Type:** bool
-
-Enable LLM-based chat feature and calls to the inference service.
-
-#### LLM_INFERENCES_BACKEND_TYPE
-
-**Type:** str
-
-**Default value:** ollama
-
-Type of LLM inference backend. For example: openai, ollama.
-
-#### LLM_INFERENCES_API_URL
+#### ONBOARDING_DNB_API_URL
 
 **Type:** url_field
 
-Base URL for LLM inference service API.
+**Default value:** <https://sandbox-api.bisnode.com/credit-data-companies/v2>
 
-#### LLM_INFERENCES_API_TOKEN
+Dun & Bradstreet (Bisnode) Credit Data API base URL
 
-**Type:** secret_field
+#### ONBOARDING_DNB_RTS_API_URL
 
-API key for authenticating with the LLM inference service.
+**Type:** url_field
 
-#### LLM_INFERENCES_MODEL
+**Default value:** <https://sandbox-api.bisnode.com/nordic-rts/v1>
+
+Dun & Bradstreet (Bisnode) Nordic Right to Sign API base URL
+
+#### ONBOARDING_DNB_TOKEN_URL
+
+**Type:** url_field
+
+**Default value:** <https://login.bisnode.com/as/token.oauth2>
+
+Dun & Bradstreet OAuth2 token endpoint URL
+
+#### ONBOARDING_DNB_CLIENT_ID
 
 **Type:** str
 
-**Default value:** gemma3:27b
+Dun & Bradstreet API client identifier
 
-Name of the LLM model to use for inference.
+#### ONBOARDING_DNB_CLIENT_SECRET
 
-#### LLM_TOKEN_LIMIT_DAILY
+**Type:** secret_field
+
+Dun & Bradstreet API client secret
+
+### AI assistant settings
+
+#### AI_ASSISTANT_NAME
+
+**Type:** str
+
+**Default value:** Waldur Assistant
+
+Display name for the AI Assistant persona (e.g. 'Mari', 'Waldur Assistant').
+
+#### AI_ASSISTANT_ENABLED
+
+**Type:** bool
+
+Enable AI Assistant feature and calls to the inference service.
+
+#### AI_ASSISTANT_ENABLED_ROLES
+
+**Type:** choice_field
+
+**Default value:** disabled
+
+Controls which user roles can access the AI Assistant. 'disabled': No role-based access. 'staff': Staff users only. 'staff_and_support': Staff and support users. 'all': All authenticated users. 'anonymous': All users including anonymous (enables the public anonymous chat endpoint).
+
+#### AI_ASSISTANT_BACKEND_TYPE
+
+**Type:** str
+
+**Default value:** vllm
+
+Type of AI Assistant backend. For example: vllm, openai, ollama.
+
+#### AI_ASSISTANT_API_URL
+
+**Type:** url_field
+
+Base URL for AI Assistant service API.
+
+#### AI_ASSISTANT_API_TOKEN
+
+**Type:** secret_field
+
+API key for authenticating with the AI Assistant service.
+
+#### AI_ASSISTANT_MODEL
+
+**Type:** str
+
+**Default value:** qwen3.5-122b-nothinking
+
+Name of the AI Assistant model to use for inference.
+
+#### AI_ASSISTANT_SYSTEM_PROMPT_CUSTOM_INSTRUCTIONS
+
+**Type:** text_field
+
+Additional instructions injected into the AI Assistant system prompt. Use this for organisation-specific context, terminology, FAQ content, or behavioural guidelines. Supports {assistant_name} and {organization} placeholders. Overridden by the active SystemPrompt record when set.
+
+#### AI_ASSISTANT_COMPLETION_KWARGS
+
+**Type:** dict_field
+
+Override keyword arguments merged on top of provider defaults for AI Assistant chat completion. Supported keys: temperature, top_p, top_k, max_tokens, max_completion_tokens, presence_penalty, frequency_penalty, repetition_penalty, stop, seed, reasoning_effort, extra_body. Leave empty to use provider defaults.
+
+#### AI_ASSISTANT_STREAM_TIMEOUT_SECONDS
+
+**Type:** int
+
+**Default value:** 120
+
+Hard timeout in seconds for a full streaming request including LLM completion.
+
+#### AI_ASSISTANT_TOKEN_LIMIT_DAILY
 
 **Type:** int
 
 **Default value:** -1
 
-Default daily token limit (integer). -1 means unlimited.
+Per-actor daily token cap (authenticated OR anonymous). -1 means unlimited.
 
-#### LLM_TOKEN_LIMIT_WEEKLY
-
-**Type:** int
-
-**Default value:** -1
-
-Default weekly token limit (integer). -1 means unlimited.
-
-#### LLM_TOKEN_LIMIT_MONTHLY
+#### AI_ASSISTANT_TOKEN_LIMIT_WEEKLY
 
 **Type:** int
 
 **Default value:** -1
 
-Default monthly token limit (integer). -1 means unlimited.
+Per-actor (authenticated OR anonymous) weekly token cap. -1 means unlimited.
 
-### Software catalog settings
+#### AI_ASSISTANT_TOKEN_LIMIT_MONTHLY
 
-#### SOFTWARE_CATALOG_EESSI_UPDATE_ENABLED
+**Type:** int
+
+**Default value:** -1
+
+Per-actor (authenticated OR anonymous) monthly token cap. -1 means unlimited.
+
+#### AI_ASSISTANT_GLOBAL_DAILY_TOKEN_BUDGET
+
+**Type:** int
+
+**Default value:** 5000000
+
+Site-wide daily token cap across all assistant traffic (auth + anonymous). -1 means unlimited.
+
+#### AI_ASSISTANT_GLOBAL_REQUESTS_PER_MINUTE
+
+**Type:** int
+
+**Default value:** 60
+
+Site-wide burst cap across all assistant traffic.
+
+#### AI_ASSISTANT_SESSION_RETENTION_DAYS
+
+**Type:** int
+
+**Default value:** 90
+
+Number of days to retain AI Assistant sessions before automatic deletion. Set to -1 to disable automatic cleanup.
+
+#### AI_ASSISTANT_HISTORY_LIMIT
+
+**Type:** int
+
+**Default value:** 50
+
+Maximum number of past messages included in the AI Assistant context window.
+
+#### AI_ASSISTANT_INJECTION_ALLOWLIST
+
+**Type:** str
+
+Comma-separated allowlist phrases that bypass injection detection.
+
+#### ANONYMOUS_CHAT_USER_SLUG_SALT
+
+**Type:** secret_field
+
+Scrypt salt for per-IP user_slug derivation. Empty disables slug computation (interactions are written without it).
+
+#### ANONYMOUS_CHAT_FEEDBACK_TOKEN_SECRET
+
+**Type:** secret_field
+
+HMAC-SHA256 secret for /feedback/ anti-replay tokens. Loss of secrecy invalidates all in-flight feedback submissions.
+
+#### ANONYMOUS_CHAT_CATALOG_MAX_ENTRIES
+
+**Type:** int
+
+**Default value:** 50
+
+Hard cap on the number of offerings injected into the anonymous assistant's system prompt catalog summary. Past this, drop the tail.
+
+#### ANONYMOUS_CHAT_REVIEW_ENABLED
 
 **Type:** bool
 
 **Default value:** True
+
+Master toggle for the nightly LLM-as-judge review of completed anonymous sessions. On by default — cost is bounded by ANONYMOUS_CHAT_REVIEW_DAILY_TOKEN_BUDGET.
+
+#### ANONYMOUS_CHAT_REVIEW_DAILY_TOKEN_BUDGET
+
+**Type:** int
+
+**Default value:** 2000000
+
+Independent budget for the LLM judge so review can't starve user-facing traffic. Reuses AI_ASSISTANT_API_URL/TOKEN/MODEL.
+
+#### ANONYMOUS_CHAT_ARTIFACT_RETENTION_DAYS
+
+**Type:** int
+
+**Default value:** 30
+
+Days of inactivity after which pseudonymous bookkeeping rows (SessionBinding, AnonymousChatBudget) are purged. Active blocks are always retained until they expire. Set to -1 to disable.
+
+### Software catalog general
+
+#### SOFTWARE_CATALOG_UPDATE_EXISTING_PACKAGES
+
+**Type:** bool
+
+**Default value:** True
+
+Update existing packages during catalog refresh
+
+#### SOFTWARE_CATALOG_CLEANUP_ENABLED
+
+**Type:** bool
+
+**Default value:** True
+
+Enable automatic cleanup of old catalog data
+
+#### SOFTWARE_CATALOG_RETENTION_DAYS
+
+**Type:** int
+
+**Default value:** 90
+
+Number of days to retain old catalog versions
+
+### Software catalog EESSI
+
+#### SOFTWARE_CATALOG_EESSI_UPDATE_ENABLED
+
+**Type:** bool
 
 Enable automated daily updates for EESSI software catalog
 
@@ -2550,11 +2992,11 @@ Base URL for EESSI API data
 
 Include extension packages (Python, R packages, etc.) from EESSI
 
+### Software catalog Spack
+
 #### SOFTWARE_CATALOG_SPACK_UPDATE_ENABLED
 
 **Type:** bool
-
-**Default value:** True
 
 Enable automated daily updates for Spack software catalog
 
@@ -2572,29 +3014,33 @@ Spack catalog version to load (auto-detect if empty)
 
 URL for Spack repology.json data
 
-#### SOFTWARE_CATALOG_UPDATE_EXISTING_PACKAGES
+### System Logging
+
+#### SYSTEM_LOG_ENABLED
 
 **Type:** bool
 
-**Default value:** True
+Enable storing system logs (API, Worker, Beat) in the database for staff viewing.
 
-Update existing packages during catalog refresh
-
-#### SOFTWARE_CATALOG_CLEANUP_ENABLED
-
-**Type:** bool
-
-**Default value:** True
-
-Enable automatic cleanup of old catalog data
-
-#### SOFTWARE_CATALOG_RETENTION_DAYS
+#### SYSTEM_LOG_MAX_ROWS_PER_SOURCE
 
 **Type:** int
 
-**Default value:** 90
+**Default value:** 5000
 
-Number of days to retain old catalog versions
+Maximum number of log rows to keep per source (api, worker, beat). Oldest rows are deleted when exceeded.
+
+#### OPENSTACK_LOG_CALLS_ENABLED
+
+**Type:** bool
+
+Emit one log line per OpenStack HTTP call on logger `waldur_openstack.calls` (method, host+path, status, elapsed ms, originating backend action). Useful for diagnosing slow tenant operations; off by default because chatty under steady-state load.
+
+#### OPENSTACK_LOG_CALLS_THRESHOLD_MS
+
+**Type:** int
+
+When OPENSTACK_LOG_CALLS_ENABLED is on, only emit lines for calls slower than this many milliseconds. 0 logs every call. Errors are always logged regardless of this threshold.
 
 ### Table Growth Monitoring
 
@@ -2643,8 +3089,6 @@ Minimum table size in bytes (default 1MB) to monitor. Smaller tables are ignored
 #### USER_ACTIONS_ENABLED
 
 **Type:** bool
-
-**Default value:** True
 
 Enable user actions notification system.
 
@@ -2735,3 +3179,247 @@ Billing export check interval in hours for reconciliation
 **Default value:** 90
 
 Number of days to retain SLURM policy evaluation log entries before automatic cleanup.
+
+### Usage Polling
+
+#### USAGE_POLL_RECORD_RETENTION_MONTHS
+
+**Type:** int
+
+**Default value:** 3
+
+Number of months to retain usage poll records before automatic cleanup.
+
+### Identity Bridge
+
+#### FEDERATED_IDENTITY_SYNC_ENABLED
+
+**Type:** bool
+
+Enable the Identity Bridge API for push-based ISD user attribute synchronization.
+
+#### FEDERATED_IDENTITY_SYNC_ALLOWED_ATTRIBUTES
+
+**Type:** multiple_choice_field
+
+**Default value:** ['first_name', 'last_name', 'email', 'organization', 'affiliations']
+
+User attributes settable via Identity Bridge.
+
+#### FEDERATED_IDENTITY_AUTHORITATIVE_ISD
+
+**Type:** str
+
+ISD source identifier that is authoritative for FEDERATED_IDENTITY_LOCKED_FIELDS (e.g. 'isd:efp'). When set and present in a user's active ISDs, other identity sources (eduTEAMS, OIDC logins, ...) cannot overwrite the locked fields on sync. Empty disables the protection.
+
+#### FEDERATED_IDENTITY_LOCKED_FIELDS
+
+**Type:** multiple_choice_field
+
+User attributes that only FEDERATED_IDENTITY_AUTHORITATIVE_ISD may set. Other identity sources cannot overwrite these once the authoritative ISD has asserted the user (e.g. first_name, last_name). Empty disables the protection.
+
+#### FEDERATED_IDENTITY_DEACTIVATION_POLICY
+
+**Type:** choice_field
+
+**Default value:** any_isd_removed
+
+When to deactivate a federated user.
+
+### Project Digest
+
+#### ENABLE_PROJECT_DIGEST
+
+**Type:** bool
+
+Enable project digest email notifications for organizations.
+
+### SSH keys
+
+#### SSH_KEY_ALLOWED_TYPES
+
+**Type:** multiple_choice_field
+
+**Default value:** ['ssh-ed25519', 'ecdsa-sha2-nistp256', 'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521', 'ssh-rsa', 'sk-ssh-ed25519@openssh.com', 'sk-ecdsa-sha2-nistp256@openssh.com']
+
+List of allowed SSH key types. Empty list means all types are allowed.
+
+#### SSH_KEY_MIN_RSA_KEY_SIZE
+
+**Type:** int
+
+**Default value:** 2048
+
+Minimum allowed RSA key size in bits. Set to 0 to disable the check.
+
+#### ENABLE_ISSUES_FOR_USER_SSH_KEY_CHANGES
+
+**Type:** bool
+
+If true, a support ticket is created when a user adds or removes an SSH public key.
+
+### Reporting
+
+#### ENABLED_REPORTING_SCREENS
+
+**Type:** multiple_choice_field
+
+**Default value:** ['resource-usage', 'user-usage', 'quotas', 'usage-monitoring', 'usage-trends', 'organization-summary', 'project-detail', 'resources-geography', 'project-classification', 'usage-by-customer', 'usage-by-org-type', 'usage-by-creator', 'call-performance', 'review-progress', 'resource-demand', 'capacity', 'provider-overview', 'provider-revenue', 'provider-orders', 'provider-resources', 'provider-customers', 'provider-offerings', 'openstack-instances', 'offering-usage', 'user-analytics', 'user-demographics', 'user-organizations', 'user-affiliations', 'user-roles', 'growth', 'revenue', 'pricelist', 'orders', 'offering-costs', 'maintenance-overview', 'provisioning-stats']
+
+Select which reporting screens should be visible to users. Uncheck to disable specific reports.
+
+### POSIX ID pools
+
+#### POSIX_ID_POOL_UTILIZATION_THRESHOLD
+
+**Type:** int
+
+**Default value:** 90
+
+Utilization percentage of a POSIX ID pool namespace that triggers a warning event.
+
+### Affiliates
+
+#### AFFILIATES_ENABLED
+
+**Type:** bool
+
+Enable the affiliate program: staff-configured affiliate links, fee accrual from finalized invoices, and the customer-affiliates API.
+
+### Matrix chat
+
+#### MATRIX_ENABLED
+
+**Type:** bool
+
+Enable Matrix chat integration.
+
+#### MATRIX_HOMESERVER_URL
+
+**Type:** url_field
+
+Matrix homeserver base URL, e.g. https://matrix.example.com
+
+#### MATRIX_HOMESERVER_PUBLIC_URL
+
+**Type:** url_field
+
+Matrix homeserver URL used by browser clients. Falls back to MATRIX_HOMESERVER_URL when blank. Set this when the homeserver is reachable from servers and browsers at different addresses (e.g. a Docker-internal name vs. a public Caddy-proxied URL).
+
+#### MATRIX_HOMESERVER_DOMAIN
+
+**Type:** str
+
+Matrix homeserver domain name, e.g. matrix.example.com
+
+#### MATRIX_APPSERVICE_AS_TOKEN
+
+**Type:** secret_field
+
+Application service token for authenticating to the homeserver.
+
+#### MATRIX_APPSERVICE_HS_TOKEN
+
+**Type:** secret_field
+
+Homeserver token for authenticating webhook requests.
+
+#### MATRIX_APPSERVICE_SENDER_LOCALPART
+
+**Type:** str
+
+**Default value:** waldur-bot
+
+Localpart for the appservice bot user.
+
+#### MATRIX_HISTORY_EXPORT_ENABLED
+
+**Type:** bool
+
+Enable periodic history export of Matrix rooms.
+
+#### MATRIX_EXPORT_MEDIA
+
+**Type:** bool
+
+Include media files when exporting Matrix room history.
+
+#### MATRIX_USER_REGISTRATION_SECRET
+
+**Type:** secret_field
+
+Shared secret for Matrix user registration.
+
+#### MATRIX_USER_ID_FORMAT
+
+**Type:** str
+
+**Default value:** username
+
+Format for generating Matrix user IDs: username, uuid, or email_local.
+
+#### MATRIX_LOGIN_METHOD
+
+**Type:** str
+
+**Default value:** token
+
+Login method for Matrix credentials: password, token, or oidc.
+
+#### MATRIX_OIDC_PROVIDER_URL
+
+**Type:** url_field
+
+OIDC provider URL for Matrix SSO login.
+
+#### MATRIX_LIVEKIT_KEY
+
+**Type:** str
+
+LiveKit API key for the Element Call SFU (Calls observability tab).
+
+#### MATRIX_LIVEKIT_SECRET
+
+**Type:** secret_field
+
+LiveKit API secret used to mint the admin token.
+
+#### MATRIX_LIVEKIT_URL
+
+**Type:** url_field
+
+Internal LiveKit base URL. Falls back to http://livekit:7880 when blank.
+
+### Personal Access Tokens
+
+#### PAT_ENABLED
+
+**Type:** bool
+
+Enable Personal Access Token authentication.
+
+#### PAT_MAX_LIFETIME_DAYS
+
+**Type:** int
+
+**Default value:** 365
+
+Maximum PAT lifetime in days.
+
+#### PAT_MAX_TOKENS_PER_USER
+
+**Type:** int
+
+**Default value:** 20
+
+Maximum number of active PATs per user.
+
+### Site Agent Logs
+
+#### SITE_AGENT_LOG_MAX_ROWS_PER_IDENTITY
+
+**Type:** int
+
+**Default value:** 10000
+
+Maximum number of log rows to keep per agent identity. Oldest rows are deleted when exceeded.

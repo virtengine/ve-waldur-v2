@@ -25,7 +25,7 @@ from waldur_mastermind.marketplace_site_agent.tests import (
 )
 
 
-class SendMessagesAboutPendingOrdersTest(test.APITransactionTestCase):
+class SendMessagesAboutPendingOrdersTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -87,7 +87,7 @@ class SendMessagesAboutPendingOrdersTest(test.APITransactionTestCase):
         mocked_publish_messages.assert_called_once()
 
 
-class AllocationDeleteTest(test.APITransactionTestCase):
+class AllocationDeleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = site_agent_fixtures.MarketplaceSiteAgentFixture()
         self.allocation = self.fixture.allocation
@@ -159,7 +159,7 @@ class AllocationDeleteTest(test.APITransactionTestCase):
         self.allocation.refresh_from_db()
 
 
-class AllocationCreationFailureTest(test.APITransactionTestCase):
+class AllocationCreationFailureTest(test.APITestCase):
     def setUp(self):
         self.fixture = site_agent_fixtures.MarketplaceSiteAgentFixture()
         self.offering = self.fixture.offering
@@ -179,9 +179,11 @@ class AllocationCreationFailureTest(test.APITransactionTestCase):
             attributes={"name": "failed-allocation"},
         )
 
-    def test_resource_with_failed_order_is_erred(self):
+    def test_resource_with_failed_order_and_no_backend_id_is_terminated(self):
         """
-        This test checks that when a resource fails to be created, the order and resource are set to ERRED.
+        This test checks that when a resource with no backend_id (i.e. never
+        provisioned) fails to be created, the order is set to ERRED and the
+        resource is terminated directly rather than left stuck in ERRED.
         """
 
         self.client.force_authenticate(self.fixture.staff)
@@ -228,11 +230,14 @@ class AllocationCreationFailureTest(test.APITransactionTestCase):
         self.order.resource.refresh_from_db()
         self.order.refresh_from_db()
 
-        # Resource should be ERRED (state 3), as set in resource_creation_failed in callbacks.py
+        # Resource has no backend_id, i.e. it was never provisioned, so it should
+        # be terminated directly instead of getting stuck in ERRED - see
+        # update_resource_state_on_order_rejection_error_or_cancellation in
+        # marketplace/handlers.py.
         self.assertEqual(
             self.order.resource.state,
-            ResourceStates.ERRED,
-            f"Resource {self.order.resource.id} should be ERRED, but got {self.order.resource.state}",
+            ResourceStates.TERMINATED,
+            f"Resource {self.order.resource.id} should be TERMINATED, but got {self.order.resource.state}",
         )
         # Order should be ERRED
         self.assertEqual(
@@ -242,7 +247,7 @@ class AllocationCreationFailureTest(test.APITransactionTestCase):
         )
 
 
-class AllocationCleanupTest(test.APITransactionTestCase):
+class AllocationCleanupTest(test.APITestCase):
     def setUp(self):
         self.fixture = site_agent_fixtures.MarketplaceSiteAgentFixture()
         self.allocation = self.fixture.allocation

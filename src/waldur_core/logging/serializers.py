@@ -1,13 +1,21 @@
 import logging
 import uuid
 
+from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
 from django.utils.translation import gettext_lazy as _
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
+from waldur_core.core.authentication import refresh_token
 from waldur_core.core.fields import NaturalChoiceField
-from waldur_core.core.serializers import RestrictedSerializerMixin
+from waldur_core.core.serializers import (
+    AllowedScopeInputSerializer,
+    RestrictedSerializerMixin,
+)
 from waldur_core.logging import backend, enums, event_logger, models
+from waldur_core.permissions.enums import TYPE_MAP
+from waldur_core.permissions.utils import holds_any_role_on_scope_or_ancestor
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +105,14 @@ class BaseHookSerializer(serializers.HyperlinkedModelSerializer):
 
 class SummaryHookSerializer(serializers.Serializer):
     def to_representation(self, instance):
+        if type(instance) is models.BaseHook:
+            for model in models.BaseHook.get_all_models():
+                if model == models.BaseHook:
+                    continue
+                attr = model.__name__.lower()
+                if hasattr(instance, attr):
+                    instance = getattr(instance, attr)
+                    break
         serializer = self.get_hook_serializer(instance.__class__)
         return serializer(instance, context=self.context).data
 
@@ -129,8 +145,19 @@ class EmailHookSerializer(BaseHookSerializer):
         return "email"
 
 
+class EventSubscriptionObservableObjectSerializer(serializers.Serializer):
+    offering_uuid = serializers.UUIDField(required=False)
+    object_type = serializers.CharField()
+    object_id = serializers.IntegerField(required=False)
+
+
+@extend_schema_field(EventSubscriptionObservableObjectSerializer(many=True))
+class ObservableObjectsField(serializers.JSONField):
+    pass
+
+
 class EventSubscriptionSerializer(serializers.HyperlinkedModelSerializer):
-    observable_objects = serializers.JSONField(
+    observable_objects = ObservableObjectsField(
         default=list,
         help_text="List of objects to observe. Each item must have 'object_type' "
         "(one of: order, user_role, resource, offering_user, importable_resources, "
@@ -212,8 +239,9 @@ class EventSubscriptionSerializer(serializers.HyperlinkedModelSerializer):
             logger.error("Failed to create RabbitMQ virtual host: %s", vhost_name)
             raise serializers.ValidationError("Failed to create RabbitMQ virtual host")
 
-        # Create RabbitMQ user
-        if not rmq_backend.create_rabbitmq_user(object_uuid, user.auth_token.key):
+        # Create RabbitMQ user. refresh_token get-or-creates the DRF token,
+        # avoiding Token.DoesNotExist when the caller authenticated without one.
+        if not rmq_backend.create_rabbitmq_user(object_uuid, refresh_token(user).key):
             logger.error("Failed to create RabbitMQ user: %s", object_uuid)
             raise serializers.ValidationError("Failed to create RabbitMQ user")
 
@@ -281,6 +309,7 @@ class EventSubscriptionQueueCreateSerializer(serializers.Serializer):
 
     def validate_offering_uuid(self, value):
         """Verify user has access to this offering."""
+        from waldur_mastermind.marketplace import enums as marketplace_enums
         from waldur_mastermind.marketplace import models as marketplace_models
 
         request = self.context.get("request")
@@ -295,14 +324,23 @@ class EventSubscriptionQueueCreateSerializer(serializers.Serializer):
                 f"Offering with UUID {value} does not exist"
             )
 
-        # Check user has access to the offering
+        # Check user has access to the offering via standard permissions
         user_offerings = marketplace_models.Offering.objects.all().filter_for_user(
             request.user
         )
-        if not user_offerings.filter(uuid=value).exists():
-            raise serializers.ValidationError("You do not have access to this offering")
+        if user_offerings.filter(uuid=value).exists():
+            return value
 
-        return value
+        # ISD identity managers can access non-archived/draft offerings
+        # for STOMP event subscription queue creation
+        if request.user.is_identity_manager and request.user.managed_isds:
+            if marketplace_models.Offering.objects.filter(
+                uuid=value,
+                state__in=marketplace_enums.OfferingStates.ISD_ALLOWED_STATES,
+            ).exists():
+                return value
+
+        raise serializers.ValidationError("You do not have access to this offering")
 
     @transaction.atomic
     def create(self, validated_data):
@@ -408,6 +446,42 @@ class EmailLogSerializer(serializers.HyperlinkedModelSerializer):
                 "view_name": "email-log-detail",
             },
         }
+
+
+class SystemLogSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.SystemLog
+        fields = (
+            "id",
+            "created",
+            "source",
+            "instance",
+            "level",
+            "level_number",
+            "logger_name",
+            "message",
+            "context",
+        )
+        read_only_fields = fields
+
+
+class SystemLogStatsInstanceSerializer(serializers.Serializer):
+    source = serializers.CharField(read_only=True)
+    instance = serializers.CharField(read_only=True)
+    count = serializers.IntegerField(read_only=True)
+
+
+class SystemLogStatsResponseSerializer(serializers.Serializer):
+    instances = SystemLogStatsInstanceSerializer(many=True, read_only=True)
+    total_size_bytes = serializers.IntegerField(read_only=True)
+    total_size_mb = serializers.FloatField(read_only=True)
+
+
+class SystemLogInstanceSerializer(serializers.Serializer):
+    source = serializers.CharField(read_only=True)
+    instance = serializers.CharField(read_only=True)
+    last_seen = serializers.DateTimeField(read_only=True)
+    count = serializers.IntegerField(read_only=True)
 
 
 # RabbitMQ Stats API Serializers
@@ -663,7 +737,7 @@ class RmqClientPropertiesSerializer(serializers.Serializer):
     platform = serializers.CharField(
         read_only=True,
         allow_null=True,
-        help_text="Client platform (e.g., 'Python 3.11')",
+        help_text="Client platform (e.g., 'Python 3.12')",
     )
 
 
@@ -993,15 +1067,6 @@ class PublishingMetricsSerializer(serializers.Serializer):
     )
 
 
-class MetricsResetSerializer(serializers.Serializer):
-    """Serializer for metrics reset response."""
-
-    status = serializers.CharField(
-        read_only=True,
-        help_text="Operation status",
-    )
-
-
 class MessageStateCacheFilterSerializer(serializers.Serializer):
     """Serializer for message state cache filter params."""
 
@@ -1186,3 +1251,120 @@ class DeadLetterQueueSerializer(serializers.Serializer):
         read_only=True,
         help_text="Informational note about DLQs",
     )
+
+
+class EventConsumerRegistrationSerializer(serializers.Serializer):
+    """Input for registering an event-consumer queue."""
+
+    object_types = serializers.ListField(
+        child=serializers.ChoiceField(
+            choices=[(m.value, m.value) for m in enums.ObservableObjectType],
+        ),
+        required=False,
+        # Deliberately NO default: an OMITTED field must mean "leave the
+        # consumer's current filter alone", while an explicit [] means "all
+        # types". Defaulting to [] would make a re-registration that simply
+        # doesn't send the field silently widen a narrowed consumer to the full
+        # firehose — for a global consumer, the all-user PII stream.
+        help_text=(
+            "Observable object types to receive. An explicit empty list means "
+            "all types; omitting the field leaves an existing consumer's "
+            "filter unchanged."
+        ),
+    )
+    scopes = AllowedScopeInputSerializer(
+        many=True,
+        required=False,
+        default=list,
+        help_text=(
+            "Entity bindings this consumer receives events for — e.g. "
+            "several projects, a customer, an offering. You may only bind to an "
+            "entity you hold a role on. AN EMPTY LIST MEANS GLOBAL (every "
+            "event, including all-user PII) and is staff/support only."
+        ),
+    )
+
+    def validate_scopes(self, value):
+        """Resolve {type, uuid} bindings and enforce the privilege-escalation
+        guard: you may only subscribe to what you already have access to."""
+        user = self.context["request"].user
+        resolved = []
+        errors = []
+        for entry in value:
+            type_key = entry["type"]
+            uuid_value = entry["uuid"]
+            app_label, model_name = TYPE_MAP[type_key]
+            try:
+                content_type = ContentType.objects.get_by_natural_key(
+                    app_label, model_name
+                )
+            except ContentType.DoesNotExist:
+                errors.append(f"Unknown scope type '{type_key}'.")
+                continue
+            instance = (
+                content_type.model_class().objects.filter(uuid=uuid_value).first()
+            )
+            if instance is None:
+                errors.append(f"{type_key} with uuid {uuid_value} does not exist.")
+                continue
+            if not holds_any_role_on_scope_or_ancestor(user, instance):
+                errors.append(
+                    f"You do not hold a role on {type_key} {uuid_value}, so you "
+                    f"may not subscribe to its events."
+                )
+                continue
+            resolved.append(
+                {"content_type_id": content_type.id, "object_id": instance.id}
+            )
+        if errors:
+            raise serializers.ValidationError(errors)
+        return resolved
+
+
+class EventConsumerRegistrationResponseSerializer(serializers.Serializer):
+    rmq_username = serializers.CharField(
+        help_text="RabbitMQ username (UUID hex) for STOMP authentication",
+    )
+    queue_name = serializers.CharField(
+        help_text="RabbitMQ queue name (consumer_{consumer_uuid})",
+    )
+    vhost = serializers.CharField(help_text="RabbitMQ virtual host (user UUID)")
+    observable_object_types = serializers.ListField(
+        child=serializers.CharField(),
+        help_text="Object types routed to this queue",
+    )
+
+
+class EventConsumerScopeOutputSerializer(serializers.Serializer):
+    type = serializers.SerializerMethodField()
+    uuid = serializers.SerializerMethodField()
+
+    def get_type(self, scope) -> str | None:
+        key = (scope.content_type.app_label, scope.content_type.model)
+        for type_key, natural_key in TYPE_MAP.items():
+            if natural_key == key:
+                return type_key
+        return scope.content_type.model
+
+    def get_uuid(self, scope) -> str | None:
+        target = scope.scope
+        return getattr(target, "uuid", None) and target.uuid.hex
+
+
+class EventConsumerSerializer(serializers.ModelSerializer):
+    scopes = EventConsumerScopeOutputSerializer(many=True, read_only=True)
+    is_global = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = models.EventConsumer
+        fields = (
+            "uuid",
+            "object_types",
+            "scopes",
+            "is_global",
+            "rmq_username",
+            "queue_created",
+            "created",
+            "modified",
+        )
+        read_only_fields = fields

@@ -7,6 +7,9 @@ from waldur_mastermind.marketplace.enums import (
     MaintenanceState,
     MaintenanceType,
 )
+from waldur_mastermind.marketplace.maintenance_utils import (
+    MaintenanceAnnouncementTemplate,
+)
 from waldur_mastermind.marketplace.tests import factories
 from waldur_mastermind.notifications.models import AdminAnnouncement
 
@@ -113,11 +116,14 @@ class MaintenanceAnnouncementSignalsTest(TransactionTestCase):
 
         admin_announcement = maintenance.admin_announcement
 
-        # Should contain type prefix and original message
-        expected_content = (
-            "🔧 Scheduled Maintenance: System will be unavailable for upgrades"
+        # Should contain type prefix, original message and the scheduled window
+        self.assertTrue(
+            admin_announcement.description.startswith(
+                "🔧 Scheduled Maintenance: System will be unavailable for upgrades"
+            ),
+            admin_announcement.description,
         )
-        self.assertEqual(admin_announcement.description, expected_content)
+        self.assertIn("(Scheduled ", admin_announcement.description)
         self.assertEqual(admin_announcement.type, AdminAnnouncement.Type.INFORMATION)
 
     def test_emergency_maintenance_gets_danger_priority(self):
@@ -139,10 +145,12 @@ class MaintenanceAnnouncementSignalsTest(TransactionTestCase):
         admin_announcement = maintenance.admin_announcement
 
         # Should have emergency prefix and DANGER priority
-        expected_content = (
-            "🚨 Emergency Maintenance: Critical security vulnerability fix"
+        self.assertTrue(
+            admin_announcement.description.startswith(
+                "🚨 Emergency Maintenance: Critical security vulnerability fix"
+            ),
+            admin_announcement.description,
         )
-        self.assertEqual(admin_announcement.description, expected_content)
         self.assertEqual(admin_announcement.type, AdminAnnouncement.Type.DANGER)
 
     def test_security_maintenance_gets_warning_priority(self):
@@ -164,10 +172,12 @@ class MaintenanceAnnouncementSignalsTest(TransactionTestCase):
         admin_announcement = maintenance.admin_announcement
 
         # Should have security prefix and WARNING priority
-        expected_content = (
-            "🔒 Security Maintenance: Installing security patches for all services"
+        self.assertTrue(
+            admin_announcement.description.startswith(
+                "🔒 Security Maintenance: Installing security patches for all services"
+            ),
+            admin_announcement.description,
         )
-        self.assertEqual(admin_announcement.description, expected_content)
         self.assertEqual(admin_announcement.type, AdminAnnouncement.Type.WARNING)
 
     def test_maintenance_content_updates_when_message_changes(self):
@@ -233,6 +243,29 @@ class MaintenanceAnnouncementSignalsTest(TransactionTestCase):
 
         # Priority should be escalated to DANGER
         self.assertEqual(admin_announcement.type, AdminAnnouncement.Type.DANGER)
+
+    def test_admin_announcement_serializer_includes_service_provider(self):
+        """The banner attributes maintenance to a provider, so the name must resolve."""
+        from waldur_mastermind.notifications.serializers import (
+            AdminAnnouncementSerializer,
+        )
+
+        maintenance = factories.MaintenanceAnnouncementFactory(
+            name="Test Maintenance",
+            message="Testing provider attribution",
+            service_provider=self.service_provider,
+            state=MaintenanceState.DRAFT,
+        )
+        maintenance.schedule()
+        maintenance.save()
+        maintenance.refresh_from_db()
+
+        data = AdminAnnouncementSerializer(maintenance.admin_announcement).data
+
+        self.assertEqual(
+            data["maintenance_service_provider"],
+            self.service_provider.customer.name,
+        )
 
     def test_admin_announcement_serializer_includes_affected_offerings(self):
         """Test that AdminAnnouncementSerializer includes affected offerings information."""
@@ -507,3 +540,172 @@ class MaintenanceAnnouncementSignalsTest(TransactionTestCase):
 
         completed_maintenance.refresh_from_db()
         self.assertIsNone(completed_maintenance.admin_announcement)
+
+    @override_config(
+        MAINTENANCE_ANNOUNCEMENT_NOTIFY_BEFORE_MINUTES=60,
+        MAINTENANCE_ANNOUNCEMENT_TRAILING_BUFFER_MINUTES=60,
+    )
+    def test_scheduled_end_patch_during_in_progress_updates_active_to(self):
+        """Patching scheduled_end while IN_PROGRESS must shift active_to."""
+        maintenance = factories.MaintenanceAnnouncementFactory(
+            service_provider=self.service_provider,
+            state=MaintenanceState.DRAFT,
+        )
+        maintenance.schedule()
+        maintenance.save()
+        maintenance.refresh_from_db()
+
+        maintenance.start_maintenance()
+        maintenance.save()
+        maintenance.refresh_from_db()
+
+        new_scheduled_end = maintenance.scheduled_end + timezone.timedelta(hours=3)
+        maintenance.scheduled_end = new_scheduled_end
+        maintenance.save()
+
+        admin_announcement = maintenance.admin_announcement
+        admin_announcement.refresh_from_db()
+        self.assertEqual(
+            admin_announcement.active_to,
+            new_scheduled_end + timezone.timedelta(minutes=60),
+        )
+
+    @override_config(
+        MAINTENANCE_ANNOUNCEMENT_NOTIFY_BEFORE_MINUTES=60,
+        MAINTENANCE_ANNOUNCEMENT_TRAILING_BUFFER_MINUTES=60,
+    )
+    def test_early_completion_collapses_active_to_to_actual_end(self):
+        """Completing early collapses active_to to actual_end + buffer."""
+        maintenance = factories.MaintenanceAnnouncementFactory(
+            service_provider=self.service_provider,
+            state=MaintenanceState.DRAFT,
+        )
+        maintenance.schedule()
+        maintenance.save()
+        maintenance.refresh_from_db()
+
+        maintenance.start_maintenance()
+        maintenance.save()
+        maintenance.refresh_from_db()
+
+        early_end = maintenance.scheduled_end - timezone.timedelta(hours=1)
+        maintenance.actual_end = early_end
+        maintenance.complete_maintenance()
+        maintenance.save()
+
+        admin_announcement = maintenance.admin_announcement
+        admin_announcement.refresh_from_db()
+        self.assertEqual(
+            admin_announcement.active_to,
+            early_end + timezone.timedelta(minutes=60),
+        )
+        # Content uses the maintenance_type prefix; ensure it was regenerated.
+        self.assertIn(
+            MaintenanceAnnouncementTemplate.TYPE_PREFIXES[MaintenanceType.SCHEDULED],
+            admin_announcement.description,
+        )
+
+    @override_config(
+        MAINTENANCE_ANNOUNCEMENT_NOTIFY_BEFORE_MINUTES=60,
+        MAINTENANCE_ANNOUNCEMENT_TRAILING_BUFFER_MINUTES=60,
+    )
+    def test_overrun_extends_active_to_when_scheduled_end_pushed_in_progress(self):
+        """Pushing scheduled_end past the original while IN_PROGRESS extends the window."""
+        maintenance = factories.MaintenanceAnnouncementFactory(
+            service_provider=self.service_provider,
+            state=MaintenanceState.DRAFT,
+        )
+        maintenance.schedule()
+        maintenance.save()
+        maintenance.refresh_from_db()
+
+        maintenance.start_maintenance()
+        maintenance.save()
+        maintenance.refresh_from_db()
+
+        admin_announcement = maintenance.admin_announcement
+        original_active_to = admin_announcement.active_to
+
+        extended_end = maintenance.scheduled_end + timezone.timedelta(hours=4)
+        maintenance.scheduled_end = extended_end
+        maintenance.save()
+
+        admin_announcement.refresh_from_db()
+        self.assertGreater(admin_announcement.active_to, original_active_to)
+        self.assertEqual(
+            admin_announcement.active_to,
+            extended_end + timezone.timedelta(minutes=60),
+        )
+
+    def test_in_progress_offering_change_updates_announcement(self):
+        """Adding an affected offering while IN_PROGRESS refreshes the announcement."""
+        maintenance = factories.MaintenanceAnnouncementFactory(
+            service_provider=self.service_provider,
+            state=MaintenanceState.DRAFT,
+        )
+        maintenance.schedule()
+        maintenance.save()
+        maintenance.refresh_from_db()
+
+        maintenance.start_maintenance()
+        maintenance.save()
+        maintenance.refresh_from_db()
+
+        admin_announcement = maintenance.admin_announcement
+        original_modified = admin_announcement.modified
+
+        offering = factories.OfferingFactory(name="In-progress Service")
+        factories.MaintenanceAnnouncementOfferingFactory(
+            maintenance=maintenance,
+            offering=offering,
+            impact_level=ImpactLevel.FULL_OUTAGE,
+            impact_description="Added mid-run",
+        )
+
+        admin_announcement.refresh_from_db()
+        self.assertGreaterEqual(admin_announcement.modified, original_modified)
+        # FK reference should still be intact.
+        maintenance.refresh_from_db()
+        self.assertEqual(maintenance.admin_announcement_id, admin_announcement.id)
+
+    def test_cancel_still_removes_announcement(self):
+        """Regression: cancelling a scheduled maintenance still deletes the announcement."""
+        maintenance = factories.MaintenanceAnnouncementFactory(
+            service_provider=self.service_provider,
+            state=MaintenanceState.DRAFT,
+        )
+        maintenance.schedule()
+        maintenance.save()
+        maintenance.refresh_from_db()
+
+        self.assertIsNotNone(maintenance.admin_announcement)
+        admin_announcement_id = maintenance.admin_announcement.id
+
+        maintenance.cancel_maintenance()
+        maintenance.save()
+        maintenance.refresh_from_db()
+
+        self.assertIsNone(maintenance.admin_announcement)
+        self.assertFalse(
+            AdminAnnouncement.objects.filter(id=admin_announcement_id).exists()
+        )
+
+    @override_config(
+        MAINTENANCE_ANNOUNCEMENT_NOTIFY_BEFORE_MINUTES=60,
+        MAINTENANCE_ANNOUNCEMENT_TRAILING_BUFFER_MINUTES=30,
+    )
+    def test_trailing_buffer_constance_override(self):
+        """Trailing buffer Constance setting governs how far past the end we stay visible."""
+        maintenance = factories.MaintenanceAnnouncementFactory(
+            service_provider=self.service_provider,
+            state=MaintenanceState.DRAFT,
+        )
+        maintenance.schedule()
+        maintenance.save()
+        maintenance.refresh_from_db()
+
+        admin_announcement = maintenance.admin_announcement
+        self.assertEqual(
+            admin_announcement.active_to,
+            maintenance.scheduled_end + timezone.timedelta(minutes=30),
+        )

@@ -3,6 +3,8 @@ import datetime
 from constance.test.unittest import override_config as override_constance_config
 from ddt import data, ddt
 from django.contrib.contenttypes.models import ContentType
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from freezegun import freeze_time
 from rest_framework import status, test
@@ -29,7 +31,7 @@ from waldur_mastermind.marketplace.enums import (
 from waldur_mastermind.marketplace.tests import factories, fixtures
 
 
-class StatsBaseTest(test.APITransactionTestCase):
+class StatsBaseTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
         self.customer = self.fixture.customer
@@ -295,6 +297,7 @@ class ComponentStatsTest(StatsBaseTest):
                 "plan_component_id": self.plan_component.id,
                 "offering_component_type": self.plan_component.component.type,
                 "offering_component_name": self.plan_component.component.name,
+                "discount_usage": 1.0,
                 "resource_limit_periods": [
                     {
                         "end": "2020-03-31T23:59:59.999999+00:00",
@@ -392,7 +395,7 @@ class ComponentStatsTest(StatsBaseTest):
 
 
 @ddt
-class CustomerStatsTest(test.APITransactionTestCase):
+class CustomerStatsTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
 
@@ -546,7 +549,7 @@ class CustomerStatsTest(test.APITransactionTestCase):
 
 
 @ddt
-class LimitsStatsTest(test.APITransactionTestCase):
+class LimitsStatsTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.resource_1 = factories.ResourceFactory(
@@ -642,7 +645,7 @@ class LimitsStatsTest(test.APITransactionTestCase):
 
 @ddt
 @override_constance_config(ENFORCE_USER_CONSENT_FOR_OFFERINGS=True)
-class CountUsersOfServiceProviderTest(test.APITransactionTestCase):
+class CountUsersOfServiceProviderTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.url = "/api/marketplace-stats/count_users_of_service_providers/"
@@ -757,7 +760,7 @@ class CountUsersOfServiceProviderTest(test.APITransactionTestCase):
 
 
 @ddt
-class CountProjectsGroupedByOecdOfServiceProviderTest(test.APITransactionTestCase):
+class CountProjectsGroupedByOecdOfServiceProviderTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.url = "/api/marketplace-stats/count_projects_of_service_providers_grouped_by_oecd/"
@@ -797,7 +800,7 @@ class CountProjectsGroupedByOecdOfServiceProviderTest(test.APITransactionTestCas
 
 @ddt
 class CountUniqueUsersConnectedWithActiveResourcesOfServiceProviderTest(
-    test.APITransactionTestCase
+    test.APITestCase
 ):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
@@ -865,7 +868,7 @@ class CountUniqueUsersConnectedWithActiveResourcesOfServiceProviderTest(
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
 
-class CountCustomersTest(test.APITransactionTestCase):
+class CountCustomersTest(test.APITestCase):
     @freeze_time("2020-01-01")
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
@@ -993,7 +996,7 @@ class CountCustomersTest(test.APITransactionTestCase):
             )
 
 
-class OfferingStatsTest(test.APITransactionTestCase):
+class OfferingStatsTest(test.APITestCase):
     @freeze_time("2020-01-01")
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
@@ -1023,7 +1026,76 @@ class OfferingStatsTest(test.APITransactionTestCase):
         self.assertEqual(response.data["customers_count"], 1)
 
 
-class OfferingStatsCounterTest(test.APITransactionTestCase):
+class CountActiveResourcesByOrganizationGroupTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = structure_fixtures.ProjectFixture()
+        self.url = (
+            "/api/marketplace-stats/"
+            "count_active_resources_grouped_by_organization_group/"
+        )
+
+        self.group_1 = structure_factories.OrganizationGroupFactory()
+        self.group_2 = structure_factories.OrganizationGroupFactory()
+
+        # customer_1 belongs to both groups -> its resources counted in both
+        self.customer_1 = structure_factories.CustomerFactory()
+        self.customer_1.organization_groups.add(self.group_1, self.group_2)
+        self.offering_1 = factories.OfferingFactory(customer=self.customer_1)
+        factories.ResourceFactory(offering=self.offering_1, state=ResourceStates.OK)
+        factories.ResourceFactory(
+            offering=self.offering_1, state=ResourceStates.TERMINATING
+        )
+        # terminated resource must be excluded
+        factories.ResourceFactory(
+            offering=self.offering_1, state=ResourceStates.TERMINATED
+        )
+
+        # customer_2 belongs only to group_2
+        self.customer_2 = structure_factories.CustomerFactory()
+        self.customer_2.organization_groups.add(self.group_2)
+        self.offering_2 = factories.OfferingFactory(customer=self.customer_2)
+        factories.ResourceFactory(offering=self.offering_2, state=ResourceStates.OK)
+
+        # customer without any organization group must not appear
+        self.offering_3 = factories.OfferingFactory()
+        factories.ResourceFactory(offering=self.offering_3, state=ResourceStates.OK)
+
+    def test_active_resources_are_grouped_by_organization_group(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        counts = {record["uuid"]: record["count"] for record in response.data}
+        # group_1: only customer_1's active resources (2)
+        self.assertEqual(counts[self.group_1.uuid.hex], 2)
+        # group_2: customer_1 (2) + customer_2 (1)
+        self.assertEqual(counts[self.group_2.uuid.hex], 3)
+        # only the two groups with active resources are present
+        self.assertEqual(len(response.data), 2)
+
+    def test_number_of_queries_does_not_grow_with_groups(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        with CaptureQueriesContext(connection) as ctx_before:
+            self.client.get(self.url)
+        queries_before = len(ctx_before.captured_queries)
+
+        # add more groups with resources; query count must stay constant
+        for _ in range(3):
+            group = structure_factories.OrganizationGroupFactory()
+            customer = structure_factories.CustomerFactory()
+            customer.organization_groups.add(group)
+            offering = factories.OfferingFactory(customer=customer)
+            factories.ResourceFactory(offering=offering, state=ResourceStates.OK)
+
+        with CaptureQueriesContext(connection) as ctx_after:
+            self.client.get(self.url)
+        queries_after = len(ctx_after.captured_queries)
+
+        self.assertEqual(queries_before, queries_after)
+
+
+class OfferingStatsCounterTest(test.APITestCase):
     def setUp(self):
         self.provider1 = factories.structure_factories.CustomerFactory()
         self.category1 = factories.CategoryFactory()
@@ -1286,7 +1358,7 @@ class CountResourceProvisioningStatsTest(StatsBaseTest):
 
 
 @ddt
-class CountUserIdentitySourceStatsTest(test.APITransactionTestCase):
+class CountUserIdentitySourceStatsTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.url = "/api/marketplace-stats/user_identity_source_count/"
@@ -1324,7 +1396,7 @@ class CountUserIdentitySourceStatsTest(test.APITransactionTestCase):
 
 
 @ddt
-class ComponentUsagesStatsTest(test.APITransactionTestCase):
+class ComponentUsagesStatsTest(test.APITestCase):
     """Tests for /api/marketplace-stats/component_usages/ endpoint.
 
     This endpoint returns component usages for the current month,
@@ -1470,7 +1542,7 @@ class ComponentUsagesStatsTest(test.APITransactionTestCase):
 
 
 @ddt
-class ResourcesMissingUsageTest(test.APITransactionTestCase):
+class ResourcesMissingUsageTest(test.APITestCase):
     """Tests for /api/marketplace-stats/resources_missing_usage/ endpoint.
 
     This endpoint returns resources with usage-based billing components
@@ -1646,7 +1718,7 @@ class ResourcesMissingUsageTest(test.APITransactionTestCase):
 
 
 @ddt
-class OrderStatsTest(test.APITransactionTestCase):
+class OrderStatsTest(test.APITestCase):
     """Tests for /api/marketplace-stats/order_stats/ endpoint.
 
     This endpoint returns comprehensive order statistics including
@@ -1809,7 +1881,7 @@ class OrderStatsTest(test.APITransactionTestCase):
 
 
 @ddt
-class ProviderResourcesStatsTest(test.APITransactionTestCase):
+class ProviderResourcesStatsTest(test.APITestCase):
     """Tests for /api/marketplace-stats/provider_resources/ endpoint.
 
     This endpoint returns resource statistics for a service provider.
@@ -1885,6 +1957,30 @@ class ProviderResourcesStatsTest(test.APITransactionTestCase):
         # Total excludes terminated resources
         self.assertGreaterEqual(response.data["total"], 1)
 
+    def test_resource_counts_by_state_uses_human_readable_names(self):
+        """Test that by_state dictionary uses human-readable state names as keys."""
+        factories.ResourceFactory(
+            offering=self.fixture.offering,
+            state=ResourceStates.OK,
+        )
+        factories.ResourceFactory(
+            offering=self.fixture.offering,
+            state=ResourceStates.ERRED,
+        )
+
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(
+            self.url, {"provider_uuid": str(self.fixture.service_provider.uuid)}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        by_state = response.data["by_state"]
+        self.assertIn("OK", by_state)
+        self.assertIn("Erred", by_state)
+        # Verify they are not numeric strings (which would be '1', '2' etc.)
+        self.assertNotIn(str(ResourceStates.OK), by_state)
+        self.assertNotIn(str(ResourceStates.ERRED), by_state)
+
     def test_resource_counts_by_offering(self):
         """Test that resources are grouped by offering."""
         factories.ResourceFactory(
@@ -1906,7 +2002,7 @@ class ProviderResourcesStatsTest(test.APITransactionTestCase):
 
 
 @ddt
-class ProviderCustomersStatsTest(test.APITransactionTestCase):
+class ProviderCustomersStatsTest(test.APITestCase):
     """Tests for /api/marketplace-stats/provider_customers/ endpoint.
 
     This endpoint returns customer statistics for a service provider.
@@ -1981,7 +2077,7 @@ class ProviderCustomersStatsTest(test.APITransactionTestCase):
 
 
 @ddt
-class ProviderOfferingsStatsTest(test.APITransactionTestCase):
+class ProviderOfferingsStatsTest(test.APITestCase):
     """Tests for /api/marketplace-stats/provider_offerings/ endpoint.
 
     This endpoint returns offering performance statistics for a service provider.
@@ -2032,6 +2128,24 @@ class ProviderOfferingsStatsTest(test.APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
         self.assertIn("offerings", response.data)
+        if response.data["offerings"]:
+            offering = response.data["offerings"][0]
+            self.assertIn("offering_uuid", offering)
+            self.assertIn("offering_name", offering)
+            self.assertIn("category_name", offering)
+            self.assertIn("state", offering)
+            self.assertIn("active_resources", offering)
+            self.assertIn("total_resources", offering)
+            self.assertIn("revenue", offering)
+            self.assertIn("plans", offering)
+
+            if offering["plans"]:
+                plan = offering["plans"][0]
+                self.assertIn("plan_uuid", plan)
+                self.assertIn("plan_name", plan)
+                self.assertIn("usage", plan)
+                self.assertIn("limit", plan)
+                self.assertIn("utilization", plan)
 
     def test_offering_statistics(self):
         """Test that offering statistics are correctly calculated."""
@@ -2072,7 +2186,7 @@ class ProviderOfferingsStatsTest(test.APITransactionTestCase):
             self.assertIn(field, offering)
 
 
-class PlanComponentSerializerTest(test.APITransactionTestCase):
+class PlanComponentSerializerTest(test.APITestCase):
     """Tests for PlanComponentSerializer fields."""
 
     def setUp(self):
@@ -2109,7 +2223,7 @@ class PlanComponentSerializerTest(test.APITransactionTestCase):
 
 
 @ddt
-class ResourceUsageByOrganizationTypeTest(test.APITransactionTestCase):
+class ResourceUsageByOrganizationTypeTest(test.APITestCase):
     """Tests for /api/marketplace-stats/resource_usage_by_organization_type/ endpoint.
 
     This endpoint returns component usages grouped by the organization type
@@ -2271,3 +2385,238 @@ class ResourceUsageByOrganizationTypeTest(test.APITransactionTestCase):
         # Usage should be attributed to project member (university), not service account (empty)
         org_types = {r["organization_type"] for r in response.data}
         self.assertIn("urn:schac:homeOrganizationType:int:university", org_types)
+
+
+@ddt
+class ProjectsLimitsGroupedByIndustryFlagTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.url = "/api/marketplace-stats/projects_limits_grouped_by_industry_flag/"
+
+    @data("staff", "global_support")
+    def test_user_can_get_stats(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("limits", response.data)
+
+    @data("owner", "user", "customer_support", "admin", "manager")
+    def test_user_cannot_get_stats(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_limits_are_grouped_by_industry_flag(self):
+        # Set up an industry project with an active resource
+        self.fixture.project.is_industry = True
+        self.fixture.project.save()
+        self.fixture.resource.state = ResourceStates.OK
+        self.fixture.resource.limits = {"cpu": 10, "ram": 20}
+        self.fixture.resource.save()
+
+        # Set up a non-industry project with an active resource
+        non_industry_project = structure_factories.ProjectFactory(
+            customer=self.fixture.customer, is_industry=False
+        )
+        factories.ResourceFactory(
+            offering=self.fixture.offering,
+            project=non_industry_project,
+            state=ResourceStates.OK,
+            limits={"cpu": 5, "ram": 8},
+        )
+
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        limits = response.data["limits"]
+        self.assertIn("True", limits)
+        self.assertIn("False", limits)
+        self.assertEqual(limits["True"]["cpu"], 10)
+        self.assertEqual(limits["True"]["ram"], 20)
+        self.assertEqual(limits["False"]["cpu"], 5)
+        self.assertEqual(limits["False"]["ram"], 8)
+
+    def test_resources_with_empty_limits_are_excluded(self):
+        self.fixture.resource.state = ResourceStates.OK
+        self.fixture.resource.limits = {}
+        self.fixture.resource.save()
+
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["limits"], {})
+
+    def test_non_ok_resources_are_excluded(self):
+        self.fixture.resource.state = ResourceStates.CREATING
+        self.fixture.resource.limits = {"cpu": 10}
+        self.fixture.resource.save()
+
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["limits"], {})
+
+    def test_limits_are_summed_across_resources(self):
+        self.fixture.resource.state = ResourceStates.OK
+        self.fixture.resource.limits = {"cpu": 10}
+        self.fixture.resource.save()
+
+        factories.ResourceFactory(
+            offering=self.fixture.offering,
+            project=self.fixture.project,
+            state=ResourceStates.OK,
+            limits={"cpu": 5, "ram": 8},
+        )
+
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url)
+        limits = response.data["limits"]
+        field_value = str(self.fixture.project.is_industry)
+        self.assertEqual(limits[field_value]["cpu"], 15)
+        self.assertEqual(limits[field_value]["ram"], 8)
+
+
+@ddt
+class ProjectsLimitsGroupedByOecdTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.url = "/api/marketplace-stats/projects_limits_grouped_by_oecd/"
+
+    @data("staff", "global_support")
+    def test_user_can_get_stats(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("limits", response.data)
+
+    @data("owner", "user", "customer_support", "admin", "manager")
+    def test_user_cannot_get_stats(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class UserStatsTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = structure_fixtures.ProjectFixture()
+        self.staff = self.fixture.staff
+        self.support = self.fixture.global_support
+        self.user = self.fixture.user
+
+        structure_factories.UserFactory.create_batch(
+            3, nationality="EE", country_of_residence="EE"
+        )
+        structure_factories.UserFactory.create_batch(
+            2, nationality="FI", country_of_residence="FI"
+        )
+        structure_factories.UserFactory.create_batch(
+            1, nationality="", country_of_residence="LV"
+        )
+
+    def test_staff_can_access_user_stats(self):
+        self.client.force_authenticate(self.staff)
+
+        # Test nationality
+        response = self.client.get("/api/marketplace-stats/user_nationality/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(
+            any(
+                item["nationality"] == "EE" and item["count"] == 3
+                for item in response.data
+            )
+        )
+
+        # Test residence
+        response = self.client.get("/api/marketplace-stats/user_residence_country/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(
+            any(
+                item["country_of_residence"] == "EE" and item["count"] == 3
+                for item in response.data
+            )
+        )
+
+    def test_support_can_access_user_stats(self):
+        self.client.force_authenticate(self.support)
+        response = self.client.get("/api/marketplace-stats/user_nationality/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_regular_user_cannot_access_user_stats(self):
+        self.client.force_authenticate(self.user)
+        response = self.client.get("/api/marketplace-stats/user_nationality/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_anonymous_user_cannot_access_user_stats(self):
+        response = self.client.get("/api/marketplace-stats/user_nationality/")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+@ddt
+class CreationTrendStatsTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+
+    @data("staff", "global_support")
+    def test_staff_can_access_project_creation_trend(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        response = self.client.get("/api/marketplace-stats/project_creation_trend/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(len(response.data) > 0)
+        self.assertIn("month", response.data[0])
+        self.assertIn("count", response.data[0])
+
+    @data("staff", "global_support")
+    def test_staff_can_access_resource_creation_trend(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        response = self.client.get("/api/marketplace-stats/resource_creation_trend/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    @data("owner", "user", "customer_support", "admin", "manager")
+    def test_user_cannot_access_creation_trends(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        response = self.client.get("/api/marketplace-stats/project_creation_trend/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+@ddt
+class TopProviderStatsTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+
+    @data("staff", "global_support")
+    def test_staff_can_access_top_service_providers_by_resources(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        response = self.client.get(
+            "/api/marketplace-stats/top_service_providers_by_resources/"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    @data("staff", "global_support")
+    def test_count_active_resources_grouped_by_offering_with_pagination(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        response = self.client.get(
+            "/api/marketplace-stats/count_active_resources_grouped_by_offering/",
+            {"page_size": 2},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(len(response.data) <= 2)
+        self.assertIn("X-Result-Count", response.headers)
+
+    @data("owner", "user", "customer_support", "admin", "manager")
+    def test_user_cannot_access_top_providers(self, user):
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+        response = self.client.get(
+            "/api/marketplace-stats/top_service_providers_by_resources/"
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)

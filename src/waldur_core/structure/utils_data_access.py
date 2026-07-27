@@ -2,6 +2,7 @@
 Utility functions for user data access logging.
 """
 
+import ipaddress
 import logging
 
 from constance import config
@@ -24,6 +25,14 @@ def get_client_ip(request):
         ip = x_forwarded_for.split(",")[0].strip()
     else:
         ip = request.META.get("REMOTE_ADDR")
+
+    if ip:
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            logger.warning("Invalid IP address in request: %s", ip)
+            return None
+
     return ip
 
 
@@ -105,17 +114,67 @@ def log_user_data_access_sync(
         log_context["method"] = request.method
 
     try:
-        UserDataAccessLog.objects.create(
-            target_user=target_user,
-            accessor=accessor,
-            accessor_type=accessor_type,
-            accessed_fields=accessed_fields,
-            ip_address=ip_address,
-            context=log_context,
-        )
+        with transaction.atomic():
+            UserDataAccessLog.objects.create(
+                target_user=target_user,
+                accessor=accessor,
+                accessor_type=accessor_type,
+                accessed_fields=accessed_fields,
+                ip_address=ip_address,
+                context=log_context,
+            )
     except Exception as e:
-        # Log error but don't fail the request
+        # Log error but don't fail the request.
+        # The savepoint (transaction.atomic) ensures a failed INSERT
+        # does not corrupt the outer transaction.
         logger.warning("Failed to log user data access: %s", e)
+
+
+def bulk_log_user_data_access(entries, accessor, request):
+    """Bulk log user data access entries using a single INSERT.
+
+    Used by list views to avoid N+1 INSERT queries when serializing
+    multiple users. Also avoids N+1 constance config lookups by
+    checking settings once before the bulk operation.
+    """
+    from waldur_core.logging.models import UserDataAccessLog
+
+    if not entries:
+        return
+
+    if not config.USER_DATA_ACCESS_LOGGING_ENABLED:
+        return
+
+    log_self_access = config.USER_DATA_ACCESS_LOG_SELF_ACCESS
+    ip_address = get_client_ip(request)
+    log_context = {}
+    if request:
+        log_context["endpoint"] = request.path
+        log_context["method"] = request.method
+
+    logs = []
+    for entry in entries:
+        target_user = entry["target_user"]
+        if accessor == target_user and not log_self_access:
+            continue
+        accessor_type = determine_accessor_type(accessor, target_user)
+        logs.append(
+            UserDataAccessLog(
+                target_user=target_user,
+                accessor=accessor,
+                accessor_type=accessor_type,
+                accessed_fields=entry["accessed_fields"],
+                ip_address=ip_address,
+                context=log_context,
+            )
+        )
+
+    if logs:
+        try:
+            with transaction.atomic():
+                UserDataAccessLog.objects.bulk_create(logs)
+        except Exception as e:
+            logger.warning("Failed to bulk log user data access: %s", e)
 
 
 # Backwards compatibility alias

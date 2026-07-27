@@ -2,7 +2,7 @@ from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import OpenApiParameter, extend_schema
-from httpx import TimeoutException
+from httpx import TransportError
 from rest_framework import exceptions, status
 from rest_framework import permissions as rf_permissions
 from rest_framework.decorators import action
@@ -10,20 +10,12 @@ from rest_framework.exceptions import NotFound, PermissionDenied, ValidationErro
 from rest_framework.generics import GenericAPIView
 from rest_framework.request import Request
 from rest_framework.response import Response
-from waldur_api_client.api.customers import customers_list
-from waldur_api_client.api.marketplace_categories import marketplace_categories_list
-from waldur_api_client.api.marketplace_orders import (
-    marketplace_orders_reject_by_consumer,
-)
-from waldur_api_client.api.marketplace_public_offerings import (
-    marketplace_public_offerings_retrieve,
-)
-from waldur_api_client.errors import UnexpectedStatus
-from waldur_api_client.models.customers_list_field_item import CustomersListFieldItem
-from waldur_api_client.models.marketplace_public_offerings_list_field_item import (
-    MarketplacePublicOfferingsListFieldItem,
-)
 
+# waldur_api_client pulls in a large generated attrs/pydantic model graph
+# (~70 MB resident). Its symbols are imported lazily inside the view methods
+# below so the SDK does not load at Django startup (this module is imported
+# during URLconf resolution in every process). See the "Lazy imports for heavy
+# optional backends" section of CLAUDE.md.
 from waldur_core.core import permissions as core_permissions
 from waldur_core.core import views as core_views
 from waldur_core.core.client import get_waldur_client
@@ -111,20 +103,24 @@ class CustomersView(RemoteView):
         description="List remote customers owned by current user",
     )
     def post(self, request, *args, **kwargs):
+        from waldur_api_client.api.customers import customers_list
+        from waldur_api_client.errors import UnexpectedStatus
+        from waldur_api_client.models.customer_field_enum import CustomerFieldEnum
+
         client = self.get_client(request)
         try:
             customers = customers_list.sync_all(
                 client=client,
                 owned_by_current_user=True,
                 field=[
-                    CustomersListFieldItem.UUID,
-                    CustomersListFieldItem.NAME,
-                    CustomersListFieldItem.ABBREVIATION,
-                    CustomersListFieldItem.PHONE_NUMBER,
-                    CustomersListFieldItem.EMAIL,
+                    CustomerFieldEnum.UUID,
+                    CustomerFieldEnum.NAME,
+                    CustomerFieldEnum.ABBREVIATION,
+                    CustomerFieldEnum.PHONE_NUMBER,
+                    CustomerFieldEnum.EMAIL,
                 ],
             )
-        except (UnexpectedStatus, TimeoutException) as e:
+        except (UnexpectedStatus, TransportError) as e:
             return Response(str(e), status=status.HTTP_400_BAD_REQUEST)
         return Response([customer.to_dict() for customer in customers])
 
@@ -136,10 +132,15 @@ class СategoriesView(RemoteView):
         description="List remote marketplace categories",
     )
     def post(self, request, *args, **kwargs):
+        from waldur_api_client.api.marketplace_categories import (
+            marketplace_categories_list,
+        )
+        from waldur_api_client.errors import UnexpectedStatus
+
         client = self.get_client(request)
         try:
             сategories = marketplace_categories_list.sync_all(client=client)
-        except (UnexpectedStatus, TimeoutException) as e:
+        except (UnexpectedStatus, TransportError) as e:
             return Response(str(e), status=status.HTTP_400_BAD_REQUEST)
         return Response([category.to_dict() for category in сategories])
 
@@ -156,6 +157,11 @@ class OfferingsListView(RemoteView):
         description="List remote importable offerings for particular customer",
     )
     def post(self, request, *args, **kwargs):
+        from waldur_api_client.errors import UnexpectedStatus
+        from waldur_api_client.models.public_offering_details_field_enum import (
+            PublicOfferingDetailsFieldEnum,
+        )
+
         client = self.get_client(request)
         if "customer_uuid" not in request.query_params:
             raise ValidationError(
@@ -168,14 +174,14 @@ class OfferingsListView(RemoteView):
                 client,
                 remote_customer_uuid,
                 fields=[
-                    MarketplacePublicOfferingsListFieldItem.UUID,
-                    MarketplacePublicOfferingsListFieldItem.NAME,
-                    MarketplacePublicOfferingsListFieldItem.TYPE,
-                    MarketplacePublicOfferingsListFieldItem.STATE,
-                    MarketplacePublicOfferingsListFieldItem.CATEGORY_TITLE,
+                    PublicOfferingDetailsFieldEnum.UUID,
+                    PublicOfferingDetailsFieldEnum.NAME,
+                    PublicOfferingDetailsFieldEnum.TYPE,
+                    PublicOfferingDetailsFieldEnum.STATE,
+                    PublicOfferingDetailsFieldEnum.CATEGORY_TITLE,
                 ],
             )
-        except (UnexpectedStatus, TimeoutException) as e:
+        except (UnexpectedStatus, TransportError) as e:
             return Response(str(e), status=status.HTTP_400_BAD_REQUEST)
 
         local_offerings = list(
@@ -199,6 +205,11 @@ class OfferingCreateView(RemoteView):
         description="Create local offering from remote",
     )
     def post(self, request, *args, **kwargs):
+        from waldur_api_client.api.marketplace_public_offerings import (
+            marketplace_public_offerings_retrieve,
+        )
+        from waldur_api_client.errors import UnexpectedStatus
+
         serializer = serializers.RemoteOfferingCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         client = self.get_client(request)
@@ -220,7 +231,7 @@ class OfferingCreateView(RemoteView):
             remote_offering = marketplace_public_offerings_retrieve.sync(
                 client=client, uuid=remote_offering_uuid.hex
             )
-        except (UnexpectedStatus, TimeoutException) as e:
+        except (UnexpectedStatus, TransportError) as e:
             return Response(str(e), status=status.HTTP_400_BAD_REQUEST)
 
         secret_options = {
@@ -337,6 +348,11 @@ class CancelTerminationOrderView(GenericAPIView):
 
     @extend_schema(description="Cancel termination order")
     def post(self, request, *args, **kwargs):
+        from waldur_api_client.api.marketplace_orders import (
+            marketplace_orders_reject_by_consumer,
+        )
+        from waldur_api_client.errors import UnexpectedStatus
+
         order = self.get_order()
         if not has_permission(
             request, PermissionEnum.APPROVE_ORDER, order.offering.customer
@@ -349,7 +365,7 @@ class CancelTerminationOrderView(GenericAPIView):
             marketplace_orders_reject_by_consumer.sync_detailed(
                 client=client, uuid=order.backend_id
             )
-        except (UnexpectedStatus, TimeoutException) as exc:
+        except (UnexpectedStatus, TransportError) as exc:
             raise ValidationError(exc)
         callbacks.sync_order_state(order, OrderStates.CANCELED)
 
@@ -393,10 +409,6 @@ class PullOfferingUsage(OfferingActionView):
     task = tasks.pull_offering_usage
 
 
-class PullOfferingInvoices(OfferingActionView):
-    task = tasks.pull_offering_invoices
-
-
 class PullOfferingRobotAccounts(OfferingActionView):
     task = tasks.pull_offering_robot_accounts
 
@@ -427,7 +439,10 @@ class RemoteSynchronisationViewSet(core_views.ActionsViewSet):
     )
     permission_classes = [rf_permissions.IsAuthenticated, core_permissions.IsStaff]
 
-    @extend_schema(request=None)
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.RemoteSynchronisationSerializer},
+        request=None,
+    )
     @action(detail=True, methods=["post"])
     def run_synchronisation(self, request, **kwargs):
         sync: RemoteSynchronisation = self.get_object()

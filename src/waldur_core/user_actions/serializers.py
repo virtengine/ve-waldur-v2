@@ -133,8 +133,14 @@ class UserActionSummarySerializer(serializers.Serializer):
     """Serializer for action summary statistics"""
 
     total = serializers.IntegerField()
-    by_urgency = serializers.DictField()
-    by_type = serializers.DictField()
+    by_urgency = serializers.DictField(
+        child=serializers.IntegerField(),
+        help_text="Map of urgency level to count of actions",
+    )
+    by_type = serializers.DictField(
+        child=serializers.IntegerField(),
+        help_text="Map of action type string to count of actions",
+    )
     overdue = serializers.IntegerField()
 
 
@@ -221,12 +227,6 @@ class SilenceActionResponseSerializer(serializers.Serializer):
     duration_days = serializers.IntegerField(required=False, allow_null=True)
 
 
-class UnsilenceActionResponseSerializer(serializers.Serializer):
-    """Serializer for unsilence action response"""
-
-    status = serializers.CharField()
-
-
 class ExecuteActionResponseSerializer(serializers.Serializer):
     """Serializer for execute action response"""
 
@@ -248,3 +248,10 @@ class BulkSilenceResponseSerializer(serializers.Serializer):
     status = serializers.CharField()
     count = serializers.IntegerField()
     duration_days = serializers.IntegerField(required=False, allow_null=True)
+
+
+class SendNotificationResponseSerializer(serializers.Serializer):
+    """Serializer for send notification response"""
+
+    status = serializers.CharField()
+    message = serializers.CharField()

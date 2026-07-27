@@ -1,4 +1,15 @@
-from . import views
+from django.urls import include, re_path
+from rest_framework.routers import SimpleRouter
+
+from . import discovery_views, views
+
+# Dedicated router for OpenStack settings discovery
+settings_discovery_router = SimpleRouter()
+settings_discovery_router.register(
+    r"discovery",
+    discovery_views.OpenStackDiscoveryViewSet,
+    basename="openstack-discovery",
+)
 
 
 def register_in(router):
@@ -10,6 +21,21 @@ def register_in(router):
         r"openstack-volume-types",
         views.VolumeTypeViewSet,
         basename="openstack-volume-type",
+    )
+    router.register(
+        r"openstack-external-networks",
+        views.ExternalNetworkViewSet,
+        basename="openstack-external-network",
+    )
+    router.register(
+        r"openstack-hypervisors",
+        views.HypervisorViewSet,
+        basename="openstack-hypervisor",
+    )
+    router.register(
+        r"openstack-hypervisor-inventories",
+        views.HypervisorInventoryViewSet,
+        basename="openstack-hypervisor-inventory",
     )
     router.register(
         r"openstack-tenants", views.TenantViewSet, basename="openstack-tenant"
@@ -30,6 +56,31 @@ def register_in(router):
     )
     router.register(
         r"openstack-routers", views.RouterViewSet, basename="openstack-router"
+    )
+    router.register(
+        r"openstack-loadbalancers",
+        views.LoadBalancerViewSet,
+        basename="openstack-loadbalancer",
+    )
+    router.register(
+        r"openstack-pools",
+        views.PoolViewSet,
+        basename="openstack-pool",
+    )
+    router.register(
+        r"openstack-pool-members",
+        views.PoolMemberViewSet,
+        basename="openstack-poolmember",
+    )
+    router.register(
+        r"openstack-health-monitors",
+        views.HealthMonitorViewSet,
+        basename="openstack-healthmonitor",
+    )
+    router.register(
+        r"openstack-listeners",
+        views.ListenerViewSet,
+        basename="openstack-listener",
     )
     router.register(
         r"openstack-networks", views.NetworkViewSet, basename="openstack-network"
@@ -75,4 +126,9 @@ def register_in(router):
     )
 
 
-urlpatterns = []
+urlpatterns = [
+    re_path(
+        r"^api/openstack/",
+        include(settings_discovery_router.urls),
+    ),
+]

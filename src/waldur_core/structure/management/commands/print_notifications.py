@@ -9,7 +9,6 @@ from waldur_core.structure.notifications import NOTIFICATIONS
 TAB_OF_4 = " " * 4
 
 CUSTOM_LOADER_SETTING = (
-    "admin_tools.template_loaders.Loader",
     "django.template.loaders.filesystem.Loader",
     "django.template.loaders.app_directories.Loader",
 )
@@ -23,7 +22,7 @@ class Command(BaseCommand):
         # reset loaders to use only filesystem based
         file_engine[0].engine.loaders = CUSTOM_LOADER_SETTING
         # reset cached_property
-        del file_engine[0].engine.__dict__["template_loaders"]
+        file_engine[0].engine.__dict__.pop("template_loaders", None)
 
         output = ["# Notifications\n"]
 

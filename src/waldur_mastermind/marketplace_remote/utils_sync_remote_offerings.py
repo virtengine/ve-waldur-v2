@@ -1,16 +1,20 @@
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
 from django.db.models.query import QuerySet
 from django.utils import timezone
-from httpx import TimeoutException
-from waldur_api_client.api.marketplace_categories import marketplace_categories_list
-from waldur_api_client.errors import UnexpectedStatus
-from waldur_api_client.models.marketplace_categories_list_field_item import (
-    MarketplaceCategoriesListFieldItem,
-)
-from waldur_api_client.models.public_offering_details import PublicOfferingDetails
+from httpx import TransportError
 
+# waldur_api_client pulls in a large generated attrs/pydantic model graph
+# (~70 MB resident). Its symbols are imported lazily inside the methods below so
+# the SDK does not load at Django startup. See the "Lazy imports for heavy
+# optional backends" section of CLAUDE.md.
 from waldur_core.core.client import get_waldur_client
+
+if TYPE_CHECKING:
+    from waldur_api_client.models.public_offering_details import PublicOfferingDetails
 from waldur_mastermind.marketplace import models
 from waldur_mastermind.marketplace.enums import REMOTE_OFFERING, OfferingStates
 from waldur_mastermind.marketplace_remote import models as remote_models
@@ -24,12 +28,14 @@ class RemoteSynchronisationRunner:
         self.sync: remote_models.RemoteSynchronisation = sync
 
     def run(self) -> None:
+        from waldur_api_client.errors import UnexpectedStatus
+
         try:
             self._initialize_sync()
             self._process_sync()
             self.sync.state = remote_models.RemoteSynchronisation.States.OK
 
-        except (UnexpectedStatus, TimeoutException) as e:
+        except (UnexpectedStatus, TransportError) as e:
             self._handle_sync_error(e)
             self.sync.state = remote_models.RemoteSynchronisation.States.ERRED
 
@@ -44,6 +50,13 @@ class RemoteSynchronisationRunner:
         self.sync.save()
 
     def _process_sync(self) -> None:
+        from waldur_api_client.api.marketplace_categories import (
+            marketplace_categories_list,
+        )
+        from waldur_api_client.models.marketplace_category_field_enum import (
+            MarketplaceCategoryFieldEnum,
+        )
+
         existing_offerings = models.Offering.objects.filter(
             type=REMOTE_OFFERING,
             customer=self.sync.local_service_provider.customer,
@@ -54,8 +67,8 @@ class RemoteSynchronisationRunner:
         remote_categories = marketplace_categories_list.sync_all(
             client=client,
             field=[
-                MarketplaceCategoriesListFieldItem.UUID,
-                MarketplaceCategoriesListFieldItem.TITLE,
+                MarketplaceCategoryFieldEnum.UUID,
+                MarketplaceCategoryFieldEnum.TITLE,
             ],
         )
 
@@ -97,6 +110,7 @@ class RemoteSynchronisationRunner:
                 ).first()
 
                 if local_offering:
+                    self._refresh_offering_credentials(local_offering)
                     updated_local_offering = utils.upsert_offering(
                         remote_offering=remote_offering,
                         local_category=category_mapping.local_category,
@@ -122,6 +136,26 @@ class RemoteSynchronisationRunner:
 
         self._archive_stale_offerings(existing_offerings, processed_offering_ids)
 
+    def _refresh_offering_credentials(self, offering: models.Offering) -> None:
+        # Offerings keep their own copy of the remote credentials in
+        # secret_options; propagate changes made to the synchronisation
+        # settings so that offering-scoped clients don't use stale values.
+        expected = {"api_url": self.sync.api_url, "token": self.sync.token}
+        updates = {
+            key: value
+            for key, value in expected.items()
+            if offering.secret_options.get(key) != value
+        }
+        if not updates:
+            return
+        offering.secret_options.update(updates)
+        offering.save(update_fields=["secret_options"])
+        message = (
+            f"Updated {' and '.join(updates)} in secret options of offering {offering}."
+        )
+        self.sync.last_output += f"\t{message}\n"
+        logger.info(message)
+
     def _create_new_offering(
         self,
         remote_offering: PublicOfferingDetails,
@@ -146,6 +180,8 @@ class RemoteSynchronisationRunner:
         return local_offering
 
     def _handle_sync_error(self, error: Exception) -> None:
+        from waldur_api_client.errors import UnexpectedStatus
+
         if isinstance(error, UnexpectedStatus):
             self.sync.error_message = error.content.decode("utf-8")
         else:

@@ -46,6 +46,17 @@ class OpenStackFixture(ProjectFixture):
         )
         ProjectRole.MANAGER.add_permission(PermissionEnum.CAN_MANAGE_OPENSTACK_INSTANCE)
 
+        # Add router gateway permissions
+        CustomerRole.OWNER.add_permission(
+            PermissionEnum.CAN_MANAGE_OPENSTACK_ROUTER_GATEWAY
+        )
+        ProjectRole.ADMIN.add_permission(
+            PermissionEnum.CAN_MANAGE_OPENSTACK_ROUTER_GATEWAY
+        )
+        ProjectRole.MANAGER.add_permission(
+            PermissionEnum.CAN_MANAGE_OPENSTACK_ROUTER_GATEWAY
+        )
+
     @cached_property
     def settings(self):
         return factories.SettingsFactory(
@@ -203,7 +214,9 @@ class OpenStackFixture(ProjectFixture):
 
 
 def mock_session():
-    session_mock = mock.patch("keystoneauth1.session.Session").start()()
+    # Patch the subclass we actually instantiate in create_session/recover_cached_session
+    # so test code never makes real keystone HTTP calls.
+    session_mock = mock.patch("waldur_openstack.session.TimedSession").start()()
     session_mock.auth.auth_url = "auth_url"
     session_mock.auth.project_id = "project_id"
     session_mock.auth.project_domain_name = None

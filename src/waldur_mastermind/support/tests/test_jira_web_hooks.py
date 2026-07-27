@@ -9,7 +9,7 @@ from constance.test.unittest import override_config as override_constance_config
 from django.core import mail
 from django.test import override_settings
 from django.urls import reverse
-from rest_framework.test import APITransactionTestCase
+from rest_framework.test import APITestCase
 
 from waldur_core.core.tests.helpers import load_json_resource
 from waldur_mastermind.support.backend import SupportBackendType
@@ -20,14 +20,19 @@ from waldur_mastermind.support.backend.atlassian import (
 )
 from waldur_mastermind.support.tests import factories
 
+JIRA_WEBHOOK_TEST_SECRET = "jira-test-secret"  # noqa: S105
 
-@mock.patch("waldur_mastermind.support.serializers.ServiceDeskBackend")
+
+# ServiceDeskBackend is imported lazily inside the webhook serializer's create(),
+# so patch it at its source module (the lazy `from ... import` resolves there).
+@mock.patch("waldur_mastermind.support.backend.atlassian.ServiceDeskBackend")
 @override_constance_config(
     WALDUR_SUPPORT_ENABLED=True,
     WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE="basic",
+    JIRA_WEBHOOK_SHARED_SECRET=JIRA_WEBHOOK_TEST_SECRET,
 )
 @override_settings(task_always_eager=True)
-class TestJiraWebHooks(APITransactionTestCase):
+class TestJiraWebHooks(APITestCase):
     def setUp(self):
         self.url = reverse("web-hook-receiver")
         backend_id = "SNT-101"
@@ -46,40 +51,46 @@ class TestJiraWebHooks(APITransactionTestCase):
         )
         [create_request(self, *r) for r in jira_requests]
 
+    def _post(self, body):
+        # Inbound webhooks now require the X-Webhook-Secret header — see SEC-C7.
+        return self.client.post(
+            self.url, body, HTTP_X_WEBHOOK_SECRET=JIRA_WEBHOOK_TEST_SECRET
+        )
+
     def test_issue_update(self, mock_jira):
         self.request_data_issue_updated["issue_event_type_name"] = "issue_updated"
-        self.client.post(self.url, self.request_data_issue_updated)
+        self._post(self.request_data_issue_updated)
         self.assertTrue(self._call_update_issue(mock_jira))
 
     def test_generic_update(self, mock_jira):
         self.request_data_issue_updated["issue_event_type_name"] = "issue_generic"
-        self.client.post(self.url, self.request_data_issue_updated)
+        self._post(self.request_data_issue_updated)
         self.assertTrue(self._call_update_issue(mock_jira))
 
     def test_comment_create(self, mock_jira):
-        self.client.post(self.url, self.request_data_comment_create)
+        self._post(self.request_data_comment_create)
         self.assertTrue(self._call_create_comment(mock_jira))
 
     def test_comment_update(self, mock_jira):
         comment = factories.CommentFactory(issue=self.issue)
         self.request_data_comment_update["comment"]["id"] = comment.backend_id
-        self.client.post(self.url, self.request_data_comment_update)
+        self._post(self.request_data_comment_update)
         self.assertTrue(self._call_update_comment(mock_jira))
 
     def test_comment_delete(self, mock_jira):
         comment = factories.CommentFactory(issue=self.issue)
         self.request_data_comment_delete["comment"]["id"] = comment.backend_id
-        self.client.post(self.url, self.request_data_comment_delete)
+        self._post(self.request_data_comment_delete)
         self.assertTrue(self._call_delete_comment(mock_jira))
 
     def test_add_attachment(self, mock_jira):
         self.request_data_issue_updated["issue_event_type_name"] = "issue_updated"
-        self.client.post(self.url, self.request_data_issue_updated)
+        self._post(self.request_data_issue_updated)
         self.assertTrue(self._call_update_attachment(mock_jira))
 
     def test_delete_attachment(self, mock_jira):
         self.request_data_issue_updated["issue_event_type_name"] = "issue_updated"
-        self.client.post(self.url, self.request_data_issue_updated)
+        self._post(self.request_data_issue_updated)
         self.assertTrue(self._call_update_attachment(mock_jira))
 
     def _call_update_attachment(self, mock_jira):
@@ -114,7 +125,7 @@ MockResolution = collections.namedtuple("MockResolution", ["name"])
 
 @override_settings(task_always_eager=True)
 @override_constance_config(WALDUR_SUPPORT_ENABLED=True)
-class TestUpdateIssueFromJira(APITransactionTestCase):
+class TestUpdateIssueFromJira(APITestCase):
     def setUp(self):
         self.issue = factories.IssueFactory()
 
@@ -302,7 +313,7 @@ class TestUpdateIssueFromJira(APITransactionTestCase):
         self.assertEqual(self.issue.feedback_request, False)
 
 
-class TestUpdateCommentFromJira(APITransactionTestCase):
+class TestUpdateCommentFromJira(APITestCase):
     @override_constance_config(
         WALDUR_SUPPORT_ENABLED=True,
         WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE=SupportBackendType.ATLASSIAN,
@@ -328,8 +339,8 @@ class TestUpdateCommentFromJira(APITransactionTestCase):
 
         # Make the mock work with dictionary access as well for Service Desk API
         self.backend_comment.__getitem__ = lambda _, key: self.service_desk_comment[key]
-        self.backend_comment.get = (
-            lambda _, key, default=None: self.service_desk_comment.get(key, default)
+        self.backend_comment.get = lambda _, key, default=None: (
+            self.service_desk_comment.get(key, default)
         )
 
         # Helper method to sync changes between attribute and dictionary access
@@ -373,6 +384,22 @@ class TestUpdateCommentFromJira(APITransactionTestCase):
         self.comment.refresh_from_db()
         self.assertEqual(self.comment.is_public, False)
 
+    def test_update_comment_is_public_via_jsd_public(self):
+        # REST API v2/v3 uses "jsdPublic" instead of "public"
+        del self.service_desk_comment["public"]
+        self.service_desk_comment["jsdPublic"] = False
+        self.backend.update_comment_from_jira(self.comment)
+        self.comment.refresh_from_db()
+        self.assertEqual(self.comment.is_public, False)
+
+    def test_update_comment_defaults_to_public_when_no_flag(self):
+        # When neither "public" nor "jsdPublic" is present, default to public
+        self.service_desk_comment.pop("public", None)
+        self.service_desk_comment.pop("jsdPublic", None)
+        self.backend.update_comment_from_jira(self.comment)
+        self.comment.refresh_from_db()
+        self.assertEqual(self.comment.is_public, True)
+
     def test_webhook_cleans_up_user_info_and_does_not_update_comment_if_it_is_not_changed(
         self,
     ):
@@ -385,7 +412,7 @@ class TestUpdateCommentFromJira(APITransactionTestCase):
         self.assertEqual(self.comment.description, expected_comment_body)
 
 
-class TestUpdateAttachmentFromJira(APITransactionTestCase):
+class TestUpdateAttachmentFromJira(APITestCase):
     @override_constance_config(
         WALDUR_SUPPORT_ENABLED=True,
         WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE=SupportBackendType.ATLASSIAN,

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 from typing import cast
 from uuid import UUID
@@ -5,26 +7,14 @@ from uuid import UUID
 from django.conf import settings
 from django.db import transaction
 from django.urls import reverse
-from waldur_api_client.api.marketplace_orders import marketplace_orders_create
-from waldur_api_client.api.marketplace_resources import (
-    marketplace_resources_retrieve,
-    marketplace_resources_terminate,
-    marketplace_resources_update_limits,
-)
-from waldur_api_client.errors import UnexpectedStatus
-from waldur_api_client.models.order_create_request import OrderCreateRequest
-from waldur_api_client.models.order_create_request_limits import (
-    OrderCreateRequestLimits,
-)
-from waldur_api_client.models.resource_terminate_request import ResourceTerminateRequest
-from waldur_api_client.models.resource_update_limits_request import (
-    ResourceUpdateLimitsRequest,
-)
-from waldur_api_client.models.resource_update_limits_request_limits import (
-    ResourceUpdateLimitsRequestLimits,
-)
-from waldur_api_client.types import UNSET
+from django.utils.translation import gettext_lazy as _
+from rest_framework.exceptions import ValidationError
 
+# waldur_api_client pulls in a large generated attrs/pydantic model graph
+# (~70 MB resident). Its symbols are imported lazily inside the processor
+# methods below so the SDK does not load at Django startup in processes that
+# never provision remote resources. See the "Lazy imports for heavy optional
+# backends" section of CLAUDE.md.
 from waldur_core.core.models import User
 from waldur_core.core.utils import serialize_instance
 from waldur_mastermind.marketplace import models, processors
@@ -45,15 +35,71 @@ def build_callback_url(order: models.Order):
 
 class RemoteCreateResourceProcessor(processors.BaseOrderProcessor):
     def validate_order(self, request):
-        # TODO: Implement validation
-        pass
+        name = self.order.attributes.get("name", "")
+        if name:
+            queryset = models.Resource.objects.filter(
+                project=self.order.project,
+                offering=self.order.offering,
+                name=name,
+                state__in=(
+                    models.Resource.States.CREATING,
+                    models.Resource.States.OK,
+                    models.Resource.States.UPDATING,
+                    models.Resource.States.TERMINATING,
+                ),
+            )
+            if self.order.resource and self.order.resource.uuid:
+                queryset = queryset.exclude(uuid=self.order.resource.uuid)
+
+            if queryset.exists():
+                raise ValidationError(
+                    _(
+                        "Active resource with name '%(name)s' already exists "
+                        "in this project for this offering."
+                    )
+                    % {"name": name}
+                )
 
     def process_order(self, user: User):
+        from waldur_api_client.api.marketplace_orders import marketplace_orders_create
+        from waldur_api_client.api.marketplace_resources import (
+            marketplace_resources_list,
+        )
+        from waldur_api_client.models.order_create_request import OrderCreateRequest
+        from waldur_api_client.models.order_create_request_limits import (
+            OrderCreateRequestLimits,
+        )
+        from waldur_api_client.models.resource_state import ResourceState
+        from waldur_api_client.types import UNSET
+
         client = utils.get_client_for_offering(self.order.offering)
         remote_project, _ = utils.get_or_create_remote_project(
             self.order.offering, self.order.project, client
         )
         remote_project_uuid = cast(UUID, remote_project.uuid).hex
+
+        # Check for existing resource on the remote side to prevent duplicates
+        name = self.order.attributes.get("name", "")
+        if name:
+            remote_resources = marketplace_resources_list.sync(
+                client=client,
+                project_uuid=UUID(remote_project_uuid),
+                offering_uuid=[UUID(self.order.offering.backend_id)],
+                name_exact=name,
+                state=[
+                    ResourceState.CREATING,
+                    ResourceState.OK,
+                    ResourceState.UPDATING,
+                    ResourceState.TERMINATING,
+                ],
+            )
+            if remote_resources:
+                raise Exception(
+                    f"Resource with name '{name}' already exists in remote project. "
+                    f"Remote resource UUID: {remote_resources[0].uuid}. "
+                    f"This may be an orphan from a previously failed order."
+                )
+
         # To bypass the api check we convert the attributes to a generic object with to_dict method
         converted_attributes = utils.GenericOrderAttribute(self.order.attributes)
         response = marketplace_orders_create.sync(
@@ -93,6 +139,18 @@ class RemoteCreateResourceProcessor(processors.BaseOrderProcessor):
 
 class RemoteUpdateResourceProcessor(processors.BasicUpdateResourceProcessor):
     def update_limits_process(self, user: User):
+        from waldur_api_client.api.marketplace_resources import (
+            marketplace_resources_retrieve,
+            marketplace_resources_update_limits,
+        )
+        from waldur_api_client.errors import UnexpectedStatus
+        from waldur_api_client.models.resource_update_limits_request import (
+            ResourceUpdateLimitsRequest,
+        )
+        from waldur_api_client.models.resource_update_limits_request_limits import (
+            ResourceUpdateLimitsRequestLimits,
+        )
+
         client = utils.get_client_for_offering(self.order.offering)
         # Check if limits are already set on the remote side
         try:
@@ -154,8 +212,24 @@ class RemoteUpdateResourceProcessor(processors.BasicUpdateResourceProcessor):
 
 class RemoteDeleteResourceProcessor(processors.BasicDeleteResourceProcessor):
     def send_request(self, user, resource: models.Resource):
+        from waldur_api_client.api.marketplace_resources import (
+            marketplace_resources_terminate,
+        )
+        from waldur_api_client.errors import UnexpectedStatus
+        from waldur_api_client.models.resource_terminate_request import (
+            ResourceTerminateRequest,
+        )
+
         # Resource is switched to terminated state by caller method
         if not resource.backend_id:
+            logger.warning(
+                "Terminating resource %s locally without remote cleanup — "
+                "backend_id is empty. A remote orphan may exist for "
+                "offering %s in project %s.",
+                resource.uuid,
+                resource.offering,
+                resource.project,
+            )
             return True
 
         # If terminate order already exists in the remote side,
@@ -170,11 +244,23 @@ class RemoteDeleteResourceProcessor(processors.BasicDeleteResourceProcessor):
             return False
 
         client = utils.get_client_for_offering(self.order.offering)
-        response = marketplace_resources_terminate.sync(
-            client=client,
-            uuid=UUID(self.order.resource.backend_id),
-            body=ResourceTerminateRequest(),
-        )
+        try:
+            response = marketplace_resources_terminate.sync(
+                client=client,
+                uuid=UUID(self.order.resource.backend_id),
+                body=ResourceTerminateRequest(),
+            )
+        except (UnexpectedStatus, Exception) as exc:
+            logger.error(
+                "Failed to terminate remote resource %s: %s",
+                self.order.resource.backend_id,
+                exc,
+            )
+            self.order.set_state_erred()
+            self.order.error_message = str(exc)[:255]
+            self.order.save()
+            return False
+
         if response:
             self.order.backend_id = response.order_uuid.hex
             self.order.save(update_fields=["backend_id"])

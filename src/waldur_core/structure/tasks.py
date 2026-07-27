@@ -19,6 +19,7 @@ from waldur_core.structure.exceptions import (
     ServiceBackendNotImplemented,
 )
 from waldur_core.structure.managers import count_customer_users
+from waldur_core.structure.models import ProjectEndDateChangeRequest
 from waldur_core.structure.registry import SupportedServices
 
 logger = logging.getLogger(__name__)
@@ -51,11 +52,6 @@ class BackgroundPullTask(core_tasks.BackgroundTask):
             self.on_pull_fail(instance, e)
         else:
             self.on_pull_success(instance)
-
-    def is_equal(self, other_task, serialized_instance):
-        return self.name == other_task.get(
-            "name"
-        ) and serialized_instance in other_task.get("args", [])
 
     def pull(self, instance):
         """Pull instance from backend.
@@ -102,17 +98,17 @@ class BackgroundListPullTask(core_tasks.BackgroundTask):
     model = NotImplemented
     pull_task = NotImplemented
 
-    def is_equal(self, other_task):
-        return self.name == other_task.get("name")
-
     def get_pulled_objects(self):
         return self.model.objects.filter(
             state__in=[CoreStates.ERRED, CoreStates.OK]
         ).exclude(backend_id="")
 
     def run(self):
-        # Use iterator() with chunk_size to prevent loading all instances into memory
-        for instance in self.get_pulled_objects().iterator(chunk_size=50):
+        # Client-side chunked iteration: avoids server-side cursors which
+        # break with PgBouncer transaction pooling / load-balanced PG.
+        for instance in core_utils.chunked_queryset(
+            self.get_pulled_objects(), chunk_size=50, max_records=50_000
+        ):
             serialized = core_utils.serialize_instance(instance)
             self.pull_task().apply_async(args=(serialized,), kwargs={})
 
@@ -146,20 +142,6 @@ class ServiceResourcesPullTask(BackgroundPullTask):
             )
         else:
             backend.pull_resources()
-
-
-class ServicePropertiesListPullTask(ServiceListPullTask):
-    """Pull service properties from all active service backends."""
-
-    name = "waldur_core.structure.ServicePropertiesListPullTask"
-    pull_task = ServicePropertiesPullTask
-
-
-class ServiceResourcesListPullTask(ServiceListPullTask):
-    """Pull resources from all active service backends."""
-
-    name = "waldur_core.structure.ServiceResourcesListPullTask"
-    pull_task = ServiceResourcesPullTask
 
 
 class RetryUntilAvailableTask(core_tasks.Task):
@@ -216,9 +198,6 @@ class SetErredStuckResources(core_tasks.BackgroundTask):
     """
 
     name = "waldur_core.structure.SetErredStuckResources"
-
-    def is_equal(self, other_task):
-        return self.name == other_task.get("name")
 
     def run(self):
         cutoff = timezone.now() - timedelta(hours=3)
@@ -322,4 +301,146 @@ def send_structure_role_granted_notification(
     context = {"permission": permission, "structure": structure}
     core_utils.broadcast_mail(
         "structure", "structure_role_granted", context, [user.email]
+    )
+
+
+@shared_task(
+    name="waldur_core.structure.send_project_end_date_change_request_notification"
+)
+def send_project_end_date_change_request_notification(request_uuid):
+    """Notify organization owners when a project end date change request is created."""
+
+    try:
+        request = ProjectEndDateChangeRequest.objects.get(uuid=request_uuid)
+    except ProjectEndDateChangeRequest.DoesNotExist:
+        logger.warning(
+            "Project end date change request %s not found, skipping notification",
+            request_uuid,
+        )
+        return
+
+    mails = request.project.customer.get_owner_mails()
+    if not mails:
+        logger.info(
+            "No owner emails for customer %s, skipping project end date change request notification",
+            request.project.customer.uuid,
+        )
+        return
+
+    logger.info(
+        "Sending project end date change request notification for request %s to %d recipient(s)",
+        request_uuid,
+        len(mails),
+    )
+    project_url = core_utils.format_homeport_link(
+        "projects/{project_uuid}/manage/?tab=end-date-change-requests",
+        project_uuid=request.project.uuid.hex,
+    )
+    context = {
+        "project_end_date_change_request": request,
+        "project_url": project_url,
+    }
+    core_utils.broadcast_mail(
+        "structure",
+        "notification_project_end_date_change_request_created",
+        context,
+        mails,
+    )
+
+
+@shared_task(
+    name="waldur_core.structure.send_project_end_date_change_request_approved_notification"
+)
+def send_project_end_date_change_request_approved_notification(request_uuid):
+    """Notify the requester when their project end date change request is approved."""
+
+    try:
+        request = ProjectEndDateChangeRequest.objects.get(uuid=request_uuid)
+    except ProjectEndDateChangeRequest.DoesNotExist:
+        logger.warning(
+            "Project end date change request %s not found, skipping approved notification",
+            request_uuid,
+        )
+        return
+
+    if not request.created_by or not request.created_by.email:
+        logger.info(
+            "No requester email for project end date change request %s, skipping approved notification",
+            request_uuid,
+        )
+        return
+
+    if not request.created_by.notifications_enabled:
+        logger.info(
+            "Requester has notifications disabled for request %s, skipping approved notification",
+            request_uuid,
+        )
+        return
+
+    logger.info(
+        "Sending project end date change request approved notification for request %s",
+        request_uuid,
+    )
+    project_url = core_utils.format_homeport_link(
+        "organization/{customer_uuid}/project-end-date-change-requests/",
+        customer_uuid=request.project.customer.uuid.hex,
+    )
+    context = {
+        "project_end_date_change_request": request,
+        "project_url": project_url,
+    }
+    core_utils.broadcast_mail(
+        "structure",
+        "notification_project_end_date_change_request_approved",
+        context,
+        [request.created_by.email],
+    )
+
+
+@shared_task(
+    name="waldur_core.structure.send_project_end_date_change_request_rejected_notification"
+)
+def send_project_end_date_change_request_rejected_notification(request_uuid):
+    """Notify the requester when their project end date change request is rejected."""
+
+    try:
+        request = ProjectEndDateChangeRequest.objects.get(uuid=request_uuid)
+    except ProjectEndDateChangeRequest.DoesNotExist:
+        logger.warning(
+            "Project end date change request %s not found, skipping rejected notification",
+            request_uuid,
+        )
+        return
+
+    if not request.created_by or not request.created_by.email:
+        logger.info(
+            "No requester email for project end date change request %s, skipping rejected notification",
+            request_uuid,
+        )
+        return
+
+    if not request.created_by.notifications_enabled:
+        logger.info(
+            "Requester has notifications disabled for request %s, skipping rejected notification",
+            request_uuid,
+        )
+        return
+
+    logger.info(
+        "Sending project end date change request rejected notification for request %s",
+        request_uuid,
+    )
+    project_url = core_utils.format_homeport_link(
+        "organization/{customer_uuid}/project-end-date-change-requests/",
+        customer_uuid=request.project.customer.uuid.hex,
+    )
+    context = {
+        "project_end_date_change_request": request,
+        "project_url": project_url,
+    }
+    core_utils.broadcast_mail(
+        "structure",
+        "notification_project_end_date_change_request_rejected",
+        context,
+        [request.created_by.email],
     )

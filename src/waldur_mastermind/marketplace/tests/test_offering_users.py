@@ -1,5 +1,8 @@
+import json
+import logging
 from unittest import mock
 
+from constance.test.unittest import override_config
 from ddt import data, ddt
 from rest_framework import status, test
 from rest_framework.reverse import reverse
@@ -10,13 +13,18 @@ from waldur_core.logging.models import Event
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import (
     CustomerRole,
+    OfferingRole,
     ProjectRole,
     ServiceProviderRole,
 )
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_core.structure.tests.factories import UserFactory
-from waldur_mastermind.marketplace import models
-from waldur_mastermind.marketplace.enums import OfferingUserStates, ResourceStates
+from waldur_mastermind.marketplace import models, utils
+from waldur_mastermind.marketplace.enums import (
+    OfferingUserRuntimeStates,
+    OfferingUserStates,
+    ResourceStates,
+)
 from waldur_mastermind.marketplace.models import OfferingUser
 from waldur_mastermind.marketplace.tests.factories import (
     OfferingFactory,
@@ -28,7 +36,7 @@ from . import factories, fixtures
 
 
 @ddt
-class ListOfferingUsersTest(test.APITransactionTestCase):
+class ListOfferingUsersTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
         self.offering = factories.OfferingFactory(
@@ -103,6 +111,28 @@ class ListOfferingUsersTest(test.APITransactionTestCase):
         self.assertEqual(1, len(response.data))
         self.assertEqual("user", response.data[0]["username"])
 
+    @data("user_first_name", "-user_first_name", "user_last_name", "-user_last_name")
+    def test_user_can_order_offering_users_by_name(self, ordering):
+        self.client.force_login(self.fixture.staff)
+        response = self.client.get(
+            OfferingUserFactory.get_list_url(),
+            {"o": ordering},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(2, len(response.data))
+
+    def test_query_search_by_uid_and_gid(self):
+        OfferingUser.objects.filter(username="user").update(
+            backend_metadata={"uidnumber": 100042, "primarygroup": 200042}
+        )
+        self.client.force_login(self.fixture.staff)
+
+        for value in ("100042", "200042", "0004"):  # exact uid, exact gid, partial
+            response = self.client.get(
+                OfferingUserFactory.get_list_url(), {"query": value}
+            )
+            self.assertEqual([u["username"] for u in response.data], ["user"], value)
+
     def test_user_can_filter_by_user_username(self):
         offering_user = OfferingUser.objects.get(username="user")
         user = offering_user.user
@@ -121,7 +151,7 @@ class ListOfferingUsersTest(test.APITransactionTestCase):
 
 
 @ddt
-class CreateOfferingUsersTest(test.APITransactionTestCase):
+class CreateOfferingUsersTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
         self.offering = factories.OfferingFactory(
@@ -196,7 +226,7 @@ class CreateOfferingUsersTest(test.APITransactionTestCase):
 
 
 @ddt
-class ListUsersTest(test.APITransactionTestCase):
+class ListUsersTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.fixture.admin
@@ -240,7 +270,7 @@ class ListUsersTest(test.APITransactionTestCase):
 
 
 @ddt
-class OfferingUsersUpdateTest(test.APITransactionTestCase):
+class OfferingUsersUpdateTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.CustomerFixture()
         self.offering = factories.OfferingFactory(
@@ -280,6 +310,21 @@ class OfferingUsersUpdateTest(test.APITransactionTestCase):
         self.offering_user.refresh_from_db()
         self.assertEqual("new_username", self.offering_user.username)
 
+    def test_username_update_is_logged(self):
+        self.client.force_authenticate(user=self.fixture.staff)
+        url = self.get_url(self.offering_user)
+
+        with self.assertLogs(
+            "waldur_mastermind.marketplace.views", level=logging.INFO
+        ) as logs:
+            response = self.client.patch(url, {"username": "new_username"})
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.data)
+        self.assertTrue(
+            any("OfferingUser username update via API" in line for line in logs.output),
+            logs.output,
+        )
+
     @data("customer_support", "service_manager")
     def test_unauthorized_user_can_not_update_offering_user(self, user):
         response = self.update_offering_user(user, self.offering_user)
@@ -287,7 +332,171 @@ class OfferingUsersUpdateTest(test.APITransactionTestCase):
 
 
 @ddt
-class OfferingUsersDeleteTest(test.APITransactionTestCase):
+class OfferingUserPosixAttributesTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = structure_fixtures.CustomerFixture()
+        self.offering = factories.OfferingFactory(
+            shared=True, customer=self.fixture.customer
+        )
+        self.offering.plugin_options = {
+            "service_provider_can_create_offering_user": True,
+            "homedir_prefix": "/home/hpc/",
+        }
+        self.offering.save()
+        self.offering_user = OfferingUser.objects.create(
+            offering=self.offering,
+            user=UserFactory(),
+            username="alice",
+            backend_metadata={
+                "uidnumber": 1000,
+                "loginShell": "/bin/bash",
+                "homeDir": "/home/hpc/alice",
+            },
+        )
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_USER)
+
+    def get_url(self, action=None):
+        url = OfferingUserFactory.get_url(self.offering_user)
+        return url if action is None else url + action + "/"
+
+    # --- #1: home directory follows the username ---------------------------
+
+    def test_home_directory_is_rederived_on_username_change(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.patch(self.get_url(), {"username": "alice2"})
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.data)
+        self.offering_user.refresh_from_db()
+        self.assertEqual(
+            self.offering_user.backend_metadata["homeDir"], "/home/hpc/alice2"
+        )
+
+    def test_overridden_home_directory_is_preserved_on_username_change(self):
+        self.offering_user.backend_metadata["homeDir"] = "/custom/alice"
+        self.offering_user.save()
+        self.client.force_authenticate(self.fixture.staff)
+        self.client.patch(self.get_url(), {"username": "alice2"})
+        self.offering_user.refresh_from_db()
+        self.assertEqual(
+            self.offering_user.backend_metadata["homeDir"], "/custom/alice"
+        )
+
+    # --- #2: per-user POSIX attribute overrides ----------------------------
+
+    def test_posix_attributes_are_exposed_read_only(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.get_url())
+        self.assertEqual(response.data["login_shell"], "/bin/bash")
+        self.assertEqual(response.data["home_directory"], "/home/hpc/alice")
+
+    @data("staff", "owner")
+    def test_authorized_user_can_set_posix_attributes(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.post(
+            self.get_url("set_posix_attributes"),
+            {"login_shell": "/bin/zsh", "home_directory": "/data/alice"},
+        )
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.data)
+        self.offering_user.refresh_from_db()
+        self.assertEqual(self.offering_user.backend_metadata["loginShell"], "/bin/zsh")
+        self.assertEqual(self.offering_user.backend_metadata["homeDir"], "/data/alice")
+        # The allocated uid is untouched.
+        self.assertEqual(self.offering_user.backend_metadata["uidnumber"], 1000)
+
+    def test_set_posix_attributes_accepts_partial_payload(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(
+            self.get_url("set_posix_attributes"), {"login_shell": "/bin/sh"}
+        )
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.data)
+        self.offering_user.refresh_from_db()
+        self.assertEqual(self.offering_user.backend_metadata["loginShell"], "/bin/sh")
+        self.assertEqual(
+            self.offering_user.backend_metadata["homeDir"], "/home/hpc/alice"
+        )
+
+    def test_set_posix_attributes_rejects_empty_payload(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(self.get_url("set_posix_attributes"), {})
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code)
+
+    @data("customer_support", "service_manager")
+    def test_unauthorized_user_can_not_set_posix_attributes(self, user):
+        self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.post(
+            self.get_url("set_posix_attributes"), {"login_shell": "/bin/zsh"}
+        )
+        self.assertEqual(status.HTTP_403_FORBIDDEN, response.status_code)
+
+
+class OfferingUserPosixGroupsTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = structure_fixtures.ProjectFixture()
+        self.offering = factories.OfferingFactory(customer=self.fixture.customer)
+        self.offering_user = OfferingUser.objects.create(
+            offering=self.offering, user=self.fixture.manager, username="m"
+        )
+        group = models.OfferingUserGroup.objects.create(
+            offering=self.offering, backend_metadata={"gid": 8500}
+        )
+        group.projects.add(self.fixture.project)
+
+    def get_url(self):
+        return OfferingUserFactory.get_url(self.offering_user) + "posix_groups/"
+
+    def test_lists_project_group_gids_for_member(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.get_url())
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.data)
+        self.assertEqual(len(response.data), 1)
+        row = response.data[0]
+        self.assertEqual(row["gid"], 8500)
+        self.assertEqual(row["project_uuid"], self.fixture.project.uuid.hex)
+        self.assertEqual(row["customer_name"], self.fixture.customer.name)
+        self.assertEqual(row["customer_uuid"], self.fixture.customer.uuid.hex)
+        # Staff may open any project.
+        self.assertTrue(row["project_accessible"])
+        # The GID was seeded directly, so it is not tied to any pool.
+        self.assertIsNone(row["pool_uuid"])
+
+    def test_group_gid_shows_originating_pool_when_allocated(self):
+        service_provider = factories.ServiceProviderFactory(
+            customer=self.fixture.customer
+        )
+        pool = factories.PosixIdPoolFactory(
+            service_provider=service_provider,
+            min_uid=1000,
+            max_uid=7999,
+            next_uid=1000,
+            min_gid=8000,
+            max_gid=8999,
+            next_gid=8000,
+        )
+        group = models.OfferingUserGroup.objects.get(offering=self.offering)
+        models.PosixIdentity.objects.create(
+            pool=pool, gid=8500, consumer=group, offering=self.offering
+        )
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.get_url())
+        row = response.data[0]
+        self.assertEqual(row["pool_uuid"], pool.uuid.hex)
+
+    def test_project_not_accessible_for_unconnected_viewer(self):
+        outsider = UserFactory()
+        rows = utils.get_offering_user_posix_groups(self.offering_user, viewer=outsider)
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0]["project_accessible"])
+        # The organization is still reported.
+        self.assertEqual(rows[0]["customer_name"], self.fixture.customer.name)
+
+    def test_empty_when_group_has_no_gid(self):
+        models.OfferingUserGroup.objects.all().update(backend_metadata={})
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.get_url())
+        self.assertEqual(response.data, [])
+
+
+@ddt
+class OfferingUsersDeleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.CustomerFixture()
         self.offering = factories.OfferingFactory(
@@ -329,7 +538,7 @@ class OfferingUsersDeleteTest(test.APITransactionTestCase):
         self.assertEqual(status.HTTP_403_FORBIDDEN, response.status_code)
 
 
-class OfferingUsersHandlerTest(test.APITransactionTestCase):
+class OfferingUsersHandlerTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
 
@@ -358,9 +567,59 @@ class OfferingUsersHandlerTest(test.APITransactionTestCase):
             ).exists()
         )
 
+    def test_when_offering_user_username_is_changed_audit_log_is_generated(self):
+        self.client.force_authenticate(user=self.fixture.staff)
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_USER)
+        self.fixture.offering.customer.add_user(self.fixture.staff, CustomerRole.OWNER)
+
+        offering_user = OfferingUser.objects.create(
+            offering=self.fixture.offering,
+            user=self.fixture.user,
+            username="initial",
+        )
+        models.UserOfferingConsent.objects.create(
+            user=self.fixture.user,
+            offering=self.fixture.offering,
+            version="1.0",
+        )
+
+        url = OfferingUserFactory.get_url(offering_user)
+
+        response = self.client.patch(url, {"username": "new_username"})
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.data)
+
+        event = (
+            Event.objects.filter(event_type="marketplace_offering_user_updated")
+            .order_by("-created")
+            .first()
+        )
+        self.assertIsNotNone(event)
+        self.assertEqual(event.context["old_username"], "initial")
+        self.assertEqual(event.context["new_username"], "new_username")
+        self.assertEqual(
+            event.context["affected_user_uuid"], self.fixture.user.uuid.hex
+        )
+        self.assertIn("ip_address", event.context)
+
+        response = self.client.patch(url, {"username": ""})
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.data)
+
+        event = (
+            Event.objects.filter(event_type="marketplace_offering_user_updated")
+            .order_by("-created")
+            .first()
+        )
+        self.assertIsNotNone(event)
+        self.assertEqual(event.context["old_username"], "new_username")
+        self.assertEqual(event.context["new_username"], "")
+        self.assertEqual(
+            event.context["affected_user_uuid"], self.fixture.user.uuid.hex
+        )
+        self.assertIn("ip_address", event.context)
+
 
 @ddt
-class OferingUserRestrictedUpdateTest(test.APITransactionTestCase):
+class OferingUserRestrictedUpdateTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.CustomerFixture()
         self.offering = factories.OfferingFactory(
@@ -417,7 +676,7 @@ class OferingUserRestrictedUpdateTest(test.APITransactionTestCase):
 
 
 @ddt
-class OfferingUserStateTransitionTest(test.APITransactionTestCase):
+class OfferingUserStateTransitionTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.CustomerFixture()
         self.offering = factories.OfferingFactory(
@@ -883,7 +1142,7 @@ class OfferingUserStateTransitionTest(test.APITransactionTestCase):
 
 
 @ddt
-class OfferingUserBackwardCompatibilityTest(test.APITransactionTestCase):
+class OfferingUserBackwardCompatibilityTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.CustomerFixture()
         self.offering = factories.OfferingFactory(
@@ -995,7 +1254,7 @@ class OfferingUserBackwardCompatibilityTest(test.APITransactionTestCase):
         self.assertEqual(offering_user.state, OfferingUserStates.OK)
 
 
-class SetOfferingsUsernameBackwardCompatibilityTest(test.APITransactionTestCase):
+class SetOfferingsUsernameBackwardCompatibilityTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
         self.service_provider = factories.ServiceProviderFactory(
@@ -1126,7 +1385,7 @@ class SetOfferingsUsernameBackwardCompatibilityTest(test.APITransactionTestCase)
 
 
 @ddt
-class OfferingUserStateFilterTest(test.APITransactionTestCase):
+class OfferingUserStateFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.CustomerFixture()
         self.offering = factories.OfferingFactory(
@@ -1246,7 +1505,7 @@ class OfferingUserStateFilterTest(test.APITransactionTestCase):
 
 
 @ddt
-class OfferingUserDeletionWorkflowTest(test.APITransactionTestCase):
+class OfferingUserDeletionWorkflowTest(test.APITestCase):
     """Test the complete deletion workflow for OfferingUsers."""
 
     def setUp(self):
@@ -1426,7 +1685,7 @@ class OfferingUserDeletionWorkflowTest(test.APITransactionTestCase):
 
 
 @ddt
-class OfferingUserChecklistTest(test.APITransactionTestCase):
+class OfferingUserChecklistTest(test.APITestCase):
     """Test checklist functionality for offering users."""
 
     def setUp(self):
@@ -1685,7 +1944,7 @@ class OfferingUserChecklistTest(test.APITransactionTestCase):
 
 
 @ddt
-class ServiceProviderComplianceTest(test.APITransactionTestCase):
+class ServiceProviderComplianceTest(test.APITestCase):
     """Test service provider compliance management endpoints."""
 
     def setUp(self):
@@ -2120,7 +2379,7 @@ class ServiceProviderComplianceTest(test.APITransactionTestCase):
             )
 
 
-class OfferingComplianceSerializerTest(test.APITransactionTestCase):
+class OfferingComplianceSerializerTest(test.APITestCase):
     """Test that offering API exposes compliance checklist information."""
 
     def setUp(self):
@@ -2167,7 +2426,7 @@ class OfferingComplianceSerializerTest(test.APITransactionTestCase):
 
 
 @ddt
-class ServiceProviderCompliancePerformanceTest(test.APITransactionTestCase):
+class ServiceProviderCompliancePerformanceTest(test.APITestCase):
     """Test performance of compliance_overview action."""
 
     def setUp(self):
@@ -2396,7 +2655,7 @@ class ServiceProviderCompliancePerformanceTest(test.APITransactionTestCase):
         self.assertAlmostEqual(first_offering_data["compliance_rate"], 66.67, places=1)
 
 
-class OfferingUserSignalTest(test.APITransactionTestCase):
+class OfferingUserSignalTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
 
@@ -2441,7 +2700,6 @@ class OfferingUserSignalTest(test.APITransactionTestCase):
         mock_publish_messages.assert_called_once()
 
         message = mock_publish_messages.call_args[0][0][0]
-        import json
 
         payload = json.loads(message["payload"])
 
@@ -2468,7 +2726,6 @@ class OfferingUserSignalTest(test.APITransactionTestCase):
         mock_publish_messages.assert_called_once()
 
         message = mock_publish_messages.call_args[0][0][0]
-        import json
 
         payload = json.loads(message["payload"])
         self.assertEqual(payload["offering_user_uuid"], new_offering_user.uuid.hex)
@@ -2500,7 +2757,6 @@ class OfferingUserSignalTest(test.APITransactionTestCase):
         mock_publish_messages.assert_called_once()
 
         message = mock_publish_messages.call_args[0][0][0]
-        import json
 
         payload = json.loads(message["payload"])
 
@@ -2519,7 +2775,6 @@ class OfferingUserSignalTest(test.APITransactionTestCase):
         mock_publish_messages.assert_called_once()
 
         message = mock_publish_messages.call_args[0][0][0]
-        import json
 
         payload = json.loads(message["payload"])
 
@@ -2541,7 +2796,6 @@ class OfferingUserSignalTest(test.APITransactionTestCase):
         mock_publish_messages.assert_called_once()
 
         message = mock_publish_messages.call_args[0][0][0]
-        import json
 
         payload = json.loads(message["payload"])
 
@@ -2559,7 +2813,6 @@ class OfferingUserSignalTest(test.APITransactionTestCase):
         mock_publish_messages.assert_called_once()
 
         message = mock_publish_messages.call_args[0][0][0]
-        import json
 
         payload = json.loads(message["payload"])
 
@@ -2567,7 +2820,7 @@ class OfferingUserSignalTest(test.APITransactionTestCase):
         self.assertEqual(payload["state"], self.offering_user.get_state_display())
 
 
-class OfferingUserComplianceFieldTest(test.APITransactionTestCase):
+class OfferingUserComplianceFieldTest(test.APITestCase):
     """Test the has_compliance_checklist field in OfferingUserSerializer."""
 
     def setUp(self):
@@ -2651,7 +2904,7 @@ class OfferingUserComplianceFieldTest(test.APITransactionTestCase):
 
 
 @ddt
-class OfferingUserCommentUrlResetTest(test.APITransactionTestCase):
+class OfferingUserCommentUrlResetTest(test.APITestCase):
     """Test cases for the comment_url field reset bug fix."""
 
     def setUp(self):
@@ -2799,3 +3052,764 @@ class OfferingUserCommentUrlResetTest(test.APITransactionTestCase):
 
         self.offering_user.refresh_from_db()
         self.assertEqual(self.offering_user.service_provider_comment_url, target_url)
+
+
+class OfferingUserProfileCompletenessTest(test.APITestCase):
+    """Tests for filtering OfferingUsers by user attribute completeness."""
+
+    def setUp(self):
+        self.fixture = structure_fixtures.ProjectFixture()
+        self.offering = factories.OfferingFactory(
+            shared=True, customer=self.fixture.customer
+        )
+        self.offering.plugin_options = {
+            "service_provider_can_create_offering_user": True
+        }
+        self.offering.save()
+
+        # Create a user with complete profile
+        self.complete_user = UserFactory(
+            first_name="John",
+            last_name="Doe",
+            email="john@example.com",
+            username="johndoe",
+        )
+        self.fixture.project.add_user(self.complete_user, ProjectRole.ADMIN)
+        self.complete_offering_user = OfferingUser.objects.create(
+            offering=self.offering,
+            user=self.complete_user,
+            username="johndoe",
+        )
+
+        # Create a user with incomplete profile (empty email)
+        self.incomplete_user = UserFactory(
+            first_name="Jane",
+            last_name="Doe",
+            email="",
+            username="janedoe",
+        )
+        self.fixture.project.add_user(self.incomplete_user, ProjectRole.ADMIN)
+        self.incomplete_offering_user = OfferingUser.objects.create(
+            offering=self.offering,
+            user=self.incomplete_user,
+            username="janedoe",
+        )
+
+        # Create attribute config requiring email
+        self.config = models.OfferingUserAttributeConfig.objects.create(
+            offering=self.offering,
+            expose_username=True,
+            expose_full_name=True,
+            expose_email=True,
+            expose_registration_method=False,
+        )
+
+    def _list_offering_users(self, user, params=None):
+        self.client.force_authenticate(user=user)
+        url = OfferingUserFactory.get_list_url()
+        return self.client.get(url, params)
+
+    @override_config(ENFORCE_OFFERING_USER_PROFILE_COMPLETENESS=True)
+    def test_sp_cannot_see_offering_user_with_incomplete_profile(self):
+        response = self._list_offering_users(self.fixture.owner)
+        uuids = {item["uuid"] for item in response.data}
+        self.assertNotIn(str(self.incomplete_offering_user.uuid), uuids)
+
+    @override_config(ENFORCE_OFFERING_USER_PROFILE_COMPLETENESS=True)
+    def test_sp_can_see_offering_user_with_complete_profile(self):
+        response = self._list_offering_users(self.fixture.owner)
+        uuids = {item["uuid"] for item in response.data}
+        self.assertIn(str(self.complete_offering_user.uuid), uuids)
+
+    @override_config(ENFORCE_OFFERING_USER_PROFILE_COMPLETENESS=True)
+    def test_user_always_sees_own_record(self):
+        """A user with incomplete profile still sees their own OfferingUser."""
+        response = self._list_offering_users(self.incomplete_user)
+        uuids = {item["uuid"] for item in response.data}
+        self.assertIn(str(self.incomplete_offering_user.uuid), uuids)
+
+    @override_config(ENFORCE_OFFERING_USER_PROFILE_COMPLETENESS=True)
+    def test_staff_sees_all_regardless_of_completeness(self):
+        response = self._list_offering_users(self.fixture.staff)
+        uuids = {item["uuid"] for item in response.data}
+        self.assertIn(str(self.complete_offering_user.uuid), uuids)
+        self.assertIn(str(self.incomplete_offering_user.uuid), uuids)
+
+    @override_config(ENFORCE_OFFERING_USER_PROFILE_COMPLETENESS=False)
+    def test_enforcement_off_shows_all_records(self):
+        response = self._list_offering_users(self.fixture.owner)
+        uuids = {item["uuid"] for item in response.data}
+        self.assertIn(str(self.complete_offering_user.uuid), uuids)
+        self.assertIn(str(self.incomplete_offering_user.uuid), uuids)
+
+    @override_config(ENFORCE_OFFERING_USER_PROFILE_COMPLETENESS=True)
+    def test_no_config_on_offering_means_no_filtering(self):
+        """When offering has no OfferingUserAttributeConfig, all users are visible."""
+        self.config.delete()
+        response = self._list_offering_users(self.fixture.owner)
+        uuids = {item["uuid"] for item in response.data}
+        self.assertIn(str(self.complete_offering_user.uuid), uuids)
+        self.assertIn(str(self.incomplete_offering_user.uuid), uuids)
+
+    @override_config(ENFORCE_OFFERING_USER_PROFILE_COMPLETENESS=True)
+    def test_json_field_empty_list_is_incomplete(self):
+        """Empty affiliations list treated as incomplete."""
+        self.config.expose_affiliations = True
+        self.config.save()
+        # complete_user has affiliations=[] by default
+        self.complete_user.affiliations = []
+        self.complete_user.save()
+
+        response = self._list_offering_users(self.fixture.owner)
+        uuids = {item["uuid"] for item in response.data}
+        self.assertNotIn(str(self.complete_offering_user.uuid), uuids)
+
+    @override_config(ENFORCE_OFFERING_USER_PROFILE_COMPLETENESS=True)
+    def test_full_name_incomplete_only_when_both_empty(self):
+        """full_name is incomplete only when both first_name AND last_name are empty."""
+        self.config.expose_email = False
+        self.config.save()
+
+        # Only last_name empty - should be complete
+        self.complete_user.first_name = "John"
+        self.complete_user.last_name = ""
+        self.complete_user.save()
+
+        response = self._list_offering_users(self.fixture.owner)
+        uuids = {item["uuid"] for item in response.data}
+        self.assertIn(str(self.complete_offering_user.uuid), uuids)
+
+    @override_config(ENFORCE_OFFERING_USER_PROFILE_COMPLETENESS=True)
+    def test_full_name_incomplete_when_both_names_empty(self):
+        """full_name is incomplete when both first_name AND last_name are empty."""
+        self.config.expose_email = False
+        self.config.save()
+
+        self.complete_user.first_name = ""
+        self.complete_user.last_name = ""
+        self.complete_user.save()
+
+        response = self._list_offering_users(self.fixture.owner)
+        uuids = {item["uuid"] for item in response.data}
+        self.assertNotIn(str(self.complete_offering_user.uuid), uuids)
+
+    @override_config(ENFORCE_OFFERING_USER_PROFILE_COMPLETENESS=True)
+    def test_multiple_attributes_all_must_be_filled(self):
+        """ALL exposed attributes must be filled (AND logic)."""
+        self.config.expose_phone_number = True
+        self.config.save()
+
+        # email is filled but phone_number is not
+        self.complete_user.email = "john@example.com"
+        self.complete_user.phone_number = ""
+        self.complete_user.save()
+
+        response = self._list_offering_users(self.fixture.owner)
+        uuids = {item["uuid"] for item in response.data}
+        self.assertNotIn(str(self.complete_offering_user.uuid), uuids)
+
+    @override_config(ENFORCE_OFFERING_USER_PROFILE_COMPLETENESS=False)
+    def test_has_complete_profile_filter_true(self):
+        """Explicit filter works independently of global toggle."""
+        response = self._list_offering_users(
+            self.fixture.owner, {"has_complete_profile": True}
+        )
+        uuids = {item["uuid"] for item in response.data}
+        self.assertIn(str(self.complete_offering_user.uuid), uuids)
+        self.assertNotIn(str(self.incomplete_offering_user.uuid), uuids)
+
+    @override_config(ENFORCE_OFFERING_USER_PROFILE_COMPLETENESS=False)
+    def test_has_complete_profile_filter_false(self):
+        """Explicit filter can find incomplete profiles."""
+        response = self._list_offering_users(
+            self.fixture.owner, {"has_complete_profile": False}
+        )
+        uuids = {item["uuid"] for item in response.data}
+        self.assertNotIn(str(self.complete_offering_user.uuid), uuids)
+        self.assertIn(str(self.incomplete_offering_user.uuid), uuids)
+
+    def test_response_includes_is_profile_complete_true(self):
+        """Complete user record includes is_profile_complete=True."""
+        response = self._list_offering_users(self.fixture.owner)
+        record = next(
+            item
+            for item in response.data
+            if item["uuid"] == str(self.complete_offering_user.uuid)
+        )
+        self.assertTrue(record["is_profile_complete"])
+        self.assertEqual(record["missing_profile_attributes"], [])
+
+    def test_response_includes_is_profile_complete_false(self):
+        """Incomplete user record includes is_profile_complete=False with missing attrs."""
+        response = self._list_offering_users(self.fixture.owner)
+        record = next(
+            item
+            for item in response.data
+            if item["uuid"] == str(self.incomplete_offering_user.uuid)
+        )
+        self.assertFalse(record["is_profile_complete"])
+        self.assertIn("email", record["missing_profile_attributes"])
+
+    def test_own_record_shows_missing_attributes(self):
+        """User's own record includes missing_profile_attributes for self-service."""
+        response = self._list_offering_users(self.incomplete_user)
+        record = next(
+            item
+            for item in response.data
+            if item["uuid"] == str(self.incomplete_offering_user.uuid)
+        )
+        self.assertFalse(record["is_profile_complete"])
+        self.assertIn("email", record["missing_profile_attributes"])
+
+
+class IdentityManagerOfferingUserVisibilityTest(test.APITestCase):
+    """Identity managers can list OfferingUsers whose linked user's active_isds
+    overlap with the manager's managed_isds, even without direct offering access."""
+
+    def setUp(self):
+        self.fixture = structure_fixtures.ProjectFixture()
+        self.offering = OfferingFactory(
+            customer=self.fixture.customer,
+            shared=True,
+        )
+        self.offering.plugin_options = {
+            "service_provider_can_create_offering_user": True,
+        }
+        self.offering.save()
+
+        # A user with active_isds linked to an offering user
+        self.target_user = UserFactory(active_isds=["isd:efp", "isd:puhuri"])
+        self.offering_user = OfferingUser.objects.create(
+            offering=self.offering,
+            user=self.target_user,
+            username="target-user",
+        )
+
+        # Identity manager with matching managed_isds but no offering access
+        self.identity_manager = UserFactory(
+            is_identity_manager=True,
+            managed_isds=["isd:efp"],
+        )
+
+    def _list_offering_users(self, user):
+        self.client.force_authenticate(user=user)
+        return self.client.get(OfferingUserFactory.get_list_url())
+
+    def test_identity_manager_can_list_offering_users_with_overlapping_isds(self):
+        response = self._list_offering_users(self.identity_manager)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["username"], "target-user")
+
+    def test_identity_manager_cannot_see_users_without_isd_overlap(self):
+        non_matching_user = UserFactory(active_isds=["isd:fenix"])
+        OfferingUser.objects.create(
+            offering=self.offering,
+            user=non_matching_user,
+            username="fenix-user",
+        )
+        response = self._list_offering_users(self.identity_manager)
+        usernames = [item["username"] for item in response.data]
+        self.assertIn("target-user", usernames)
+        self.assertNotIn("fenix-user", usernames)
+
+    def test_non_identity_manager_without_access_cannot_list(self):
+        regular_user = UserFactory()
+        response = self._list_offering_users(regular_user)
+        self.assertEqual(len(response.data), 0)
+
+    def test_identity_manager_without_managed_isds_cannot_list(self):
+        manager_no_isds = UserFactory(
+            is_identity_manager=True,
+            managed_isds=[],
+        )
+        response = self._list_offering_users(manager_no_isds)
+        self.assertEqual(len(response.data), 0)
+
+
+class OfferingManagerOfferingUserVisibilityTest(test.APITestCase):
+    """Offering managers can list and manage OfferingUsers on offerings they manage."""
+
+    def setUp(self):
+        self.fixture = structure_fixtures.ProjectFixture()
+        self.offering = OfferingFactory(
+            customer=self.fixture.customer,
+            shared=True,
+        )
+        self.offering.plugin_options = {
+            "service_provider_can_create_offering_user": True,
+        }
+        self.offering.save()
+
+        # A regular user linked to this offering
+        self.target_user = UserFactory()
+        self.offering_user = OfferingUser.objects.create(
+            offering=self.offering,
+            user=self.target_user,
+            username="target-user",
+        )
+
+        # An offering manager with ONLY offering-scoped role (no customer role)
+        self.offering_manager = UserFactory()
+        self.offering.add_user(self.offering_manager, OfferingRole.MANAGER)
+
+    def _list_offering_users(self, user):
+        self.client.force_authenticate(user=user)
+        return self.client.get(OfferingUserFactory.get_list_url())
+
+    def test_offering_manager_can_list_offering_users(self):
+        response = self._list_offering_users(self.offering_manager)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["username"], "target-user")
+
+    def test_offering_manager_cannot_see_users_on_other_offerings(self):
+        other_offering = OfferingFactory(shared=True)
+        other_offering.plugin_options = {
+            "service_provider_can_create_offering_user": True,
+        }
+        other_offering.save()
+        other_user = UserFactory()
+        OfferingUser.objects.create(
+            offering=other_offering,
+            user=other_user,
+            username="other-user",
+        )
+
+        response = self._list_offering_users(self.offering_manager)
+        usernames = [item["username"] for item in response.data]
+        self.assertIn("target-user", usernames)
+        self.assertNotIn("other-user", usernames)
+
+
+class OfferingUserPartialUpdatePermissionTest(test.APITestCase):
+    """partial_update must enforce permission checks, not just queryset visibility."""
+
+    def setUp(self):
+        self.fixture = structure_fixtures.ProjectFixture()
+        self.offering = OfferingFactory(
+            customer=self.fixture.customer,
+            shared=True,
+        )
+        self.offering.plugin_options = {
+            "service_provider_can_create_offering_user": True,
+        }
+        self.offering.save()
+
+        self.target_user = UserFactory(active_isds=["isd:efp"])
+        self.offering_user = OfferingUser.objects.create(
+            offering=self.offering,
+            user=self.target_user,
+            username="target-user",
+        )
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_USER)
+        OfferingRole.MANAGER.add_permission(PermissionEnum.UPDATE_OFFERING_USER)
+
+    def _patch_offering_user(self, user, offering_user, data):
+        self.client.force_authenticate(user=user)
+        url = OfferingUserFactory.get_url(offering_user)
+        return self.client.patch(url, data)
+
+    def test_identity_manager_cannot_patch_offering_user(self):
+        identity_manager = UserFactory(
+            is_identity_manager=True,
+            managed_isds=["isd:efp"],
+        )
+        response = self._patch_offering_user(
+            identity_manager, self.offering_user, {"username": "hacked"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.offering_user.refresh_from_db()
+        self.assertEqual(self.offering_user.username, "target-user")
+
+    def test_customer_owner_can_patch_offering_user(self):
+        response = self._patch_offering_user(
+            self.fixture.owner, self.offering_user, {"username": "updated"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.offering_user.refresh_from_db()
+        self.assertEqual(self.offering_user.username, "updated")
+
+    def test_offering_user_cannot_patch_own_record(self):
+        response = self._patch_offering_user(
+            self.target_user, self.offering_user, {"username": "self-updated"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.offering_user.refresh_from_db()
+        self.assertEqual(self.offering_user.username, "target-user")
+
+    def test_offering_manager_can_patch_offering_user(self):
+        offering_manager = UserFactory()
+        self.offering.add_user(offering_manager, OfferingRole.MANAGER)
+        response = self._patch_offering_user(
+            offering_manager, self.offering_user, {"username": "mgr-updated"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.offering_user.refresh_from_db()
+        self.assertEqual(self.offering_user.username, "mgr-updated")
+
+
+@ddt
+class OfferingUserUpdateRuntimeStateTest(test.APITestCase):
+    """Tests for the update_runtime_state action on OfferingUsersViewSet."""
+
+    def setUp(self):
+        self.fixture = structure_fixtures.CustomerFixture()
+        self.offering = factories.OfferingFactory(
+            shared=True, customer=self.fixture.customer
+        )
+        self.offering.plugin_options = {
+            "service_provider_can_create_offering_user": True
+        }
+        self.offering.save()
+        user = UserFactory()
+
+        self.offering_user = OfferingUser.objects.create(
+            offering=self.offering, user=user, username="user"
+        )
+        models.UserOfferingConsent.objects.create(
+            user=user,
+            offering=self.offering,
+            version="1.0",
+        )
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_USER)
+        ServiceProviderRole.MANAGER.add_permission(PermissionEnum.UPDATE_OFFERING_USER)
+
+    def get_url(self, offering_user):
+        url = "http://testserver" + reverse(
+            "marketplace-offering-user-detail",
+            kwargs={"uuid": offering_user.uuid.hex},
+        )
+        return url + "update_runtime_state/"
+
+    def test_new_offering_user_has_active_runtime_state_by_default(self):
+        """New OfferingUser defaults to ACTIVE runtime state."""
+        user = UserFactory()
+        offering_user = OfferingUser.objects.create(offering=self.offering, user=user)
+        self.assertEqual(offering_user.runtime_state, OfferingUserRuntimeStates.ACTIVE)
+
+    def test_runtime_state_exposed_in_serializer(self):
+        """runtime_state field is present in the API response."""
+        self.client.force_authenticate(user=self.fixture.owner)
+        url = "http://testserver" + reverse(
+            "marketplace-offering-user-detail",
+            kwargs={"uuid": self.offering_user.uuid.hex},
+        )
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("runtime_state", response.data)
+        self.assertEqual(response.data["runtime_state"], "Active")
+
+    @data("staff", "owner", "service_manager")
+    def test_authorized_user_can_update_runtime_state(self, user):
+        """Owner/manager can set runtime_state to pending account linking."""
+        self.client.force_authenticate(user=getattr(self.fixture, user))
+        response = self.client.post(
+            self.get_url(self.offering_user),
+            {"runtime_state": OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.offering_user.refresh_from_db()
+        self.assertEqual(
+            self.offering_user.runtime_state,
+            OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+        )
+
+    def test_unauthorized_user_cannot_update_runtime_state(self):
+        """Support user (no UPDATE_OFFERING_USER) is denied."""
+        self.client.force_authenticate(user=self.fixture.user)
+        self.fixture.customer.add_user(self.fixture.user, CustomerRole.SUPPORT)
+        response = self.client.post(
+            self.get_url(self.offering_user),
+            {"runtime_state": OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING},
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, response.data)
+
+    def test_can_set_pending_additional_validation(self):
+        """Runtime state can be set to PENDING_ADDITIONAL_VALIDATION (TOU not accepted)."""
+        self.client.force_authenticate(user=self.fixture.owner)
+        response = self.client.post(
+            self.get_url(self.offering_user),
+            {"runtime_state": OfferingUserRuntimeStates.PENDING_ADDITIONAL_VALIDATION},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.offering_user.refresh_from_db()
+        self.assertEqual(
+            self.offering_user.runtime_state,
+            OfferingUserRuntimeStates.PENDING_ADDITIONAL_VALIDATION,
+        )
+
+    def test_can_update_ok_lifecycle_user_runtime_state(self):
+        """Runtime state can be set even when lifecycle state is OK (the backfill case)."""
+        self.offering_user.state = OfferingUserStates.OK
+        self.offering_user.save(update_fields=["state"])
+
+        self.client.force_authenticate(user=self.fixture.owner)
+        response = self.client.post(
+            self.get_url(self.offering_user),
+            {"runtime_state": OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.offering_user.refresh_from_db()
+        self.assertEqual(
+            self.offering_user.runtime_state,
+            OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+        )
+
+    def test_can_set_runtime_state_back_to_active(self):
+        """Runtime state can be reset to ACTIVE after a blocker is resolved."""
+        self.offering_user.runtime_state = (
+            OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING
+        )
+        self.offering_user.save(update_fields=["runtime_state"])
+
+        self.client.force_authenticate(user=self.fixture.owner)
+        response = self.client.post(
+            self.get_url(self.offering_user),
+            {"runtime_state": OfferingUserRuntimeStates.ACTIVE},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.offering_user.refresh_from_db()
+        self.assertEqual(
+            self.offering_user.runtime_state, OfferingUserRuntimeStates.ACTIVE
+        )
+
+    def test_cannot_update_runtime_state_for_deleted_offering_user(self):
+        """Updating runtime_state is rejected when lifecycle state is DELETED."""
+        self.offering_user.state = OfferingUserStates.DELETED
+        self.offering_user.save(update_fields=["state"])
+
+        self.client.force_authenticate(user=self.fixture.owner)
+        response = self.client.post(
+            self.get_url(self.offering_user),
+            {"runtime_state": OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING},
+        )
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
+        self.offering_user.refresh_from_db()
+        self.assertEqual(
+            self.offering_user.runtime_state, OfferingUserRuntimeStates.ACTIVE
+        )
+
+    def test_invalid_runtime_state_value_returns_400(self):
+        """Passing an unknown runtime_state value returns HTTP 400."""
+        self.client.force_authenticate(user=self.fixture.owner)
+        response = self.client.post(
+            self.get_url(self.offering_user),
+            {"runtime_state": 999},
+        )
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
+
+    def test_event_logged_on_runtime_state_update(self):
+        """An event is emitted when runtime state is updated."""
+        self.client.force_authenticate(user=self.fixture.owner)
+        self.client.post(
+            self.get_url(self.offering_user),
+            {"runtime_state": OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING},
+        )
+        self.assertTrue(
+            Event.objects.filter(
+                event_type="marketplace_offering_user_updated"
+            ).exists()
+        )
+
+    def test_can_update_runtime_state_with_comments(self):
+        """Runtime state and service provider comments can be set in one request."""
+        self.client.force_authenticate(user=self.fixture.owner)
+        response = self.client.post(
+            self.get_url(self.offering_user),
+            {
+                "runtime_state": OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+                "service_provider_comment": "Please link your MyAccessID account",
+                "service_provider_comment_url": "https://help.example.com/linking",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.offering_user.refresh_from_db()
+        self.assertEqual(
+            self.offering_user.runtime_state,
+            OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+        )
+        self.assertEqual(
+            self.offering_user.service_provider_comment,
+            "Please link your MyAccessID account",
+        )
+        self.assertEqual(
+            self.offering_user.service_provider_comment_url,
+            "https://help.example.com/linking",
+        )
+
+    def test_runtime_state_update_without_comments_leaves_existing_comments(self):
+        """Omitting comment fields does not clear existing service provider comments."""
+        self.offering_user.service_provider_comment = "Existing comment"
+        self.offering_user.service_provider_comment_url = "https://example.com/existing"
+        self.offering_user.save(
+            update_fields=["service_provider_comment", "service_provider_comment_url"]
+        )
+
+        self.client.force_authenticate(user=self.fixture.owner)
+        response = self.client.post(
+            self.get_url(self.offering_user),
+            {"runtime_state": OfferingUserRuntimeStates.PENDING_ADDITIONAL_VALIDATION},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.offering_user.refresh_from_db()
+        self.assertEqual(
+            self.offering_user.runtime_state,
+            OfferingUserRuntimeStates.PENDING_ADDITIONAL_VALIDATION,
+        )
+        self.assertEqual(
+            self.offering_user.service_provider_comment, "Existing comment"
+        )
+        self.assertEqual(
+            self.offering_user.service_provider_comment_url,
+            "https://example.com/existing",
+        )
+
+    def test_can_clear_comments_when_updating_runtime_state(self):
+        """Blank comment fields clear existing service provider comments."""
+        self.offering_user.service_provider_comment = "Old comment"
+        self.offering_user.service_provider_comment_url = "https://example.com/old"
+        self.offering_user.save(
+            update_fields=["service_provider_comment", "service_provider_comment_url"]
+        )
+
+        self.client.force_authenticate(user=self.fixture.owner)
+        response = self.client.post(
+            self.get_url(self.offering_user),
+            {
+                "runtime_state": OfferingUserRuntimeStates.ACTIVE,
+                "service_provider_comment": "",
+                "service_provider_comment_url": "",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.offering_user.refresh_from_db()
+        self.assertEqual(
+            self.offering_user.runtime_state, OfferingUserRuntimeStates.ACTIVE
+        )
+        self.assertEqual(self.offering_user.service_provider_comment, "")
+        self.assertEqual(self.offering_user.service_provider_comment_url, "")
+
+
+@ddt
+class OfferingUserRuntimeStateFilterTest(test.APITestCase):
+    """Tests for filtering OfferingUsers by runtime_state."""
+
+    def setUp(self):
+        self.fixture = structure_fixtures.CustomerFixture()
+        self.offering = factories.OfferingFactory(
+            shared=True, customer=self.fixture.customer
+        )
+        user_active = UserFactory()
+        user_pending = UserFactory()
+
+        self.offering_user_active = OfferingUser.objects.create(
+            offering=self.offering,
+            user=user_active,
+            username="active_user",
+            runtime_state=OfferingUserRuntimeStates.ACTIVE,
+        )
+        self.offering_user_pending = OfferingUser.objects.create(
+            offering=self.offering,
+            user=user_pending,
+            username="pending_user",
+            runtime_state=OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+        )
+
+    def test_filter_by_runtime_state_active(self):
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.get(
+            OfferingUserFactory.get_list_url(),
+            {"runtime_state": "Active"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        usernames = [r["username"] for r in response.data]
+        self.assertIn("active_user", usernames)
+        self.assertNotIn("pending_user", usernames)
+
+    def test_filter_by_runtime_state_pending_account_linking(self):
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.get(
+            OfferingUserFactory.get_list_url(),
+            {"runtime_state": "Pending account linking"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        usernames = [r["username"] for r in response.data]
+        self.assertIn("pending_user", usernames)
+        self.assertNotIn("active_user", usernames)
+
+    def test_filter_by_multiple_runtime_states(self):
+        self.client.force_authenticate(user=self.fixture.staff)
+        response = self.client.get(
+            OfferingUserFactory.get_list_url(),
+            {"runtime_state": ["Active", "Pending account linking"]},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 2)
+
+
+class OfferingUserRuntimeStateStompTest(test.APITestCase):
+    """Tests that STOMP messages include runtime_state."""
+
+    def setUp(self):
+        self.fixture = structure_fixtures.ProjectFixture()
+        self.offering = OfferingFactory()
+        self.offering.project = self.fixture.project
+        self.offering.save()
+        self.user = self.fixture.user
+        self.offering_user = OfferingUserFactory(
+            offering=self.offering,
+            user=self.user,
+            username="testuser",
+        )
+        self.offering.project.add_user(self.user, ProjectRole.ADMIN)
+
+        from waldur_core.logging import enums as logging_enums
+        from waldur_core.logging.tests import factories as logging_factories
+
+        self.event_subscription = logging_factories.EventSubscriptionFactory(
+            user=self.user,
+            observable_objects=[
+                {"object_type": logging_enums.ObservableObjectType.OFFERING_USER.value}
+            ],
+        )
+        logging_factories.EventSubscriptionQueueFactory(
+            event_subscription=self.event_subscription,
+            offering_uuid=self.offering.uuid,
+            object_type=logging_enums.ObservableObjectType.OFFERING_USER.value,
+        )
+
+    @mock.patch("waldur_core.logging.tasks.publish_messages.delay")
+    def test_create_message_includes_runtime_state(self, mock_publish):
+        """Creation STOMP message includes runtime_state field."""
+
+        new_offering_user = OfferingUserFactory(
+            offering=self.offering,
+            user=self.fixture.admin,
+            username="newuser",
+        )
+        mock_publish.assert_called_once()
+        payload = json.loads(mock_publish.call_args[0][0][0]["payload"])
+        self.assertIn("runtime_state", payload)
+        self.assertEqual(
+            payload["runtime_state"], new_offering_user.get_runtime_state_display()
+        )
+
+    @mock.patch("waldur_core.logging.tasks.publish_messages.delay")
+    def test_update_message_includes_runtime_state(self, mock_publish):
+        """Update STOMP message includes runtime_state and lists it in changed_fields."""
+
+        self.offering_user.runtime_state = (
+            OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING
+        )
+        self.offering_user.save(update_fields=["runtime_state"])
+
+        mock_publish.assert_called_once()
+        payload = json.loads(mock_publish.call_args[0][0][0]["payload"])
+        self.assertIn("runtime_state", payload)
+        self.assertEqual(payload["runtime_state"], "Pending account linking")
+        self.assertIn("runtime_state", payload["changed_fields"])

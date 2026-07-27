@@ -20,7 +20,13 @@ def register_in(router):
         views.EventSubscriptionQueueViewSet,
         basename="event-subscription-queue",
     )
+    router.register(
+        r"event-consumers",
+        views.EventConsumerViewSet,
+        basename="event-consumer",
+    )
     router.register(r"email-logs", views.EmailLogView, basename="email-log")
+    router.register(r"system-logs", views.SystemLogViewSet, basename="system-log")
     router.register(
         r"data-access-logs",
         views.UserDataAccessLogViewSet,

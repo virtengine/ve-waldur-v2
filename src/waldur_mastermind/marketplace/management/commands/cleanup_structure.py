@@ -1,6 +1,9 @@
+import time
+
 from django.core.management.base import BaseCommand
 from django.db import connection, transaction
 from django.db.models import signals
+from rest_framework.authtoken.models import Token
 
 from waldur_core.checklist.models import (
     Answer,
@@ -10,9 +13,21 @@ from waldur_core.checklist.models import (
 )
 from waldur_core.core.middleware import skip_side_effects
 from waldur_core.core.models import User
-from waldur_core.logging.models import Event, Feed
+from waldur_core.logging.models import (
+    EmailHook,
+    Event,
+    EventSubscription,
+    Feed,
+    UserDataAccessLog,
+    WebHook,
+)
 from waldur_core.permissions.models import Role, RolePermission, UserRole
-from waldur_core.structure.models import Customer, Project, UserAgreement
+from waldur_core.structure.models import (
+    Customer,
+    Project,
+    ServiceSettings,
+    UserAgreement,
+)
 from waldur_core.users.models import GroupInvitation, Invitation, PermissionRequest
 from waldur_mastermind.invoices import handlers as invoice_handlers
 from waldur_mastermind.invoices.models import (
@@ -31,13 +46,26 @@ from waldur_mastermind.marketplace.models import (
     MaintenanceAnnouncementOffering,
     Offering,
     OfferingComponent,
+    OfferingPartition,
+    OfferingSoftwareCatalog,
     OfferingUser,
+    OfferingUserGroup,
     Order,
     Plan,
     PlanComponent,
     ProjectServiceAccount,
     Resource,
+    RobotAccount,
     ServiceProvider,
+    SoftwareCatalog,
+    SoftwarePackage,
+    SoftwareTarget,
+    SoftwareVersion,
+)
+from waldur_mastermind.policy.models import (
+    CustomerEstimatedCostPolicy,
+    ProjectEstimatedCostPolicy,
+    SlurmPeriodicUsagePolicy,
 )
 from waldur_mastermind.proposal.models import (
     Call,
@@ -49,6 +77,7 @@ from waldur_mastermind.proposal.models import (
     Review,
     Round,
 )
+from waldur_openstack.models import Flavor, Image, Instance, Tenant, Volume
 
 
 class Command(BaseCommand):
@@ -87,6 +116,8 @@ class Command(BaseCommand):
             "questions": {"deleted": 0, "errors": 0},
             "checklists": {"deleted": 0, "errors": 0},
             "offering_users": {"deleted": 0, "errors": 0},
+            "robot_accounts": {"deleted": 0, "errors": 0},
+            "offering_user_groups": {"deleted": 0, "errors": 0},
             "invoice_items": {"deleted": 0, "errors": 0},
             "invoices": {"deleted": 0, "errors": 0},
             "customer_credits": {"deleted": 0, "errors": 0},
@@ -110,6 +141,11 @@ class Command(BaseCommand):
             "category_groups": {"deleted": 0, "errors": 0},
             "user_agreements": {"deleted": 0, "errors": 0},
             "customers": {"deleted": 0, "errors": 0},
+            "auth_tokens": {"deleted": 0, "errors": 0},
+            "user_data_access_logs": {"deleted": 0, "errors": 0},
+            "webhooks": {"deleted": 0, "errors": 0},
+            "email_hooks": {"deleted": 0, "errors": 0},
+            "event_subscriptions": {"deleted": 0, "errors": 0},
             "users": {"deleted": 0, "errors": 0},
             "permission_requests": {"deleted": 0, "errors": 0},
             "invitations": {"deleted": 0, "errors": 0},
@@ -126,6 +162,23 @@ class Command(BaseCommand):
             # Maintenance announcement stats
             "maintenance_announcement_offerings": {"deleted": 0, "errors": 0},
             "maintenance_announcements": {"deleted": 0, "errors": 0},
+            # Software catalog stats
+            "offering_software_catalogs": {"deleted": 0, "errors": 0},
+            "offering_partitions": {"deleted": 0, "errors": 0},
+            "software_targets": {"deleted": 0, "errors": 0},
+            "software_versions": {"deleted": 0, "errors": 0},
+            "software_packages": {"deleted": 0, "errors": 0},
+            "software_catalogs": {"deleted": 0, "errors": 0},
+            # OpenStack backend model stats
+            "openstack_volumes": {"deleted": 0, "errors": 0},
+            "openstack_instances": {"deleted": 0, "errors": 0},
+            "openstack_tenants": {"deleted": 0, "errors": 0},
+            "openstack_images": {"deleted": 0, "errors": 0},
+            "openstack_flavors": {"deleted": 0, "errors": 0},
+            "openstack_service_settings": {"deleted": 0, "errors": 0},
+            "project_estimated_cost_policies": {"deleted": 0, "errors": 0},
+            "customer_estimated_cost_policies": {"deleted": 0, "errors": 0},
+            "slurm_periodic_policies": {"deleted": 0, "errors": 0},
         }
         self.dry_run = False
 
@@ -208,90 +261,133 @@ class Command(BaseCommand):
         # Print summary
         self.print_summary()
 
+    def _safe_cleanup(self, cleanup_func):
+        """Run a cleanup function within a savepoint.
+
+        If the cleanup fails (e.g. due to permission errors on leftover
+        test tables), the savepoint is rolled back so the rest of the
+        transaction can continue.
+        """
+        sid = transaction.savepoint()
+        try:
+            cleanup_func()
+            transaction.savepoint_commit(sid)
+        except Exception:
+            transaction.savepoint_rollback(sid)
+
     def _perform_cleanup(self, skip_users, skip_roles):
         """Perform the actual cleanup operations."""
         with transaction.atomic():
             # Delete in reverse dependency order (opposite of import)
 
             # Delete feeds and events first (logging)
-            self.cleanup_feeds()
-            self.cleanup_events()
+            self._safe_cleanup(self.cleanup_feeds)
+            self._safe_cleanup(self.cleanup_events)
 
-            # Delete offering users
-            self.cleanup_offering_users()
+            # Delete offering users, robot accounts and offering user groups
+            self._safe_cleanup(self.cleanup_offering_users)
+            self._safe_cleanup(self.cleanup_robot_accounts)
+            self._safe_cleanup(self.cleanup_offering_user_groups)
 
             # Delete checklist data (answers -> completions -> questions -> checklists)
-            self.cleanup_answers()
-            self.cleanup_checklist_completions()
-            self.cleanup_questions()
-            self.cleanup_checklists()
+            self._safe_cleanup(self.cleanup_answers)
+            self._safe_cleanup(self.cleanup_checklist_completions)
+            self._safe_cleanup(self.cleanup_questions)
+            self._safe_cleanup(self.cleanup_checklists)
 
             # Delete proposal/call management data (reverse dependency order)
             # reviews -> requested_resources -> proposals -> call_resource_templates -> rounds -> requested_offerings -> calls -> call_managing_organisations
-            self.cleanup_reviews()
-            self.cleanup_requested_resources()
-            self.cleanup_proposals()
-            self.cleanup_call_resource_templates()
-            self.cleanup_rounds()
-            self.cleanup_requested_offerings()
-            self.cleanup_calls()
-            self.cleanup_call_managing_organisations()
+            self._safe_cleanup(self.cleanup_reviews)
+            self._safe_cleanup(self.cleanup_requested_resources)
+            self._safe_cleanup(self.cleanup_proposals)
+            self._safe_cleanup(self.cleanup_call_resource_templates)
+            self._safe_cleanup(self.cleanup_rounds)
+            self._safe_cleanup(self.cleanup_requested_offerings)
+            self._safe_cleanup(self.cleanup_calls)
+            self._safe_cleanup(self.cleanup_call_managing_organisations)
 
             # Delete credits (depends on customers, projects)
-            self.cleanup_project_credits()
-            self.cleanup_customer_credits()
+            self._safe_cleanup(self.cleanup_project_credits)
+            self._safe_cleanup(self.cleanup_customer_credits)
             # Delete invoicing (depends on customers, resources, projects)
-            self.cleanup_invoice_items()
-            self.cleanup_invoices()
+            self._safe_cleanup(self.cleanup_invoice_items)
+            self._safe_cleanup(self.cleanup_invoices)
 
             # Delete account types
-            self.cleanup_course_accounts()
-            self.cleanup_customer_service_accounts()
-            self.cleanup_project_service_accounts()
+            self._safe_cleanup(self.cleanup_course_accounts)
+            self._safe_cleanup(self.cleanup_customer_service_accounts)
+            self._safe_cleanup(self.cleanup_project_service_accounts)
 
             # Delete user roles
-            self.cleanup_user_roles()
+            self._safe_cleanup(self.cleanup_user_roles)
 
             # Delete user management data (depends on users, customers, roles)
-            self.cleanup_permission_requests()
-            self.cleanup_invitations()
-            self.cleanup_group_invitations()
+            self._safe_cleanup(self.cleanup_permission_requests)
+            self._safe_cleanup(self.cleanup_invitations)
+            self._safe_cleanup(self.cleanup_group_invitations)
 
             # Delete roles and permissions
             if not skip_roles:
-                self.cleanup_role_permissions()
-                self.cleanup_roles()
+                self._safe_cleanup(self.cleanup_role_permissions)
+                self._safe_cleanup(self.cleanup_roles)
 
             # Delete orders (depends on resources, projects, users, plans)
-            self.cleanup_orders()
+            self._safe_cleanup(self.cleanup_orders)
 
             # Delete component usages (depends on resources and components)
-            self.cleanup_component_usages()
+            self._safe_cleanup(self.cleanup_component_usages)
+
+            # Delete OpenStack backend models (before resources, reverse dependency order)
+            self._safe_cleanup(self.cleanup_openstack_volumes)
+            self._safe_cleanup(self.cleanup_openstack_instances)
+            self._safe_cleanup(self.cleanup_openstack_tenants)
+            self._safe_cleanup(self.cleanup_openstack_images)
+            self._safe_cleanup(self.cleanup_openstack_flavors)
+            self._safe_cleanup(self.cleanup_openstack_service_settings)
 
             # Delete resources (depends on offerings, plans, projects)
-            self.cleanup_resources()
+            self._safe_cleanup(self.cleanup_resources)
 
             # Delete marketplace components and plans
-            self.cleanup_plan_components()
-            self.cleanup_offering_components()
-            self.cleanup_plans()
+            self._safe_cleanup(self.cleanup_plan_components)
+            self._safe_cleanup(self.cleanup_offering_components)
+            self._safe_cleanup(self.cleanup_plans)
 
             # Delete maintenance announcements (depends on service_providers, offerings)
-            self.cleanup_maintenance_announcement_offerings()
-            self.cleanup_maintenance_announcements()
+            self._safe_cleanup(self.cleanup_maintenance_announcement_offerings)
+            self._safe_cleanup(self.cleanup_maintenance_announcements)
+
+            # Delete software catalog links and content (reverse dependency order)
+            self._safe_cleanup(self.cleanup_offering_software_catalogs)
+            self._safe_cleanup(self.cleanup_offering_partitions)
+            self._safe_cleanup(self.cleanup_software_targets)
+            self._safe_cleanup(self.cleanup_software_versions)
+            self._safe_cleanup(self.cleanup_software_packages)
+            self._safe_cleanup(self.cleanup_software_catalogs)
+
+            # Delete policies (depends on offerings, projects, customers)
+            self._safe_cleanup(self.cleanup_slurm_periodic_policies)
+            self._safe_cleanup(self.cleanup_project_estimated_cost_policies)
+            self._safe_cleanup(self.cleanup_customer_estimated_cost_policies)
 
             # Delete offerings, service providers, projects, customers, categories
-            self.cleanup_offerings()
-            self.cleanup_service_providers()
-            self.cleanup_projects()
-            self.cleanup_categories()
-            self.cleanup_category_groups()
-            self.cleanup_user_agreements()
-            self.cleanup_customers()
+            self._safe_cleanup(self.cleanup_offerings)
+            self._safe_cleanup(self.cleanup_service_providers)
+            self._safe_cleanup(self.cleanup_projects)
+            self._safe_cleanup(self.cleanup_categories)
+            self._safe_cleanup(self.cleanup_category_groups)
+            self._safe_cleanup(self.cleanup_user_agreements)
+            self._safe_cleanup(self.cleanup_customers)
 
             # Delete users last
             if not skip_users:
-                self.cleanup_users()
+                self._safe_cleanup(self.cleanup_auth_tokens)
+                # Logging tables with FK to core_user must be deleted before users
+                self._safe_cleanup(self.cleanup_user_data_access_logs)
+                self._safe_cleanup(self.cleanup_webhooks)
+                self._safe_cleanup(self.cleanup_email_hooks)
+                self._safe_cleanup(self.cleanup_event_subscriptions)
+                self._safe_cleanup(self.cleanup_users)
 
             if self.dry_run:
                 # Rollback transaction in dry-run mode
@@ -311,6 +407,8 @@ class Command(BaseCommand):
             ("events", "logging_event"),
             # Offering users
             ("offering_users", "marketplace_offeringuser"),
+            ("robot_accounts", "marketplace_robotaccount"),
+            ("offering_user_groups", "marketplace_offeringusergroup"),
             # Checklists
             ("answers", "checklist_answer"),
             ("checklist_completions", "checklist_checklistcompletion"),
@@ -345,6 +443,12 @@ class Command(BaseCommand):
             ("orders", "marketplace_order"),
             # Component usages
             ("component_usages", "marketplace_componentusage"),
+            # OpenStack backend models (before resources, reverse dependency order)
+            ("openstack_volumes", "openstack_volume"),
+            ("openstack_instances", "openstack_instance"),
+            ("openstack_tenants", "openstack_tenant"),
+            ("openstack_images", "openstack_image"),
+            ("openstack_flavors", "openstack_flavor"),
             # Resources
             ("resources", "marketplace_resource"),
             # Marketplace components and plans
@@ -357,6 +461,13 @@ class Command(BaseCommand):
                 "marketplace_maintenanceannouncementoffering",
             ),
             ("maintenance_announcements", "marketplace_maintenanceannouncement"),
+            # Software catalogs
+            ("offering_software_catalogs", "marketplace_offeringsoftwarecatalog"),
+            ("offering_partitions", "marketplace_offeringpartition"),
+            ("software_targets", "marketplace_softwaretarget"),
+            ("software_versions", "marketplace_softwareversion"),
+            ("software_packages", "marketplace_softwarepackage"),
+            ("software_catalogs", "marketplace_softwarecatalog"),
             # Offerings, service providers, projects, customers, categories
             ("offerings", "marketplace_offering"),
             ("service_providers", "marketplace_serviceprovider"),
@@ -374,6 +485,12 @@ class Command(BaseCommand):
 
         # Add users if not skipped
         if not skip_users:
+            tables.append(("auth_tokens", "authtoken_token"))
+            # Logging tables with FK to core_user must be deleted before users
+            tables.append(("user_data_access_logs", "logging_userdataaccesslog"))
+            tables.append(("webhooks", "logging_webhook"))
+            tables.append(("email_hooks", "logging_emailhook"))
+            tables.append(("event_subscriptions", "logging_eventsubscription"))
             tables.append(("users", "core_user"))
 
         with transaction.atomic():
@@ -381,26 +498,53 @@ class Command(BaseCommand):
 
             for stat_key, table_name in tables:
                 self.stdout.write(f"Deleting {stat_key}...")
-                try:
-                    # Get count first
-                    cursor.execute(f"SELECT COUNT(*) FROM {table_name}")  # noqa: S608
-                    count = cursor.fetchone()[0]
+                self._fast_delete_table(cursor, stat_key, table_name)
 
-                    if not self.dry_run:
-                        # Use TRUNCATE CASCADE for speed and to handle FK dependencies
-                        cursor.execute(
-                            f"TRUNCATE TABLE {table_name} CASCADE"  # noqa: S608
+            if self.dry_run:
+                raise Exception("Dry run - rolling back transaction")
+
+    def _fast_delete_table(self, cursor, stat_key, table_name, max_retries=3):
+        """
+        Delete a table using TRUNCATE CASCADE with retries on deadlock.
+
+        TRUNCATE acquires AccessExclusiveLock on the target table and all
+        tables referenced via CASCADE, which can deadlock with concurrent
+        processes (e.g. Celery workers, API requests). On deadlock, we retry
+        TRUNCATE CASCADE after a delay rather than falling back to DELETE FROM,
+        because DELETE FROM does not cascade and will fail on tables with
+        unhandled foreign key dependencies.
+        """
+        for attempt in range(max_retries):
+            sid = transaction.savepoint()
+            try:
+                cursor.execute(f"SELECT COUNT(*) FROM {table_name}")  # noqa: S608
+                count = cursor.fetchone()[0]
+
+                if not self.dry_run:
+                    cursor.execute(
+                        f"TRUNCATE TABLE {table_name} CASCADE"  # noqa: S608
+                    )
+
+                transaction.savepoint_commit(sid)
+                self.stats[stat_key]["deleted"] = count
+                return
+            except Exception as e:
+                transaction.savepoint_rollback(sid)
+                if "deadlock detected" in str(e) and attempt < max_retries - 1:
+                    wait = 2**attempt
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Deadlock on {stat_key}, retrying TRUNCATE CASCADE in {wait}s "
+                            f"(attempt {attempt + 2}/{max_retries})..."
                         )
-
-                    self.stats[stat_key]["deleted"] = count
-                except Exception as e:
+                    )
+                    time.sleep(wait)
+                else:
                     self.stdout.write(
                         self.style.WARNING(f"Failed to delete {stat_key}: {e}")
                     )
                     self.stats[stat_key]["errors"] += 1
-
-            if self.dry_run:
-                raise Exception("Dry run - rolling back transaction")
+                    return
 
     def cleanup_feeds(self):
         """Delete all feed data."""
@@ -429,6 +573,84 @@ class Command(BaseCommand):
         except Exception as e:
             self.stdout.write(self.style.WARNING(f"Failed to delete events: {e}"))
             self.stats["events"]["errors"] += 1
+
+    def cleanup_auth_tokens(self):
+        """Delete all auth tokens."""
+        self.stdout.write("Deleting auth tokens...")
+        try:
+            if not self.dry_run:
+                count = Token.objects.count()
+                Token.objects.all().delete()
+                self.stats["auth_tokens"]["deleted"] = count
+            else:
+                self.stats["auth_tokens"]["deleted"] = Token.objects.count()
+        except Exception as e:
+            self.stdout.write(self.style.WARNING(f"Failed to delete auth tokens: {e}"))
+            self.stats["auth_tokens"]["errors"] += 1
+
+    def cleanup_user_data_access_logs(self):
+        """Delete all user data access logs."""
+        self.stdout.write("Deleting user data access logs...")
+        try:
+            if not self.dry_run:
+                count = UserDataAccessLog.objects.count()
+                UserDataAccessLog.objects.all().delete()
+                self.stats["user_data_access_logs"]["deleted"] = count
+            else:
+                self.stats["user_data_access_logs"]["deleted"] = (
+                    UserDataAccessLog.objects.count()
+                )
+        except Exception as e:
+            self.stdout.write(
+                self.style.WARNING(f"Failed to delete user data access logs: {e}")
+            )
+            self.stats["user_data_access_logs"]["errors"] += 1
+
+    def cleanup_webhooks(self):
+        """Delete all webhook configurations."""
+        self.stdout.write("Deleting webhooks...")
+        try:
+            if not self.dry_run:
+                count = WebHook.objects.count()
+                WebHook.objects.all().delete()
+                self.stats["webhooks"]["deleted"] = count
+            else:
+                self.stats["webhooks"]["deleted"] = WebHook.objects.count()
+        except Exception as e:
+            self.stdout.write(self.style.WARNING(f"Failed to delete webhooks: {e}"))
+            self.stats["webhooks"]["errors"] += 1
+
+    def cleanup_email_hooks(self):
+        """Delete all email hook configurations."""
+        self.stdout.write("Deleting email hooks...")
+        try:
+            if not self.dry_run:
+                count = EmailHook.objects.count()
+                EmailHook.objects.all().delete()
+                self.stats["email_hooks"]["deleted"] = count
+            else:
+                self.stats["email_hooks"]["deleted"] = EmailHook.objects.count()
+        except Exception as e:
+            self.stdout.write(self.style.WARNING(f"Failed to delete email hooks: {e}"))
+            self.stats["email_hooks"]["errors"] += 1
+
+    def cleanup_event_subscriptions(self):
+        """Delete all event subscriptions."""
+        self.stdout.write("Deleting event subscriptions...")
+        try:
+            if not self.dry_run:
+                count = EventSubscription.objects.count()
+                EventSubscription.objects.all().delete()
+                self.stats["event_subscriptions"]["deleted"] = count
+            else:
+                self.stats["event_subscriptions"]["deleted"] = (
+                    EventSubscription.objects.count()
+                )
+        except Exception as e:
+            self.stdout.write(
+                self.style.WARNING(f"Failed to delete event subscriptions: {e}")
+            )
+            self.stats["event_subscriptions"]["errors"] += 1
 
     def cleanup_users(self):
         """Delete all user data."""
@@ -847,6 +1069,40 @@ class Command(BaseCommand):
             )
             self.stats["offering_users"]["errors"] += 1
 
+    def cleanup_robot_accounts(self):
+        """Delete all robot account data."""
+        self.stdout.write("Deleting robot accounts...")
+        try:
+            if not self.dry_run:
+                count = RobotAccount.objects.count()
+                RobotAccount.objects.all().delete()
+                self.stats["robot_accounts"]["deleted"] = count
+            else:
+                self.stats["robot_accounts"]["deleted"] = RobotAccount.objects.count()
+        except Exception as e:
+            self.stdout.write(
+                self.style.WARNING(f"Failed to delete robot accounts: {e}")
+            )
+            self.stats["robot_accounts"]["errors"] += 1
+
+    def cleanup_offering_user_groups(self):
+        """Delete all offering user group data."""
+        self.stdout.write("Deleting offering user groups...")
+        try:
+            if not self.dry_run:
+                count = OfferingUserGroup.objects.count()
+                OfferingUserGroup.objects.all().delete()
+                self.stats["offering_user_groups"]["deleted"] = count
+            else:
+                self.stats["offering_user_groups"]["deleted"] = (
+                    OfferingUserGroup.objects.count()
+                )
+        except Exception as e:
+            self.stdout.write(
+                self.style.WARNING(f"Failed to delete offering user groups: {e}")
+            )
+            self.stats["offering_user_groups"]["errors"] += 1
+
     def cleanup_answers(self):
         """Delete all answer data."""
         self.stdout.write("Deleting answers...")
@@ -1122,6 +1378,275 @@ class Command(BaseCommand):
                 )
             )
             self.stats["maintenance_announcement_offerings"]["errors"] += 1
+
+    def cleanup_offering_software_catalogs(self):
+        """Delete all offering-to-software-catalog links."""
+        self.stdout.write("Deleting offering software catalog links...")
+        try:
+            if not self.dry_run:
+                count = OfferingSoftwareCatalog.objects.count()
+                OfferingSoftwareCatalog.objects.all().delete()
+                self.stats["offering_software_catalogs"]["deleted"] = count
+            else:
+                self.stats["offering_software_catalogs"]["deleted"] = (
+                    OfferingSoftwareCatalog.objects.count()
+                )
+        except Exception as e:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"Failed to delete offering software catalog links: {e}"
+                )
+            )
+            self.stats["offering_software_catalogs"]["errors"] += 1
+
+    def cleanup_offering_partitions(self):
+        """Delete all offering partition data."""
+        self.stdout.write("Deleting offering partitions...")
+        try:
+            if not self.dry_run:
+                count = OfferingPartition.objects.count()
+                OfferingPartition.objects.all().delete()
+                self.stats["offering_partitions"]["deleted"] = count
+            else:
+                self.stats["offering_partitions"]["deleted"] = (
+                    OfferingPartition.objects.count()
+                )
+        except Exception as e:
+            self.stdout.write(
+                self.style.WARNING(f"Failed to delete offering partitions: {e}")
+            )
+            self.stats["offering_partitions"]["errors"] += 1
+
+    def cleanup_software_targets(self):
+        """Delete all software target data."""
+        self.stdout.write("Deleting software targets...")
+        try:
+            if not self.dry_run:
+                count = SoftwareTarget.objects.count()
+                SoftwareTarget.objects.all().delete()
+                self.stats["software_targets"]["deleted"] = count
+            else:
+                self.stats["software_targets"]["deleted"] = (
+                    SoftwareTarget.objects.count()
+                )
+        except Exception as e:
+            self.stdout.write(
+                self.style.WARNING(f"Failed to delete software targets: {e}")
+            )
+            self.stats["software_targets"]["errors"] += 1
+
+    def cleanup_software_versions(self):
+        """Delete all software version data."""
+        self.stdout.write("Deleting software versions...")
+        try:
+            if not self.dry_run:
+                count = SoftwareVersion.objects.count()
+                SoftwareVersion.objects.all().delete()
+                self.stats["software_versions"]["deleted"] = count
+            else:
+                self.stats["software_versions"]["deleted"] = (
+                    SoftwareVersion.objects.count()
+                )
+        except Exception as e:
+            self.stdout.write(
+                self.style.WARNING(f"Failed to delete software versions: {e}")
+            )
+            self.stats["software_versions"]["errors"] += 1
+
+    def cleanup_software_packages(self):
+        """Delete all software package data."""
+        self.stdout.write("Deleting software packages...")
+        try:
+            if not self.dry_run:
+                count = SoftwarePackage.objects.count()
+                SoftwarePackage.objects.all().delete()
+                self.stats["software_packages"]["deleted"] = count
+            else:
+                self.stats["software_packages"]["deleted"] = (
+                    SoftwarePackage.objects.count()
+                )
+        except Exception as e:
+            self.stdout.write(
+                self.style.WARNING(f"Failed to delete software packages: {e}")
+            )
+            self.stats["software_packages"]["errors"] += 1
+
+    def cleanup_software_catalogs(self):
+        """Delete all software catalog data."""
+        self.stdout.write("Deleting software catalogs...")
+        try:
+            if not self.dry_run:
+                count = SoftwareCatalog.objects.count()
+                SoftwareCatalog.objects.all().delete()
+                self.stats["software_catalogs"]["deleted"] = count
+            else:
+                self.stats["software_catalogs"]["deleted"] = (
+                    SoftwareCatalog.objects.count()
+                )
+        except Exception as e:
+            self.stdout.write(
+                self.style.WARNING(f"Failed to delete software catalogs: {e}")
+            )
+            self.stats["software_catalogs"]["errors"] += 1
+
+    def cleanup_openstack_volumes(self):
+        """Delete all OpenStack volume data."""
+        self.stdout.write("Deleting OpenStack volumes...")
+        try:
+            if not self.dry_run:
+                count = Volume.objects.count()
+                Volume.objects.all().delete()
+                self.stats["openstack_volumes"]["deleted"] = count
+            else:
+                self.stats["openstack_volumes"]["deleted"] = Volume.objects.count()
+        except Exception as e:
+            self.stdout.write(
+                self.style.WARNING(f"Failed to delete OpenStack volumes: {e}")
+            )
+            self.stats["openstack_volumes"]["errors"] += 1
+
+    def cleanup_openstack_instances(self):
+        """Delete all OpenStack instance data."""
+        self.stdout.write("Deleting OpenStack instances...")
+        try:
+            if not self.dry_run:
+                count = Instance.objects.count()
+                Instance.objects.all().delete()
+                self.stats["openstack_instances"]["deleted"] = count
+            else:
+                self.stats["openstack_instances"]["deleted"] = Instance.objects.count()
+        except Exception as e:
+            self.stdout.write(
+                self.style.WARNING(f"Failed to delete OpenStack instances: {e}")
+            )
+            self.stats["openstack_instances"]["errors"] += 1
+
+    def cleanup_openstack_tenants(self):
+        """Delete all OpenStack tenant data."""
+        self.stdout.write("Deleting OpenStack tenants...")
+        try:
+            if not self.dry_run:
+                count = Tenant.objects.count()
+                Tenant.objects.all().delete()
+                self.stats["openstack_tenants"]["deleted"] = count
+            else:
+                self.stats["openstack_tenants"]["deleted"] = Tenant.objects.count()
+        except Exception as e:
+            self.stdout.write(
+                self.style.WARNING(f"Failed to delete OpenStack tenants: {e}")
+            )
+            self.stats["openstack_tenants"]["errors"] += 1
+
+    def cleanup_openstack_images(self):
+        """Delete all OpenStack image data."""
+        self.stdout.write("Deleting OpenStack images...")
+        try:
+            if not self.dry_run:
+                count = Image.all_objects.count()
+                Image.all_objects.all().delete()
+                self.stats["openstack_images"]["deleted"] = count
+            else:
+                self.stats["openstack_images"]["deleted"] = Image.all_objects.count()
+        except Exception as e:
+            self.stdout.write(
+                self.style.WARNING(f"Failed to delete OpenStack images: {e}")
+            )
+            self.stats["openstack_images"]["errors"] += 1
+
+    def cleanup_openstack_flavors(self):
+        """Delete all OpenStack flavor data."""
+        self.stdout.write("Deleting OpenStack flavors...")
+        try:
+            if not self.dry_run:
+                count = Flavor.objects.count()
+                Flavor.objects.all().delete()
+                self.stats["openstack_flavors"]["deleted"] = count
+            else:
+                self.stats["openstack_flavors"]["deleted"] = Flavor.objects.count()
+        except Exception as e:
+            self.stdout.write(
+                self.style.WARNING(f"Failed to delete OpenStack flavors: {e}")
+            )
+            self.stats["openstack_flavors"]["errors"] += 1
+
+    def cleanup_openstack_service_settings(self):
+        """Delete OpenStack service settings (type='OpenStack' only)."""
+        self.stdout.write("Deleting OpenStack service settings...")
+        try:
+            if not self.dry_run:
+                qs = ServiceSettings.objects.filter(type="OpenStack")
+                count = qs.count()
+                qs.delete()
+                self.stats["openstack_service_settings"]["deleted"] = count
+            else:
+                self.stats["openstack_service_settings"]["deleted"] = (
+                    ServiceSettings.objects.filter(type="OpenStack").count()
+                )
+        except Exception as e:
+            self.stdout.write(
+                self.style.WARNING(f"Failed to delete OpenStack service settings: {e}")
+            )
+            self.stats["openstack_service_settings"]["errors"] += 1
+
+    def cleanup_project_estimated_cost_policies(self):
+        """Delete project estimated cost policies."""
+        self.stdout.write("Deleting project estimated cost policies...")
+        try:
+            if not self.dry_run:
+                count = ProjectEstimatedCostPolicy.objects.count()
+                ProjectEstimatedCostPolicy.objects.all().delete()
+                self.stats["project_estimated_cost_policies"]["deleted"] = count
+            else:
+                self.stats["project_estimated_cost_policies"]["deleted"] = (
+                    ProjectEstimatedCostPolicy.objects.count()
+                )
+        except Exception as e:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"Failed to delete project estimated cost policies: {e}"
+                )
+            )
+            self.stats["project_estimated_cost_policies"]["errors"] += 1
+
+    def cleanup_customer_estimated_cost_policies(self):
+        """Delete customer estimated cost policies."""
+        self.stdout.write("Deleting customer estimated cost policies...")
+        try:
+            if not self.dry_run:
+                count = CustomerEstimatedCostPolicy.objects.count()
+                CustomerEstimatedCostPolicy.objects.all().delete()
+                self.stats["customer_estimated_cost_policies"]["deleted"] = count
+            else:
+                self.stats["customer_estimated_cost_policies"]["deleted"] = (
+                    CustomerEstimatedCostPolicy.objects.count()
+                )
+        except Exception as e:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"Failed to delete customer estimated cost policies: {e}"
+                )
+            )
+            self.stats["customer_estimated_cost_policies"]["errors"] += 1
+
+    def cleanup_slurm_periodic_policies(self):
+        """Delete SLURM periodic usage policies."""
+        self.stdout.write("Deleting SLURM periodic usage policies...")
+        try:
+            if not self.dry_run:
+                count = SlurmPeriodicUsagePolicy.objects.count()
+                SlurmPeriodicUsagePolicy.objects.all().delete()
+                self.stats["slurm_periodic_policies"]["deleted"] = count
+            else:
+                self.stats["slurm_periodic_policies"]["deleted"] = (
+                    SlurmPeriodicUsagePolicy.objects.count()
+                )
+        except Exception as e:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"Failed to delete SLURM periodic usage policies: {e}"
+                )
+            )
+            self.stats["slurm_periodic_policies"]["errors"] += 1
 
     def print_summary(self):
         """Print cleanup summary statistics."""

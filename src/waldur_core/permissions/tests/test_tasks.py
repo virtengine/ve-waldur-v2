@@ -1,10 +1,18 @@
 from constance.test.unittest import override_config
+from django.db import connection
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 
 from waldur_core.logging import models as logging_models
 from waldur_core.permissions import tasks
-from waldur_core.permissions.fixtures import CustomerRole
+from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
+from waldur_core.permissions.handlers import (
+    deactivate_user_with_logging,
+    reactivate_user_with_logging,
+)
 from waldur_core.structure.tests import factories as structure_factories
+from waldur_mastermind.marketplace.enums import CourseAccountState
+from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 
 
 class SyncUserDeactivationStatusTest(TestCase):
@@ -265,3 +273,351 @@ class SyncUserDeactivationStatusTest(TestCase):
             and "Reactivated: 0" in log
         ]
         self.assertTrue(len(summary_logs) > 0)
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_does_not_deactivate_users_with_active_course_accounts(self):
+        """Test that users with active course accounts in non-removed projects are not deactivated."""
+        user_with_course = structure_factories.UserFactory(is_active=True)
+        self.assertFalse(user_with_course.userrole_set.filter(is_active=True).exists())
+
+        marketplace_factories.CourseAccountFactory(
+            user=user_with_course,
+            state=CourseAccountState.OK,
+        )
+
+        tasks.sync_user_deactivation_status()
+
+        user_with_course.refresh_from_db()
+        self.assertTrue(user_with_course.is_active)
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_reactivates_inactive_users_with_ok_course_accounts(self):
+        """Test that inactive users with OK course accounts in active projects are reactivated."""
+        user_with_course = structure_factories.UserFactory(is_active=False)
+        self.assertFalse(user_with_course.userrole_set.filter(is_active=True).exists())
+
+        marketplace_factories.CourseAccountFactory(
+            user=user_with_course,
+            state=CourseAccountState.OK,
+        )
+
+        tasks.sync_user_deactivation_status()
+
+        user_with_course.refresh_from_db()
+        self.assertTrue(user_with_course.is_active)
+        self.assertEqual(user_with_course.deactivation_reason, "")
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_does_not_reactivate_users_with_only_closed_course_accounts(self):
+        """Test that inactive users with only closed course accounts stay inactive."""
+        user_with_closed_course = structure_factories.UserFactory(is_active=False)
+        self.assertFalse(
+            user_with_closed_course.userrole_set.filter(is_active=True).exists()
+        )
+
+        marketplace_factories.CourseAccountFactory(
+            user=user_with_closed_course,
+            state=CourseAccountState.CLOSED,
+        )
+
+        tasks.sync_user_deactivation_status()
+
+        user_with_closed_course.refresh_from_db()
+        self.assertFalse(user_with_closed_course.is_active)
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_deactivates_users_with_closed_course_accounts(self):
+        """Test that users with only closed course accounts are still deactivated."""
+        user_with_closed_course = structure_factories.UserFactory(is_active=True)
+        self.assertFalse(
+            user_with_closed_course.userrole_set.filter(is_active=True).exists()
+        )
+
+        marketplace_factories.CourseAccountFactory(
+            user=user_with_closed_course,
+            state=CourseAccountState.CLOSED,
+        )
+
+        tasks.sync_user_deactivation_status()
+
+        user_with_closed_course.refresh_from_db()
+        self.assertFalse(user_with_closed_course.is_active)
+
+
+class TerminatedProjectRolesTest(TestCase):
+    """Roles whose scope is a removed (terminated) project must not count as
+    "active roles" for the auto-deactivation policy.
+
+    Project termination only revokes the roles of *active* users (see
+    ``revoke_roles_on_project_deletion`` + ``get_permissions``), so a role that
+    belonged to an already-inactive user at termination time survives with
+    ``is_active=True`` while pointing at a removed project. Historical data and
+    bulk imports can leave the same orphaned rows. Such roles grant no real
+    access and must not keep a user active or trigger reactivation — mirroring
+    the ``project__is_removed=False`` guard already applied to course accounts.
+    """
+
+    def _orphan_role_on_removed_project(self, user):
+        """Give the user a role on a project, then mark the project removed
+        without revoking the role — reproducing the orphaned-role state."""
+        project = structure_factories.ProjectFactory()
+        project.add_user(user, ProjectRole.MEMBER)
+        project.is_removed = True
+        project.save(update_fields=["is_removed"])
+        return project
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_deactivates_user_whose_only_role_is_on_removed_project(self):
+        user = structure_factories.UserFactory(is_active=True)
+        self._orphan_role_on_removed_project(user)
+        # The role is still flagged active at the DB level.
+        self.assertTrue(user.userrole_set.filter(is_active=True).exists())
+
+        tasks.sync_user_deactivation_status()
+
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_does_not_reactivate_user_whose_only_role_is_on_removed_project(self):
+        user = structure_factories.UserFactory(is_active=True)
+        self._orphan_role_on_removed_project(user)
+        user.is_active = False
+        user.save(update_fields=["is_active"])
+
+        tasks.sync_user_deactivation_status()
+
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_keeps_user_active_with_role_on_live_project(self):
+        """Control: an identical role on a live project keeps the user active."""
+        user = structure_factories.UserFactory(is_active=True)
+        project = structure_factories.ProjectFactory()
+        project.add_user(user, ProjectRole.MEMBER)
+
+        tasks.sync_user_deactivation_status()
+
+        user.refresh_from_db()
+        self.assertTrue(user.is_active)
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_keeps_user_active_when_a_concurrent_live_role_exists(self):
+        """A removed-project role is ignored, but a parallel live role counts."""
+        user = structure_factories.UserFactory(is_active=True)
+        self._orphan_role_on_removed_project(user)
+        live_project = structure_factories.ProjectFactory()
+        live_project.add_user(user, ProjectRole.MEMBER)
+
+        tasks.sync_user_deactivation_status()
+
+        user.refresh_from_db()
+        self.assertTrue(user.is_active)
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_get_deactivation_reason_ignores_removed_project_roles(self):
+        from waldur_core.permissions.handlers import get_deactivation_reason
+
+        user = structure_factories.UserFactory(is_active=True)
+        self._orphan_role_on_removed_project(user)
+
+        self.assertIsNotNone(get_deactivation_reason(user))
+
+
+class AdminDeactivationOverrideTest(TestCase):
+    """Administratively deactivated users (staff override) must never be revived
+    by the automatic role-sync, even when they still hold active roles."""
+
+    def setUp(self):
+        self.customer = structure_factories.CustomerFactory()
+
+    def _user_with_role(self, **kwargs):
+        user = structure_factories.UserFactory(is_active=True, **kwargs)
+        self.customer.add_user(user, CustomerRole.OWNER)
+        return user
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_sync_does_not_reactivate_admin_deactivated_user_with_roles(self):
+        user = self._user_with_role()
+        user.is_active = False
+        user.is_admin_deactivated = True
+        user.save(update_fields=["is_active", "is_admin_deactivated"])
+
+        tasks.sync_user_deactivation_status()
+
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_sync_reactivates_auto_deactivated_user_with_roles(self):
+        """Control: a non-admin deactivation IS reversible."""
+        user = self._user_with_role()
+        user.is_active = False
+        user.is_admin_deactivated = False
+        user.save(update_fields=["is_active", "is_admin_deactivated"])
+
+        tasks.sync_user_deactivation_status()
+
+        user.refresh_from_db()
+        self.assertTrue(user.is_active)
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_should_reactivate_user_is_false_for_admin_deactivated(self):
+        from waldur_core.permissions.handlers import should_reactivate_user
+
+        user = self._user_with_role()
+        user.is_active = False
+        user.is_admin_deactivated = True
+        user.save(update_fields=["is_active", "is_admin_deactivated"])
+
+        self.assertFalse(should_reactivate_user(user))
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_gaining_a_role_does_not_revive_admin_deactivated_user(self):
+        user = structure_factories.UserFactory(is_active=True)
+        user.is_active = False
+        user.is_admin_deactivated = True
+        user.save(update_fields=["is_active", "is_admin_deactivated"])
+
+        # role_granted signal fires here; the override must hold.
+        self.customer.add_user(user, CustomerRole.OWNER)
+
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)
+
+
+class DeactivationReasonTest(TestCase):
+    """Tests that deactivation_reason is set and cleared across all code paths."""
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_deactivate_user_with_logging_sets_reason(self):
+        user = structure_factories.UserFactory(is_active=True)
+        deactivate_user_with_logging(user, "All roles were revoked")
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)
+        self.assertEqual(user.deactivation_reason, "All roles were revoked")
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_reactivate_user_with_logging_clears_reason(self):
+        user = structure_factories.UserFactory(
+            is_active=False, deactivation_reason="All roles were revoked"
+        )
+        reactivate_user_with_logging(user, "Gained a new role")
+        user.refresh_from_db()
+        self.assertTrue(user.is_active)
+        self.assertEqual(user.deactivation_reason, "")
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_periodic_sync_sets_descriptive_reason_no_course_accounts(self):
+        user = structure_factories.UserFactory(is_active=True)
+        tasks.sync_user_deactivation_status()
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)
+        self.assertEqual(
+            user.deactivation_reason, "No active roles and no course accounts"
+        )
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_periodic_sync_sets_descriptive_reason_with_closed_course_accounts(self):
+        user = structure_factories.UserFactory(is_active=True)
+        marketplace_factories.CourseAccountFactory(
+            user=user, state=CourseAccountState.CLOSED
+        )
+        tasks.sync_user_deactivation_status()
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)
+        self.assertIn(
+            "1 course account(s) but none in OK state", user.deactivation_reason
+        )
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_periodic_sync_clears_reason_on_reactivated_users(self):
+        user = structure_factories.UserFactory(
+            is_active=False,
+            deactivation_reason="No active roles and no course accounts",
+        )
+        customer = structure_factories.CustomerFactory()
+        customer.add_user(user, CustomerRole.OWNER)
+        # Manually set inactive after role assignment to avoid handler interference
+        user.is_active = False
+        user.deactivation_reason = "No active roles and no course accounts"
+        user.save()
+
+        tasks.sync_user_deactivation_status()
+
+        user.refresh_from_db()
+        self.assertTrue(user.is_active)
+        self.assertEqual(user.deactivation_reason, "")
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_signal_handler_sets_reason_on_last_role_revoked(self):
+        user = structure_factories.UserFactory(is_active=True)
+        customer = structure_factories.CustomerFactory()
+        customer.add_user(user, CustomerRole.OWNER)
+
+        # Revoke the role — triggers deactivate_user_if_no_roles signal handler
+        role = user.userrole_set.get(is_active=True)
+        role.revoke()
+
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)
+        self.assertEqual(
+            user.deactivation_reason, "No active roles and no course accounts"
+        )
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_signal_handler_clears_reason_on_role_granted(self):
+        user = structure_factories.UserFactory(
+            is_active=False, deactivation_reason="All roles were revoked"
+        )
+        customer = structure_factories.CustomerFactory()
+
+        # Granting a role triggers reactivate_user_if_gaining_roles signal handler
+        customer.add_user(user, CustomerRole.OWNER)
+
+        user.refresh_from_db()
+        self.assertTrue(user.is_active)
+        self.assertEqual(user.deactivation_reason, "")
+
+
+class SyncUserDeactivationQueryCountTest(TestCase):
+    """Regression test: the periodic task must not scale linearly with the
+    number of users. Previously it issued one ``UserRole.exists()`` and one
+    ``CourseAccount.exists()`` per user, which dominated runtime on
+    production-sized tables (see Sentry transaction
+    ``waldur_core.permissions.sync_user_deactivation_status``)."""
+
+    def _make_noop_users(self, n: int) -> None:
+        """Create N users that already match the desired state, so the task
+        has no work to do regardless of the user count."""
+        customer = structure_factories.CustomerFactory()
+        for _ in range(n):
+            # Active user with an active role — neither deactivation nor
+            # reactivation should fire for this user.
+            user = structure_factories.UserFactory(is_active=True)
+            customer.add_user(user, CustomerRole.OWNER)
+
+    def _count_queries(self) -> int:
+        with CaptureQueriesContext(connection) as ctx:
+            tasks.sync_user_deactivation_status()
+        return len(ctx.captured_queries)
+
+    @override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+    def test_query_count_is_bounded_for_noop_users(self):
+        self._make_noop_users(5)
+        small_count = self._count_queries()
+
+        self._make_noop_users(45)  # 50 total
+        large_count = self._count_queries()
+
+        # Bulk Exists() filtering pushes role/course-account checks into
+        # SQL, so query count must stay flat as the user table grows.
+        # Allow a small slack for chunk pagination and Constance lookups,
+        # but reject anything that scales with N.
+        self.assertLess(
+            large_count,
+            small_count + 10,
+            f"Query count grew from {small_count} to {large_count} when user "
+            f"count went from 5 to 50 — likely a per-user N+1 regression.",
+        )

@@ -20,9 +20,17 @@ Enable onboarding functionality.
 
 Allows to show permission reviews tab and popups for organisations.
 
+## customer.show_project_digest
+
+Enable display of project digest configuration in organization settings.
+
 ## deployment.enable_cookie_notice
 
 Enable cookie notice in marketplace.
+
+## deployment.enable_disclaimer_area
+
+Enable disclaimer area below the footer.
 
 ## deployment.send_metrics
 
@@ -56,13 +64,29 @@ Allow marketplace to serve only as aggregator of call info.
 
 Allow marketplace to function as a catalogue only.
 
+## marketplace.conceal_audit_log_from_end_users
+
+Hide audit log tab from non-staff and non-support users.
+
 ## marketplace.conceal_offering_pricing_tab_in_public_view
 
 Conceal offering pricing tab in the offering's public view.
 
+## marketplace.conceal_pending_consumer_orders
+
+Hide pending consumer orders section from the pending confirmations drawer.
+
+## marketplace.conceal_pending_provider_orders
+
+Hide pending provider orders section from the pending confirmations drawer.
+
 ## marketplace.conceal_prices
 
 Do not render prices in order details.
+
+## marketplace.conceal_resource_metadata
+
+Conceal resource metadata from non-staff users in resource detail view.
 
 ## marketplace.display_offering_partitions
 
@@ -75,6 +99,14 @@ Enable display of software catalog in UI.
 ## marketplace.display_user_tos
 
 Enable display of user terms of service in UI.
+
+## marketplace.hide_marketplace_from_end_users
+
+Hide marketplace functionality from end users but allow staff access.
+
+## marketplace.hide_organization_information_from_project_members
+
+Hide organization information from project-level users. Organization owners, managers, and staff retain full access.
 
 ## marketplace.import_resources
 
@@ -92,6 +124,14 @@ Enabled display of call management functionality.
 
 Enabled display of experimental or mocked components in marketplace.
 
+## marketplace.show_openstack_duplicate_offerings
+
+Show the staff diagnostics page listing tenants with duplicate per-tenant OpenStack offerings.
+
+## marketplace.show_posix_id_pools
+
+Render POSIX ID pool management UI for service providers.
+
 ## marketplace.show_resource_end_date
 
 Show resource end date as a non optional column in resources list.
@@ -108,10 +148,6 @@ Show OpenStack tenant migrations action and tab
 
 Render estimated cost column in projects list.
 
-## project.mandatory_end_date
-
-Make the project end date mandatory.
-
 ## project.mandatory_start_date
 
 Make the project start date mandatory.
@@ -119,6 +155,10 @@ Make the project start date mandatory.
 ## project.oecd_fos_2007_code
 
 Enable OECD code.
+
+## project.science_domain
+
+Enable science domain/sub-domain selection for projects.
 
 ## project.show_credit_in_create_dialog
 
@@ -144,6 +184,10 @@ Show industry flag.
 
 Show kind field in project create dialog.
 
+## project.show_matrix_chat
+
+Render the project Matrix chat UI. Backend access is gated separately on the MATRIX_ENABLED Constance setting.
+
 ## project.show_permission_reviews
 
 Allows to show permission reviews tab and popups for projects.
@@ -164,13 +208,13 @@ Render Rancher apps as a separate tab in resource details page.
 
 Allow to select mount point for data volume when Rancher cluster is provisioned.
 
+## reseller.affiliates
+
+Show affiliate program menus and pages. Backend enforcement is controlled separately by the AFFILIATES_ENABLED Constance setting.
+
 ## reseller.arrow
 
 Enable Arrow integration menu in administration.
-
-## slurm.jobs
-
-Render list of SLURM jobs as a separate tab in allocation details page.
 
 ## support.conceal_change_request
 
@@ -178,7 +222,7 @@ Conceal "Change request" from a selection of issue types for non-staff/non-suppo
 
 ## support.enable_llm_assistant
 
-Enable LLM Assistant
+Enable AI Assistant
 
 ## support.pricelist
 
@@ -187,6 +231,18 @@ Render marketplace plan components pricelist in support workspace.
 ## support.vm_type_overview
 
 Enable VM type overview in support workspace.
+
+## user.conceal_api_token
+
+Hide API token management tab from non-staff and non-support users.
+
+## user.conceal_permission_requests
+
+Hide permission requests tab from non-staff and non-support users.
+
+## user.conceal_remote_accounts
+
+Hide remote accounts tab from non-staff and non-support users.
 
 ## user.disable_user_termination
 
@@ -207,6 +263,10 @@ Render preferred language column in users list.
 ## user.show_data_access
 
 Enable Data Access tab showing who can access user profile data.
+
+## user.show_identity_bridge
+
+Show identity bridge information in user profiles and admin views.
 
 ## user.show_slug
 

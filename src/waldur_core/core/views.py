@@ -1,19 +1,25 @@
 import functools
 import logging
 import mimetypes
+from collections import defaultdict
+from datetime import timedelta
 from typing import Any
 from urllib.parse import urlencode
 
 import requests
 import reversion
 from constance import config
+from constance import settings as constance_settings
+from constance.codecs import loads as constance_loads
+from constance.models import Constance
+from constance.utils import get_values as constance_get_values
 from django.conf import settings
 from django.contrib import auth
 from django.contrib.contenttypes.models import ContentType
 from django.core.cache import cache
 from django.core.exceptions import ObjectDoesNotExist
 from django.core.files.storage import default_storage
-from django.db import connection, connections
+from django.db import connection, connections, transaction
 from django.db.models import ForeignKey, ProtectedError
 from django.http import FileResponse, HttpResponse, HttpResponseRedirect, JsonResponse
 from django.utils import timezone
@@ -25,6 +31,7 @@ from packaging import version
 from rest_framework import exceptions, generics, mixins, serializers, status, viewsets
 from rest_framework import mixins as rf_mixins
 from rest_framework import permissions as rf_permissions
+from rest_framework.authtoken.models import Token
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
@@ -45,7 +52,7 @@ from waldur_core.core.authentication import (
 )
 from waldur_core.core.exceptions import ExtensionDisabled, IncorrectStateException
 from waldur_core.core.features import FEATURES
-from waldur_core.core.logos import DEFAULT_LOGOS, LOGO_MAP
+from waldur_core.core.logos import DEFAULT_LOGOS, LOGO_MAP, build_logo_url
 from waldur_core.core.metadata import WaldurConfiguration
 from waldur_core.core.metadata_schemas import (
     EventMetadataResponseSerializer,
@@ -54,8 +61,11 @@ from waldur_core.core.metadata_schemas import (
     SettingsMetadataResponseSerializer,
 )
 from waldur_core.core.mixins import ensure_atomic_transaction
-from waldur_core.core.models import DailyTableSizeHistory
+from waldur_core.core.models import DailyTableSizeHistory, TokenExchangeCode
+from waldur_core.core.permissions import PATScopeAwareIsAdminUser
 from waldur_core.core.serializers import (
+    AvailableBindingTargetSerializer,
+    AvailableScopeSerializer,
     CeleryStatsResponseSerializer,
     ConstanceSettingsSerializer,
     CoreAuthTokenSerializer,
@@ -63,11 +73,18 @@ from waldur_core.core.serializers import (
     EmptySerializer,
     LogoutSerializer,
     ObtainAuthTokenSerializer,
+    PersonalAccessTokenCreatedSerializer,
+    PersonalAccessTokenCreateSerializer,
+    PersonalAccessTokenSerializer,
     QuerySerializer,
     TableGrowthStatsResponseSerializer,
+    TableGrowthTriggerResponseSerializer,
+    TokenExchangeSerializer,
     VersionHistorySerializer,
     VersionSerializer,
+    _serialize_allowed_scopes,
 )
+from waldur_core.core.tasks import sample_table_sizes
 from waldur_core.core.utils import format_homeport_link
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
@@ -75,12 +92,28 @@ from waldur_core.logging.event_logger import get_event_groups
 from waldur_core.permissions.enums import (
     CREATE_PERMISSIONS,
     PERMISSION_DESCRIPTION,
+    TYPE_KEY_BY_CT,
+    TYPE_MAP,
     PermissionEnum,
     RoleEnum,
 )
+from waldur_core.permissions.models import UserRole
 from waldur_core.structure.permissions import IsStaffOrSupportUser
 
 logger = logging.getLogger(__name__)
+
+
+def count_action(func):
+    """Opt a detail-scoped list @action into a HEAD `count` companion operation.
+
+    Collection endpoints get a `_count` HEAD operation (and thus an SDK
+    `*Count` method) automatically. Detail-scoped actions do not, because a
+    count is usually meaningless there. Actions that return a list (e.g.
+    `list_users`) can opt in by stacking this on top of the @action decorator;
+    WaldurOpenApiInspector reads the flag when generating the schema.
+    """
+    func.count_enabled = True
+    return func
 
 
 def validate_authentication_method(method):
@@ -226,6 +259,55 @@ class ObtainAuthToken(APIView):
         return Response({"token": token.key})
 
 
+TOKEN_EXCHANGE_TTL = timedelta(seconds=10)
+_INVALID_CODE_RESPONSE = {"detail": _("Invalid or expired exchange code.")}
+
+
+class TokenExchangeView(APIView):
+    permission_classes = ()
+    throttle_scope = "token_exchange"
+    serializer_class = TokenExchangeSerializer
+
+    @extend_schema(
+        summary="Exchange code for token",
+        description="Exchanges a short-lived one-time code for an authentication token.",
+        request=TokenExchangeSerializer,
+        responses={
+            200: CoreAuthTokenSerializer,
+            400: OpenApiTypes.OBJECT,
+        },
+    )
+    def post(self, request):
+        serializer = self.serializer_class(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        code = serializer.validated_data["code"]
+        # Single-use: select the row for update, validate freshness, then delete
+        # inside one transaction so concurrent requests can't both return a token.
+        with transaction.atomic():
+            exchange_code = (
+                models.TokenExchangeCode.objects.select_for_update(of=("self",))
+                .select_related("token")
+                .filter(uuid=code)
+                .first()
+            )
+            if exchange_code is None:
+                return Response(
+                    data=_INVALID_CODE_RESPONSE,
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            fresh = timezone.now() - exchange_code.created <= TOKEN_EXCHANGE_TTL
+            token_key = exchange_code.resolve_token_key() if fresh else None
+            exchange_code.delete()
+
+        if not fresh or not token_key:
+            return Response(
+                data=_INVALID_CODE_RESPONSE,
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response({"token": token_key})
+
+
 class LogoutView(generics.GenericAPIView):
     permission_classes = (rf_permissions.IsAuthenticated,)
     filter_backends = []
@@ -261,6 +343,9 @@ class LogoutView(generics.GenericAPIView):
                         "client_id": idp.client_id,
                     }
                     logout_url = f"{idp.logout_url}?{urlencode(params)}"
+                elif config.OIDC_DEFAULT_LOGOUT_URL:
+                    # Fallback to default logout URL if IdentityProvider doesn't support OIDC logout
+                    logout_url = config.OIDC_DEFAULT_LOGOUT_URL
         elif (
             authentication_method == AuthenticationMethod.SAML2
             and settings.WALDUR_AUTH_SAML2.get("ENABLE_SINGLE_LOGOUT")
@@ -416,12 +501,47 @@ def get_feature_values():
     }
 
 
-def get_constance_plugin_settings(request, plugin, fields):
+def _safe_get_constance_values():
+    """Get constance values, handling corrupt NULL entries gracefully.
+
+    When a constance setting has a NULL value in the database,
+    constance raises a TypeError during JSON deserialization.
+    This wrapper catches the error, logs the corrupt keys,
+    and returns None for those settings.
+    """
+    try:
+        return constance_get_values()
+    except TypeError:
+        prefix = constance_settings.DATABASE_PREFIX
+        values = {}
+        for key, options in constance_settings.CONFIG.items():
+            default_value = options[0]
+            prefixed_key = f"{prefix}{key}"
+            try:
+                entry = Constance.objects.filter(key=prefixed_key).first()
+                if entry is not None:
+                    values[key] = constance_loads(entry.value)
+                else:
+                    values[key] = default_value
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Constance setting '%s' has a corrupt (NULL) value in the "
+                    "database, returning None. To fix, re-save this setting "
+                    "via the admin panel or API.",
+                    key,
+                )
+                values[key] = None
+        return values
+
+
+def get_constance_plugin_settings(all_constance_values, plugin, fields):
     plugin_settings = {}
-    if request:
-        for field in fields:
-            if f"{plugin}_{field}" in settings.PUBLIC_CONSTANCE_SETTINGS:
-                plugin_settings[field] = getattr(config, f"{plugin}_{field}")
+    if not all_constance_values:
+        return plugin_settings
+    for field in fields:
+        key = f"{plugin}_{field}"
+        if key in settings.PUBLIC_CONSTANCE_SETTINGS:
+            plugin_settings[field] = all_constance_values.get(key)
     return plugin_settings
 
 
@@ -477,20 +597,19 @@ def get_public_settings(request=None):
             for s, v in ext.get_dynamic_settings().items():
                 public_settings[settings_name][s] = v
 
-    from constance.admin import get_values
-
     constance_settings = {}
+    all_constance_values = _safe_get_constance_values() if request else {}
     if request:
-        for key in get_values():
+        for key, value in all_constance_values.items():
             if key in settings.PUBLIC_CONSTANCE_SETTINGS and not key.startswith(
                 "WALDUR_"
             ):
-                constance_settings[key] = get_values()[key]
+                constance_settings[key] = value
     if public_settings.get("WALDUR_CORE"):
         if request:
             for key, val in LOGO_MAP.items():
                 if constance_settings.get(key) or key in DEFAULT_LOGOS:
-                    constance_settings[key] = request.build_absolute_uri("/" + val)
+                    constance_settings[key] = build_logo_url(val, request)
         public_settings["WALDUR_CORE"].update(constance_settings)
         provider_name = public_settings["WALDUR_CORE"].get("DEFAULT_IDP")
         if provider_name:
@@ -507,9 +626,14 @@ def get_public_settings(request=None):
                     "auth_url": provider.auth_url,
                 }
     public_settings["WALDUR_SUPPORT"] = get_constance_plugin_settings(
-        request,
+        all_constance_values,
         "WALDUR_SUPPORT",
-        ["ENABLED", "DISPLAY_REQUEST_TYPE", "ACTIVE_BACKEND_TYPE"],
+        [
+            "ENABLED",
+            "DISPLAY_REQUEST_TYPE",
+            "ACTIVE_BACKEND_TYPE",
+            "PROVIDER_ROUTING_ENABLED",
+        ],
     )
     cache.set(
         "API_CONFIGURATION", public_settings, None
@@ -521,7 +645,7 @@ def get_public_settings(request=None):
     summary="Get public configuration",
     description="Returns a dictionary of public settings for the Waldur deployment. This includes feature flags, authentication methods, and other configuration details that are safe to expose to any user.",
     request=None,
-    responses={status.HTTP_200_OK: dict},
+    responses={status.HTTP_200_OK: OpenApiTypes.OBJECT},
 )
 @api_view(["GET"])
 @permission_classes((rf_permissions.AllowAny,))
@@ -609,12 +733,10 @@ def _parse_bracket_notation(data):
     ],
 )
 @api_view(["POST", "GET"])
-@permission_classes((rf_permissions.IsAdminUser,))
+@permission_classes((PATScopeAwareIsAdminUser,))
 def override_db_settings(request):
     if request.method == "GET":
-        from constance.admin import get_values
-
-        return Response(get_values())
+        return Response(_safe_get_constance_values())
 
     # Parse bracket notation keys for nested dict fields (e.g., multilingual images)
     data = _parse_bracket_notation(request.data)
@@ -648,7 +770,7 @@ def override_db_settings(request):
     ],
 )
 @api_view(["POST"])
-@permission_classes((rf_permissions.IsAdminUser,))
+@permission_classes((PATScopeAwareIsAdminUser,))
 def feature_values(request):
     if not isinstance(request.data, dict):
         return Response(
@@ -676,8 +798,15 @@ def redirect_with(url_template, **kwargs):
 
 
 def login_completed(token, method="default"):
+    if isinstance(token, Token):
+        token_obj = token
+    else:
+        token_obj = Token.objects.get(key=token)
+    exchange_code = TokenExchangeCode.generate_code(
+        user=token_obj.user, token=token_obj
+    )
     url = format_homeport_link(
-        "login_completed/{token}/{method}/", token=token, method=method
+        "login_completed/{code}/{method}/", code=exchange_code.uuid.hex, method=method
     )
     return HttpResponseRedirect(url)
 
@@ -714,8 +843,6 @@ class ConstanceCheckExtensionMixin:
     extension_name = NotImplemented
 
     def initial(self, request, *args, **kwargs):
-        from constance import config
-
         conf = getattr(config, f"{self.extension_name}_ENABLED", None)
         if not conf:
             raise ExtensionDisabled()
@@ -742,7 +869,7 @@ class CreateReversionMixin:
 
     def perform_create(self, serializer):
         with reversion.create_revision():
-            super().perform_update(serializer)
+            super().perform_create(serializer)
             reversion.set_user(self.request.user)
             reversion.set_comment("Created via REST API")
 
@@ -1354,12 +1481,17 @@ Requires support user permissions.""",
 
 
 class QueryViewSet(generics.GenericAPIView):
-    permission_classes = [rf_permissions.IsAuthenticated, permissions.IsSupport]
+    # Tightened from IsSupport to IsStaff: this endpoint executes
+    # caller-supplied SQL against the read replica. Even with a true
+    # SELECT-only DB role, any reader can pull token hashes, password
+    # hashes, and PII out of the database, so it must be restricted to
+    # staff-level operators rather than the broader is_support role.
+    permission_classes = [rf_permissions.IsAuthenticated, permissions.IsStaff]
     serializer_class = QuerySerializer
 
     @extend_schema(
         summary="Execute read-only SQL query",
-        description="Execute a given SQL query against a read-only database replica. This is a powerful tool for diagnostics and reporting, but should be used with caution. Requires support user permissions.",
+        description="Execute a given SQL query against a read-only database replica. This is a powerful tool for diagnostics and reporting, but should be used with caution. Requires staff user permissions.",
         request=QuerySerializer,
         responses={
             200: list[Any],
@@ -1431,6 +1563,11 @@ class TableGrowthStatsViewSet(APIView):
     """
 
     permission_classes = [rf_permissions.IsAuthenticated, permissions.IsSupport]
+
+    def get_permissions(self):
+        if self.request.method == "POST":
+            return [rf_permissions.IsAuthenticated(), permissions.IsStaff()]
+        return super().get_permissions()
 
     @extend_schema(
         summary="Get table growth statistics",
@@ -1594,6 +1731,20 @@ Requires support user permissions.""",
 
         return Response(response_data, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        summary="Trigger table size sampling",
+        description="Triggers the sample_table_sizes Celery task to collect current table size data. "
+        "Requires staff permissions.",
+        request=None,
+        responses={status.HTTP_202_ACCEPTED: TableGrowthTriggerResponseSerializer},
+    )
+    def post(self, request, *args, **kwargs):
+        sample_table_sizes.delay()
+        return Response(
+            {"detail": "Table size sampling task has been scheduled."},
+            status=status.HTTP_202_ACCEPTED,
+        )
+
 
 @extend_schema(exclude=True)
 @api_view(["GET"])
@@ -1637,6 +1788,11 @@ def get_latest_github_tag(timeout=5):
     Fetch the latest tag from GitHub with caching.
     Cache timeout is 1 hour to avoid hitting GitHub API too frequently.
     """
+    if not config.CHECK_FOR_UPDATES:
+        # Update checks are disabled (e.g. deployments without egress). Skip the
+        # outbound request to api.github.com entirely.
+        return None
+
     cache_key = "waldur_latest_github_tag"
     cached_version = cache.get(cache_key)
     if cached_version:
@@ -1649,23 +1805,33 @@ def get_latest_github_tag(timeout=5):
         )
         response.raise_for_status()
     except requests.RequestException as e:
-        logger.error(f"Failed to fetch latest GitHub tag: {str(e)}")
+        # External network failures are expected and non-actionable — keep them
+        # out of the production error log.
+        logger.warning(f"Failed to fetch latest GitHub tag: {str(e)}")
         return None
 
     try:
         tags = response.json()
     except requests.JSONDecodeError:
-        logger.error("Failed to decode JSON response from GitHub")
+        logger.warning("Failed to decode JSON response from GitHub")
         return None
 
-    # Get the last tag (most recent one)
-    try:
-        tags.sort(key=lambda x: version.Version(x["ref"].split("/")[-1]))
-        latest_tag = tags[-1]["ref"].replace("refs/tags/", "")
+    # Filter to tags with valid PEP 440 version strings and sort them
+    valid_tags = []
+    for tag in tags:
+        try:
+            tag_name = tag["ref"].split("/")[-1]
+            tag_version = version.Version(tag_name)
+            valid_tags.append((tag_version, tag_name))
+        except (TypeError, KeyError, version.InvalidVersion):
+            continue
 
-    except (TypeError, KeyError, version.InvalidVersion) as e:
-        logger.error("Error processing GitHub tags: %s", str(e))
+    if not valid_tags:
+        logger.warning("No valid version tags found among GitHub tags")
         return None
+
+    valid_tags.sort(key=lambda x: x[0])
+    latest_tag = valid_tags[-1][1]
 
     # Cache for 1 hour
     cache.set(cache_key, latest_tag, timeout=3600)
@@ -1772,9 +1938,22 @@ class ActionMethodMixin:
                     status=status.HTTP_201_CREATED,
                 )
 
+            queryset = getattr(obj, set_name)
+            if hasattr(queryset, "all"):
+                queryset = queryset.all()
+            # Respect ?page / ?page_size when the viewset has a pagination
+            # class configured (LinkHeaderPagination by default).
+            page = self.paginate_queryset(queryset)
+            if page is not None:
+                serializer = self.get_serializer(
+                    page,
+                    context=self.get_serializer_context(),
+                    many=True,
+                )
+                return self.get_paginated_response(serializer.data)
             return Response(
                 self.get_serializer(
-                    getattr(obj, set_name),
+                    queryset,
                     context=self.get_serializer_context(),
                     many=True,
                 ).data,
@@ -1930,7 +2109,7 @@ class SettingsMetadataView(APIView):
                     default = settings.CONSTANCE_CONFIG[key][0]
                     description = settings.CONSTANCE_CONFIG[key][1].replace("'", "\\'")
                     value_type = (
-                        len(settings.CONSTANCE_CONFIG[key]) == 3
+                        len(settings.CONSTANCE_CONFIG[key]) >= 3
                         and settings.CONSTANCE_CONFIG[key][2]
                         or None
                     )
@@ -1955,15 +2134,241 @@ class SettingsMetadataView(APIView):
                     else:
                         formatted_type = "string"
 
-                    section["items"].append(
-                        {
-                            "key": key,
-                            "description": description,
-                            "default": formatted_default,
-                            "type": formatted_type,
-                        }
-                    )
+                    item_data = {
+                        "key": key,
+                        "description": description,
+                        "default": formatted_default,
+                        "type": formatted_type,
+                    }
+
+                    if (
+                        hasattr(settings, "CONSTANCE_CONFIG_CHOICES")
+                        and key in settings.CONSTANCE_CONFIG_CHOICES
+                    ):
+                        choices = settings.CONSTANCE_CONFIG_CHOICES[key]
+                        item_data["options"] = [
+                            {"value": c[0], "label": c[1]} for c in choices
+                        ]
+
+                    section["items"].append(item_data)
 
             settings_data.append(section)
 
         return Response({"settings": settings_data})
+
+
+class PersonalAccessTokenViewSet(ActionsViewSet):
+    """Manage personal access tokens for programmatic API access."""
+
+    serializer_class = PersonalAccessTokenSerializer
+    create_serializer_class = PersonalAccessTokenCreateSerializer
+    lookup_field = "uuid"
+    disabled_actions = ["update", "partial_update"]
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return models.PersonalAccessToken.objects.none()
+        return models.PersonalAccessToken.objects.filter(user=self.request.user)
+
+    def initial(self, request, *args, **kwargs):
+        super().initial(request, *args, **kwargs)
+        # Block PAT-via-PAT for management endpoints
+        if self.action in ("create", "destroy", "rotate"):
+            auth = getattr(request, "auth", None)
+            if auth and hasattr(auth, "token_hash"):
+                raise exceptions.PermissionDenied(
+                    "PAT management requires session or token authentication."
+                )
+
+    @extend_schema(
+        summary="Create a personal access token",
+        request=PersonalAccessTokenCreateSerializer,
+        responses={201: PersonalAccessTokenCreatedSerializer},
+    )
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        pat = serializer.save()
+
+        event_logger.emit(
+            f"Personal access token {pat.name} has been created for user {{affected_user_username}}.",
+            event_type=EventType.PAT_CREATED,
+            event_context={"affected_user": request.user},
+            scopes=[request.user],
+        )
+
+        response_data = PersonalAccessTokenCreatedSerializer(
+            {
+                "uuid": pat.uuid,
+                "name": pat.name,
+                "token": pat._plaintext_token,
+                "scopes": pat.scopes,
+                "allowed_scopes": _serialize_allowed_scopes(pat.allowed_scopes),
+                "expires_at": pat.expires_at,
+                "created": pat.created,
+            }
+        ).data
+
+        response = Response(response_data, status=status.HTTP_201_CREATED)
+        response["Cache-Control"] = "no-store"
+        return response
+
+    @extend_schema(
+        summary="Revoke a personal access token",
+        responses={204: None},
+    )
+    def destroy(self, request, *args, **kwargs):
+        pat = self.get_object()
+        pat.is_active = False
+        pat.save(update_fields=["is_active"])
+
+        event_logger.emit(
+            f"Personal access token {pat.name} has been revoked for user {{affected_user_username}}.",
+            event_type=EventType.PAT_REVOKED,
+            event_context={"affected_user": request.user},
+            scopes=[request.user],
+        )
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @extend_schema(
+        summary="Rotate a personal access token",
+        request=None,
+        responses={201: PersonalAccessTokenCreatedSerializer},
+    )
+    @action(detail=True, methods=["post"])
+    def rotate(self, request, uuid=None):
+        """Atomically revoke the old token and create a new one with the same scopes and bindings."""
+        from django.db import transaction as db_transaction
+
+        old_pat = self.get_object()
+
+        with db_transaction.atomic():
+            # Lock the row
+            locked = models.PersonalAccessToken.objects.select_for_update().get(
+                pk=old_pat.pk
+            )
+            if not locked.is_active:
+                raise ValidationError("Cannot rotate an inactive token.")
+
+            # Generate new token
+            full_token, prefix, token_hash = models.PersonalAccessToken.generate_token(
+                locked.expires_at
+            )
+            new_pat = models.PersonalAccessToken.objects.create(
+                user=request.user,
+                name=locked.name,
+                token_prefix=prefix,
+                token_hash=token_hash,
+                scopes=locked.scopes,
+                allowed_scopes=locked.allowed_scopes,
+                expires_at=locked.expires_at,
+            )
+
+            # Revoke old
+            locked.is_active = False
+            locked.save(update_fields=["is_active"])
+
+        event_logger.emit(
+            f"Personal access token {new_pat.name} has been rotated for user {{affected_user_username}}.",
+            event_type=EventType.PAT_ROTATED,
+            event_context={"affected_user": request.user},
+            scopes=[request.user],
+        )
+
+        response_data = PersonalAccessTokenCreatedSerializer(
+            {
+                "uuid": new_pat.uuid,
+                "name": new_pat.name,
+                "token": full_token,
+                "scopes": new_pat.scopes,
+                "allowed_scopes": _serialize_allowed_scopes(new_pat.allowed_scopes),
+                "expires_at": new_pat.expires_at,
+                "created": new_pat.created,
+            }
+        ).data
+
+        response = Response(response_data, status=status.HTTP_201_CREATED)
+        response["Cache-Control"] = "no-store"
+        return response
+
+    @extend_schema(
+        summary="List available scopes for PAT creation",
+        responses={200: AvailableScopeSerializer(many=True)},
+    )
+    @action(detail=False, methods=["get"])
+    def available_scopes(self, request):
+        """Return permissions the current user can delegate to a PAT.
+
+        Staff users can delegate any permission (they bypass UserRole checks).
+        For other users only the permissions granted by their active roles are
+        offered, plus SUPPORT.ACCESS for support users — mirroring what the
+        create serializer would accept.
+        """
+        user = request.user
+        if user.is_staff:
+            allowed = {perm.value for perm in PermissionEnum}
+        else:
+            allowed = set(
+                UserRole.objects.filter(user=user, is_active=True)
+                .values_list("role__permissions__permission", flat=True)
+                .distinct()
+            )
+            allowed.discard(None)
+            allowed.discard("")
+            # Global scopes are gated on user flags, not roles.
+            allowed.discard(PermissionEnum.STAFF_ACCESS.value)
+            allowed.discard(PermissionEnum.SUPPORT_ACCESS.value)
+            if user.is_support:
+                allowed.add(PermissionEnum.SUPPORT_ACCESS.value)
+        result = [
+            {"permission": perm.value, "description": perm.value}
+            for perm in PermissionEnum
+            if perm.value in allowed
+        ]
+        return Response(AvailableScopeSerializer(result, many=True).data)
+
+    @extend_schema(
+        summary="List entity types the caller can bind each permission to",
+        responses={200: AvailableBindingTargetSerializer(many=True)},
+    )
+    @action(detail=False, methods=["get"])
+    def available_binding_targets(self, request):
+        """For each permission, which TYPE_MAP keys the caller could bind a PAT to.
+
+        Drives the create-PAT frontend's type picker. For staff users every
+        type is offered for every permission (they bypass UserRole checks).
+        For other users we return only types where they hold an active role
+        granting the permission directly (the binding then inherits to
+        descendants at request time).
+        """
+        user = request.user
+        perm_to_types: dict[str, set[str]] = defaultdict(set)
+        if user.is_staff:
+            type_keys = set(TYPE_MAP.keys())
+            for perm in PermissionEnum:
+                if perm in (PermissionEnum.STAFF_ACCESS, PermissionEnum.SUPPORT_ACCESS):
+                    continue
+                perm_to_types[perm.value] = set(type_keys)
+        else:
+            rows = (
+                UserRole.objects.filter(user=user, is_active=True)
+                .values_list(
+                    "content_type__app_label",
+                    "content_type__model",
+                    "role__permissions__permission",
+                )
+                .distinct()
+            )
+            for app_label, model_name, perm_value in rows:
+                if not perm_value:
+                    continue
+                type_key = TYPE_KEY_BY_CT.get((app_label, model_name))
+                if type_key:
+                    perm_to_types[perm_value].add(type_key)
+
+        result = [
+            {"permission": perm, "types": sorted(types)}
+            for perm, types in sorted(perm_to_types.items())
+        ]
+        return Response(AvailableBindingTargetSerializer(result, many=True).data)

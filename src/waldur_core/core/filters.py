@@ -67,6 +67,20 @@ class GenericKeyFilterBackend(BaseFilterBackend):
             )
         return queryset
 
+    def get_schema_operation_parameters(self, view):
+        return [
+            {
+                "name": self.get_field_name(),
+                "required": False,
+                "in": "query",
+                "schema": {
+                    "type": "string",
+                    "format": "uri",
+                },
+                "description": f"Filter by {self.get_field_name()} URL.",
+            }
+        ]
+
 
 class MappedMultipleChoiceFilter(django_filters.MultipleChoiceFilter):
     """
@@ -106,12 +120,6 @@ class LooseMultipleChoiceFilter(MultipleChoiceFilter):
     field_class = LooseMultipleChoiceField
 
 
-class UUIDInFilter(django_filters.BaseInFilter, django_filters.UUIDFilter):
-    """A UUIDFilter that accepts multiple values (comma-separated)."""
-
-    pass
-
-
 class CharInFilter(django_filters.BaseInFilter, django_filters.CharFilter):
     """A CharFilter that accepts multiple values (comma-separated)."""
 
@@ -139,10 +147,40 @@ class URLFilter(django_filters.CharFilter):
         if value in EMPTY_VALUES:
             return qs
 
-        uuid_value = self.get_uuid(value)
-        if not core_utils.is_uuid_like(uuid_value):
+        lookup_value = self.get_uuid(value)
+        if not lookup_value:
             return qs.none()
-        return super().filter(qs, uuid_value)
+        if self.lookup_field == "uuid" and not core_utils.is_uuid_like(lookup_value):
+            return qs.none()
+        return super().filter(qs, lookup_value)
+
+
+class RelatedUUIDFilter(django_filters.UUIDFilter):
+    """
+    UUIDFilter that also stores view_name for OpenAPI schema generation.
+    """
+
+    def __init__(self, view_name=None, **kwargs):
+        super().__init__(**kwargs)
+        self.view_name = view_name
+
+
+class RelatedUUIDInFilter(django_filters.BaseInFilter, RelatedUUIDFilter):
+    """
+    UUIDInFilter that also stores view_name for OpenAPI schema generation.
+    """
+
+    pass
+
+
+class ModelMultipleChoiceFilter(django_filters.ModelMultipleChoiceFilter):
+    """
+    ModelMultipleChoiceFilter that also stores view_name for OpenAPI schema generation.
+    """
+
+    def __init__(self, view_name=None, **kwargs):
+        super().__init__(**kwargs)
+        self.view_name = view_name
 
 
 class TimestampFilter(django_filters.NumberFilter):
@@ -222,6 +260,13 @@ class ExternalFilterBackend(BaseFilterBackend):
             queryset = item.filter_queryset(request, queryset, view)
         return queryset
 
+    def get_schema_operation_parameters(self, view):
+        parameters = []
+        for item in self.__class__.get_registered_filters():
+            if hasattr(item, "get_schema_operation_parameters"):
+                parameters.extend(item.get_schema_operation_parameters(view))
+        return parameters
+
 
 class EmptyFilter(django_filters.CharFilter):
     """
@@ -276,7 +321,13 @@ class ExtendedOrderingFilter(django_filters.OrderingFilter):
 
 class CreatedModifiedFilter(django_filters.FilterSet):
     created = django_filters.DateTimeFilter(lookup_expr="gte", label="Created after")
+    created_before = django_filters.DateTimeFilter(
+        field_name="created", lookup_expr="lte", label="Created before"
+    )
     modified = django_filters.DateTimeFilter(lookup_expr="gte", label="Modified after")
+    modified_before = django_filters.DateTimeFilter(
+        field_name="modified", lookup_expr="lte", label="Modified before"
+    )
 
 
 def filter_by_full_name(queryset, value, field=""):

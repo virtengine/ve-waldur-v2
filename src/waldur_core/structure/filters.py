@@ -5,7 +5,7 @@ from django.conf import settings as django_settings
 from django.contrib.contenttypes.models import ContentType
 from django.core import exceptions
 from django.db.models import OuterRef, Q, Subquery
-from django.db.models.functions import Concat
+from django.db.models.functions import Concat, Length
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django_filters.widgets import BooleanWidget
@@ -24,6 +24,7 @@ from waldur_core.core.utils import get_ordering, is_uuid_like, order_with_nulls
 from waldur_core.permissions.enums import (
     SYSTEM_CUSTOMER_ROLES,
     SYSTEM_PROJECT_ROLES,
+    PermissionEnum,
     RoleEnum,
 )
 from waldur_core.permissions.models import UserRole
@@ -96,6 +97,26 @@ class GenericRoleFilter(BaseFilterBackend):
             call_manager_ct = None
             call_ct = None
 
+        # Resource and ResourceProject roles also confer customer visibility
+        # via Resource.project.customer. Lazy import keeps waldur_core free of
+        # marketplace dependencies at module load.
+        try:
+            from waldur_mastermind.marketplace.models import (
+                Resource as MarketplaceResource,
+            )
+            from waldur_mastermind.marketplace.models import ResourceProject
+
+            resource_ct = ContentType.objects.get_for_model(MarketplaceResource)
+            resource_project_ct = ContentType.objects.get_for_model(ResourceProject)
+            content_type_conditions |= Q(content_type=resource_ct) | Q(
+                content_type=resource_project_ct
+            )
+        except ImportError:
+            resource_ct = None
+            resource_project_ct = None
+            MarketplaceResource = None
+            ResourceProject = None
+
         # Single query to get all relevant user roles
         user_roles = (
             UserRole.objects.filter(user=user, is_active=True)
@@ -108,6 +129,8 @@ class GenericRoleFilter(BaseFilterBackend):
         project_ids = []
         call_manager_ids = []
         call_ids = []
+        resource_ids = []
+        resource_project_ids = []
 
         for role in user_roles:
             model_name = role["content_type__model"]
@@ -121,13 +144,31 @@ class GenericRoleFilter(BaseFilterBackend):
                 call_manager_ids.append(object_id)
             elif model_name == "call":
                 call_ids.append(object_id)
+            elif model_name == "resource":
+                resource_ids.append(object_id)
+            elif model_name == "resourceproject":
+                resource_project_ids.append(object_id)
 
         # Handle project-level access (customers via projects)
         if project_ids:
-            project_customer_ids = models.Project.objects.filter(
+            project_customer_ids = models.Project.available_objects.filter(
                 id__in=project_ids
             ).values_list("customer_id", flat=True)
             accessible_customer_ids.update(project_customer_ids)
+
+        # Resource → Project → Customer
+        if resource_ids and MarketplaceResource is not None:
+            resource_customer_ids = MarketplaceResource.objects.filter(
+                id__in=resource_ids
+            ).values_list("project__customer_id", flat=True)
+            accessible_customer_ids.update(resource_customer_ids)
+
+        # ResourceProject → Resource → Project → Customer
+        if resource_project_ids and ResourceProject is not None:
+            rp_customer_ids = ResourceProject.objects.filter(
+                id__in=resource_project_ids
+            ).values_list("resource__project__customer_id", flat=True)
+            accessible_customer_ids.update(rp_customer_ids)
 
         # Handle call management permissions using the data we already collected
         if call_manager_ids and call_manager_ct:
@@ -169,6 +210,17 @@ class GenericUserFilter(BaseFilterBackend):
 
         return filter_queryset_for_user(queryset, user)
 
+    def get_schema_operation_parameters(self, view):
+        return [
+            build_parameter_type(
+                name="user_uuid",
+                schema={"type": "string", "format": "uuid"},
+                location=OpenApiParameter.QUERY,
+                description="Filter by user UUID.",
+                extensions={"x-waldur-operation-id": "users_retrieve"},
+            )
+        ]
+
 
 class CustomerFilter(NameFilterSet):
     query = django_filters.CharFilter(
@@ -184,21 +236,35 @@ class CustomerFilter(NameFilterSet):
     contact_details = django_filters.CharFilter(
         lookup_expr="icontains", label="Contact details"
     )
-    organization_group_uuid = django_filters.ModelMultipleChoiceFilter(
+    organization_group_uuid = core_filters.ModelMultipleChoiceFilter(
         field_name="organization_groups__uuid",
         label="Organization group UUID",
         to_field_name="uuid",
         queryset=models.OrganizationGroup.objects.all(),
+        view_name="organization-group-detail",
     )
     organization_group_name = django_filters.CharFilter(
         field_name="organization_groups__name",
         lookup_expr="icontains",
         label="Organization group name",
     )
+    slug = django_filters.CharFilter(
+        field_name="slug", lookup_expr="exact", label="Slug"
+    )
     owned_by_current_user = django_filters.BooleanFilter(
         widget=BooleanWidget,
         method="filter_owned_by_current_user",
         label="Return a list of customers where current user is owner.",
+    )
+    current_user_has_project_create_permission = django_filters.BooleanFilter(
+        widget=BooleanWidget,
+        method="filter_current_user_has_project_create_permission",
+        label="Return a list of customers where current user has project create permission.",
+    )
+    current_user_has_role = core_filters.CharInFilter(
+        method="filter_current_user_has_role",
+        label="Filter organizations where the current user holds one of the given "
+        "roles (on the organization or any of its projects).",
     )
 
     class Meta:
@@ -233,6 +299,43 @@ class CustomerFilter(NameFilterSet):
             return queryset.filter(id__in=ids)
         return queryset
 
+    def filter_current_user_has_project_create_permission(self, queryset, name, value):
+        user = self.request.user
+
+        if user.is_staff:
+            return queryset
+
+        customer_ids_with_permission = (
+            UserRole.objects.filter(
+                user=user,
+                is_active=True,
+            )
+            .filter(
+                role__permissions__permission=PermissionEnum.CREATE_PROJECT,
+                content_type=ContentType.objects.get_for_model(models.Customer),
+                object_id__in=queryset.values_list("id", flat=True),
+            )
+            .values_list("object_id", flat=True)
+            .distinct()
+        )
+
+        if value:
+            return queryset.filter(id__in=customer_ids_with_permission)
+
+        return queryset
+
+    def filter_current_user_has_role(self, queryset, name, value):
+        user = self.request.user
+        if user.is_anonymous or not value:
+            return queryset
+        connected_customers = get_connected_customers(user, value)
+        project_customers = models.Project.objects.filter(
+            id__in=get_connected_projects(user, value)
+        ).values_list("customer_id", flat=True)
+        return queryset.filter(
+            Q(id__in=connected_customers) | Q(id__in=project_customers)
+        ).distinct()
+
 
 class ExternalCustomerFilterBackend(ExternalFilterBackend):
     pass
@@ -243,6 +346,17 @@ class AccountingStartDateFilter(BaseFilterBackend):
         query = Q(accounting_start_date__gt=timezone.now())
         return filter_by_accounting_is_running(request, queryset, query)
 
+    def get_schema_operation_parameters(self, view):
+        return [
+            build_parameter_type(
+                name="accounting_is_running",
+                schema={"type": "boolean"},
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Filter by whether accounting is running.",
+            )
+        ]
+
 
 class CustomerAccountingStartDateFilter(BaseFilterBackend):
     def filter_queryset(self, request, queryset, view):
@@ -251,6 +365,17 @@ class CustomerAccountingStartDateFilter(BaseFilterBackend):
         else:
             query = Q(customer__accounting_start_date__gt=timezone.now())
         return filter_by_accounting_is_running(request, queryset, query)
+
+    def get_schema_operation_parameters(self, view):
+        return [
+            build_parameter_type(
+                name="accounting_is_running",
+                schema={"type": "boolean"},
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Filter by whether accounting is running.",
+            )
+        ]
 
 
 def filter_by_accounting_is_running(request, queryset, query):
@@ -280,14 +405,10 @@ class ProjectTypeFilter(NameFilterSet):
         fields = ["name"]
 
 
-class CustomerInFilter(django_filters.BaseInFilter, django_filters.UUIDFilter):
-    pass
-
-
 class ProjectFilter(core_filters.CreatedModifiedFilter, NameFilterSet):
-    customer = CustomerInFilter(
+    customer = core_filters.RelatedUUIDInFilter(
+        view_name="customer-detail",
         field_name="customer__uuid",
-        lookup_expr="in",
         distinct=True,
         label="Customer UUID",
     )
@@ -345,6 +466,50 @@ class ProjectFilter(core_filters.CreatedModifiedFilter, NameFilterSet):
 
     is_removed = django_filters.BooleanFilter(widget=BooleanWidget, label="Is removed")
 
+    user_uuid_with_active_role = core_filters.RelatedUUIDFilter(
+        view_name="user-detail",
+        method="filter_by_user_uuid_with_active_role",
+        label="Filter projects where the given user has a role.",
+    )
+
+    current_user_has_role = core_filters.CharInFilter(
+        method="filter_current_user_has_role",
+        label="Filter projects where the current user holds one of the given roles "
+        "(on the project or its organization).",
+    )
+
+    affiliation_uuid = core_filters.ModelMultipleChoiceFilter(
+        field_name="affiliation__uuid",
+        label="Affiliation UUID",
+        to_field_name="uuid",
+        queryset=models.AffiliatedOrganization.objects.all(),
+        view_name="affiliated-organization-detail",
+    )
+
+    affiliation_name = django_filters.CharFilter(
+        field_name="affiliation__name",
+        lookup_expr="icontains",
+        label="Affiliation name",
+    )
+
+    has_affiliation = django_filters.BooleanFilter(
+        widget=BooleanWidget,
+        method="filter_has_affiliation",
+        label="Filter projects that have an affiliation.",
+    )
+
+    science_domain_uuid = core_filters.RelatedUUIDFilter(
+        view_name="science-domain-detail",
+        field_name="science_sub_domain__domain__uuid",
+        label="Science domain UUID",
+    )
+
+    science_sub_domain_uuid = core_filters.RelatedUUIDFilter(
+        view_name="science-sub-domain-detail",
+        field_name="science_sub_domain__uuid",
+        label="Science sub-domain UUID",
+    )
+
     o = django_filters.OrderingFilter(
         fields=(
             ("name", "name"),
@@ -372,6 +537,7 @@ class ProjectFilter(core_filters.CreatedModifiedFilter, NameFilterSet):
             "modified",
             "query",
             "backend_id",
+            "user_uuid_with_active_role",
         ]
 
     def filter_can_manage(self, queryset, name, value):
@@ -385,6 +551,16 @@ class ProjectFilter(core_filters.CreatedModifiedFilter, NameFilterSet):
             ).distinct()
         return queryset
 
+    def filter_current_user_has_role(self, queryset, name, value):
+        user = self.request.user
+        if user.is_anonymous or not value:
+            return queryset
+        connected_projects = get_connected_projects(user, value)
+        connected_customers = get_connected_customers(user, value)
+        return queryset.filter(
+            Q(id__in=connected_projects) | Q(customer__in=connected_customers)
+        ).distinct()
+
     def filter_can_admin(self, queryset, name, value):
         user = self.request.user
 
@@ -392,6 +568,19 @@ class ProjectFilter(core_filters.CreatedModifiedFilter, NameFilterSet):
             connected_projects = get_connected_projects(user, RoleEnum.PROJECT_ADMIN)
             queryset = queryset.filter(id__in=connected_projects)
         return queryset
+
+    def filter_by_user_uuid_with_active_role(self, queryset, name, value):
+        try:
+            user = core_models.User.objects.get(uuid=value)
+        except core_models.User.DoesNotExist:
+            return queryset.none()
+        project_ct = ContentType.objects.get_for_model(models.Project)
+        project_ids = UserRole.objects.filter(
+            user=user,
+            is_active=True,
+            content_type=project_ct,
+        ).values_list("object_id", flat=True)
+        return queryset.filter(id__in=project_ids)
 
     def filter_query(self, queryset, name, value):
         if is_uuid_like(value):
@@ -414,6 +603,11 @@ class ProjectFilter(core_filters.CreatedModifiedFilter, NameFilterSet):
         if value:
             return queryset.exclude(end_date__lt=timezone.now())
         return queryset
+
+    def filter_has_affiliation(self, queryset, name, value):
+        if value:
+            return queryset.filter(affiliation__isnull=False)
+        return queryset.filter(affiliation__isnull=True)
 
 
 def filter_visible_users(queryset, user, extra=None):
@@ -523,11 +717,11 @@ class UserFilter(BaseUserFilter):
         method="filter_query",
         label="Filter by first name, last name, civil number, username or email",
     )
-    customer_uuid = django_filters.UUIDFilter(
-        method="filter_by_customer", label="Customer UUID"
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail", method="filter_by_customer", label="Customer UUID"
     )
-    project_uuid = django_filters.UUIDFilter(
-        method="filter_by_project", label="Project UUID"
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", method="filter_by_project", label="Project UUID"
     )
     username_list = django_filters.CharFilter(
         method="filter_username_list", label="Comma-separated usernames"
@@ -580,11 +774,15 @@ class UserFilter(BaseUserFilter):
 
     def filter_organization_roles(self, queryset, name, value):
         roles = self.request.GET.getlist("organization_roles")
-        return queryset.filter(userrole__role__name__in=roles).distinct()
+        return queryset.filter(
+            userrole__role__name__in=roles, userrole__is_active=True
+        ).distinct()
 
     def filter_project_roles(self, queryset, name, value):
         roles = self.request.GET.getlist("project_roles")
-        return queryset.filter(userrole__role__name__in=roles).distinct()
+        return queryset.filter(
+            userrole__role__name__in=roles, userrole__is_active=True
+        ).distinct()
 
     def filter_query(self, queryset, name, value):
         q = (
@@ -648,8 +846,8 @@ class ConcatenatedNameOrderingBackend(BaseFilterBackend):
 
 
 class PermissionReviewFilter(django_filters.FilterSet):
-    reviewer_uuid = django_filters.UUIDFilter(
-        field_name="reviewer__uuid", label="Reviewer UUID"
+    reviewer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail", field_name="reviewer__uuid", label="Reviewer UUID"
     )
     is_pending = django_filters.BooleanFilter(
         field_name="is_pending", label="Is pending"
@@ -665,8 +863,8 @@ class PermissionReviewFilter(django_filters.FilterSet):
 
 
 class CustomerPermissionReviewFilter(PermissionReviewFilter):
-    customer_uuid = django_filters.UUIDFilter(
-        field_name="customer__uuid", label="Customer UUID"
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail", field_name="customer__uuid", label="Customer UUID"
     )
 
     class Meta:
@@ -677,8 +875,8 @@ class CustomerPermissionReviewFilter(PermissionReviewFilter):
 
 
 class ProjectPermissionReviewFilter(PermissionReviewFilter):
-    project_uuid = django_filters.UUIDFilter(
-        field_name="project__uuid", label="Project UUID"
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", field_name="project__uuid", label="Project UUID"
     )
 
     class Meta:
@@ -688,9 +886,31 @@ class ProjectPermissionReviewFilter(PermissionReviewFilter):
         ]
 
 
+class ProjectEndDateChangeRequestFilter(django_filters.FilterSet):
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", field_name="project__uuid", label="Project UUID"
+    )
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        field_name="project__customer__uuid",
+        label="Customer UUID",
+    )
+    created_by_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail",
+        field_name="created_by__uuid",
+        label="Created by UUID",
+    )
+    state = core_filters.ReviewStateFilter()
+
+    class Meta:
+        model = models.ProjectEndDateChangeRequest
+        fields = []
+
+
 class SshKeyFilter(core_filters.CreatedModifiedFilter, NameFilterSet):
-    uuid = django_filters.UUIDFilter(label="UUID")
-    user_uuid = django_filters.UUIDFilter(field_name="user__uuid", label="User UUID")
+    user_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail", field_name="user__uuid", label="User UUID"
+    )
 
     o = django_filters.OrderingFilter(fields=("name",), label="Ordering")
 
@@ -701,7 +921,6 @@ class SshKeyFilter(core_filters.CreatedModifiedFilter, NameFilterSet):
             "fingerprint_md5",
             "fingerprint_sha256",
             "fingerprint_sha512",
-            "uuid",
             "user_uuid",
             "is_shared",
         ]
@@ -719,13 +938,13 @@ class ServiceSettingsFilter(NameFilterSet):
         CoreStates.choices,
         label="State",
     )
-    customer = django_filters.UUIDFilter(
-        field_name="customer__uuid", label="Customer UUID"
+    customer = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail", field_name="customer__uuid", label="Customer UUID"
     )
-    customer_uuid = django_filters.UUIDFilter(
-        field_name="customer__uuid", label="Customer UUID"
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail", field_name="customer__uuid", label="Customer UUID"
     )
-    scope_uuid = django_filters.UUIDFilter(
+    scope_uuid = core_filters.RelatedUUIDFilter(
         method=get_generic_field_filter(
             models_to_search=models.BaseResource.get_all_models()
         ),
@@ -753,11 +972,15 @@ class BaseResourceFilter(NameFilterSet):
         )
 
     # customer
-    customer = django_filters.UUIDFilter(
-        field_name="project__customer__uuid", label="Customer UUID"
+    customer = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        field_name="project__customer__uuid",
+        label="Customer UUID",
     )
-    customer_uuid = django_filters.UUIDFilter(
-        field_name="project__customer__uuid", label="Customer UUID"
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        field_name="project__customer__uuid",
+        label="Customer UUID",
     )
     customer_name = django_filters.CharFilter(
         field_name="project__customer__name",
@@ -775,18 +998,20 @@ class BaseResourceFilter(NameFilterSet):
         label="Customer abbreviation",
     )
     # project
-    project = django_filters.UUIDFilter(
-        field_name="project__uuid", label="Project UUID"
+    project = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", field_name="project__uuid", label="Project UUID"
     )
-    project_uuid = django_filters.UUIDFilter(
-        field_name="project__uuid", label="Project UUID"
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail", field_name="project__uuid", label="Project UUID"
     )
     project_name = django_filters.CharFilter(
         field_name="project__name", lookup_expr="icontains", label="Project name"
     )
     # service settings
-    service_settings_uuid = django_filters.UUIDFilter(
-        field_name="service_settings__uuid", label="Service settings UUID"
+    service_settings_uuid = core_filters.RelatedUUIDFilter(
+        view_name="servicesettings-detail",
+        field_name="service_settings__uuid",
+        label="Service settings UUID",
     )
     service_settings_name = django_filters.CharFilter(
         field_name="service_settings__name",
@@ -798,7 +1023,6 @@ class BaseResourceFilter(NameFilterSet):
         lookup_expr="icontains", label="Description"
     )
     state = core_filters.MappedMultipleChoiceFilter(CoreStates.choices, label="State")
-    uuid = django_filters.UUIDFilter(lookup_expr="exact", label="UUID")
     backend_id = django_filters.CharFilter(
         field_name="backend_id", lookup_expr="exact", label="Backend ID"
     )
@@ -864,7 +1088,6 @@ class BaseResourceFilter(NameFilterSet):
             "name_exact",
             "description",
             "state",
-            "uuid",
             "backend_id",
         )
 
@@ -876,6 +1099,20 @@ class StartTimeFilter(BaseFilterBackend):
             return queryset
         return order_with_nulls(queryset, order_by)
 
+    def get_schema_operation_parameters(self, view):
+        return [
+            build_parameter_type(
+                name="o",
+                schema={
+                    "type": "string",
+                    "enum": ["start_time", "-start_time"],
+                },
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Ordering. Sort by start time.",
+            )
+        ]
+
 
 class BaseServicePropertyFilter(NameFilterSet):
     class Meta:
@@ -883,8 +1120,10 @@ class BaseServicePropertyFilter(NameFilterSet):
 
 
 class ServicePropertySettingsFilter(BaseServicePropertyFilter):
-    settings_uuid = django_filters.UUIDFilter(
-        field_name="settings__uuid", label="Settings UUID"
+    settings_uuid = core_filters.RelatedUUIDFilter(
+        view_name="servicesettings-detail",
+        field_name="settings__uuid",
+        label="Settings UUID",
     )
     settings = core_filters.URLFilter(
         view_name="servicesettings-detail",
@@ -898,13 +1137,108 @@ class ServicePropertySettingsFilter(BaseServicePropertyFilter):
 
 
 class OrganizationGroupFilter(NameFilterSet):
-    parent = django_filters.UUIDFilter(field_name="parent__uuid", label="Parent UUID")
+    parent = core_filters.RelatedUUIDFilter(
+        view_name="organization-group-detail",
+        field_name="parent__uuid",
+        label="Parent UUID",
+    )
 
     class Meta:
         model = models.OrganizationGroup
         fields = [
             "name",
         ]
+
+
+class AffiliatedOrganizationFilter(NameFilterSet):
+    query = django_filters.CharFilter(method="filter_query", label="Search")
+    code = django_filters.CharFilter(lookup_expr="iexact", label="Code")
+    abbreviation = django_filters.CharFilter(
+        lookup_expr="icontains", label="Abbreviation"
+    )
+    country = django_filters.CharFilter(lookup_expr="exact", label="Country")
+    default_for_customer = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        field_name="default_for_customers__uuid",
+        label="Limit to a customer's default affiliation list",
+    )
+
+    class Meta:
+        model = models.AffiliatedOrganization
+        fields = [
+            "query",
+            "name",
+            "code",
+            "abbreviation",
+            "country",
+            "default_for_customer",
+        ]
+
+    def filter_query(self, queryset, name, value):
+        return queryset.filter(
+            Q(name__icontains=value)
+            | Q(code__icontains=value)
+            | Q(abbreviation__icontains=value)
+        )
+
+
+class NaturalCodeOrderingFilter(django_filters.OrderingFilter):
+    """OrderingFilter that sorts 'code' field naturally (1, 2, 10 not 1, 10, 2)."""
+
+    def filter(self, qs, value):
+        if not value:
+            return qs
+        ordering = []
+        for field in value:
+            bare = field.lstrip("-")
+            desc = field.startswith("-")
+            if bare == "code":
+                length_expr = Length("code")
+                if desc:
+                    ordering.extend([length_expr.desc(), "-code"])
+                else:
+                    ordering.extend([length_expr.asc(), "code"])
+            else:
+                ordering.append(field)
+        return qs.order_by(*ordering)
+
+
+class ScienceDomainFilter(NameFilterSet):
+    o = NaturalCodeOrderingFilter(
+        fields=(
+            ("name", "name"),
+            ("code", "code"),
+        ),
+    )
+
+    class Meta:
+        model = models.ScienceDomain
+        fields = ["name"]
+
+
+class ScienceSubDomainFilter(NameFilterSet):
+    domain_uuid = core_filters.RelatedUUIDFilter(
+        view_name="science-domain-detail",
+        field_name="domain__uuid",
+        label="Domain UUID",
+    )
+    domain_name = django_filters.CharFilter(
+        field_name="domain__name",
+        lookup_expr="icontains",
+        label="Domain name",
+    )
+    o = NaturalCodeOrderingFilter(
+        fields=(
+            ("name", "name"),
+            ("code", "code"),
+            ("domain__name", "domain_name"),
+            ("projects_count", "projects_count"),
+        ),
+    )
+
+    class Meta:
+        model = models.ScienceSubDomain
+        fields = ["name", "domain_uuid", "domain_name"]
 
 
 class UserAgreementsFilter(django_filters.FilterSet):
@@ -1015,6 +1349,20 @@ class ProjectEstimatedCostFilter(BaseFilterBackend):
         )
         return order_with_nulls(queryset, order_by)
 
+    def get_schema_operation_parameters(self, view):
+        return [
+            build_parameter_type(
+                name="o",
+                schema={
+                    "type": "string",
+                    "enum": ["estimated_cost", "-estimated_cost"],
+                },
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Ordering. Sort by estimated cost.",
+            )
+        ]
+
 
 class NotificationTemplateFilter(NameFilterSet):
     path = django_filters.CharFilter(lookup_expr="icontains", label="Path")
@@ -1071,8 +1419,8 @@ class AccessSubnetFilter(django_filters.FilterSet):
         field_name="customer__uuid",
         label="Customer URL",
     )
-    customer_uuid = django_filters.UUIDFilter(
-        field_name="customer__uuid", label="Customer UUID"
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail", field_name="customer__uuid", label="Customer UUID"
     )
     inet = django_filters.CharFilter(lookup_expr="icontains", label="Inet")
     description = django_filters.CharFilter(

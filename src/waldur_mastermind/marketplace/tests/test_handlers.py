@@ -4,7 +4,7 @@ from unittest import mock
 import httpx
 import respx
 from django.db import transaction
-from rest_framework.test import APITransactionTestCase
+from rest_framework.test import APITestCase
 
 from waldur_core.core.tests.helpers import override_waldur_core_settings
 from waldur_core.logging.models import Event
@@ -20,6 +20,7 @@ from waldur_mastermind.marketplace.enums import (
     BillingTypes,
     OfferingUserStates,
     OrderStates,
+    OrderTypes,
     ResourceStates,
 )
 from waldur_mastermind.marketplace.tests import factories, fixtures
@@ -32,7 +33,64 @@ def add_user_to_project(user, project, role=None):
     tasks.create_or_restore_offering_users_for_user(user.uuid.hex, project.uuid.hex)
 
 
-class ResourceHandlerTest(APITransactionTestCase):
+class OfferingOptionsHandlerTest(APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+
+    def test_event_emitted_when_offering_options_are_updated(self):
+        Event.objects.all().delete()
+        self.fixture.offering.options = {"options": {}, "order": []}
+        self.fixture.offering.save()
+
+        self.fixture.offering.options = {
+            "order": ["storageRequest"],
+            "options": {
+                "storageRequest": {
+                    "type": "integer",
+                    "label": "Storage request (GB)",
+                    "required": True,
+                    "min": 0,
+                    "max": 102400,
+                }
+            },
+        }
+        self.fixture.offering.save()
+
+        event = Event.objects.filter(
+            event_type="marketplace_offering_options_updated"
+        ).first()
+        self.assertIsNotNone(event)
+        self.assertIn(self.fixture.offering.name, event.message)
+        self.assertIn("storageRequest", event.message)
+        self.assertIn("Details:", event.message)
+
+    def test_event_emitted_when_offering_resource_options_are_updated(self):
+        Event.objects.all().delete()
+        self.fixture.offering.resource_options = {"options": {}, "order": []}
+        self.fixture.offering.save()
+
+        self.fixture.offering.resource_options = {
+            "order": ["researchFields"],
+            "options": {
+                "researchFields": {
+                    "type": "string",
+                    "label": "Research fields",
+                    "required": False,
+                }
+            },
+        }
+        self.fixture.offering.save()
+
+        event = Event.objects.filter(
+            event_type="marketplace_offering_resource_options_updated"
+        ).first()
+        self.assertIsNotNone(event)
+        self.assertIn(self.fixture.offering.name, event.message)
+        self.assertIn("researchFields", event.message)
+        self.assertIn("Details:", event.message)
+
+
+class ResourceHandlerTest(APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
 
@@ -370,7 +428,7 @@ class ResourceHandlerTest(APITransactionTestCase):
         )
 
 
-class UpdateOfferingUserUsernameAfterUserChangeTest(APITransactionTestCase):
+class UpdateOfferingUserUsernameAfterUserChangeTest(APITestCase):
     def setUp(self):
         self.offering = factories.OfferingFactory(
             type=BASIC_OFFERING,
@@ -419,7 +477,64 @@ class UpdateOfferingUserUsernameAfterUserChangeTest(APITransactionTestCase):
         self.assertEqual(offering_user.username, "old_username")
 
 
-class SetOrderCompletionTimestampTest(APITransactionTestCase):
+class UpdateOfferingUserUsernameAfterOfferingSettingsChangeTest(APITestCase):
+    def setUp(self):
+        self.old_username = "old_username"
+        self.site_username = "site-user"
+        self.preserved_username = "preserved_username"
+        self.offering = factories.OfferingFactory(
+            type=BASIC_OFFERING,
+            plugin_options={
+                "username_generation_policy": utils.UsernameGenerationPolicy.WALDUR_USERNAME.value
+            },
+        )
+
+        self.offering_user = factories.OfferingUserFactory(
+            offering=self.offering,
+            username=self.old_username,
+        )
+
+    def test_update_offering_user_username_when_username_generation_policy_changes(
+        self,
+    ):
+        self.offering.plugin_options["username_generation_policy"] = (
+            utils.UsernameGenerationPolicy.IDENTITY_CLAIM.value
+        )
+        self.offering_user.user.details = {"site_username": self.site_username}
+        self.offering_user.user.save()
+        self.offering.save()
+
+        self.offering_user.refresh_from_db()
+        self.assertEqual(self.offering_user.username, self.site_username)
+
+    def test_do_not_update_offering_user_username_when_unrelated_plugin_option_changes(
+        self,
+    ):
+        self.offering.plugin_options["offering_user_auto_deletion"] = True
+        self.offering.save()
+
+        self.offering_user.refresh_from_db()
+        self.assertEqual(self.offering_user.username, self.old_username)
+
+    def test_do_not_clear_offering_user_username_for_service_provider_policy_on_unrelated_change(
+        self,
+    ):
+        self.offering.plugin_options = {
+            "username_generation_policy": utils.UsernameGenerationPolicy.SERVICE_PROVIDER.value
+        }
+        self.offering.save()
+
+        self.offering_user.username = self.preserved_username
+        self.offering_user.save()
+
+        self.offering.plugin_options["offering_user_auto_deletion"] = True
+        self.offering.save()
+
+        self.offering_user.refresh_from_db()
+        self.assertEqual(self.offering_user.username, self.preserved_username)
+
+
+class SetOrderCompletionTimestampTest(APITestCase):
     def setUp(self):
         self.fixed_time = datetime.datetime(2025, 5, 23, 12, 0, 0)
         self.order = factories.OrderFactory(state=OrderStates.PENDING_PROVIDER)
@@ -482,7 +597,7 @@ TOKEN_SECRET = "test-secret"
     SERVICE_ACCOUNT_TOKEN_CLIENT_ID=TOKEN_CLIENT_ID,
     SERVICE_ACCOUNT_TOKEN_SECRET=TOKEN_SECRET,
 )
-class ServiceAccountHandlersTest(APITransactionTestCase):
+class ServiceAccountHandlersTest(APITestCase):
     def setUp(self):
         respx.start()
         self.fixture = fixtures.MarketplaceFixture()
@@ -661,7 +776,7 @@ class ServiceAccountHandlersTest(APITransactionTestCase):
         )
 
 
-class OfferingUserCreationWithUsernameTest(APITransactionTestCase):
+class OfferingUserCreationWithUsernameTest(APITestCase):
     """
     Test that OfferingUser instances are created with correct state when username is known.
     """
@@ -671,15 +786,20 @@ class OfferingUserCreationWithUsernameTest(APITransactionTestCase):
         # Create a second offering for testing multiple offerings
         self.offering2 = factories.OfferingFactory(customer=self.fixture.customer)
 
-    def test_create_offering_user_for_new_resource_with_ok_state_when_username_provided(
-        self,
+    @mock.patch(
+        "waldur_mastermind.marketplace.tasks.create_or_restore_offering_users_for_project.delay"
+    )
+    def test_create_offering_user_for_new_resource_dispatches_batch_task(
+        self, mock_delay
     ):
         """
-        Test that handlers.create_offering_user_for_new_resource creates OfferingUser with OK state.
+        Test that handlers.create_offering_user_for_new_resource dispatches
+        a single batch Celery task for the project.
         """
-        # Configure offering to generate usernames
+        # Configure offering to generate usernames and allow user creation
         self.fixture.offering.plugin_options = {
             "username_generation_policy": "full_name",
+            "service_provider_can_create_offering_user": True,
         }
         self.fixture.offering.save()
 
@@ -690,57 +810,17 @@ class OfferingUserCreationWithUsernameTest(APITransactionTestCase):
             state=ResourceStates.OK,
         )
 
-        # Call the handler function
-        marketplace_handlers.create_offering_user_for_new_resource(
-            None, resource, created=True
-        )
-
-        # Verify OfferingUser was created with OK state
-        project_users = self.fixture.project.get_users()
-        for user in project_users:
-            offering_user = marketplace_models.OfferingUser.objects.get(
-                user=user, offering=self.fixture.offering
+        # Call the handler function inside captureOnCommitCallbacks to execute deferred callbacks
+        with self.captureOnCommitCallbacks(execute=True):
+            marketplace_handlers.create_offering_user_for_new_resource(
+                None, resource, created=True
             )
-            self.assertEqual(offering_user.state, OfferingUserStates.OK)
-            self.assertIsNotNone(offering_user.username)
-            # Username should be based on full name for this policy
-            self.assertIn(user.first_name.lower(), offering_user.username)
 
-    def test_create_offering_user_for_new_resource_with_creation_requested_when_no_username(
-        self,
-    ):
-        """
-        Test that handlers.create_offering_user_for_new_resource creates OfferingUser with CREATION_REQUESTED state.
-        """
-        # Configure offering to NOT generate usernames
-        self.fixture.offering.plugin_options = {
-            "username_generation_policy": "service_provider",
-        }
-        self.fixture.offering.save()
-
-        # Create a resource that triggers the handler
-        resource = factories.ResourceFactory(
-            offering=self.fixture.offering,
-            project=self.fixture.project,
-            state=ResourceStates.OK,
-        )
-
-        # Call the handler function
-        marketplace_handlers.create_offering_user_for_new_resource(
-            None, resource, created=True
-        )
-
-        # Verify OfferingUser was created with CREATION_REQUESTED state
-        project_users = self.fixture.project.get_users()
-        for user in project_users:
-            offering_user = marketplace_models.OfferingUser.objects.get(
-                user=user, offering=self.fixture.offering
-            )
-            self.assertEqual(offering_user.state, OfferingUserStates.CREATION_REQUESTED)
-            self.assertEqual(offering_user.username, "")
+        # Verify a single batch Celery task was dispatched for the project
+        mock_delay.assert_called_once_with(self.fixture.project.uuid.hex)
 
 
-class OfferingUserDirectCreationTest(APITransactionTestCase):
+class OfferingUserDirectCreationTest(APITestCase):
     """
     Test direct creation of OfferingUser objects with different username scenarios.
     """
@@ -789,15 +869,16 @@ class OfferingUserDirectCreationTest(APITransactionTestCase):
         self.assertEqual(offering_user.username, "")
 
 
-class OfferingUserDeletionOnProjectAccessLossTest(APITransactionTestCase):
+class OfferingUserDeletionOnProjectAccessLossTest(APITestCase):
     """Test that offering users are marked for deletion when user loses project access."""
 
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
-        # Configure offering to support offering users
+        # Configure offering to support offering users with auto deletion enabled
         self.fixture.offering.plugin_options = {
             "service_provider_can_create_offering_user": True,
             "username_generation_policy": "waldur_username",
+            "offering_user_auto_deletion": True,
         }
         self.fixture.offering.save()
 
@@ -866,6 +947,7 @@ class OfferingUserDeletionOnProjectAccessLossTest(APITransactionTestCase):
             plugin_options={
                 "service_provider_can_create_offering_user": True,
                 "username_generation_policy": "waldur_username",
+                "offering_user_auto_deletion": True,
             },
         )
         factories.ResourceFactory(
@@ -914,7 +996,7 @@ class OfferingUserDeletionOnProjectAccessLossTest(APITransactionTestCase):
         )
 
 
-class OfferingUserRestorationOnProjectAccessGainedTest(APITransactionTestCase):
+class OfferingUserRestorationOnProjectAccessGainedTest(APITestCase):
     """Test that offering users are restored when user regains project access."""
 
     def setUp(self):
@@ -1098,7 +1180,7 @@ class OfferingUserRestorationOnProjectAccessGainedTest(APITransactionTestCase):
         self.assertIn(self.fixture.offering.name, event.message)
 
 
-class CleanupStaleOfferingUsersTest(APITransactionTestCase):
+class CleanupStaleOfferingUsersTest(APITestCase):
     """Test the periodic cleanup task for stale offering users."""
 
     def setUp(self):
@@ -1190,3 +1272,427 @@ class CleanupStaleOfferingUsersTest(APITransactionTestCase):
         tasks.cleanup_stale_offering_users()
 
         mock_delay.assert_called_once_with(self.user1.uuid.hex)
+
+
+class OfferingUserAutoDeleteDisabledTest(APITestCase):
+    """Test that offering users are NOT auto-deleted when offering_user_auto_deletion is False or missing."""
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        # Configure offering WITHOUT offering_user_auto_deletion (default is False)
+        self.fixture.offering.plugin_options = {
+            "service_provider_can_create_offering_user": True,
+            "username_generation_policy": "waldur_username",
+        }
+        self.fixture.offering.save()
+
+        self.resource = factories.ResourceFactory(
+            offering=self.fixture.offering,
+            project=self.fixture.project,
+            state=ResourceStates.OK,
+        )
+
+        self.test_user = structure_factories.UserFactory(username="test_user")
+
+    def test_offering_user_not_deleted_when_auto_deletion_disabled(self):
+        """Offering user in OK state is NOT marked for deletion when auto_deletion is off."""
+        add_user_to_project(self.test_user, self.fixture.project)
+
+        offering_user = marketplace_models.OfferingUser.objects.get(
+            user=self.test_user, offering=self.fixture.offering
+        )
+        self.assertEqual(offering_user.state, OfferingUserStates.OK)
+
+        self.fixture.project.remove_user(self.test_user, ProjectRole.MANAGER)
+        tasks.request_offering_user_deletion_for_user(self.test_user.uuid.hex)
+
+        offering_user.refresh_from_db()
+        self.assertEqual(offering_user.state, OfferingUserStates.OK)
+
+    def test_offering_user_deleted_when_auto_deletion_enabled(self):
+        """Offering user in OK state IS marked for deletion when auto_deletion is on."""
+        self.fixture.offering.plugin_options["offering_user_auto_deletion"] = True
+        self.fixture.offering.save()
+
+        add_user_to_project(self.test_user, self.fixture.project)
+
+        offering_user = marketplace_models.OfferingUser.objects.get(
+            user=self.test_user, offering=self.fixture.offering
+        )
+        self.assertEqual(offering_user.state, OfferingUserStates.OK)
+
+        self.fixture.project.remove_user(self.test_user, ProjectRole.MANAGER)
+        tasks.request_offering_user_deletion_for_user(self.test_user.uuid.hex)
+
+        offering_user.refresh_from_db()
+        self.assertEqual(offering_user.state, OfferingUserStates.DELETION_REQUESTED)
+
+    def test_unprovisioned_offering_user_not_deleted_when_auto_deletion_disabled(self):
+        """Offering user in CREATION_REQUESTED state is NOT deleted when auto_deletion is off."""
+        offering_user = marketplace_models.OfferingUser.objects.create(
+            user=self.test_user,
+            offering=self.fixture.offering,
+            state=OfferingUserStates.CREATION_REQUESTED,
+        )
+
+        self.fixture.project.add_user(self.test_user, ProjectRole.MANAGER)
+        self.fixture.project.remove_user(self.test_user, ProjectRole.MANAGER)
+
+        tasks.request_offering_user_deletion_for_user(self.test_user.uuid.hex)
+
+        offering_user.refresh_from_db()
+        self.assertEqual(offering_user.state, OfferingUserStates.CREATION_REQUESTED)
+
+    def test_offering_user_not_deleted_when_auto_deletion_explicitly_false(self):
+        """Offering user is NOT deleted when auto_deletion is explicitly set to False."""
+        self.fixture.offering.plugin_options["offering_user_auto_deletion"] = False
+        self.fixture.offering.save()
+
+        add_user_to_project(self.test_user, self.fixture.project)
+
+        offering_user = marketplace_models.OfferingUser.objects.get(
+            user=self.test_user, offering=self.fixture.offering
+        )
+        self.assertEqual(offering_user.state, OfferingUserStates.OK)
+
+        self.fixture.project.remove_user(self.test_user, ProjectRole.MANAGER)
+        tasks.request_offering_user_deletion_for_user(self.test_user.uuid.hex)
+
+        offering_user.refresh_from_db()
+        self.assertEqual(offering_user.state, OfferingUserStates.OK)
+
+
+class UserOfferingsMappingRestorationTest(APITestCase):
+    """Test that user_offerings_mapping restores offering users from DELETION_REQUESTED state."""
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.fixture.offering.plugin_options = {
+            "service_provider_can_create_offering_user": True,
+            "username_generation_policy": "waldur_username",
+        }
+        self.fixture.offering.save()
+
+        self.resource = factories.ResourceFactory(
+            offering=self.fixture.offering,
+            project=self.fixture.project,
+            state=ResourceStates.OK,
+        )
+
+        self.test_user = structure_factories.UserFactory(username="test_user")
+        self.fixture.project.add_user(self.test_user, ProjectRole.MANAGER)
+
+    def test_restores_deletion_requested_user_with_username(self):
+        """Offering user in DELETION_REQUESTED with username is restored to OK."""
+        offering_user = marketplace_models.OfferingUser.objects.create(
+            user=self.test_user,
+            offering=self.fixture.offering,
+            state=OfferingUserStates.OK,
+            username="test_user",
+        )
+        offering_user.request_deletion()
+        offering_user.save()
+        self.assertEqual(offering_user.state, OfferingUserStates.DELETION_REQUESTED)
+
+        utils.user_offerings_mapping([self.fixture.offering])
+
+        offering_user.refresh_from_db()
+        self.assertEqual(offering_user.state, OfferingUserStates.OK)
+
+    def test_restores_deletion_requested_user_without_username(self):
+        """Offering user in DELETION_REQUESTED without username is set to CREATION_REQUESTED."""
+        offering_user = marketplace_models.OfferingUser.objects.create(
+            user=self.test_user,
+            offering=self.fixture.offering,
+            state=OfferingUserStates.OK,
+            username="",
+        )
+        offering_user.request_deletion()
+        offering_user.save()
+        self.assertEqual(offering_user.state, OfferingUserStates.DELETION_REQUESTED)
+
+        utils.user_offerings_mapping([self.fixture.offering])
+
+        offering_user.refresh_from_db()
+        self.assertEqual(offering_user.state, OfferingUserStates.CREATION_REQUESTED)
+
+    def test_does_not_restore_deleting_user(self):
+        """Offering user in DELETING state is left untouched."""
+        offering_user = marketplace_models.OfferingUser.objects.create(
+            user=self.test_user,
+            offering=self.fixture.offering,
+            state=OfferingUserStates.OK,
+            username="test_user",
+        )
+        offering_user.request_deletion()
+        offering_user.set_deleting()
+        offering_user.save()
+        self.assertEqual(offering_user.state, OfferingUserStates.DELETING)
+
+        utils.user_offerings_mapping([self.fixture.offering])
+
+        offering_user.refresh_from_db()
+        self.assertEqual(offering_user.state, OfferingUserStates.DELETING)
+
+    def test_does_not_restore_deleted_user(self):
+        """Offering user in DELETED state is left untouched."""
+        offering_user = marketplace_models.OfferingUser.objects.create(
+            user=self.test_user,
+            offering=self.fixture.offering,
+            state=OfferingUserStates.CREATION_REQUESTED,
+        )
+        offering_user.set_deleted()
+        offering_user.save()
+        self.assertEqual(offering_user.state, OfferingUserStates.DELETED)
+
+        utils.user_offerings_mapping([self.fixture.offering])
+
+        offering_user.refresh_from_db()
+        self.assertEqual(offering_user.state, OfferingUserStates.DELETED)
+
+
+class OfferingUserCreationHandlerWhenOrderIsValidTest(APITestCase):
+    """
+    Tests for create_offering_users_if_order_is_valid handler. Offering users are created when order reaches PENDING_PROVIDER or EXECUTING.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.fixture.offering.plugin_options = {
+            "service_provider_can_create_offering_user": True,
+        }
+        self.fixture.offering.save()
+
+        self.project_user = structure_factories.UserFactory()
+        self.fixture.project.add_user(self.project_user, ProjectRole.MANAGER)
+
+        self.order = factories.OrderFactory(
+            project=self.fixture.project,
+            offering=self.fixture.offering,
+            plan=self.fixture.plan,
+            state=OrderStates.PENDING_CONSUMER,
+            type=OrderTypes.CREATE,
+        )
+
+    def _call_handler_for_state_change(self, new_state):
+        self.order.state = new_state
+        marketplace_handlers.create_offering_users_if_order_is_valid(
+            sender=None, instance=self.order, created=False
+        )
+        self.order.save()
+        tasks.create_or_restore_offering_users_for_project(
+            self.fixture.project.uuid.hex
+        )
+
+    def _offering_user_exists(self):
+        return marketplace_models.OfferingUser.objects.filter(
+            user=self.project_user,
+            offering=self.fixture.offering,
+        ).exists()
+
+    def test_offering_users_created_for_existing_members_when_order_reaches_pending_provider(
+        self,
+    ):
+        self._call_handler_for_state_change(OrderStates.PENDING_PROVIDER)
+        self.assertTrue(self._offering_user_exists())
+
+    def test_offering_users_created_when_order_transitions_to_executing(self):
+        self._call_handler_for_state_change(OrderStates.EXECUTING)
+        self.assertTrue(self._offering_user_exists())
+
+    def test_no_offering_user_when_order_state_has_not_changed(self):
+        marketplace_handlers.create_offering_users_if_order_is_valid(
+            sender=None, instance=self.order, created=False
+        )
+        self.assertFalse(self._offering_user_exists())
+
+    def test_no_offering_user_when_order_transitions_to_unrelated_state(self):
+        self.order.state = OrderStates.REJECTED
+        marketplace_handlers.create_offering_users_if_order_is_valid(
+            sender=None, instance=self.order, created=False
+        )
+        self.assertFalse(self._offering_user_exists())
+
+    def test_no_offering_user_for_non_create_order_type(self):
+        self.order.type = OrderTypes.UPDATE
+        self.order.state = OrderStates.PENDING_PROVIDER
+        marketplace_handlers.create_offering_users_if_order_is_valid(
+            sender=None, instance=self.order, created=False
+        )
+        self.assertFalse(self._offering_user_exists())
+
+    def test_no_offering_user_when_plugin_option_disabled(self):
+        self.fixture.offering.plugin_options = {
+            "service_provider_can_create_offering_user": False,
+        }
+        self.fixture.offering.save()
+        self.order.state = OrderStates.PENDING_PROVIDER
+        marketplace_handlers.create_offering_users_if_order_is_valid(
+            sender=None, instance=self.order, created=False
+        )
+        self.assertFalse(self._offering_user_exists())
+
+    def test_no_offering_user_for_disallowed_offering_type(self):
+        self.fixture.offering.type = "Marketplace.OpenStack"
+        self.fixture.offering.save()
+        self.order.state = OrderStates.PENDING_PROVIDER
+        marketplace_handlers.create_offering_users_if_order_is_valid(
+            sender=None, instance=self.order, created=False
+        )
+        self.assertFalse(self._offering_user_exists())
+
+    def test_offering_user_not_duplicated_if_already_exists(self):
+        marketplace_models.OfferingUser.objects.create(
+            offering=self.fixture.offering,
+            user=self.project_user,
+            username="existing",
+        )
+        self._call_handler_for_state_change(OrderStates.PENDING_PROVIDER)
+        count = marketplace_models.OfferingUser.objects.filter(
+            user=self.project_user,
+            offering=self.fixture.offering,
+        ).count()
+        self.assertEqual(count, 1)
+
+
+class CreateOrRestoreOfferingUsersTaskOrderStateFilterTest(APITestCase):
+    """
+    Tests for the create_or_restore_offering_users_for_user task state filter.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.fixture.offering.plugin_options = {
+            "service_provider_can_create_offering_user": True,
+        }
+        self.fixture.offering.save()
+
+        self.project_user = structure_factories.UserFactory()
+        self.fixture.project.add_user(self.project_user, ProjectRole.MANAGER)
+
+    def _make_resource_with_order(
+        self, resource_state, order_state, order_type=OrderTypes.CREATE
+    ):
+        resource = factories.ResourceFactory(
+            offering=self.fixture.offering,
+            project=self.fixture.project,
+            state=resource_state,
+        )
+        factories.OrderFactory(
+            project=self.fixture.project,
+            offering=self.fixture.offering,
+            plan=self.fixture.plan,
+            resource=resource,
+            state=order_state,
+            type=order_type,
+        )
+        return resource
+
+    def _run_task(self):
+        tasks.create_or_restore_offering_users_for_user(
+            self.project_user.uuid.hex,
+            self.fixture.project.uuid.hex,
+        )
+
+    def _offering_user_exists(self):
+        return marketplace_models.OfferingUser.objects.filter(
+            user=self.project_user,
+            offering=self.fixture.offering,
+        ).exists()
+
+    def test_no_offering_user_while_order_pending_consumer(self):
+        """Customer hasn't approved yet — SP must not see users at this stage."""
+        self._make_resource_with_order(
+            ResourceStates.CREATING, OrderStates.PENDING_CONSUMER
+        )
+        self._run_task()
+        self.assertFalse(self._offering_user_exists())
+
+    def test_fix_offering_user_created_once_order_reaches_pending_provider(self):
+        """fix: resource still CREATING but order approved → offering user created."""
+        self._make_resource_with_order(
+            ResourceStates.CREATING, OrderStates.PENDING_PROVIDER
+        )
+        self._run_task()
+        self.assertTrue(self._offering_user_exists())
+
+    def test_offering_user_created_when_resource_creating_and_order_executing(self):
+        self._make_resource_with_order(ResourceStates.CREATING, OrderStates.EXECUTING)
+        self._run_task()
+        self.assertTrue(self._offering_user_exists())
+
+    def test_offering_user_created_when_resource_ok(self):
+        self._make_resource_with_order(ResourceStates.OK, OrderStates.DONE)
+        self._run_task()
+        self.assertTrue(self._offering_user_exists())
+
+    def test_no_offering_user_when_order_pending_project(self):
+        self._make_resource_with_order(
+            ResourceStates.CREATING, OrderStates.PENDING_PROJECT
+        )
+        self._run_task()
+        self.assertFalse(self._offering_user_exists())
+
+    def test_no_offering_user_for_erred_resource(self):
+        self._make_resource_with_order(ResourceStates.ERRED, OrderStates.ERRED)
+        self._run_task()
+        self.assertFalse(self._offering_user_exists())
+
+
+class CreatePlanPeriodOnOkTransitionTest(APITestCase):
+    """A resource that reaches OK from a state other than CREATING (e.g. it
+    erred during creation, or was synced from a backend) must still get a
+    ResourcePlanPeriod, otherwise its usage cannot be billed. Duplicates must
+    not be created when an open plan period already exists (e.g. UPDATING -> OK).
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+
+    def _make_resource(self, state):
+        return factories.ResourceFactory(
+            offering=self.fixture.offering,
+            plan=self.fixture.plan,
+            project=self.fixture.project,
+            state=state,
+        )
+
+    def _open_periods(self, resource):
+        return marketplace_models.ResourcePlanPeriod.objects.filter(
+            resource=resource, end=None
+        )
+
+    def test_plan_period_created_on_transition_to_ok_from_non_creating_state(self):
+        resource = self._make_resource(ResourceStates.ERRED)
+        self.assertFalse(self._open_periods(resource).exists())
+
+        resource.state = ResourceStates.OK
+        resource.save()
+
+        self.assertEqual(self._open_periods(resource).count(), 1)
+
+    def test_no_duplicate_plan_period_when_open_one_exists(self):
+        resource = self._make_resource(ResourceStates.UPDATING)
+        plan_period = marketplace_models.ResourcePlanPeriod.objects.create(
+            resource=resource,
+            plan=resource.plan,
+            start=datetime.datetime(2024, 1, 1, tzinfo=datetime.UTC),
+            end=None,
+        )
+
+        resource.state = ResourceStates.OK
+        resource.save()
+
+        periods = self._open_periods(resource)
+        self.assertEqual(periods.count(), 1)
+        self.assertEqual(periods.first(), plan_period)
+
+    def test_no_plan_period_without_plan(self):
+        resource = self._make_resource(ResourceStates.ERRED)
+        resource.plan = None
+        resource.save()
+
+        resource.state = ResourceStates.OK
+        resource.save()
+
+        self.assertFalse(self._open_periods(resource).exists())

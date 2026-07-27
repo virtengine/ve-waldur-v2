@@ -32,7 +32,7 @@ from waldur_mastermind.marketplace.tests import factories
 from waldur_mastermind.marketplace.tests import fixtures as marketplace_fixtures
 
 
-class OrderApproveByConsumerTest(test.APITransactionTestCase):
+class OrderApproveByConsumerTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.project = self.fixture.project
@@ -199,6 +199,25 @@ class OrderApproveByConsumerTest(test.APITransactionTestCase):
         order.refresh_from_db()
         self.assertEqual(order.state, OrderStates.PENDING_PROVIDER)
 
+    def test_update_order_requires_purchase_order_when_configured(self):
+        self.order.type = OrderTypes.UPDATE
+        self.order.offering.plugin_options = {"require_purchase_order_upload": True}
+        self.order.offering.save()
+        self.order.save(update_fields=["type"])
+        response = self.approve_order(self.fixture.owner)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_update_order_with_attachment_is_approved_when_purchase_order_required(
+        self,
+    ):
+        self.order.type = OrderTypes.UPDATE
+        self.order.offering.plugin_options = {"require_purchase_order_upload": True}
+        self.order.offering.save()
+        self.order.attachment = "marketplace_order_attachments/po.pdf"
+        self.order.save(update_fields=["type", "attachment"])
+        response = self.approve_order(self.fixture.owner)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
     def approve_order(self, user, order=None):
         order = order or self.order
         self.client.force_authenticate(user)
@@ -342,7 +361,7 @@ class OrderApproveByProviderTest(test.APITransactionTestCase):
 
 
 @ddt
-class OrderRejectByConsumerTest(test.APITransactionTestCase):
+class OrderRejectByConsumerTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.project = self.fixture.project
@@ -398,6 +417,7 @@ class OrderRejectByConsumerTest(test.APITransactionTestCase):
         self.assertEqual(self.order.state, OrderStates.REJECTED)
         self.assertEqual(self.order.error_message, "Test error message")
         self.assertEqual(self.order.error_traceback, "Test stack trace")
+        self.assertIsNotNone(self.order.error_updated_at)
 
     def test_empty_request_still_works(self):
         response = self.reject_order(self.fixture.staff)
@@ -420,9 +440,27 @@ class OrderRejectByConsumerTest(test.APITransactionTestCase):
         self.assertEqual(self.order.error_message, "Only message provided")
         self.assertEqual(self.order.error_traceback, "")
 
+    def test_consumer_rejection_comment_is_saved(self):
+        data = {"consumer_rejection_comment": "Budget not approved"}
+        response = self.reject_order(self.fixture.staff, data=data)
+
+        self.order.refresh_from_db()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.order.state, OrderStates.REJECTED)
+        self.assertEqual(self.order.consumer_rejection_comment, "Budget not approved")
+
+    def test_consumer_rejection_comment_defaults_to_empty(self):
+        response = self.reject_order(self.fixture.staff)
+
+        self.order.refresh_from_db()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.order.consumer_rejection_comment, "")
+
 
 @ddt
-class OrderRejectByProviderTest(test.APITransactionTestCase):
+class OrderRejectByProviderTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
         self.project = self.fixture.project
@@ -520,15 +558,49 @@ class OrderRejectByProviderTest(test.APITransactionTestCase):
         self.order.refresh_from_db()
         self.assertEqual(ResourceStates.OK, self.order.resource.state)
 
-    def reject_order(self, user):
+    def reject_order(self, user, data=None):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
         url = factories.OrderFactory.get_url(self.order, "reject_by_provider")
-        return self.client.post(url)
+        return self.client.post(url, data=data)
+
+    def test_provider_rejection_comment_is_saved(self):
+        data = {"provider_rejection_comment": "Insufficient resources available"}
+        response = self.reject_order("owner", data=data)
+
+        self.order.refresh_from_db()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.order.state, OrderStates.REJECTED)
+        self.assertEqual(
+            self.order.provider_rejection_comment, "Insufficient resources available"
+        )
+
+    def test_empty_body_still_works_for_provider_rejection(self):
+        response = self.reject_order("owner")
+
+        self.order.refresh_from_db()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.order.state, OrderStates.REJECTED)
+        self.assertEqual(self.order.provider_rejection_comment, "")
+
+    def test_provider_rejection_comment_visible_in_order_detail(self):
+        data = {"provider_rejection_comment": "Cannot fulfill order"}
+        self.reject_order("owner", data=data)
+
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OrderFactory.get_url(self.order)
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["provider_rejection_comment"], "Cannot fulfill order"
+        )
 
 
 @ddt
-class ApproveOrderAsProviderFilterTest(test.APITransactionTestCase):
+class ApproveOrderAsProviderFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.order = self.fixture.order
@@ -559,7 +631,7 @@ class ApproveOrderAsProviderFilterTest(test.APITransactionTestCase):
 
 
 @ddt
-class ApproveOrderAsConsumerFilterTest(test.APITransactionTestCase):
+class ApproveOrderAsConsumerFilterTest(test.APITestCase):
     def setUp(self):
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.fixture.order.state = OrderStates.PENDING_CONSUMER
@@ -591,7 +663,7 @@ class ApproveOrderAsConsumerFilterTest(test.APITransactionTestCase):
         self.assertEqual(len(response.json()), expected)
 
 
-class OrderApprovalByConsumerNotificationTest(test.APITransactionTestCase):
+class OrderApprovalByConsumerNotificationTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = marketplace_fixtures.MarketplaceFixture()
 
@@ -624,7 +696,7 @@ class OrderApprovalByConsumerNotificationTest(test.APITransactionTestCase):
         self.assertEqual(len(mail.outbox), 0)
 
 
-class OrderApprovalByProviderNotificationTest(test.APITransactionTestCase):
+class OrderApprovalByProviderNotificationTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.order = self.fixture.order
@@ -652,7 +724,7 @@ class OrderApprovalByProviderNotificationTest(test.APITransactionTestCase):
         self.assertEqual(len(mail.outbox), 0)
 
 
-class ScriptOfferingOrderReviewTest(test.APITransactionTestCase):
+class ScriptOfferingOrderReviewTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.project = self.fixture.project

@@ -10,12 +10,14 @@ from rest_framework import test
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates
+from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import ProjectRole
+from waldur_core.structure.registry import SupportedServices
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.common.enums import Units
 from waldur_mastermind.invoices.tests import factories as invoices_factories
-from waldur_mastermind.marketplace import models, tasks
+from waldur_mastermind.marketplace import models, tasks, utils
 from waldur_mastermind.marketplace.enums import (
     OPENSTACK_INSTANCE_OFFERING,
     BillingTypes,
@@ -30,7 +32,7 @@ from waldur_openstack.tests.fixtures import OpenStackFixture
 from . import factories, fixtures
 
 
-class CalculateUsageForCurrentMonthTest(test.APITransactionTestCase):
+class CalculateUsageForCurrentMonthTest(test.APITestCase):
     def setUp(self):
         offering = factories.OfferingFactory()
         plan = factories.PlanFactory(offering=offering)
@@ -49,8 +51,8 @@ class CalculateUsageForCurrentMonthTest(test.APITransactionTestCase):
             resource=resource,
             component=self.offering_component,
             usage=10,
-            date=datetime.datetime.now(),
-            billing_period=core_utils.month_start(datetime.datetime.now()),
+            date=timezone.now(),
+            billing_period=core_utils.month_start(timezone.now()),
             plan_period=plan_period,
         )
 
@@ -64,8 +66,25 @@ class CalculateUsageForCurrentMonthTest(test.APITransactionTestCase):
         tasks.calculate_usage_for_current_month()
         self.assertEqual(models.CategoryComponentUsage.objects.count(), 0)
 
+    def test_calculate_usage_is_idempotent(self):
+        tasks.calculate_usage_for_current_month()
+        self.assertEqual(models.CategoryComponentUsage.objects.count(), 2)
 
-class NotificationTest(test.APITransactionTestCase):
+        # Re-running must update existing rows in place, not create duplicates.
+        models.ComponentUsage.objects.update(usage=25)
+        tasks.calculate_usage_for_current_month()
+        self.assertEqual(models.CategoryComponentUsage.objects.count(), 2)
+        self.assertEqual(
+            set(
+                models.CategoryComponentUsage.objects.values_list(
+                    "reported_usage", flat=True
+                )
+            ),
+            {25},
+        )
+
+
+class NotificationTest(test.APITestCase):
     @patch("waldur_mastermind.marketplace.tasks.core_utils.broadcast_mail")
     def test_notify_user_that_order_been_rejected(self, mock_broadcast_mail):
         """
@@ -110,7 +129,7 @@ class NotificationTest(test.APITransactionTestCase):
         self.assertIn("order_type", context, "Context is missing the order type")
 
 
-class ResourceEndDateNotificationTest(test.APITransactionTestCase):
+class ResourceEndDateNotificationTest(test.APITestCase):
     def test_notify_about_resource_scheduled_termination(self):
         fixture = fixtures.MarketplaceFixture()
         admin = fixture.admin
@@ -159,7 +178,7 @@ class ResourceEndDateNotificationTest(test.APITransactionTestCase):
         )
 
 
-class TerminateResource(test.APITransactionTestCase):
+class TerminateResource(test.APITestCase):
     def setUp(self):
         fixture = structure_fixtures.UserFixture()
         self.user = fixture.staff
@@ -184,7 +203,7 @@ class TerminateResource(test.APITransactionTestCase):
         )
 
 
-class ProjectEndDateTest(test.APITransactionTestCase):
+class ProjectEndDateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.MarketplaceFixture()
         self.fixture.project.end_date = datetime.datetime(
@@ -208,7 +227,40 @@ class ProjectEndDateTest(test.APITransactionTestCase):
             order = models.Order.objects.get(
                 resource=self.fixture.resource, type=OrderTypes.TERMINATE
             )
-            self.assertTrue(order.state, OrderStates.EXECUTING)
+            # BASIC_OFFERING skips consumer review but not provider review
+            # (order_should_not_be_reviewed_by_provider returns False for it),
+            # so the order lands in PENDING_PROVIDER, not EXECUTING.
+            self.assertEqual(order.state, OrderStates.PENDING_PROVIDER)
+            self.assertEqual(order.created_by, core_utils.get_system_robot())
+
+    def test_terminate_resources_if_project_end_date_requested_by_cannot_approve_order(
+        self,
+    ):
+        # Regression: project.end_date_requested_by is a distinct fallback from
+        # resource.end_date_requested_by (utils.schedule_resources_termination)
+        # and can equally be an ordinary project manager who lacks ORDER.APPROVE.
+        # The order still gets created and lands in PENDING_CONSUMER, but
+        # terminate_resource force-approves it immediately as the system robot
+        # — created_by (the manager, for audit) stays untouched, only who
+        # reviewed it changes.
+        ProjectRole.MANAGER.add_permission(PermissionEnum.UPDATE_RESOURCE)
+        ProjectRole.MANAGER.add_permission(PermissionEnum.TERMINATE_RESOURCE)
+        ProjectRole.MANAGER.add_permission(PermissionEnum.APPROVE_PRIVATE_ORDER)
+
+        self.fixture.project.end_date_requested_by = self.fixture.manager
+        self.fixture.project.save()
+
+        system_robot = core_utils.get_system_robot()
+
+        with freeze_time("2020-01-02"):
+            tasks.terminate_resources_if_project_end_date_has_been_reached()
+
+        order = models.Order.objects.get(
+            resource=self.fixture.resource, type=OrderTypes.TERMINATE
+        )
+        self.assertNotEqual(order.state, OrderStates.PENDING_CONSUMER)
+        self.assertEqual(order.created_by, self.fixture.manager)
+        self.assertEqual(order.consumer_reviewed_by, system_robot)
 
     def test_notification_about_project_ending(self):
         project_2 = structure_factories.ProjectFactory(
@@ -282,8 +334,186 @@ class ProjectEndDateTest(test.APITransactionTestCase):
         self.fixture.project.refresh_from_db()
 
 
+class GracePeriodPausingTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        # Project end_date in the past, but grace period extends beyond today
+        self.fixture.project.end_date = datetime.date(2020, 1, 1)
+        self.fixture.project.grace_period_days = 30
+        self.fixture.project.save()
+        self.fixture.resource.set_state_ok()
+        self.fixture.resource.save()
+
+    @freeze_time("2020-01-15")
+    def test_resource_is_paused_when_project_in_grace_period_and_offering_opts_in(self):
+        self.fixture.offering.plugin_options = {"supports_pausing": True}
+        self.fixture.offering.save()
+
+        tasks.terminate_resources_if_project_end_date_has_been_reached()
+
+        self.fixture.resource.refresh_from_db()
+        self.assertTrue(self.fixture.resource.paused)
+
+    @freeze_time("2020-01-15")
+    def test_resource_stays_active_when_offering_opts_out(self):
+        self.fixture.offering.plugin_options = {"supports_pausing": False}
+        self.fixture.offering.save()
+
+        tasks.terminate_resources_if_project_end_date_has_been_reached()
+
+        self.fixture.resource.refresh_from_db()
+        self.assertFalse(self.fixture.resource.paused)
+
+    @freeze_time("2020-01-15")
+    def test_already_paused_resource_is_not_saved_again(self):
+        self.fixture.offering.plugin_options = {"supports_pausing": True}
+        self.fixture.offering.save()
+        self.fixture.resource.paused = True
+        self.fixture.resource.save()
+
+        tasks.terminate_resources_if_project_end_date_has_been_reached()
+
+        self.fixture.resource.refresh_from_db()
+        self.assertTrue(self.fixture.resource.paused)
+
+    @freeze_time("2020-02-01")
+    def test_resources_terminated_after_grace_period_ends(self):
+        """After effective_end_date passes, resources are terminated regardless of supports_pausing."""
+        self.fixture.offering.plugin_options = {"supports_pausing": True}
+        self.fixture.offering.save()
+
+        tasks.terminate_resources_if_project_end_date_has_been_reached()
+
+        self.assertTrue(
+            models.Order.objects.filter(
+                resource=self.fixture.resource,
+                type=OrderTypes.TERMINATE,
+            ).exists()
+        )
+
+
+class GracePeriodDisableTest(test.APITestCase):
+    """Offerings with plugin_options.disable_grace_period terminate on the
+    project end date, ignoring the grace window, and are never paused."""
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        # end_date in the past; grace period would extend termination to 2020-01-31
+        self.fixture.project.end_date = datetime.date(2020, 1, 1)
+        self.fixture.project.grace_period_days = 30
+        self.fixture.project.save()
+        self.fixture.resource.set_state_ok()
+        self.fixture.resource.save()
+
+    @freeze_time("2020-01-15")
+    def test_grace_disabled_resource_is_terminated_within_grace_window(self):
+        self.fixture.offering.plugin_options = {"disable_grace_period": True}
+        self.fixture.offering.save()
+
+        tasks.terminate_resources_if_project_end_date_has_been_reached()
+
+        self.assertTrue(
+            models.Order.objects.filter(
+                resource=self.fixture.resource,
+                type=OrderTypes.TERMINATE,
+            ).exists()
+        )
+
+    @freeze_time("2020-01-15")
+    def test_normal_resource_is_not_terminated_within_grace_window(self):
+        # Control: without the flag, the resource survives the grace window.
+        self.fixture.offering.plugin_options = {}
+        self.fixture.offering.save()
+
+        tasks.terminate_resources_if_project_end_date_has_been_reached()
+
+        self.assertFalse(
+            models.Order.objects.filter(
+                resource=self.fixture.resource,
+                type=OrderTypes.TERMINATE,
+            ).exists()
+        )
+
+    @freeze_time("2020-01-15")
+    def test_grace_disabled_resource_is_terminated_not_paused(self):
+        # supports_pausing would normally pause during grace; disable_grace_period
+        # takes precedence and the resource is terminated instead.
+        self.fixture.offering.plugin_options = {
+            "supports_pausing": True,
+            "disable_grace_period": True,
+        }
+        self.fixture.offering.save()
+
+        tasks.terminate_resources_if_project_end_date_has_been_reached()
+
+        self.fixture.resource.refresh_from_db()
+        self.assertFalse(self.fixture.resource.paused)
+        self.assertTrue(
+            models.Order.objects.filter(
+                resource=self.fixture.resource,
+                type=OrderTypes.TERMINATE,
+            ).exists()
+        )
+
+
+class ResourceEndingNotificationGraceTest(test.APITestCase):
+    """notification_about_resource_ending fires on the resource's effective end
+    date, so grace-disabled resources (which terminate on the raw project end
+    date, without an own end date) are included when the project has a grace
+    window."""
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.fixture.resource.set_state_ok()
+        self.fixture.resource.save()
+        self.fixture.manager  # project user who receives the notification
+        structure_factories.NotificationFactory(
+            key="marketplace.notification_about_resource_ending"
+        )
+
+    def _configure(self, project_end_date, grace, plugin_options):
+        self.fixture.project.end_date = project_end_date
+        self.fixture.project.grace_period_days = grace
+        self.fixture.project.save()
+        self.fixture.offering.plugin_options = plugin_options
+        self.fixture.offering.save()
+
+    def test_grace_disabled_resource_notified_by_raw_project_end_date(self):
+        # Project raw end date is 7 days out; grace-disabled → terminates then.
+        self._configure(datetime.date(2020, 1, 8), 30, {"disable_grace_period": True})
+        with freeze_time("2020-01-01"):
+            tasks.notification_about_resource_ending()
+        self.assertTrue(mail.outbox)
+        self.assertIn(self.fixture.resource.name, mail.outbox[0].subject)
+
+    def test_normal_resource_without_own_end_date_is_not_notified(self):
+        # Normal offering with no own end date → the project-ending notice covers
+        # it, so notification_about_resource_ending stays silent.
+        self._configure(datetime.date(2020, 1, 8), 30, {})
+        with freeze_time("2020-01-01"):
+            tasks.notification_about_resource_ending()
+        self.assertFalse(mail.outbox)
+
+    def test_grace_disabled_without_grace_window_is_not_double_notified(self):
+        # grace = 0 → raw == effective → project-ending notice covers it.
+        self._configure(datetime.date(2020, 1, 8), 0, {"disable_grace_period": True})
+        with freeze_time("2020-01-01"):
+            tasks.notification_about_resource_ending()
+        self.assertFalse(mail.outbox)
+
+    def test_own_end_date_resource_is_still_notified(self):
+        # Regression: the original behaviour (own end date approaching) is kept.
+        self._configure(None, 0, {})
+        self.fixture.resource.end_date = datetime.date(2020, 1, 8)
+        self.fixture.resource.save()
+        with freeze_time("2020-01-01"):
+            tasks.notification_about_resource_ending()
+        self.assertTrue(mail.outbox)
+        self.assertIn(self.fixture.resource.name, mail.outbox[0].subject)
+
+
 @override_config(ENABLE_STALE_RESOURCE_NOTIFICATIONS=True)
-class NotificationAboutStaleResourceTest(test.APITransactionTestCase):
+class NotificationAboutStaleResourceTest(test.APITestCase):
     def setUp(self):
         project_fixture = structure_fixtures.ProjectFixture()
         self.owner = project_fixture.owner
@@ -341,7 +571,7 @@ class NotificationAboutStaleResourceTest(test.APITransactionTestCase):
         self.assertEqual(len(mail.outbox), 0)
 
 
-class ResourceEndDateTest(test.APITransactionTestCase):
+class ResourceEndDateTest(test.APITestCase):
     def setUp(self):
         # We need create a system robot account because
         # account created in a migration does not exist when test is running
@@ -374,7 +604,11 @@ class ResourceEndDateTest(test.APITransactionTestCase):
             order = models.Order.objects.get(
                 resource=self.fixture.resource, type=OrderTypes.TERMINATE
             )
-            self.assertTrue(order.state, OrderStates.EXECUTING)
+            # The fixture offering is BASIC_OFFERING, so consumer review is
+            # skipped but provider review is not (order_should_not_be_reviewed_
+            # by_provider returns False for BASIC_OFFERING) — the order lands
+            # in PENDING_PROVIDER, not EXECUTING.
+            self.assertEqual(order.state, OrderStates.PENDING_PROVIDER)
             self.assertEqual(order.created_by, self.system_robot)
 
     def test_terminate_resource_if_end_date_requested_by_is_passed(self):
@@ -396,8 +630,117 @@ class ResourceEndDateTest(test.APITransactionTestCase):
             order = models.Order.objects.get(
                 resource=self.fixture.resource, type=OrderTypes.TERMINATE
             )
-            self.assertTrue(order.state, OrderStates.EXECUTING)
+            self.assertEqual(order.state, OrderStates.PENDING_PROVIDER)
             self.assertEqual(order.created_by, user)
+
+    def test_terminate_resource_reuses_existing_pending_order_if_end_date_has_been_reached(
+        self,
+    ):
+        # Regression: a project admin can request termination (RESOURCE.TERMINATE)
+        # but cannot approve it (no ORDER.APPROVE) — mirrors production
+        # PROJECT.ADMIN permissions (docker/rootfs/etc/waldur/permissions.yaml).
+        # The order they submit before the resource's end_date must not be
+        # cancelled and replaced once the end date is reached — it must be
+        # approved in place, preserving who originally requested it.
+        ProjectRole.ADMIN.add_permission(PermissionEnum.UPDATE_RESOURCE)
+        ProjectRole.ADMIN.add_permission(PermissionEnum.TERMINATE_RESOURCE)
+        ProjectRole.ADMIN.add_permission(PermissionEnum.APPROVE_PRIVATE_ORDER)
+
+        with freeze_time("2019-12-01"):
+            response = utils.terminate_resource(self.resource, self.fixture.admin)
+            self.assertEqual(response.status_code, 200)
+
+        order = models.Order.objects.get(
+            resource=self.resource, type=OrderTypes.TERMINATE
+        )
+        self.assertEqual(order.state, OrderStates.PENDING_CONSUMER)
+        order_pk = order.pk
+
+        with freeze_time("2020-01-01"):
+            tasks.terminate_expired_resources()
+
+        order.refresh_from_db()
+        self.assertEqual(order.pk, order_pk)
+        self.assertNotEqual(order.state, OrderStates.PENDING_CONSUMER)
+        self.assertEqual(order.state, OrderStates.PENDING_PROVIDER)
+        self.assertEqual(order.created_by, self.fixture.admin)
+        self.assertEqual(order.consumer_reviewed_by, self.system_robot)
+
+    def test_terminate_resource_if_end_date_requested_by_cannot_approve_order(self):
+        # Regression: unlike test_terminate_resource_if_end_date_requested_by_is_passed
+        # above, end_date_requested_by here is an ordinary project admin who lacks
+        # ORDER.APPROVE. With no pre-existing pending order, the freshly created
+        # order still lands in PENDING_CONSUMER, but terminate_resource notices
+        # and force-approves it as the system robot in the same run — created_by
+        # (the admin, for audit) is untouched, only who reviewed it changes.
+        ProjectRole.ADMIN.add_permission(PermissionEnum.UPDATE_RESOURCE)
+        ProjectRole.ADMIN.add_permission(PermissionEnum.TERMINATE_RESOURCE)
+        ProjectRole.ADMIN.add_permission(PermissionEnum.APPROVE_PRIVATE_ORDER)
+
+        with freeze_time("2020-01-01"):
+            self.resource.end_date_requested_by = self.fixture.admin
+            self.resource.save()
+
+            self.assertTrue(self.resource.is_expired)
+            tasks.terminate_expired_resources()
+            self.resource.refresh_from_db()
+
+            order = models.Order.objects.get(
+                resource=self.fixture.resource, type=OrderTypes.TERMINATE
+            )
+            self.assertNotEqual(order.state, OrderStates.PENDING_CONSUMER)
+            self.assertEqual(order.state, OrderStates.PENDING_PROVIDER)
+            self.assertEqual(order.created_by, self.fixture.admin)
+            self.assertEqual(order.consumer_reviewed_by, self.system_robot)
+
+    def test_each_expired_resource_is_attributed_independently(self):
+        # Regression: actor for one resource must not leak into the next
+        # iteration of the batch. The first resource has an explicit
+        # end_date_requested_by; the second one does not. The second one
+        # must be attributed to the system robot, not to the first user.
+        end_date = datetime.datetime(day=1, month=1, year=2020).date()
+        first_user = structure_factories.UserFactory(is_staff=True)
+        self.resource.end_date_requested_by = first_user
+        self.resource.save()
+
+        second_resource = factories.ResourceFactory(
+            offering=self.resource.offering,
+            project=self.resource.project,
+            end_date=end_date,
+        )
+        second_resource.set_state_ok()
+        second_resource.save()
+
+        with freeze_time("2020-01-01"):
+            tasks.terminate_expired_resources()
+
+        first_order = models.Order.objects.get(
+            resource=self.resource, type=OrderTypes.TERMINATE
+        )
+        second_order = models.Order.objects.get(
+            resource=second_resource, type=OrderTypes.TERMINATE
+        )
+        self.assertEqual(first_order.created_by, first_user)
+        self.assertEqual(second_order.created_by, self.system_robot)
+
+    def test_terminate_resource_when_end_date_requested_by_is_inactive(self):
+        # Regression: if the user who requested the end date was later
+        # deactivated, the actor must fall through to the system robot.
+        # Otherwise the internal termination request is rejected with HTTP 401
+        # "User inactive or deleted." and the resource is never terminated.
+        with freeze_time("2020-01-01"):
+            inactive_user = structure_factories.UserFactory(is_active=False)
+            self.resource.end_date_requested_by = inactive_user
+            self.resource.save()
+
+            self.assertTrue(self.resource.is_expired)
+            tasks.terminate_expired_resources()
+            self.resource.refresh_from_db()
+
+            order = models.Order.objects.get(
+                resource=self.fixture.resource, type=OrderTypes.TERMINATE
+            )
+            self.assertEqual(order.created_by, self.system_robot)
 
     def test_notification_about_resource_ending(self):
         self.fixture.manager
@@ -415,7 +758,7 @@ class ResourceEndDateTest(test.APITransactionTestCase):
             self.assertTrue(self.resource.uuid.hex in mail.outbox[0].body)
 
 
-class MarkResourcesAsErredAfterTimeoutTest(test.APITransactionTestCase):
+class MarkResourcesAsErredAfterTimeoutTest(test.APITestCase):
     def setUp(self):
         super().setUp()
         self.fixture = OpenStackFixture()
@@ -451,6 +794,7 @@ class MarkResourcesAsErredAfterTimeoutTest(test.APITransactionTestCase):
 
         self.assertEqual(self.order.state, OrderStates.ERRED)
         self.assertEqual(self.order.error_message, "Execution has timed out.")
+        self.assertIsNotNone(self.order.error_updated_at)
         self.assertEqual(self.resource.state, ResourceStates.ERRED)
         self.assertEqual(self.resource.backend_metadata["state"], "ERRED")
         self.assertEqual(self.fixture.instance.state, CoreStates.ERRED)
@@ -475,7 +819,7 @@ class MarkResourcesAsErredAfterTimeoutTest(test.APITransactionTestCase):
         self.assertNotEqual(self.fixture.instance.state, CoreStates.ERRED)
 
 
-class RemoveDeletedRobotAccountsTest(test.APITransactionTestCase):
+class RemoveDeletedRobotAccountsTest(test.APITestCase):
     """
     Test daily task that removes deleted robot accounts from the database.
     """
@@ -531,7 +875,7 @@ class RemoveDeletedRobotAccountsTest(test.APITransactionTestCase):
         )
 
 
-class UpdateResourceScopeAvailabilityTest(test.APITransactionTestCase):
+class UpdateResourceScopeAvailabilityTest(test.APITestCase):
     def setUp(self):
         self.fixture = OpenStackFixture()
         self.instance = self.fixture.instance
@@ -561,7 +905,7 @@ class UpdateResourceScopeAvailabilityTest(test.APITransactionTestCase):
         self.assertTrue(self.instance.can_be_managed)
 
 
-class ResetStuckUpdatingResourcesTest(test.APITransactionTestCase):
+class ResetStuckUpdatingResourcesTest(test.APITestCase):
     """
     Test task that resets marketplace resources stuck in UPDATING state.
 
@@ -738,3 +1082,32 @@ class ResetStuckUpdatingResourcesTest(test.APITransactionTestCase):
         # Verify the resource state is still UPDATING
         self.resource.refresh_from_db()
         self.assertEqual(self.resource.state, ResourceStates.UPDATING)
+
+
+class MarketplaceAwareServiceListPullTaskTest(test.APITestCase):
+    """The marketplace-aware ServiceListPullTask must skip ServiceSettings
+    that no live offering references — otherwise stale settings (e.g. an
+    old DigitalOcean credential left after the offering was deleted) keep
+    generating periodic remote-API errors."""
+
+    def setUp(self):
+        registered_type = next(iter(SupportedServices.get_choices()))[0]
+        common = dict(state=CoreStates.OK, is_active=True, type=registered_type)
+        self.referenced = structure_factories.ServiceSettingsFactory(**common)
+        self.orphan = structure_factories.ServiceSettingsFactory(**common)
+        self.archived_only = structure_factories.ServiceSettingsFactory(**common)
+        factories.OfferingFactory(scope=self.referenced, state=OfferingStates.ACTIVE)
+        factories.OfferingFactory(
+            scope=self.archived_only, state=OfferingStates.ARCHIVED
+        )
+
+    def test_only_settings_with_live_offering_are_pulled(self):
+        result = list(tasks.ServiceResourcesListPullTask().get_pulled_objects())
+        self.assertIn(self.referenced, result)
+        self.assertNotIn(self.orphan, result)
+        self.assertNotIn(self.archived_only, result)
+
+    def test_paused_offering_keeps_settings_in_queryset(self):
+        factories.OfferingFactory(scope=self.orphan, state=OfferingStates.PAUSED)
+        result = list(tasks.ServicePropertiesListPullTask().get_pulled_objects())
+        self.assertIn(self.orphan, result)

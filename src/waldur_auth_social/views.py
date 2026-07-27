@@ -11,7 +11,6 @@ from django.shortcuts import redirect
 from django.utils import timezone
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import generics, status, viewsets
-from rest_framework import permissions as rf_permissions
 from rest_framework.decorators import action
 from rest_framework.exceptions import AuthenticationFailed, NotFound, ValidationError
 from rest_framework.response import Response
@@ -26,21 +25,34 @@ from waldur_auth_social.const import ProviderChoices
 from waldur_auth_social.exceptions import OAuthException
 from waldur_auth_social.models import OAuthToken
 from waldur_auth_social.utils import (
+    create_or_update_bridge_user,
     create_or_update_oauth_user,
+    get_identity_bridge_stats,
     pull_remote_eduteams_user,
+    remove_user_from_isd,
     validate_and_get_redirect_url,
 )
 from waldur_core.core import permissions as core_permissions
 from waldur_core.core.authentication import refresh_token, set_authentication_method
+from waldur_core.core.models import TokenExchangeCode, User
+from waldur_core.core.permissions import PATScopeAwareIsAdminUser
 from waldur_core.core.serializers import EmptySerializer
+from waldur_core.core.user_attributes import get_federated_identity_sync_allowed_fields
+from waldur_core.core.views import login_failed
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
+from waldur_core.structure.serializers import IdentityBridgeStatsSerializer
 
 from . import models
 from .serializers import (
     AuthSerializer,
     DiscoverMetadataRequestSerializer,
     DiscoverMetadataResponseSerializer,
+    IdentityBridgeAllowedFieldsSerializer,
+    IdentityBridgeRemoveResultSerializer,
+    IdentityBridgeRemoveSerializer,
+    IdentityBridgeRequestSerializer,
+    IdentityBridgeResultSerializer,
     IdentityProviderSerializer,
     RemoteEduteamsRequestSerializer,
     RemoteEduteamsUUIDSerializer,
@@ -98,6 +110,10 @@ class OAuthViewInit(BaseOAuthView):
         redirect_uri = reverse(f"auth_{provider}_complete", request=request)
         scope = f"openid {self.config.extra_scope or ''}".strip()
 
+        # Flush the old session before writing the new OIDC state.
+        # This creates a fresh session key so concurrent requests that already cannot overwrite the state.
+        request.session.flush()
+
         oidc_state = secrets.token_urlsafe(32)
         request.session[OIDC_STATE_KEY] = oidc_state
 
@@ -146,11 +162,32 @@ class OAuthViewComplete(BaseOAuthView):
     )
     def get(self, request, provider, format=None):
         self.validate_config(provider)
+        try:
+            return self._complete_login(request, provider)
+        except OAuthException as e:
+            # The complete endpoint is reached via a top-level browser navigation
+            # (the IdP redirects here directly), so raising a DRF exception would
+            # render raw JSON in the browser. For user-facing messages (e.g. the
+            # configurable uninvited-user block message) redirect to the Homeport
+            # login-failed page so the message is shown consistently with the rest
+            # of the UI. Other errors keep their default rendering.
+            if getattr(e, "user_facing", False):
+                return login_failed(e.user_message)
+            raise
 
+    def _complete_login(self, request, provider):
         stored_state = self.request.session.get(OIDC_STATE_KEY)
         returned_state = request.query_params.get("state")
         if not stored_state or stored_state != returned_state:
             # Potential CSRF attack - reject the request
+            logger.warning(
+                "Invalid auth state for provider %s: "
+                "stored_state=%r, returned_state=%r, session_key=%r",
+                provider,
+                stored_state,
+                returned_state,
+                request.session.session_key,
+            )
             raise OAuthException(self.config.provider, "Invalid auth state.")
         redirect_uri = reverse(f"auth_{provider}_complete", request=request)
         serializer = AuthSerializer(
@@ -174,15 +211,16 @@ class OAuthViewComplete(BaseOAuthView):
             event_context={
                 "provider": provider,
                 "user": user,
-                "request": request,
             },
             scopes=[user],
         )
         if config.OIDC_ACCESS_TOKEN_ENABLED:
-            user_token = access_token
+            exchange_code = TokenExchangeCode.generate_code(
+                user=user, external_token=access_token
+            )
         else:
-            user_token = token.key
-        params = {"token": user_token}
+            exchange_code = TokenExchangeCode.generate_code(user=user, token=token)
+        params = {"code": exchange_code.uuid.hex}
 
         # Get the stored return_url or referrer from session
         stored_return_url = request.session.get(OIDC_RETURN_URL_KEY)
@@ -210,7 +248,7 @@ class OAuthViewComplete(BaseOAuthView):
 
         refresh_token = token_data.get("refresh_token", "")
         user_info = self.get_user_info(access_token)
-        logger.info("Received user info: %s", user_info)
+        logger.debug("Received user info: %s", user_info)
 
         user, created = create_or_update_oauth_user(self.config, user_info)
 
@@ -327,7 +365,7 @@ class IdentityProvidersViewSet(viewsets.ModelViewSet):
     @action(
         detail=False,
         methods=["post"],
-        permission_classes=[rf_permissions.IsAdminUser],
+        permission_classes=[PATScopeAwareIsAdminUser],
     )
     def discover_metadata(self, request):
         serializer = DiscoverMetadataRequestSerializer(data=request.data)
@@ -438,7 +476,7 @@ class IdentityProvidersViewSet(viewsets.ModelViewSet):
         detail=False,
         methods=["post"],
         url_path="generate-mapping",
-        permission_classes=[rf_permissions.IsAdminUser],
+        permission_classes=[PATScopeAwareIsAdminUser],
     )
     def generate_mapping(self, request):
         serializer = DiscoverMetadataRequestSerializer(data=request.data)
@@ -519,3 +557,204 @@ class RemoteEduteamsView(generics.GenericAPIView):
             user.save(update_fields=["notifications_enabled"])
 
         return Response({"uuid": user.uuid.hex})
+
+
+class IdentityBridgeView(generics.GenericAPIView):
+    """Push-based Identity Bridge API for ISD user attribute synchronization."""
+
+    filter_backends = []
+    pagination_class = None
+    serializer_class = IdentityBridgeRequestSerializer
+
+    @extend_schema(
+        summary="Push user attributes from an ISD",
+        description=(
+            "Allows Identity Service Domains (ISDs) to push user attributes to Waldur. "
+            "Creates or updates a user based on username (CUID). "
+            "Requires FEDERATED_IDENTITY_SYNC_ENABLED to be True. "
+            "Caller must be staff or an identity manager with the declared source in managed_isds."
+        ),
+        request=IdentityBridgeRequestSerializer,
+        responses={200: IdentityBridgeResultSerializer},
+    )
+    def post(self, request, *args, **kwargs):
+        # 1. Check feature flag
+        if not config.FEDERATED_IDENTITY_SYNC_ENABLED:
+            return Response(
+                "Identity Bridge is disabled.",
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # 2. Check caller permissions
+        caller = request.user
+        if not caller.is_staff and not caller.is_identity_manager:
+            return Response(
+                "Only staff and identity managers are allowed to use the Identity Bridge.",
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # 3. Validate request
+        serializer = IdentityBridgeRequestSerializer(
+            data=request.data, context={"request": request, "view": self}
+        )
+        serializer.is_valid(raise_exception=True)
+
+        username = serializer.validated_data["username"]
+        source = serializer.validated_data["source"]
+
+        # 4. Check ISD scope: non-staff must have source in managed_isds
+        if not caller.is_staff:
+            managed_isds = getattr(caller, "managed_isds", []) or []
+            if source not in managed_isds:
+                return Response(
+                    f"Source '{source}' is not in your managed ISDs.",
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        # 5. Extract attribute payload (exclude meta fields)
+        attributes = {
+            k: v
+            for k, v in serializer.validated_data.items()
+            if k not in ("username", "source")
+        }
+
+        # 6. Create or update user
+        user, created, updated_fields = create_or_update_bridge_user(
+            username, attributes, source
+        )
+
+        # 7. Return response
+        response_data = {
+            "uuid": user.uuid.hex,
+            "created": created,
+            "updated_fields": sorted(updated_fields),
+        }
+        return Response(response_data, status=status.HTTP_200_OK)
+
+
+class IdentityBridgeRemoveView(generics.GenericAPIView):
+    """Remove a user from an ISD via the Identity Bridge."""
+
+    filter_backends = []
+    pagination_class = None
+    serializer_class = IdentityBridgeRemoveSerializer
+
+    @extend_schema(
+        summary="Remove a user from an ISD",
+        description=(
+            "Signals that a user has been removed from an ISD. "
+            "Removes the source from active_isds, clears attributes owned by that source, "
+            "and deactivates the user if no ISDs remain (configurable via FEDERATED_IDENTITY_DEACTIVATION_POLICY). "
+            "Requires FEDERATED_IDENTITY_SYNC_ENABLED to be True. "
+            "Caller must be staff or an identity manager with the declared source in managed_isds."
+        ),
+        request=IdentityBridgeRemoveSerializer,
+        responses={200: IdentityBridgeRemoveResultSerializer},
+    )
+    def post(self, request, *args, **kwargs):
+        # 1. Check feature flag
+        if not config.FEDERATED_IDENTITY_SYNC_ENABLED:
+            return Response(
+                "Identity Bridge is disabled.",
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # 2. Check caller permissions
+        caller = request.user
+        if not caller.is_staff and not caller.is_identity_manager:
+            return Response(
+                "Only staff and identity managers are allowed to use the Identity Bridge.",
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # 3. Validate request
+        serializer = IdentityBridgeRemoveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        username = serializer.validated_data["username"]
+        source = serializer.validated_data["source"]
+
+        # 4. Check ISD scope: non-staff must have source in managed_isds
+        if not caller.is_staff:
+            managed_isds = getattr(caller, "managed_isds", []) or []
+            if source not in managed_isds:
+                return Response(
+                    f"Source '{source}' is not in your managed ISDs.",
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        # 5. Look up the user
+        try:
+            user = User.all_objects.get(username=username)
+        except User.DoesNotExist:
+            raise NotFound(f"User {username} not found.")
+
+        # 6. Remove from ISD
+        deactivated = remove_user_from_isd(user, source)
+
+        # 7. Return response
+        response_data = {
+            "uuid": user.uuid.hex,
+            "deactivated": deactivated,
+        }
+        return Response(response_data, status=status.HTTP_200_OK)
+
+
+class IdentityBridgeStatsView(generics.GenericAPIView):
+    """System-wide Identity Bridge statistics for staff users."""
+
+    filter_backends = []
+    pagination_class = None
+    serializer_class = IdentityBridgeStatsSerializer
+
+    @extend_schema(
+        summary="Get Identity Bridge statistics",
+        description=(
+            "Returns system-wide statistics about the Identity Bridge: "
+            "feature configuration, per-ISD user counts, stale attribute detection, "
+            "and total federated user counts. Staff only."
+        ),
+        responses={200: IdentityBridgeStatsSerializer},
+    )
+    def get(self, request, *args, **kwargs):
+        if not request.user.is_staff:
+            return Response(
+                "Only staff users can view Identity Bridge statistics.",
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        data = get_identity_bridge_stats()
+        return Response(data, status=status.HTTP_200_OK)
+
+
+class IdentityBridgeAllowedFieldsView(generics.GenericAPIView):
+    """Returns the list of attribute fields accepted by the Identity Bridge."""
+
+    filter_backends = []
+    pagination_class = None
+    serializer_class = IdentityBridgeAllowedFieldsSerializer
+
+    @extend_schema(
+        summary="Get allowed Identity Bridge fields",
+        description=(
+            "Returns the list of user attribute fields that the Identity Bridge "
+            "currently accepts. Useful for clients to pre-filter payloads. "
+            "Requires staff or identity manager permissions."
+        ),
+        responses={200: IdentityBridgeAllowedFieldsSerializer},
+    )
+    def get(self, request, *args, **kwargs):
+        if not config.FEDERATED_IDENTITY_SYNC_ENABLED:
+            return Response(
+                "Identity Bridge is disabled.",
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        caller = request.user
+        if not caller.is_staff and not caller.is_identity_manager:
+            return Response(
+                "Only staff and identity managers can access this.",
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        allowed = sorted(get_federated_identity_sync_allowed_fields())
+        serializer = IdentityBridgeAllowedFieldsSerializer({"allowed_fields": allowed})
+        return Response(serializer.data)

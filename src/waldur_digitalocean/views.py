@@ -1,3 +1,4 @@
+from django.db import transaction
 from django.utils.translation import gettext_lazy as _
 from drf_spectacular.utils import OpenApiExample, extend_schema
 from rest_framework import decorators, response, status
@@ -5,7 +6,7 @@ from rest_framework import decorators, response, status
 from waldur_core.core import executors as core_executors
 from waldur_core.core import validators as core_validators
 from waldur_core.core.enums import CoreStates
-from waldur_core.core.serializers import EmptySerializer
+from waldur_core.core.serializers import StatusSerializer
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
 from waldur_core.structure import views as structure_views
@@ -60,15 +61,21 @@ class DropletViewSet(structure_views.ResourceViewSet):
 
         # XXX: We do not operate with backend_id`s in views.
         #      View should pass objects to executor.
-        self.create_executor.execute(
-            droplet,
-            is_async=self.async_executor,
-            backend_region_id=region.backend_id,
-            backend_image_id=image.backend_id,
-            backend_size_id=size.backend_id,
-            ssh_key_uuid=ssh_key.uuid.hex if ssh_key else None,
+        # on_commit ensures the executor runs only after the transaction commits.
+        # This prevents a race condition when ATOMIC_REQUESTS=True is enabled,
+        # where an async worker could try to read the object before it is visible in the DB.
+        transaction.on_commit(
+            lambda: self.create_executor.execute(
+                droplet,
+                is_async=self.async_executor,
+                backend_region_id=region.backend_id,
+                backend_image_id=image.backend_id,
+                backend_size_id=size.backend_id,
+                ssh_key_uuid=ssh_key.uuid.hex if ssh_key else None,
+            )
         )
 
+    @extend_schema(request=None, responses={status.HTTP_202_ACCEPTED: StatusSerializer})
     @decorators.action(detail=True, methods=["post"])
     def start(self, request, uuid=None):
         instance: models.Droplet = self.get_object()
@@ -81,8 +88,8 @@ class DropletViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator(models.Droplet.RuntimeStates.OFFLINE),
     ]
-    start_serializer_class = EmptySerializer
 
+    @extend_schema(request=None, responses={status.HTTP_202_ACCEPTED: StatusSerializer})
     @decorators.action(detail=True, methods=["post"])
     def stop(self, request, uuid=None):
         instance: models.Droplet = self.get_object()
@@ -95,8 +102,8 @@ class DropletViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator(models.Droplet.RuntimeStates.ONLINE),
     ]
-    stop_serializer_class = EmptySerializer
 
+    @extend_schema(request=None, responses={status.HTTP_202_ACCEPTED: StatusSerializer})
     @decorators.action(detail=True, methods=["post"])
     def restart(self, request, uuid=None):
         instance: models.Droplet = self.get_object()
@@ -109,7 +116,6 @@ class DropletViewSet(structure_views.ResourceViewSet):
         core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator(models.Droplet.RuntimeStates.ONLINE),
     ]
-    restart_serializer_class = EmptySerializer
 
     @extend_schema(
         examples=[
@@ -120,7 +126,8 @@ class DropletViewSet(structure_views.ResourceViewSet):
                     "size": "http://example.com/api/digitalocean-sizes/1ee385bc043249498cfeb8c7e3e079f0/"
                 },
             )
-        ]
+        ],
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def resize(self, request, uuid=None):

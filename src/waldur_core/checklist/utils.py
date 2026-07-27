@@ -21,6 +21,7 @@ def is_valid_operator_for_question_type(question_type, operator):
             enums.QuestionTypes.COUNTRY,
             enums.QuestionTypes.RATING,
             enums.QuestionTypes.DATETIME,
+            enums.QuestionTypes.LIKERT,
         ],
         "not_equals": [
             enums.QuestionTypes.NUMBER,
@@ -34,6 +35,7 @@ def is_valid_operator_for_question_type(question_type, operator):
             enums.QuestionTypes.COUNTRY,
             enums.QuestionTypes.RATING,
             enums.QuestionTypes.DATETIME,
+            enums.QuestionTypes.LIKERT,
         ],
         "contains": [
             enums.QuestionTypes.TEXT_INPUT,
@@ -138,6 +140,25 @@ def _is_valid_trigger_value(
     if isinstance(answer_data, list) and question_type in [
         enums.QuestionTypes.MULTIPLE_FILES,
     ]:
+        return True
+
+    # LIKERT answers are integers (scale position, 0-based) or the literal "na"
+    if question_type == enums.QuestionTypes.LIKERT:
+        if answer_data == "na":
+            return True
+        if isinstance(answer_data, bool):
+            return False
+        if isinstance(answer_data, int):
+            return True
+        if isinstance(answer_data, str):
+            try:
+                int(answer_data)
+                return True
+            except (ValueError, TypeError):
+                return False
+
+    # RICH_TEXT answers are arbitrary strings
+    if question_type == enums.QuestionTypes.RICH_TEXT and isinstance(answer_data, str):
         return True
 
     return False
@@ -267,3 +288,25 @@ def apply_operator(user_answer: any, required_value: any, operator: str) -> bool
         return user_answer != required_value
 
     return False
+
+
+def serialize_completion_answers(completion) -> list[dict]:
+    """Render a checklist completion's answers as a list of read-only dicts.
+
+    Each entry is ``{question_uuid, question, question_type, answer}`` ordered by
+    question order. ``answer`` is the human-readable value: for select-type questions
+    the stored option UUIDs are resolved to labels via ``Question.get_answer_display``.
+
+    Pass a completion whose ``answers__question__question_options`` are prefetched to
+    avoid N+1 queries.
+    """
+    answers = sorted(completion.answers.all(), key=lambda answer: answer.question.order)
+    return [
+        {
+            "question_uuid": answer.question.uuid.hex,
+            "question": answer.question.description,
+            "question_type": answer.question.question_type,
+            "answer": answer.question.get_answer_display(answer.answer_data),
+        }
+        for answer in answers
+    ]

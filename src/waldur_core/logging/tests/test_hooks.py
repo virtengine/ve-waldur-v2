@@ -5,14 +5,14 @@ from rest_framework import status, test
 
 from waldur_core.core.tests.helpers import override_waldur_core_settings
 from waldur_core.logging import event_logger, models, tasks
-from waldur_core.logging.tests.factories import WebHookFactory
+from waldur_core.logging.tests.factories import EmailHookFactory, WebHookFactory
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
 
 from . import factories
 
 
-class BaseHookApiTest(test.APITransactionTestCase):
+class BaseHookApiTest(test.APITestCase):
     def setUp(self):
         self.staff = structure_factories.UserFactory(is_staff=True)
         self.author = structure_factories.UserFactory()
@@ -152,8 +152,48 @@ class HookFilterViewTest(BaseHookApiTest):
         self.assertEqual(len(response.data), 1)
         self.assertEqual(str(self.author.uuid), str(response.data[0]["author_uuid"]))
 
+    def test_summary_lists_both_webhook_and_emailhook(self):
+        WebHookFactory(user=self.author)
+        EmailHookFactory(user=self.author)
+        self.client.force_authenticate(user=self.author)
+        response = self.client.get(reverse("hooks-list"))
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(len(response.data), 2)
+        hook_types = {item["hook_type"] for item in response.data}
+        self.assertEqual(hook_types, {"webhook", "email"})
 
-class SystemNotificationTest(test.APITransactionTestCase):
+    def test_summary_returns_child_specific_fields(self):
+        WebHookFactory(user=self.author, destination_url="http://hook.test/")
+        EmailHookFactory(user=self.author, email="notify@example.com")
+        self.client.force_authenticate(user=self.author)
+        response = self.client.get(reverse("hooks-list"))
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        data_by_type = {item["hook_type"]: item for item in response.data}
+        self.assertEqual(
+            data_by_type["webhook"]["destination_url"], "http://hook.test/"
+        )
+        self.assertEqual(data_by_type["email"]["email"], "notify@example.com")
+
+    def test_summary_filters_by_is_active(self):
+        WebHookFactory(user=self.author, is_active=True)
+        EmailHookFactory(user=self.author, is_active=False)
+        self.client.force_authenticate(user=self.author)
+        response = self.client.get(reverse("hooks-list"), {"is_active": True})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(len(response.data), 1)
+        self.assertTrue(response.data[0]["is_active"])
+
+    def test_non_staff_user_sees_only_own_hooks(self):
+        WebHookFactory(user=self.author)
+        WebHookFactory(user=self.other_user)
+        EmailHookFactory(user=self.other_user)
+        self.client.force_authenticate(user=self.author)
+        response = self.client.get(reverse("hooks-list"))
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(len(response.data), 1)
+
+
+class SystemNotificationTest(test.APITestCase):
     def setUp(self):
         self.system_notification = factories.SystemNotificationFactory()
         self.event_types = self.system_notification.event_types

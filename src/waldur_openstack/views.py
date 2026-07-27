@@ -3,13 +3,15 @@ import logging
 from django.contrib.contenttypes.models import ContentType
 from django.db.models import (
     Count,
+    Q,
+    Sum,
 )
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import (
     OpenApiExample,
     OpenApiParameter,
-    OpenApiTypes,
     extend_schema,
     extend_schema_view,
 )
@@ -22,28 +24,60 @@ from waldur_core.core import utils as core_utils
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
 from waldur_core.core.enums import CoreStates
-from waldur_core.core.serializers import EmptySerializer
+from waldur_core.core.serializers import DetailSerializer, StatusSerializer
 from waldur_core.logging import event_logger
+from waldur_core.logging.diff import compute_collection_diff
 from waldur_core.logging.enums import EventType
 from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
 from waldur_core.permissions.models import UserRole
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import models as structure_models
+from waldur_core.structure import permissions as structure_permissions
+from waldur_core.structure import serializers as structure_serializers
 from waldur_core.structure import signals as structure_signals
 from waldur_core.structure import views as structure_views
 from waldur_core.structure.managers import filter_queryset_for_user
 from waldur_core.structure.serializers import ConsoleUrlSerializer
 from waldur_core.structure.signals import resource_imported
 from waldur_mastermind.marketplace_openstack.utils import delete_instance
+from waldur_openstack import routes, topology
 from waldur_openstack.apps import OpenStackConfig
 from waldur_openstack.backend import OpenStackBackend
 from waldur_openstack.exceptions import OpenStackBackendError
 from waldur_openstack.models import Instance, Network, Volume
 
-from . import executors, filters, models, serializers, utils
+from . import audit, executors, filters, models, serializers, utils
 from . import permissions as openstack_permissions
 
 logger = logging.getLogger(__name__)
+
+
+class LBaaSAuditMixin:
+    """Emit lifecycle audit events for LBaaS resources on create/update/delete.
+
+    Designed to be mixed into ViewSets that also use ExecutorMixin. The events
+    fire from the API request thread, so they carry actor context (user, IP,
+    request id) auto-attached by CaptureEventContextMiddleware.
+    """
+
+    def perform_create(self, serializer):
+        super().perform_create(serializer)
+        instance = serializer.instance
+        if instance is not None:
+            audit.emit_lbaas_lifecycle_event(instance, "created")
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        _, serialize, _scope = audit._LBAAS_AUDIT_CONFIG[type(instance)]
+        old_payload = serialize(instance)
+        super().perform_update(serializer)
+        instance.refresh_from_db()
+        audit.emit_lbaas_lifecycle_event(instance, "updated", old_payload=old_payload)
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        audit.emit_lbaas_lifecycle_event(instance, "deleted")
+        return super().destroy(request, *args, **kwargs)
 
 
 class UsageReporter:
@@ -171,6 +205,7 @@ class FlavorViewSet(structure_views.BaseServicePropertyViewSet):
     @extend_schema(
         summary="Get flavor usage statistics",
         description="Retrieve usage statistics for VM instance flavors, showing running and created instance counts for each flavor.",
+        responses={status.HTTP_200_OK: OpenApiTypes.OBJECT},
     )
     @decorators.action(detail=False)
     def usage_stats(self, request):
@@ -197,6 +232,9 @@ class ImageViewSet(structure_views.BaseServicePropertyViewSet):
     @extend_schema(
         summary="Get image usage statistics",
         description="Retrieve usage statistics for VM instance images, showing running and created instance counts for each image.",
+        responses={
+            status.HTTP_200_OK: serializers.OpenStackUsageStatsResponseSerializer
+        },
     )
     @decorators.action(detail=False)
     def usage_stats(self, request):
@@ -235,6 +273,164 @@ class VolumeTypeViewSet(structure_views.BaseServicePropertyViewSet):
             .order_by("name")
         )
         return response.Response(names, status=status.HTTP_200_OK)
+
+
+@extend_schema_view(
+    list=extend_schema(
+        summary="List external networks",
+        description="Get a list of provider-level external networks discovered from OpenStack.",
+    ),
+    retrieve=extend_schema(
+        summary="Get external network details",
+        description="Retrieve details of a specific external network, including its subnets.",
+    ),
+)
+class ExternalNetworkViewSet(structure_views.BaseServicePropertyViewSet):
+    queryset = models.ExternalNetwork.objects.all().order_by("settings", "name")
+    serializer_class = serializers.ExternalNetworkSerializer
+    lookup_field = "uuid"
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.ExternalNetworkFilter
+
+
+class HypervisorViewSet(structure_views.BaseServicePropertyViewSet):
+    queryset = models.Hypervisor.objects.all().order_by("settings", "name")
+    serializer_class = serializers.HypervisorSerializer
+    lookup_field = "uuid"
+    filter_backends = (DjangoFilterBackend, structure_filters.GenericRoleFilter)
+    filterset_class = filters.HypervisorFilter
+
+    @extend_schema(
+        summary="Get hypervisor summary statistics",
+        description=(
+            "Return aggregated vCPU, RAM and disk totals across all hypervisors "
+            "matching the current filter (e.g. settings_uuid)."
+        ),
+        parameters=[
+            OpenApiParameter(
+                "settings_uuid",
+                OpenApiTypes.UUID,
+                OpenApiParameter.QUERY,
+                required=True,
+                description="UUID of the OpenStack ServiceSettings to aggregate over.",
+            ),
+        ],
+        responses={200: serializers.HypervisorSummarySerializer},
+    )
+    @decorators.action(detail=False, methods=["get"])
+    def summary(self, request):
+        if not request.query_params.get("settings_uuid"):
+            raise exceptions.ValidationError(
+                {"settings_uuid": "This parameter is required."}
+            )
+        qs = self.filter_queryset(self.get_queryset())
+        result = qs.aggregate(
+            total_vcpus=Sum("vcpus"),
+            used_vcpus=Sum("vcpus_used"),
+            total_memory_mb=Sum("memory_mb"),
+            used_memory_mb=Sum("memory_mb_used"),
+            total_local_gb=Sum("local_gb"),
+            used_local_gb=Sum("local_gb_used"),
+            total_running_vms=Sum("running_vms"),
+        )
+        # total_vcpus already contains the effective (overcommit-applied)
+        # number per host, sourced from Placement's per-RP allocation_ratio.
+        # See pull_hypervisors / _collect_placement_capacity in backend.py.
+        result = {k: v or 0 for k, v in result.items()}
+        serializer = serializers.HypervisorSummarySerializer(result)
+        return response.Response(serializer.data)
+
+    @extend_schema(
+        summary="Pre-flight allocation candidates",
+        description=(
+            "Ask Placement which compute hosts could currently satisfy a "
+            "request for the given resources (and required traits). Useful "
+            "as a pre-flight check before placing an order on a fully-booked "
+            "cloud. Returns 0 candidates when nothing fits, with the same "
+            "provider_summaries Placement returns for diagnostic display."
+        ),
+        parameters=[
+            OpenApiParameter(
+                "settings_uuid",
+                OpenApiTypes.UUID,
+                OpenApiParameter.QUERY,
+                required=True,
+            ),
+            OpenApiParameter(
+                "resources",
+                str,
+                OpenApiParameter.QUERY,
+                required=True,
+                description="e.g. VCPU:4,MEMORY_MB:8192,DISK_GB:10",
+            ),
+            OpenApiParameter(
+                "required",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="e.g. HW_CPU_X86_AVX2,STORAGE_DISK_SSD",
+            ),
+            OpenApiParameter(
+                "limit",
+                int,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="Cap on returned candidates (default 10).",
+            ),
+        ],
+        responses={200: serializers.AllocationCandidatesResponseSerializer},
+    )
+    @decorators.action(detail=False, methods=["get"])
+    def allocation_candidates(self, request):
+        query = serializers.AllocationCandidatesQuerySerializer(
+            data=request.query_params
+        )
+        query.is_valid(raise_exception=True)
+        # Permission scoping: confirm the caller can see at least one
+        # hypervisor for that settings_uuid (relies on the same
+        # GenericRoleFilter the queryset already uses).
+        settings_uuid = query.validated_data["settings_uuid"].hex
+        accessible_qs = self.filter_queryset(self.get_queryset()).filter(
+            settings__uuid=settings_uuid
+        )
+        if not accessible_qs.exists():
+            raise exceptions.PermissionDenied(
+                "No accessible hypervisors for the given settings_uuid."
+            )
+        settings = accessible_qs.first().settings
+
+        resources = serializers.AllocationCandidatesQuerySerializer.parse_resources(
+            query.validated_data["resources"]
+        )
+        required_str = query.validated_data.get("required") or ""
+        required = [t.strip() for t in required_str.split(",") if t.strip()]
+
+        backend = OpenStackBackend(settings)
+        try:
+            raw = backend.get_allocation_candidates(
+                resources=resources,
+                required=required or None,
+                limit=query.validated_data.get("limit"),
+            )
+        except OpenStackBackendError as e:
+            raise exceptions.ValidationError(str(e))
+
+        result = {
+            "candidate_count": len(raw.get("allocation_requests", [])),
+            "provider_summaries": raw.get("provider_summaries", {}),
+        }
+        out = serializers.AllocationCandidatesResponseSerializer(result)
+        return response.Response(out.data)
+
+
+class HypervisorInventoryViewSet(structure_views.BaseServicePropertyViewSet):
+    queryset = models.HypervisorInventory.objects.all().order_by(
+        "hypervisor", "resource_class"
+    )
+    serializer_class = serializers.HypervisorInventorySerializer
+    lookup_field = "uuid"
+    filter_backends = (DjangoFilterBackend, structure_filters.GenericRoleFilter)
+    filterset_class = filters.HypervisorInventoryFilter
 
 
 @extend_schema_view(
@@ -286,7 +482,7 @@ class SecurityGroupViewSet(structure_views.ResourceViewSet):
         summary="Set security group rules",
         description="Update the rules for a specific security group. This overwrites all existing rules.",
         request=serializers.OpenStackSecurityGroupRuleListUpdateSerializer,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
         examples=[
             OpenApiExample(
                 request_only=True,
@@ -308,25 +504,45 @@ class SecurityGroupViewSet(structure_views.ResourceViewSet):
         serializer.is_valid(raise_exception=True)
 
         security_group: models.SecurityGroup = self.get_object()
-        old_rules = serializers.DebugSecurityGroupRuleSerializer(
-            security_group.rules.all(), many=True
-        )
-
-        logger.info(
-            "About to set rules for security group with ID %s. Old rules: %s. New rules: %s",
-            security_group.id,
-            old_rules.data,
-            request.data,
-        )
+        old_snapshot = audit.snapshot_security_group_rules(security_group)
 
         serializer.save()
         security_group.refresh_from_db()
+
+        new_snapshot = audit.snapshot_security_group_rules(security_group)
+        diff = compute_collection_diff(
+            old_snapshot,
+            new_snapshot,
+            identity_key=lambda r: r["_pk"],
+            compare_fields=audit.SECURITY_GROUP_RULE_COMPARE_FIELDS,
+            serialize=lambda r: {k: v for k, v in r.items() if k != "_pk"},
+        )
+        audit.emit_security_group_rules_changed(
+            security_group, diff, trigger="user_action"
+        )
 
         executors.PushSecurityGroupRulesExecutor().execute(security_group)
         return response.Response(
             {"status": _("Rules update was successfully scheduled.")},
             status=status.HTTP_202_ACCEPTED,
         )
+
+    def destroy(self, request, *args, **kwargs):
+        security_group: models.SecurityGroup = self.get_object()
+        # Snapshot rules *before* the executor cascades them so we can record
+        # them in the aggregate event's removed_rules list.
+        old_snapshot = audit.snapshot_security_group_rules(security_group)
+        diff = compute_collection_diff(
+            old_snapshot,
+            [],
+            identity_key=lambda r: r["_pk"],
+            compare_fields=audit.SECURITY_GROUP_RULE_COMPARE_FIELDS,
+            serialize=lambda r: {k: v for k, v in r.items() if k != "_pk"},
+        )
+        audit.emit_security_group_rules_changed(
+            security_group, diff, trigger="user_action"
+        )
+        return super().destroy(request, *args, **kwargs)
 
     set_rules_validators = [core_validators.StateValidator(CoreStates.OK)]
     set_rules_serializer_class = (
@@ -349,6 +565,7 @@ class SecurityGroupViewSet(structure_views.ResourceViewSet):
     ),
 )
 class ServerGroupViewSet(structure_views.ResourceViewSet):
+    disabled_actions = ["update", "partial_update"]
     queryset = models.ServerGroup.objects.all().order_by("tenant__name")
     serializer_class = serializers.OpenStackServerGroupSerializer
     filterset_class = filters.ServerGroupFilter
@@ -388,7 +605,7 @@ class FloatingIPViewSet(structure_views.ResourceViewSet):
         summary="Attach floating IP to a port",
         description="Attach floating IP to port",
         request=serializers.OpenStackFloatingIPAttachSerializer,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def attach_to_port(self, request, uuid=None):
@@ -431,7 +648,7 @@ class FloatingIPViewSet(structure_views.ResourceViewSet):
         summary="Detach floating IP from port",
         description="Detach floating IP from port",
         request=None,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def detach_from_port(self, request=None, uuid=None):
@@ -454,7 +671,7 @@ class FloatingIPViewSet(structure_views.ResourceViewSet):
         summary="Update floating IP description",
         description="Update description of the floating IP",
         request=serializers.OpenStackFloatingIPDescriptionUpdateSerializer,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def update_description(self, request=None, uuid=None):
@@ -522,6 +739,12 @@ The following quotas are supported. All values are expected to be integers:
 - security_group_rule_count - maximal number of created security groups rules.
 - volumes - maximal number of created volumes.
 - snapshots - maximal number of created snapshots.
+- floating_ip_count - maximal number of floating IPs. Use 0 to deny, -1 for unlimited.
+- network_count - maximal number of networks. Use 0 to deny, -1 for unlimited.
+- subnet_count - maximal number of subnets. Use 0 to deny, -1 for unlimited.
+- port_count - maximal number of ports. Use 0 to deny, -1 for unlimited.
+- gigabytes_<volume_type_name> - maximal storage for a specific Cinder volume type, in GB.
+  For example, gigabytes_ssd or gigabytes___DEFAULT__. Use -1 for unlimited.
 
 It is possible to update quotas by one or by submitting all the fields in one request.
 Waldur will attempt to update the provided quotas. Please note, that if provided quotas are
@@ -535,6 +758,54 @@ In case tenant is in a non-stable status, the response would be **409 CONFLICT**
 In this case REST client is advised to repeat the request after some time.
 On successful completion the task will synchronize quotas with the backend.
 """,
+        # Named fields give SDK consumers typed hints; additionalProperties covers
+        # the dynamic gigabytes_<volume_type_name> keys (GB, min -1).
+        # Using a raw media-type dict is the drf-spectacular 0.28 way to combine
+        # both named properties and additionalProperties in one request schema.
+        request={
+            "application/json": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "integer",
+                    "minimum": -1,
+                    "description": "Per-volume-type storage quota in GB (gigabytes_<type>). Use -1 for unlimited, 0 to deny.",
+                },
+                "properties": {
+                    "instances": {"type": "integer", "minimum": 1},
+                    "volumes": {"type": "integer", "minimum": 1},
+                    "snapshots": {"type": "integer", "minimum": 1},
+                    "ram": {"type": "integer", "minimum": 1, "description": "In MiB"},
+                    "vcpu": {"type": "integer", "minimum": 1},
+                    "storage": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "In MiB",
+                    },
+                    "security_group_count": {"type": "integer", "minimum": 1},
+                    "security_group_rule_count": {"type": "integer", "minimum": 1},
+                    "floating_ip_count": {
+                        "type": "integer",
+                        "minimum": -1,
+                        "description": "Use 0 to deny, -1 for unlimited",
+                    },
+                    "network_count": {
+                        "type": "integer",
+                        "minimum": -1,
+                        "description": "Use 0 to deny, -1 for unlimited",
+                    },
+                    "subnet_count": {
+                        "type": "integer",
+                        "minimum": -1,
+                        "description": "Use 0 to deny, -1 for unlimited",
+                    },
+                    "port_count": {
+                        "type": "integer",
+                        "minimum": -1,
+                        "description": "Use 0 to deny, -1 for unlimited",
+                    },
+                },
+            }
+        },
         examples=[
             OpenApiExample(
                 request_only=True,
@@ -548,10 +819,18 @@ On successful completion the task will synchronize quotas with the backend.
                     "security_group_rule_count": 100,
                     "volumes": 10,
                     "snapshots": 20,
+                    "floating_ip_count": 50,
+                    "network_count": 10,
+                    "subnet_count": 20,
+                    "port_count": 100,
+                    "gigabytes_ssd": 500,
+                    "gigabytes___DEFAULT__": 1000,
                 },
             )
         ],
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
+    @extend_schema(responses={status.HTTP_200_OK: StatusSerializer})
     @decorators.action(detail=True, methods=["post"])
     def set_quotas(self, request, uuid=None):
         tenant: models.Tenant = self.get_object()
@@ -578,6 +857,7 @@ On successful completion the task will synchronize quotas with the backend.
     @extend_schema(
         summary="Create network for tenant",
         description="Create network for tenant",
+        responses={status.HTTP_201_CREATED: serializers.OpenStackNetworkSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def create_network(self, request, uuid=None):
@@ -663,7 +943,6 @@ On successful completion the task will synchronize quotas with the backend.
         return response.Response(status=status.HTTP_202_ACCEPTED)
 
     pull_floating_ips_validators = [core_validators.StateValidator(CoreStates.OK)]
-    pull_floating_ips_serializer_class = EmptySerializer
 
     @extend_schema(
         summary="Create security group",
@@ -701,6 +980,20 @@ On successful completion the task will synchronize quotas with the backend.
         serializer.is_valid(raise_exception=True)
         security_group = serializer.save()
 
+        # Emit one aggregate audit event with all initial rules, instead of
+        # leaving the backend layer to fan out N per-rule events.
+        new_snapshot = audit.snapshot_security_group_rules(security_group)
+        diff = compute_collection_diff(
+            [],
+            new_snapshot,
+            identity_key=lambda r: r["_pk"],
+            compare_fields=audit.SECURITY_GROUP_RULE_COMPARE_FIELDS,
+            serialize=lambda r: {k: v for k, v in r.items() if k != "_pk"},
+        )
+        audit.emit_security_group_rules_changed(
+            security_group, diff, trigger="user_action"
+        )
+
         executors.SecurityGroupCreateExecutor().execute(security_group)
         return response.Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -719,7 +1012,7 @@ On successful completion the task will synchronize quotas with the backend.
 
         To reference a remote group within a rule, use 'remote_group_name' field.""",
         request=serializers.TenantPushSecurityGroupsSerializer,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def push_security_groups(self, request, uuid=None):
@@ -744,6 +1037,7 @@ On successful completion the task will synchronize quotas with the backend.
         summary="Pull security groups",
         description="Trigger job to pull security groups from remote VPC",
         request=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def pull_security_groups(self, request, uuid=None):
@@ -759,6 +1053,7 @@ On successful completion the task will synchronize quotas with the backend.
         summary="Pull server groups",
         description="Trigger job to pull server groups from remote VPC",
         request=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def pull_server_groups(self, request, uuid=None):
@@ -780,6 +1075,10 @@ On successful completion the task will synchronize quotas with the backend.
                 value={"name": "Server group name", "policy": "affinity"},
             )
         ],
+        responses={status.HTTP_201_CREATED: serializers.OpenStackServerGroupSerializer},
+    )
+    @extend_schema(
+        responses={status.HTTP_201_CREATED: serializers.OpenStackServerGroupSerializer}
     )
     @decorators.action(detail=True, methods=["post"])
     def create_server_group(self, request, uuid=None):
@@ -797,7 +1096,7 @@ On successful completion the task will synchronize quotas with the backend.
         summary="Change tenant user password",
         description="Change password for tenant user",
         request=serializers.OpenStackTenantChangePasswordSerializer,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def change_password(self, request, uuid=None):
@@ -820,7 +1119,7 @@ On successful completion the task will synchronize quotas with the backend.
         summary="Pull tenant quotas",
         description="It triggers celery job to pull quotas from remote VPC",
         request=None,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def pull_quotas(self, request, uuid=None):
@@ -868,6 +1167,23 @@ On successful completion the task will synchronize quotas with the backend.
             raise exceptions.ValidationError(e)
         return response.Response(serializer.data, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        summary="Tenant network topology",
+        description=(
+            "Compose the tenant's network topology — routers, networks, subnets, "
+            "ports, instances, floating IPs, external networks, and inbound RBAC "
+            "shares — as a graph (nodes + edges). Read-only; all data comes from "
+            "already-pulled state, no Neutron calls."
+        ),
+        request=None,
+        responses={status.HTTP_200_OK: serializers.TenantTopologySerializer},
+    )
+    @decorators.action(detail=True, methods=["get"])
+    def topology(self, request, uuid=None):
+        tenant: models.Tenant = self.get_object()
+        graph = topology.build_tenant_topology(tenant)
+        return response.Response(graph, status=status.HTTP_200_OK)
+
 
 @extend_schema_view(
     list=extend_schema(
@@ -902,6 +1218,7 @@ class RouterViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
     @extend_schema(
         summary="Set static routes",
         description="Define or overwrite the static routes for the router.",
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["POST"])
     def set_routes(self, request, uuid=None):
@@ -948,7 +1265,7 @@ class RouterViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
         summary="Add router interface",
         description="Add interface to router. Either subnet or port must be provided.",
         request=serializers.OpenStackRouterInterfaceSerializer,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def add_router_interface(self, request, uuid=None):
@@ -1051,7 +1368,7 @@ class RouterViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
         summary="Remove router interface",
         description="Remove interface from router. Either subnet or port must be provided.",
         request=serializers.OpenStackRouterInterfaceSerializer,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def remove_router_interface(self, request, uuid=None):
@@ -1073,6 +1390,736 @@ class RouterViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
         serializers.OpenStackRouterInterfaceSerializer
     )
     remove_router_interface_validators = [core_validators.StateValidator(CoreStates.OK)]
+
+    @extend_schema(
+        summary="Set external gateway",
+        description=(
+            "Set an external network as the gateway for this router. "
+            "Advanced options (SNAT control, fixed IPs) require additional permissions."
+        ),
+        request=serializers.SetExternalGatewaySerializer,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def set_external_gateway(self, request, uuid=None):
+        router: models.Router = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        old_external_network_id = router.external_network_id
+        router.external_network_id = data["external_network_id"]
+        router.external_network_ref = data.get("external_network_ref")
+        router.enable_snat = data.get("enable_snat")
+        router.external_fixed_ips = data.get("external_fixed_ips", [])
+        router.save(
+            update_fields=[
+                "external_network_id",
+                "external_network_ref",
+                "enable_snat",
+                "external_fixed_ips",
+            ]
+        )
+        executors.RouterSetExternalGatewayExecutor.execute(router)
+
+        event_logger.emit(
+            "External gateway has been set on router.",
+            event_type=EventType.OPENSTACK_ROUTER_UPDATED,
+            event_context={
+                "router": router,
+                "tenant_backend_id": router.tenant.backend_id,
+                "old_external_network_id": old_external_network_id,
+                "new_external_network_id": router.external_network_id,
+                "enable_snat": router.enable_snat,
+                "external_fixed_ips": router.external_fixed_ips,
+            },
+            scopes=[router, router.project, router.project.customer],
+        )
+
+        logger.info(
+            "External gateway has been set on router %s to network %s "
+            "(enable_snat=%s, external_fixed_ips=%s).",
+            router,
+            router.external_network_id,
+            router.enable_snat,
+            router.external_fixed_ips,
+        )
+
+        return response.Response(
+            {"status": _("External gateway update was successfully scheduled.")},
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+    set_external_gateway_permissions = [
+        openstack_permissions.can_manage_openstack_router_gateway
+    ]
+    set_external_gateway_validators = [
+        core_validators.StateValidator(CoreStates.OK, CoreStates.ERRED)
+    ]
+    set_external_gateway_serializer_class = serializers.SetExternalGatewaySerializer
+
+    @extend_schema(
+        summary="Remove external gateway",
+        description="Remove the external gateway from this router.",
+        request=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def remove_external_gateway(self, request, uuid=None):
+        router: models.Router = self.get_object()
+        if not router.has_external_gateway:
+            return response.Response(
+                {"detail": _("Router does not have an external gateway.")},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # Check for floating IPs associated via the gateway network
+        floating_ip_count = models.FloatingIP.objects.filter(
+            tenant=router.tenant,
+            backend_network_id=router.external_network_id,
+        ).count()
+        if floating_ip_count > 0:
+            return response.Response(
+                {
+                    "detail": _(
+                        "Cannot remove external gateway: %d floating IP(s) "
+                        "are still associated with this gateway network."
+                    )
+                    % floating_ip_count
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        old_external_network_id = router.external_network_id
+        executors.RouterRemoveExternalGatewayExecutor.execute(router)
+
+        event_logger.emit(
+            "External gateway has been removed from router.",
+            event_type=EventType.OPENSTACK_ROUTER_UPDATED,
+            event_context={
+                "router": router,
+                "tenant_backend_id": router.tenant.backend_id,
+                "old_external_network_id": old_external_network_id,
+                "new_external_network_id": "",
+            },
+            scopes=[router, router.project, router.project.customer],
+        )
+
+        logger.info(
+            "External gateway (network %s) removal has been scheduled for router %s.",
+            old_external_network_id,
+            router,
+        )
+
+        return response.Response(
+            {"status": _("External gateway removal was successfully scheduled.")},
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+    remove_external_gateway_permissions = [
+        openstack_permissions.can_manage_openstack_router_gateway
+    ]
+    remove_external_gateway_validators = [
+        core_validators.StateValidator(CoreStates.OK, CoreStates.ERRED)
+    ]
+
+    @extend_schema(
+        summary="Effective routes for this router",
+        description=(
+            "Compose the router's routing table from three sources: the "
+            "default route inherited from the external gateway subnet, the "
+            "on-link routes implied by each attached interface, and the "
+            "user-set static routes. SNAT state is reported alongside."
+        ),
+        request=None,
+        responses={
+            status.HTTP_200_OK: serializers.EffectiveRoutesResponseSerializer,
+        },
+    )
+    @decorators.action(detail=True, methods=["get"])
+    def effective_routes(self, request, uuid=None):
+        router: models.Router = self.get_object()
+        return response.Response(
+            routes.compute_effective_routes(router),
+            status=status.HTTP_200_OK,
+        )
+
+    @extend_schema(
+        summary="List available external networks",
+        description=(
+            "Returns a merged list of external networks available for this router's tenant, "
+            "from both global external networks and RBAC-exposed networks."
+        ),
+        responses={200: serializers.AvailableExternalNetworkSerializer(many=True)},
+    )
+    @decorators.action(detail=True, methods=["get"])
+    def available_external_networks(self, request, uuid=None):
+        router: models.Router = self.get_object()
+        tenant = router.tenant
+        result = []
+
+        for ext_net in utils.get_tenant_external_networks(tenant, request.user):
+            subnets = [
+                {
+                    "backend_id": s.backend_id,
+                    "name": s.name,
+                    "cidr": getattr(s, "cidr", ""),
+                }
+                for s in ext_net.subnets.all()
+            ]
+            result.append(
+                {
+                    "backend_id": ext_net.backend_id,
+                    "name": ext_net.name,
+                    "description": ext_net.description,
+                    "source": "global",
+                    "subnets": subnets,
+                }
+            )
+
+        # RBAC-exposed-as-external networks
+        seen_backend_ids = {r["backend_id"] for r in result}
+        rbac_networks = models.Network.objects.filter(
+            rbac_policies__target_tenant=tenant,
+            rbac_policies__policy_type=models.NetworkRBACPolicy.NetworkShareType.EXTERNAL,
+        ).distinct()
+        for network in rbac_networks:
+            if network.backend_id in seen_backend_ids:
+                continue
+            subnets = [
+                {
+                    "backend_id": s.backend_id,
+                    "name": s.name,
+                    "cidr": s.cidr,
+                }
+                for s in network.subnets.all()
+            ]
+            result.append(
+                {
+                    "backend_id": network.backend_id,
+                    "name": network.name,
+                    "description": network.description,
+                    "source": "rbac",
+                    "subnets": subnets,
+                }
+            )
+
+        serializer = serializers.AvailableExternalNetworkSerializer(result, many=True)
+        return response.Response(serializer.data)
+
+    set_erred_serializer_class = structure_serializers.SetErredSerializer
+
+    @extend_schema(
+        summary="Mark router as ERRED",
+        description=(
+            "Manually transition the router to ERRED state. "
+            "This is useful for routers stuck in transitional states "
+            "(CREATING, UPDATING, DELETING) that cannot be synced via pull. "
+            "Staff-only operation."
+        ),
+        responses={status.HTTP_200_OK: DetailSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def set_erred(self, request, uuid=None):
+        resource = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        resource.error_message = serializer.validated_data.get("error_message", "")
+        resource.error_traceback = serializer.validated_data.get("error_traceback", "")
+        resource.set_erred()
+        resource.save(update_fields=["state", "error_message", "error_traceback"])
+        return response.Response(
+            {"detail": _("Resource has been marked as ERRED.")},
+            status=status.HTTP_200_OK,
+        )
+
+    set_erred_permissions = [structure_permissions.is_staff]
+
+    @extend_schema(
+        summary="Mark router as OK",
+        description=(
+            "Manually transition the router to OK state and clear error fields. "
+            "Staff-only operation."
+        ),
+        request=None,
+        responses={status.HTTP_200_OK: DetailSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def set_ok(self, request, uuid=None):
+        resource = self.get_object()
+        resource.error_message = ""
+        resource.error_traceback = ""
+        resource.set_ok()
+        resource.save(update_fields=["state", "error_message", "error_traceback"])
+        return response.Response(
+            {"detail": _("Resource has been marked as OK.")},
+            status=status.HTTP_200_OK,
+        )
+
+    set_ok_permissions = [structure_permissions.is_staff]
+
+
+@extend_schema_view(
+    list=extend_schema(
+        summary="List load balancers",
+        description="Get a list of load balancers.",
+    ),
+    retrieve=extend_schema(
+        summary="Get load balancer details",
+        description="Retrieve details of a specific load balancer.",
+    ),
+    create=extend_schema(
+        summary="Create load balancer",
+        description="Create a new load balancer.",
+    ),
+    update=extend_schema(
+        summary="Update load balancer",
+        description="Update an existing load balancer.",
+    ),
+    partial_update=extend_schema(
+        summary="Partially update load balancer",
+        description="Update specific fields of a load balancer.",
+    ),
+    destroy=extend_schema(
+        summary="Delete load balancer",
+        description="Delete a load balancer.",
+    ),
+)
+class LoadBalancerViewSet(
+    LBaaSAuditMixin, core_mixins.ExecutorMixin, core_views.ActionsViewSet
+):
+    lookup_field = "uuid"
+    queryset = (
+        models.LoadBalancer.objects.all()
+        .order_by("tenant__name")
+        .select_related("vip_subnet", "vip_port", "attached_floating_ip")
+        .prefetch_related("vip_port__security_groups")
+    )
+    filter_backends = (DjangoFilterBackend, structure_filters.GenericRoleFilter)
+    filterset_class = filters.LoadBalancerFilter
+    serializer_class = serializers.OpenStackLoadBalancerSerializer
+    create_serializer_class = serializers.CreateLoadBalancerSerializer
+    update_serializer_class = serializers.UpdateLoadBalancerSerializer
+    partial_update_serializer_class = serializers.UpdateLoadBalancerSerializer
+
+    delete_executor = executors.LoadBalancerDeleteExecutor
+    create_executor = executors.LoadBalancerCreateExecutor
+    update_executor = executors.LoadBalancerUpdateExecutor
+
+    @extend_schema(
+        summary="Unlink load balancer",
+        description=(
+            "Delete the load balancer from the Waldur database without scheduling "
+            "operations on the OpenStack backend and without checking resource state. "
+            "Staff-only; intended for cleaning up records stuck in transitional states."
+        ),
+        request=None,
+        responses={204: None},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def unlink(self, request, uuid=None):
+        load_balancer = self.get_object()
+        load_balancer.delete()
+        return response.Response(status=status.HTTP_204_NO_CONTENT)
+
+    unlink_permissions = [structure_permissions.is_staff]
+
+    @extend_schema(
+        summary="Attach floating IP to VIP",
+        description="Attach a floating IP to the load balancer VIP port.",
+        request=serializers.LoadBalancerAttachFloatingIPSerializer,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def attach_floating_ip(self, request, uuid=None):
+        load_balancer: models.LoadBalancer = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        floating_ip: models.FloatingIP = serializer.validated_data["floating_ip"]
+        if load_balancer.state != CoreStates.OK:
+            raise core_exceptions.IncorrectStateException(
+                _("Load balancer [%(lb)s] must be in OK state, current: [%(state)s]")
+                % {
+                    "lb": load_balancer,
+                    "state": load_balancer.get_state_display(),
+                }
+            )
+        if not load_balancer.vip_port or not load_balancer.vip_port.backend_id:
+            raise exceptions.ValidationError(
+                _(
+                    "Load balancer VIP port is not available yet. "
+                    "Wait for the load balancer to become ACTIVE."
+                )
+            )
+        if floating_ip.tenant != load_balancer.tenant:
+            raise exceptions.ValidationError(
+                _("Floating IP must belong to the same tenant as the load balancer.")
+            )
+        executors.LoadBalancerAttachFloatingIPExecutor().execute(
+            load_balancer,
+            floating_ip=core_utils.serialize_instance(floating_ip),
+        )
+        return response.Response(
+            {"status": _("Attach was scheduled")},
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+    attach_floating_ip_serializer_class = (
+        serializers.LoadBalancerAttachFloatingIPSerializer
+    )
+    attach_floating_ip_validators = [
+        core_validators.StateValidator(CoreStates.OK),
+    ]
+
+    @extend_schema(
+        summary="Detach floating IP from VIP",
+        description="Detach floating IP from the load balancer VIP port.",
+        request=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def detach_floating_ip(self, request, uuid=None):
+        load_balancer: models.LoadBalancer = self.get_object()
+        if not load_balancer.attached_floating_ip:
+            raise exceptions.ValidationError(
+                _("Load balancer has no floating IP attached.")
+            )
+        executors.LoadBalancerDetachFloatingIPExecutor().execute(load_balancer)
+        return response.Response(
+            {"status": _("Detach was scheduled")},
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+    detach_floating_ip_validators = [
+        core_validators.StateValidator(CoreStates.OK),
+    ]
+
+    @extend_schema(
+        summary="Set security groups on VIP port",
+        description="Set security groups on the load balancer VIP port to control access.",
+        request=serializers.LoadBalancerSetSecurityGroupsSerializer,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def set_security_groups(self, request, uuid=None):
+        load_balancer = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        security_groups = serializer.validated_data["security_groups"]
+        if not load_balancer.vip_port or not load_balancer.vip_port.backend_id:
+            raise exceptions.ValidationError(
+                _(
+                    "Load balancer VIP port is not available yet. "
+                    "Wait for the load balancer to become ACTIVE."
+                )
+            )
+        for sg in security_groups:
+            if sg.tenant != load_balancer.tenant:
+                raise exceptions.ValidationError(
+                    _(
+                        "Security group '%(sg)s' must belong to the same tenant "
+                        "as the load balancer."
+                    )
+                    % {"sg": sg.name}
+                )
+        old_sgs = list(load_balancer.vip_port.security_groups.all())
+        audit.emit_load_balancer_security_groups_changed(
+            load_balancer, old_sgs=old_sgs, new_sgs=security_groups
+        )
+        executors.LoadBalancerSetSecurityGroupsExecutor().execute(
+            load_balancer,
+            security_groups=[
+                core_utils.serialize_instance(sg) for sg in security_groups
+            ],
+        )
+        return response.Response(
+            {"status": _("Setting security groups was scheduled")},
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+    set_security_groups_serializer_class = (
+        serializers.LoadBalancerSetSecurityGroupsSerializer
+    )
+    set_security_groups_validators = [
+        core_validators.StateValidator(CoreStates.OK),
+    ]
+
+    @extend_schema(
+        summary="Pull load balancer",
+        description="Synchronize load balancer state from the OpenStack backend.",
+        request=None,
+        responses={202: None},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def pull(self, request, uuid=None):
+        load_balancer = self.get_object()
+        executors.LoadBalancerPullExecutor.execute(load_balancer)
+        return response.Response(status=status.HTTP_202_ACCEPTED)
+
+    pull_validators = [
+        core_validators.StateValidator(CoreStates.OK, CoreStates.ERRED),
+    ]
+
+
+@extend_schema_view(
+    list=extend_schema(
+        summary="List pools",
+        description="Get a list of load balancer pools.",
+    ),
+    retrieve=extend_schema(
+        summary="Get pool details",
+        description="Retrieve details of a specific pool.",
+    ),
+    create=extend_schema(
+        summary="Create pool",
+        description="Create a new pool for a load balancer.",
+    ),
+    update=extend_schema(
+        summary="Update pool",
+        description="Update an existing pool.",
+    ),
+    partial_update=extend_schema(
+        summary="Partially update pool",
+        description="Update specific fields of a pool.",
+    ),
+    destroy=extend_schema(
+        summary="Delete pool",
+        description="Delete a pool.",
+    ),
+)
+class PoolViewSet(
+    LBaaSAuditMixin, core_mixins.ExecutorMixin, core_views.ActionsViewSet
+):
+    lookup_field = "uuid"
+    queryset = models.Pool.objects.all().order_by("load_balancer__name", "name")
+    filter_backends = (DjangoFilterBackend, structure_filters.GenericRoleFilter)
+    filterset_class = filters.PoolFilter
+    serializer_class = serializers.OpenStackPoolSerializer
+    create_serializer_class = serializers.CreatePoolSerializer
+    update_serializer_class = serializers.UpdatePoolSerializer
+    partial_update_serializer_class = serializers.UpdatePoolSerializer
+
+    delete_executor = executors.PoolDeleteExecutor
+    create_executor = executors.PoolCreateExecutor
+    update_executor = executors.PoolUpdateExecutor
+
+    @extend_schema(
+        summary="Pull pool",
+        description="Synchronize pool state from the OpenStack backend. Also pulls the associated load balancer.",
+        request=None,
+        responses={202: None},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def pull(self, request, uuid=None):
+        pool = self.get_object()
+        executors.PoolPullExecutor.execute(
+            pool,
+            serialized_load_balancer=core_utils.serialize_instance(pool.load_balancer),
+        )
+        return response.Response(status=status.HTTP_202_ACCEPTED)
+
+    pull_validators = [
+        core_validators.StateValidator(CoreStates.OK, CoreStates.ERRED),
+    ]
+
+
+@extend_schema_view(
+    list=extend_schema(
+        summary="List listeners",
+        description="Get a list of load balancer listeners.",
+    ),
+    retrieve=extend_schema(
+        summary="Get listener details",
+        description="Retrieve details of a specific listener.",
+    ),
+    create=extend_schema(
+        summary="Create listener",
+        description="Create a new listener for a load balancer.",
+    ),
+    update=extend_schema(
+        summary="Update listener",
+        description="Update an existing listener.",
+    ),
+    partial_update=extend_schema(
+        summary="Partially update listener",
+        description="Update specific fields of a listener.",
+    ),
+    destroy=extend_schema(
+        summary="Delete listener",
+        description="Delete a listener.",
+    ),
+)
+class ListenerViewSet(
+    LBaaSAuditMixin, core_mixins.ExecutorMixin, core_views.ActionsViewSet
+):
+    lookup_field = "uuid"
+    queryset = models.Listener.objects.all().order_by(
+        "load_balancer__name", "protocol_port", "name"
+    )
+    filter_backends = (DjangoFilterBackend, structure_filters.GenericRoleFilter)
+    filterset_class = filters.ListenerFilter
+    serializer_class = serializers.OpenStackListenerSerializer
+    create_serializer_class = serializers.CreateListenerSerializer
+    update_serializer_class = serializers.UpdateListenerSerializer
+    partial_update_serializer_class = serializers.UpdateListenerSerializer
+
+    delete_executor = executors.ListenerDeleteExecutor
+    create_executor = executors.ListenerCreateExecutor
+    update_executor = executors.ListenerUpdateExecutor
+
+    @extend_schema(
+        summary="Pull listener",
+        description="Synchronize listener state from the OpenStack backend. Also pulls pools of the load balancer and the load balancer itself.",
+        request=None,
+        responses={202: None},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def pull(self, request, uuid=None):
+        listener = self.get_object()
+        executors.ListenerPullExecutor.execute(
+            listener,
+            serialized_load_balancer=core_utils.serialize_instance(
+                listener.load_balancer
+            ),
+            serialized_tenant=core_utils.serialize_instance(
+                listener.load_balancer.tenant
+            ),
+        )
+        return response.Response(status=status.HTTP_202_ACCEPTED)
+
+    pull_validators = [
+        core_validators.StateValidator(CoreStates.OK, CoreStates.ERRED),
+    ]
+
+
+@extend_schema_view(
+    list=extend_schema(
+        summary="List pool members",
+        description="Get a list of pool members.",
+    ),
+    retrieve=extend_schema(
+        summary="Get pool member details",
+        description="Retrieve details of a specific pool member.",
+    ),
+    create=extend_schema(
+        summary="Create pool member",
+        description="Create a new member for a pool.",
+    ),
+    update=extend_schema(
+        summary="Update pool member",
+        description="Update an existing pool member.",
+    ),
+    partial_update=extend_schema(
+        summary="Partially update pool member",
+        description="Update specific fields of a pool member.",
+    ),
+    destroy=extend_schema(
+        summary="Delete pool member",
+        description="Delete a pool member.",
+    ),
+)
+class PoolMemberViewSet(
+    LBaaSAuditMixin, core_mixins.ExecutorMixin, core_views.ActionsViewSet
+):
+    lookup_field = "uuid"
+    queryset = models.PoolMember.objects.all().order_by(
+        "pool__load_balancer__name", "pool__name", "address", "protocol_port"
+    )
+    filter_backends = (DjangoFilterBackend, structure_filters.GenericRoleFilter)
+    filterset_class = filters.PoolMemberFilter
+    serializer_class = serializers.OpenStackPoolMemberSerializer
+    create_serializer_class = serializers.CreatePoolMemberSerializer
+    update_serializer_class = serializers.UpdatePoolMemberSerializer
+    partial_update_serializer_class = serializers.UpdatePoolMemberSerializer
+
+    delete_executor = executors.PoolMemberDeleteExecutor
+    create_executor = executors.PoolMemberCreateExecutor
+    update_executor = executors.PoolMemberUpdateExecutor
+
+    @extend_schema(
+        summary="Pull pool member",
+        description="Synchronize pool member state from the OpenStack backend. Also pulls the associated pool and load balancer.",
+        request=None,
+        responses={202: None},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def pull(self, request, uuid=None):
+        member = self.get_object()
+        executors.PoolMemberPullExecutor.execute(
+            member,
+            serialized_pool=core_utils.serialize_instance(member.pool),
+            serialized_load_balancer=core_utils.serialize_instance(
+                member.pool.load_balancer
+            ),
+        )
+        return response.Response(status=status.HTTP_202_ACCEPTED)
+
+    pull_validators = [
+        core_validators.StateValidator(CoreStates.OK, CoreStates.ERRED),
+    ]
+
+
+@extend_schema_view(
+    list=extend_schema(
+        summary="List health monitors",
+        description="Get a list of pool health monitors.",
+    ),
+    retrieve=extend_schema(
+        summary="Get health monitor details",
+        description="Retrieve details of a specific health monitor.",
+    ),
+    create=extend_schema(
+        summary="Create health monitor",
+        description="Create a new health monitor for a pool.",
+    ),
+    update=extend_schema(
+        summary="Update health monitor",
+        description="Update an existing health monitor.",
+    ),
+    partial_update=extend_schema(
+        summary="Partially update health monitor",
+        description="Update specific fields of a health monitor.",
+    ),
+    destroy=extend_schema(
+        summary="Delete health monitor",
+        description="Delete a health monitor.",
+    ),
+)
+class HealthMonitorViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
+    lookup_field = "uuid"
+    queryset = models.HealthMonitor.objects.all().order_by(
+        "pool__load_balancer__name", "pool__name", "name"
+    )
+    filter_backends = (DjangoFilterBackend, structure_filters.GenericRoleFilter)
+    filterset_class = filters.HealthMonitorFilter
+    serializer_class = serializers.OpenStackHealthMonitorSerializer
+    create_serializer_class = serializers.CreateHealthMonitorSerializer
+    update_serializer_class = serializers.UpdateHealthMonitorSerializer
+    partial_update_serializer_class = serializers.UpdateHealthMonitorSerializer
+
+    delete_executor = executors.HealthMonitorDeleteExecutor
+    create_executor = executors.HealthMonitorCreateExecutor
+    update_executor = executors.HealthMonitorUpdateExecutor
+
+    @extend_schema(
+        summary="Pull health monitor",
+        description="Synchronize health monitor state from the OpenStack backend. Also pulls the associated pool and load balancer.",
+        request=None,
+        responses={202: None},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def pull(self, request, uuid=None):
+        hm = self.get_object()
+        executors.HealthMonitorPullExecutor.execute(
+            hm,
+            serialized_pool=core_utils.serialize_instance(hm.pool),
+            serialized_load_balancer=core_utils.serialize_instance(
+                hm.pool.load_balancer
+            ),
+        )
+        return response.Response(status=status.HTTP_202_ACCEPTED)
+
+    pull_validators = [
+        core_validators.StateValidator(CoreStates.OK, CoreStates.ERRED),
+    ]
 
 
 @extend_schema_view(
@@ -1123,8 +2170,12 @@ class PortViewSet(structure_views.ResourceViewSet):
         backend = port.get_backend()
         backend.enable_port_security(port)
 
+        was_enabled = port.port_security_enabled
         port.port_security_enabled = True
         port.save(update_fields=["port_security_enabled"])
+
+        if not was_enabled:
+            audit.emit_port_security_toggled(port, enabled=True)
 
         return response.Response(status=status.HTTP_200_OK)
 
@@ -1140,11 +2191,29 @@ class PortViewSet(structure_views.ResourceViewSet):
         backend = port.get_backend()
         backend.disable_port_security(port)
 
+        was_enabled = port.port_security_enabled
         port.port_security_enabled = False
         port.security_groups.clear()  # Remove all security groups
         port.save(update_fields=["port_security_enabled"])
 
+        if was_enabled:
+            audit.emit_port_security_toggled(port, enabled=False)
+
         return response.Response(status=status.HTTP_200_OK)
+
+    def no_allowed_address_pairs(port):
+        # Neutron rejects disabling port security while allowed address pairs
+        # are set (AddressPairAndPortSecurityRequired). Reject early with a
+        # clear message instead of letting the backend call fail.
+        if port.allowed_address_pairs:
+            raise exceptions.ValidationError(
+                _(
+                    "Allowed address pairs must be cleared before port security "
+                    "can be disabled."
+                )
+            )
+
+    disable_port_security_validators = [no_allowed_address_pairs]
 
     @extend_schema(
         summary="Enable port",
@@ -1205,14 +2274,18 @@ class PortViewSet(structure_views.ResourceViewSet):
         summary="Update port security groups",
         description="Update security groups of the port",
         request=serializers.OpenStackInstanceSecurityGroupsUpdateSerializer,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def update_security_groups(self, request, uuid=None):
         port: models.Port = self.get_object()
         serializer = self.get_serializer(port, data=request.data)
         serializer.is_valid(raise_exception=True)
+        old_sgs = list(port.security_groups.all())
         serializer.save()
+        audit.emit_port_security_groups_changed(
+            port, old_sgs=old_sgs, new_sgs=list(port.security_groups.all())
+        )
 
         executors.PortUpdateSecurityGroupsExecutor().execute(port)
         return response.Response(
@@ -1233,6 +2306,53 @@ class PortViewSet(structure_views.ResourceViewSet):
     update_security_groups_serializer_class = (
         serializers.OpenStackInstanceSecurityGroupsUpdateSerializer
     )
+
+    @extend_schema(
+        summary="Set allowed address pairs",
+        description=(
+            "Replace the Port's allowed_address_pairs list. Cluster-VIP "
+            "workloads (keepalived, MetalLB, OpenShift ingress, OVN router) "
+            "need ports to permit additional IP/MAC pairs beyond their "
+            "fixed IPs. Values are validated and pushed to Neutron."
+        ),
+        request=serializers.SetAllowedAddressPairsSerializer,
+        responses={
+            status.HTTP_200_OK: serializers.OpenStackPortSerializer,
+        },
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def set_allowed_address_pairs(self, request, uuid=None):
+        port: models.Port = self.get_object()
+        serializer = serializers.SetAllowedAddressPairsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        new_pairs = list(serializer.validated_data["allowed_address_pairs"])
+        old_pairs = list(port.allowed_address_pairs or [])
+
+        backend = port.get_backend()
+        backend.set_port_allowed_address_pairs(port, new_pairs)
+        port.allowed_address_pairs = new_pairs
+        port.save(update_fields=["allowed_address_pairs"])
+
+        audit.emit_allowed_address_pairs_changed(
+            port, old_pairs=old_pairs, new_pairs=new_pairs
+        )
+
+        result = self.get_serializer(port, context={"request": request})
+        return response.Response(result.data, status=status.HTTP_200_OK)
+
+    set_allowed_address_pairs_serializer_class = (
+        serializers.SetAllowedAddressPairsSerializer
+    )
+    set_allowed_address_pairs_validators = [
+        core_validators.StateValidator(CoreStates.OK),
+    ]
+    # AAP is a layer-2/3 spoofing primitive — must match the gate used by
+    # the existing instance-level ``update_allowed_address_pairs`` action,
+    # not the default ``is_administrator`` that ``ResourceViewSet`` would
+    # otherwise apply.
+    set_allowed_address_pairs_permissions = [
+        openstack_permissions.can_manage_openstack_instance
+    ]
 
 
 @extend_schema_view(
@@ -1325,6 +2445,7 @@ class NetworkViewSet(structure_views.ResourceViewSet):
     @extend_schema(
         summary="Create subnet",
         description="Create a new subnet within the network.",
+        responses={status.HTTP_201_CREATED: serializers.OpenStackSubNetSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def create_subnet(self, request, uuid=None):
@@ -1340,6 +2461,7 @@ class NetworkViewSet(structure_views.ResourceViewSet):
     @extend_schema(
         summary="Set network MTU",
         description="Update the Maximum Transmission Unit (MTU) for the network.",
+        responses={status.HTTP_202_ACCEPTED: serializers.SetMtuSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def set_mtu(self, request, uuid=None):
@@ -1507,8 +2629,10 @@ class SubNetViewSet(structure_views.ResourceViewSet):
         return queryset.filter(network__in=all_networks)
 
     @extend_schema(
+        request=None,
         summary="Connect subnet to router",
         description="Connect the subnet to the default tenant router.",
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def connect(self, request, uuid=None):
@@ -1516,11 +2640,12 @@ class SubNetViewSet(structure_views.ResourceViewSet):
         return response.Response(status=status.HTTP_202_ACCEPTED)
 
     connect_validators = [core_validators.StateValidator(CoreStates.OK)]
-    connect_serializer_class = EmptySerializer
 
     @extend_schema(
+        request=None,
         summary="Disconnect subnet from router",
         description="Disconnect the subnet from the default tenant router.",
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def disconnect(self, request, uuid=None):
@@ -1528,7 +2653,6 @@ class SubNetViewSet(structure_views.ResourceViewSet):
         return response.Response(status=status.HTTP_202_ACCEPTED)
 
     disconnect_validators = [core_validators.StateValidator(CoreStates.OK)]
-    disconnect_serializer_class = EmptySerializer
 
 
 @extend_schema_view(
@@ -1578,7 +2702,7 @@ class VolumeViewSet(
         summary="Extend volume size",
         description="Increase volume size",
         request=serializers.OpenStackVolumeExtendSerializer,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def extend(self, request, uuid=None):
@@ -1631,7 +2755,7 @@ class VolumeViewSet(
         summary="Attach volume to instance",
         description="Attach volume to instance",
         request=serializers.VolumeAttachSerializer,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def attach(self, request, uuid=None):
@@ -1655,7 +2779,7 @@ class VolumeViewSet(
         summary="Detach volume from instance",
         description="Detach instance from volume",
         request=None,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def detach(self, request, uuid=None):
@@ -1676,7 +2800,7 @@ class VolumeViewSet(
         summary="Change volume type",
         description="Retype detached volume",
         request=serializers.OpenStackVolumeRetypeSerializer,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def retype(self, request, uuid=None):
@@ -1728,6 +2852,12 @@ class SnapshotViewSet(structure_views.ResourceViewSet):
     pull_executor = executors.SnapshotPullExecutor
     filterset_class = filters.SnapshotFilter
     disabled_actions = ["create"]
+
+    def destroy(self, request, *args, **kwargs):
+        snapshot = self.get_object()
+        for backup in snapshot.backups.all():
+            backup.delete()
+        return super().destroy(request, *args, **kwargs)
 
     @extend_schema(
         summary="Restore volume from snapshot",
@@ -1853,7 +2983,7 @@ class InstanceViewSet(
         summary="Change instance flavor",
         description="Change flavor of the instance",
         request=serializers.InstanceFlavorChangeSerializer,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def change_flavor(self, request, uuid=None):
@@ -1887,13 +3017,62 @@ class InstanceViewSet(
         core_validators.StateValidator(CoreStates.OK),
         core_validators.RuntimeStateValidator(models.Instance.RuntimeStates.SHUTOFF),
     ]
+
+    @extend_schema(
+        summary="Diagnose connectivity",
+        description=(
+            "Walks the wiring that connects this instance to the requested "
+            "target (default 'external') and returns a per-check report "
+            "computed from Waldur's already-pulled state — no live "
+            "OpenStack call. Use to triage 'VM can't reach the internet' "
+            "or 'VIP doesn't work' tickets in one click."
+        ),
+        request=serializers.DiagnoseConnectivityRequestSerializer,
+        responses={
+            status.HTTP_200_OK: serializers.DiagnoseConnectivityResponseSerializer,
+        },
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def diagnose_connectivity(self, request, uuid=None):
+        from waldur_openstack import diagnose
+
+        instance: models.Instance = self.get_object()
+        serializer = serializers.DiagnoseConnectivityRequestSerializer(
+            data=request.data or {}
+        )
+        serializer.is_valid(raise_exception=True)
+        target = serializer.validated_data.get("target") or "external"
+
+        report = diagnose.run_diagnose(instance, target=target)
+        payload = {
+            "target": report.target,
+            "target_address": report.target_address,
+            "checks": [
+                {
+                    "check": c.check,
+                    "status": c.status,
+                    "detail": c.detail,
+                    "fix_hint": c.fix_hint,
+                }
+                for c in report.checks
+            ],
+            "root_cause": report.root_cause,
+        }
+        response_serializer = serializers.DiagnoseConnectivityResponseSerializer(
+            payload
+        )
+        return response.Response(response_serializer.data)
+
+    diagnose_connectivity_serializer_class = (
+        serializers.DiagnoseConnectivityRequestSerializer
+    )
     change_flavor_permissions = [openstack_permissions.can_manage_openstack_instance]
 
     @extend_schema(
         summary="Start instance",
         description="Start the instance",
         request=None,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def start(self, request, uuid=None):
@@ -1918,13 +3097,12 @@ class InstanceViewSet(
         core_validators.RuntimeStateValidator(models.Instance.RuntimeStates.SHUTOFF),
     ]
     start_permissions = [openstack_permissions.can_manage_openstack_instance_power]
-    start_serializer_class = EmptySerializer
 
     @extend_schema(
         summary="Stop instance",
         description="Stop the instance",
         request=None,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def stop(self, request, uuid=None):
@@ -1949,13 +3127,12 @@ class InstanceViewSet(
         core_validators.RuntimeStateValidator(models.Instance.RuntimeStates.ACTIVE),
     ]
     stop_permissions = [openstack_permissions.can_manage_openstack_instance_power]
-    stop_serializer_class = EmptySerializer
 
     @extend_schema(
         summary="Restart instance",
         description="Restart the instance",
         request=None,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def restart(self, request, uuid=None):
@@ -1980,20 +3157,76 @@ class InstanceViewSet(
         core_validators.RuntimeStateValidator(models.Instance.RuntimeStates.ACTIVE),
     ]
     restart_permissions = [openstack_permissions.can_manage_openstack_instance_power]
-    restart_serializer_class = EmptySerializer
+
+    @extend_schema(
+        summary="Rescue instance",
+        description=(
+            "Boot the instance from a separate rescue image while keeping "
+            "the original disk attached. Volume-backed instances require an "
+            "explicit rescue_image with hw_rescue_device or hw_rescue_bus set."
+        ),
+        request=serializers.InstanceRescueSerializer,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def rescue(self, request, uuid=None):
+        instance: models.Instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        rescue_image = serializer.validated_data.get("rescue_image")
+        executors.InstanceRescueExecutor().execute(
+            instance,
+            rescue_image_ref=rescue_image.backend_id if rescue_image else None,
+        )
+        return response.Response(
+            {"status": _("rescue was scheduled")}, status=status.HTTP_202_ACCEPTED
+        )
+
+    rescue_validators = [
+        core_validators.StateValidator(CoreStates.OK),
+        core_validators.RuntimeStateValidator(models.Instance.RuntimeStates.ACTIVE),
+    ]
+    rescue_permissions = [openstack_permissions.can_manage_openstack_instance_power]
+    rescue_serializer_class = serializers.InstanceRescueSerializer
+
+    @extend_schema(
+        summary="Unrescue instance",
+        description="Restore the instance from rescue mode.",
+        request=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def unrescue(self, request, uuid=None):
+        instance: models.Instance = self.get_object()
+        executors.InstanceUnrescueExecutor().execute(instance)
+        return response.Response(
+            {"status": _("unrescue was scheduled")}, status=status.HTTP_202_ACCEPTED
+        )
+
+    unrescue_validators = [
+        core_validators.StateValidator(CoreStates.OK),
+        core_validators.RuntimeStateValidator(models.Instance.RuntimeStates.RESCUE),
+    ]
+    unrescue_permissions = [openstack_permissions.can_manage_openstack_instance_power]
 
     @extend_schema(
         summary="Update instance security groups",
         description="Update security groups of the instance",
         request=serializers.OpenStackInstanceSecurityGroupsUpdateSerializer,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def update_security_groups(self, request, uuid=None):
         instance: models.Instance = self.get_object()
         serializer = self.get_serializer(instance, data=request.data)
         serializer.is_valid(raise_exception=True)
+        old_sgs = list(instance.security_groups.all())
         serializer.save()
+        audit.emit_instance_security_groups_changed(
+            instance,
+            old_sgs=old_sgs,
+            new_sgs=list(instance.security_groups.all()),
+        )
 
         executors.InstanceUpdateSecurityGroupsExecutor().execute(instance)
         return response.Response(
@@ -2032,16 +3265,14 @@ class InstanceViewSet(
         summary="Update instance allowed address pairs",
         description="Update allowed address pairs of the instance",
         request=serializers.OpenStackInstanceAllowedAddressPairsUpdateSerializer,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def update_allowed_address_pairs(self, request, uuid=None):
         instance: models.Instance = self.get_object()
         serializer = self.get_serializer(instance, data=request.data)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
         subnet = serializer.validated_data["subnet"]
-        allowed_address_pairs = serializer.validated_data["allowed_address_pairs"]
         try:
             port = models.Port.objects.get(instance=instance, subnet=subnet)
         except models.Port.DoesNotExist:
@@ -2054,6 +3285,13 @@ class InstanceViewSet(
                 {"status": _("Multiple ports are found.")},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        old_pairs = list(port.allowed_address_pairs or [])
+        serializer.save()
+        allowed_address_pairs = serializer.validated_data["allowed_address_pairs"]
+        audit.emit_allowed_address_pairs_changed(
+            port, old_pairs=old_pairs, new_pairs=allowed_address_pairs
+        )
 
         executors.InstanceAllowedAddressPairsUpdateExecutor().execute(
             instance,
@@ -2079,7 +3317,7 @@ class InstanceViewSet(
         summary="Update instance ports",
         description="Update ports of the instance",
         request=serializers.OpenStackInstancePortsUpdateSerializer,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def update_ports(self, request, uuid=None):
@@ -2117,7 +3355,7 @@ class InstanceViewSet(
         summary="Update instance floating IPs",
         description="Update floating IPs of the instance",
         request=serializers.OpenStackInstanceFloatingIPsUpdateSerializer,
-        responses=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def update_floating_ips(self, request, uuid=None):
@@ -2204,6 +3442,39 @@ class InstanceViewSet(
 
     console_log_serializer_class = serializers.OpenStackConsoleLogSerializer
     console_log_permissions = [openstack_permissions.has_permissions_for_console]
+
+    @extend_schema(
+        summary="Get Placement allocations for the instance",
+        description=(
+            "Return what the OpenStack Placement service records as currently "
+            "allocated to this instance, broken down by resource provider. "
+            "Useful for diagnostics — especially for non-classic resources "
+            "(VGPU, PCI_DEVICE, custom classes) that the flavor alone does "
+            "not describe. Returns an empty list when Placement has no record "
+            "(e.g. transient state right after create, or pre-Placement clouds)."
+        ),
+        request=None,
+        responses={200: serializers.InstancePlacementAllocationSerializer(many=True)},
+        filters=False,
+    )
+    @decorators.action(detail=True, methods=["get"])
+    def placement_allocations(self, request, uuid=None):
+        instance: models.Instance = self.get_object()
+        backend = instance.get_backend()
+        try:
+            data = backend.get_instance_placement_allocations(instance)
+        except OpenStackBackendError as e:
+            raise exceptions.ValidationError(str(e))
+        serializer = serializers.InstancePlacementAllocationSerializer(data, many=True)
+        return response.Response(serializer.data, status=status.HTTP_200_OK)
+
+    placement_allocations_validators = [core_validators.StateValidator(CoreStates.OK)]
+    # Sysadmin-scope diagnostic — Placement RP UUIDs/names are fleet-topology
+    # data, not end-user info. Restrict to staff, support and service-provider
+    # owners (mirrors Hypervisor's `Permissions.customer_path = "settings__customer"`).
+    placement_allocations_permissions = [
+        openstack_permissions.can_diagnose_openstack_instance
+    ]
 
 
 @extend_schema_view(
@@ -2445,11 +3716,36 @@ class NetworkRBACPolicyViewSet(core_views.ActionsViewSet):
     lookup_field = "uuid"
     queryset = models.NetworkRBACPolicy.objects.all().order_by("-created")
     serializer_class = serializers.NetworkRBACPolicySerializer
-    filter_backends = (DjangoFilterBackend, structure_filters.GenericRoleFilter)
+    # Visibility is handled explicitly in get_queryset (outbound + inbound),
+    # so we don't layer GenericRoleFilter on top — it would re-apply the
+    # source-side filter and drop inbound rows.
+    filter_backends = (DjangoFilterBackend,)
     filterset_class = filters.NetworkRBACPolicyFilter
 
     def get_queryset(self):
-        return filter_queryset_for_user(self.queryset, self.request.user)
+        user = self.request.user
+        if user.is_staff or user.is_support:
+            return self.queryset
+        # Build a single Q that covers both directions:
+        # - outbound: user has admin/manager on the source network's project,
+        #   or owns the source customer (mirrors the GenericRoleFilter logic
+        #   that the legacy view applied via filter_queryset_for_user).
+        # - inbound: user has admin/manager on the target tenant's project,
+        #   or owns the target customer — they are the consumer of the share
+        #   and need to inspect/audit it.
+        from waldur_core.structure.managers import (
+            get_connected_customers,
+            get_connected_projects,
+        )
+
+        connected_projects = get_connected_projects(user)
+        connected_customers = get_connected_customers(user)
+        return self.queryset.filter(
+            Q(network__tenant__project__in=connected_projects)
+            | Q(network__tenant__project__customer__in=connected_customers)
+            | Q(target_tenant__project__in=connected_projects)
+            | Q(target_tenant__project__customer__in=connected_customers)
+        ).distinct()
 
     def _check_rbac_policy_permissions(self, user, network, target_tenant):
         if user.is_staff:
@@ -2505,6 +3801,21 @@ class NetworkRBACPolicyViewSet(core_views.ActionsViewSet):
 
         logger.info("RBAC policy record created in database with UUID: %s", policy.uuid)
 
+        event_logger.emit(
+            "RBAC policy created: network {network_name} shared with {target_tenant_name} "
+            "(policy type: {policy_type}).",
+            event_type=EventType.OPENSTACK_RBAC_POLICY_CREATED,
+            event_context={
+                "rbac_policy_uuid": str(policy.uuid),
+                "network": network,
+                "target_tenant": target_tenant,
+                "network_name": network.name,
+                "target_tenant_name": target_tenant.name,
+                "policy_type": policy_type,
+            },
+            scopes=[network, network.tenant, target_tenant, network.tenant.project],
+        )
+
         result_serializer = self.get_serializer(policy, context={"request": request})
         return response.Response(result_serializer.data, status=status.HTTP_201_CREATED)
 
@@ -2521,7 +3832,28 @@ class NetworkRBACPolicyViewSet(core_views.ActionsViewSet):
             request.user, policy.network, policy.target_tenant
         )
 
-        backend = policy.network.tenant.get_backend()
+        network = policy.network
+        target_tenant = policy.target_tenant
+        policy_uuid = str(policy.uuid)
+        policy_type = policy.policy_type
+
+        backend = network.tenant.get_backend()
         backend.delete_network_rbac_policy(rbac_id=policy.backend_id)
         policy.delete()
+
+        event_logger.emit(
+            "RBAC policy removed: network {network_name} no longer shared with "
+            "{target_tenant_name} (policy type: {policy_type}).",
+            event_type=EventType.OPENSTACK_RBAC_POLICY_DELETED,
+            event_context={
+                "rbac_policy_uuid": policy_uuid,
+                "network": network,
+                "target_tenant": target_tenant,
+                "network_name": network.name,
+                "target_tenant_name": target_tenant.name,
+                "policy_type": policy_type,
+            },
+            scopes=[network, network.tenant, target_tenant, network.tenant.project],
+        )
+
         return response.Response(status=status.HTTP_204_NO_CONTENT)

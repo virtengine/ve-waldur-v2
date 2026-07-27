@@ -1,7 +1,9 @@
 import functools
+import hashlib
 import json
 import logging
 import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 from html import unescape
@@ -18,6 +20,29 @@ logger = logging.getLogger(__name__)
 
 class SmaxBackendError(ServiceBackendError):
     pass
+
+
+def get_smax_verify_ssl():
+    """Return the value for the requests `verify` argument.
+
+    If a custom CA certificate is configured, write it to a temp file and
+    return its path; otherwise fall back to the SMAX_VERIFY_SSL boolean.
+    """
+    if not config.SMAX_VERIFY_SSL:
+        return False
+
+    certificate = config.SMAX_CERTIFICATE
+    if certificate:
+        cert_hash = hashlib.sha256(certificate.encode("utf-8")).hexdigest()
+        file_path = os.path.join(
+            tempfile.gettempdir(), f"waldur-smax-certificate-{cert_hash}.pem"
+        )
+        if not os.path.isfile(file_path):
+            with open(file_path, "w") as fh:
+                fh.write(certificate)
+        return file_path
+
+    return True
 
 
 def reraise_exceptions(func):
@@ -81,15 +106,25 @@ class Category:
 
 
 class SmaxBackend:
-    def __init__(self):
-        if not config.SMAX_API_URL.endswith("/"):
-            self.api_url = f"{config.SMAX_API_URL}/"
-        else:
-            self.api_url = f"{config.SMAX_API_URL}"
+    def __init__(self, settings_override=None):
+        self._settings_override = settings_override or {}
+        api_url = self._get_config("SMAX_API_URL")
+        tenant_id = self._get_config("SMAX_TENANT_ID")
 
-        self.rest_api = f"{self.api_url}rest/{config.SMAX_TENANT_ID}/"
+        if not api_url.endswith("/"):
+            self.api_url = f"{api_url}/"
+        else:
+            self.api_url = f"{api_url}"
+
+        self.rest_api = f"{self.api_url}rest/{tenant_id}/"
         self.lwsso_cookie_key = None
         self._status_mappings = None
+
+    def _get_config(self, key, default=None):
+        """Get config value from provider settings override or Constance."""
+        if key in self._settings_override:
+            return self._settings_override[key]
+        return getattr(config, key, default)
 
     def _smax_response_to_user(self, response):
         entities = response.json()["entities"]
@@ -146,17 +181,19 @@ class SmaxBackend:
                         e["properties"]["Id"],
                     ),
                     organisation_name=e["properties"].get(
-                        config.SMAX_ORGANISATION_FIELD
+                        self._get_config("SMAX_ORGANISATION_FIELD")
                     )
-                    if config.SMAX_ORGANISATION_FIELD
+                    if self._get_config("SMAX_ORGANISATION_FIELD")
                     else None,
-                    project_name=e["properties"].get(config.SMAX_PROJECT_FIELD)
-                    if config.SMAX_PROJECT_FIELD
+                    project_name=e["properties"].get(
+                        self._get_config("SMAX_PROJECT_FIELD")
+                    )
+                    if self._get_config("SMAX_PROJECT_FIELD")
                     else None,
                     resource_name=e["properties"].get(
-                        config.SMAX_AFFECTED_RESOURCE_FIELD
+                        self._get_config("SMAX_AFFECTED_RESOURCE_FIELD")
                     )
-                    if config.SMAX_AFFECTED_RESOURCE_FIELD
+                    if self._get_config("SMAX_AFFECTED_RESOURCE_FIELD")
                     else None,
                 )
             )
@@ -271,8 +308,12 @@ class SmaxBackend:
     def auth(self):
         response = requests.post(
             f"{self.api_url}auth/authentication-endpoint/"
-            f"authenticate/login?TENANTID={config.SMAX_TENANT_ID}",
-            json={"login": config.SMAX_LOGIN, "password": config.SMAX_PASSWORD},
+            f"authenticate/login?TENANTID={self._get_config('SMAX_TENANT_ID')}",
+            json={
+                "login": self._get_config("SMAX_LOGIN"),
+                "password": self._get_config("SMAX_PASSWORD"),
+            },
+            verify=get_smax_verify_ssl(),
         )
 
         if response.status_code != status.HTTP_200_OK:
@@ -288,7 +329,7 @@ class SmaxBackend:
         params = params or {}
         self.lwsso_cookie_key or self.auth()
 
-        params["TENANTID"] = config.SMAX_TENANT_ID
+        params["TENANTID"] = self._get_config("SMAX_TENANT_ID")
         headers = {
             "Cookie": f"LWSSO_COOKIE_KEY={self.lwsso_cookie_key}",
             "Content-Type": "application/json",
@@ -298,6 +339,7 @@ class SmaxBackend:
         return requests.get(
             url=url,
             headers=headers,
+            verify=get_smax_verify_ssl(),
         )
 
     def get(
@@ -329,13 +371,13 @@ class SmaxBackend:
 
         headers.update(user_headers)
 
-        url = self.rest_api + path + f"?TENANTID={config.SMAX_TENANT_ID}"
+        url = self.rest_api + path + f"?TENANTID={self._get_config('SMAX_TENANT_ID')}"
         response = getattr(requests, method)(
             url=url,
             headers=headers,
             data=data,
             json=json,
-            verify=config.SMAX_VERIFY_SSL,
+            verify=get_smax_verify_ssl(),
             **kwargs,
         )
 
@@ -359,6 +401,8 @@ class SmaxBackend:
         return self._request(path, method="delete", **kwargs)
 
     def get_user(self, user_id):
+        if not user_id:
+            return None
         response = self.get(f"ems/Person/{user_id}?layout=Name,Email,Upn,ExternalId")
         user = self._smax_response_to_user(response)
 
@@ -402,7 +446,21 @@ class SmaxBackend:
 
         if not first_name or not last_name:
             raise SmaxBackendError(
-                "User creation has failed because first or last names have not been passed."
+                "User creation has failed because first or last names have not "
+                f"been passed. Name: {user.name!r}, email: {user.email!r}."
+            )
+
+        # SMAX keys Person entities by Email/Upn and search_user() below looks
+        # them up by those fields — so an empty email can never be found again,
+        # surfacing later as an opaque "User creation has failed" with no cause.
+        # Reject it up front with the offending identity. (Seen in production
+        # when terminating support-backed resources requested by the system
+        # robot, which has no email address.)
+        if not user.email:
+            raise SmaxBackendError(
+                "User creation has failed because no email address was passed. "
+                f"Name: {user.name!r}, upn: {user.upn!r}, "
+                f"external_id: {user.external_id!r}."
             )
 
         response = self.post(
@@ -424,13 +482,24 @@ class SmaxBackend:
         backend_user = self.wait_result(self.search_user, user.email)
 
         if not backend_user:
+            logger.error(
+                "SMAX user creation failed for email=%r name=%r: the Person was "
+                "not found after creation. HTTP %s, response: %s",
+                user.email,
+                user.name,
+                response.status_code,
+                response.text,
+            )
             raise SmaxBackendError(
-                f"User creation has failed. Creation response: {response.text}"
+                f"User creation has failed for {user.email!r}. "
+                f"HTTP {response.status_code}. Creation response: {response.text}"
             )
 
         return backend_user
 
     def get_issue(self, issue_id):
+        if not issue_id:
+            return None
         response = self.get(f"ems/Request?layout=FULL_LAYOUT&filter=Id={issue_id}")
         issues = self._smax_response_to_issue(response)
         return issues[0] if issues else None
@@ -445,20 +514,26 @@ class SmaxBackend:
             "CreationSource": "CreationSourceExternal",  # to avoid any internal SMAX notification logic
         }
 
-        if config.SMAX_ORGANISATION_FIELD and issue.organisation_name:
-            properties[config.SMAX_ORGANISATION_FIELD] = issue.organisation_name
+        if self._get_config("SMAX_ORGANISATION_FIELD") and issue.organisation_name:
+            properties[self._get_config("SMAX_ORGANISATION_FIELD")] = (
+                issue.organisation_name
+            )
 
-        if config.SMAX_PROJECT_FIELD and issue.project_name:
-            properties[config.SMAX_PROJECT_FIELD] = issue.project_name
+        if self._get_config("SMAX_PROJECT_FIELD") and issue.project_name:
+            properties[self._get_config("SMAX_PROJECT_FIELD")] = issue.project_name
 
-        if config.SMAX_AFFECTED_RESOURCE_FIELD and issue.resource_name:
-            properties[config.SMAX_AFFECTED_RESOURCE_FIELD] = issue.resource_name
+        if self._get_config("SMAX_AFFECTED_RESOURCE_FIELD") and issue.resource_name:
+            properties[self._get_config("SMAX_AFFECTED_RESOURCE_FIELD")] = (
+                issue.resource_name
+            )
 
-        if config.SMAX_CREATION_SOURCE_NAME:
-            properties["CreationSourceName_c"] = config.SMAX_CREATION_SOURCE_NAME
+        if self._get_config("SMAX_CREATION_SOURCE_NAME"):
+            properties["CreationSourceName_c"] = self._get_config(
+                "SMAX_CREATION_SOURCE_NAME"
+            )
 
-        if config.SMAX_REQUESTS_OFFERING:
-            properties["RequestsOffering"] = config.SMAX_REQUESTS_OFFERING
+        if self._get_config("SMAX_REQUESTS_OFFERING"):
+            properties["RequestsOffering"] = self._get_config("SMAX_REQUESTS_OFFERING")
 
         if issue.category_id:
             properties["Category"] = issue.category_id
@@ -663,11 +738,11 @@ class SmaxBackend:
     def wait_result(self, func, *args, **kwargs):
         result = None
 
-        for i in range(config.SMAX_TIMES_TO_PULL):
+        for i in range(self._get_config("SMAX_TIMES_TO_PULL")):
             result = func(*args, **kwargs)
             if result:
                 break
             else:
-                time.sleep(config.SMAX_SECONDS_TO_WAIT)
+                time.sleep(self._get_config("SMAX_SECONDS_TO_WAIT"))
 
         return result

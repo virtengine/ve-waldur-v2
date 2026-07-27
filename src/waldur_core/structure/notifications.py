@@ -1,4 +1,4 @@
-from typing import Any, Generic, TypeVar
+from typing import Any, TypeVar
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -15,7 +15,7 @@ class NotificationTemplate(BaseModel):
 ContextType = TypeVar("ContextType", bound=BaseModel)
 
 
-class Notification(BaseModel, Generic[ContextType]):
+class Notification[ContextType: BaseModel](BaseModel):
     """
     Represents a single notification type, including its key, description,
     and a strongly-typed schema for its context variables.
@@ -125,10 +125,32 @@ class StructureRoleGrantedContext(BaseModel):
     )
 
 
+class ProjectEndDateChangeRequestContext(BaseModel):
+    project_end_date_change_request: Any = Field(
+        description="The ProjectEndDateChangeRequest instance. Provides project_end_date_change_request.project.name, requested_end_date, created_by.full_name."
+    )
+    project_url: str = Field(description="A URL to the project's page.")
+
+
 class StructureSection(NotificationSection):
     class Meta:
         key = "structure"
 
+    notification_project_end_date_change_request_created = Notification(
+        key="notification_project_end_date_change_request_created",
+        description="Notifies organization owners when a project member requests to change project end date.",
+        context_model=ProjectEndDateChangeRequestContext,
+    )
+    notification_project_end_date_change_request_approved = Notification(
+        key="notification_project_end_date_change_request_approved",
+        description="Notifies the requester when their project end date change request is approved.",
+        context_model=ProjectEndDateChangeRequestContext,
+    )
+    notification_project_end_date_change_request_rejected = Notification(
+        key="notification_project_end_date_change_request_rejected",
+        description="Notifies the requester when their project end date change request is rejected.",
+        context_model=ProjectEndDateChangeRequestContext,
+    )
     change_email_request = Notification(
         key="change_email_request",
         description="A notification sent out when an email change is requested. Recipient is the old email address.",
@@ -225,6 +247,12 @@ class PermissionRequestSubmittedContext(BaseModel):
     )
 
 
+class PermissionRequestRejectedContext(BaseModel):
+    permission_request: Any = Field(
+        description="The PermissionRequest model instance. Provides `permission_request.created_by`, `permission_request.invitation`, `permission_request.review_comment`, and `permission_request.reviewed_by`."
+    )
+
+
 class UserSection(NotificationSection):
     class Meta:
         key = "users"
@@ -256,8 +284,13 @@ class UserSection(NotificationSection):
     )
     permission_request_submitted = Notification(
         key="permission_request_submitted",
-        description="Sent to staff or customer owners about a submitted permission request.",
+        description="Sent about a submitted permission request to the organization owners and managers who can approve it, and to the organization's contact and notification emails. Falls back to staff when none of these are available.",
         context_model=PermissionRequestSubmittedContext,
+    )
+    permission_request_rejected = Notification(
+        key="permission_request_rejected",
+        description="Sent to the user who submitted a permission request to inform them that their request has been rejected.",
+        context_model=PermissionRequestRejectedContext,
     )
 
 
@@ -460,6 +493,15 @@ class ToSReconsentRequiredContext(BaseModel):
     site_name: str = Field(description="Name of the site from settings.")
 
 
+class ResourceLimitChangeRequestContext(BaseModel):
+    resource_limit_change_request: Any = Field(
+        description="The ResourceLimitChangeRequest instance. Provides "
+        "resource_limit_change_request.resource.name, requested_limits, "
+        "created_by.full_name."
+    )
+    resource_url: str = Field(description="A URL to the resource's page.")
+
+
 class MarketplaceSection(NotificationSection):
     class Meta:
         key = "marketplace"
@@ -549,6 +591,16 @@ class MarketplaceSection(NotificationSection):
         description="Notifies service provider owners about a pending order for their offering.",
         context_model=NotifyProviderAboutPendingOrderContext,
     )
+    notify_consumer_about_provider_info = Notification(
+        key="notify_consumer_about_provider_info",
+        description="Notifies the order creator when the provider sends a message on a pending order.",
+        context_model=NotifyProviderAboutPendingOrderContext,
+    )
+    notify_provider_about_consumer_info = Notification(
+        key="notify_provider_about_consumer_info",
+        description="Notifies the provider when the consumer responds with a message on a pending order.",
+        context_model=NotifyProviderAboutPendingOrderContext,
+    )
     tos_consent_required = Notification(
         key="tos_consent_required",
         description="Notifies user that ToS consent is required to access a resource.",
@@ -558,6 +610,21 @@ class MarketplaceSection(NotificationSection):
         key="tos_reconsent_required",
         description="Notifies user that ToS has been updated and re-consent is required.",
         context_model=ToSReconsentRequiredContext,
+    )
+    notification_resource_limit_change_request_created = Notification(
+        key="notification_resource_limit_change_request_created",
+        description="Notifies organization owners when a project member requests a resource limit change.",
+        context_model=ResourceLimitChangeRequestContext,
+    )
+    notification_resource_limit_change_request_approved = Notification(
+        key="notification_resource_limit_change_request_approved",
+        description="Notifies the requester when their resource limit change request is approved.",
+        context_model=ResourceLimitChangeRequestContext,
+    )
+    notification_resource_limit_change_request_rejected = Notification(
+        key="notification_resource_limit_change_request_rejected",
+        description="Notifies the requester when their resource limit change request is rejected.",
+        context_model=ResourceLimitChangeRequestContext,
     )
 
 
@@ -606,6 +673,21 @@ class ProjectCostLimitContext(BaseModel):
     limit: float = Field(description="The cost limit that was exceeded.")
 
 
+class ResourceEndDatePulledContext(BaseModel):
+    resource: Any = Field(
+        description="The Resource model instance whose end date was updated."
+    )
+    old_end_date: str = Field(description="The previous end date (as string).")
+    new_end_date: str = Field(
+        description="The new end date pulled from remote (as string)."
+    )
+    resource_url: str = Field(description="A URL to the resource's detail page.")
+    remote_events: list = Field(
+        default_factory=list,
+        description="List of recent related events from the remote system.",
+    )
+
+
 class MarketplaceRemoteSection(NotificationSection):
     class Meta:
         key = "marketplace_remote"
@@ -619,6 +701,11 @@ class MarketplaceRemoteSection(NotificationSection):
         key="notification_about_project_details_update",
         description="Notifies users about a completed project update request, detailing the changes.",
         context_model=ProjectDetailsUpdateContext,
+    )
+    resource_end_date_pulled_from_remote = Notification(
+        key="resource_end_date_pulled_from_remote",
+        description="Notification sent when a resource's end date is automatically updated from the remote allocation system because the local date was in the past.",
+        context_model=ResourceEndDatePulledContext,
     )
 
 
@@ -683,6 +770,33 @@ class IssueUpdatedContext(BaseIssueContext):
     )
 
 
+class ProviderTicketContext(BaseModel):
+    issue: Any = Field(
+        description="The Issue model instance routed to (or withdrawn from) the provider helpdesk."
+    )
+    provider_helpdesk: Any = Field(
+        description="The ProviderHelpdesk model instance the ticket relates to."
+    )
+
+
+class ProviderCommentContext(BaseModel):
+    issue: Any = Field(description="The Issue model instance.")
+    comment: Any = Field(
+        description="The Comment model instance added by the customer."
+    )
+    provider_helpdesk: Any = Field(
+        description="The ProviderHelpdesk model instance the ticket relates to."
+    )
+
+
+class ProviderEscalationContext(BaseModel):
+    issue: Any = Field(description="The parent (operator) Issue that was escalated.")
+    child_issue: Any = Field(
+        description="The child Issue routed to the provider helpdesk."
+    )
+    reason: str = Field(description="The escalation reason.")
+
+
 class SupportSection(NotificationSection):
     class Meta:
         key = "support"
@@ -718,6 +832,31 @@ class SupportSection(NotificationSection):
         description="A template used for generating the issue summary field during issue creation.",
         templates=[NotificationTemplate(path="summary.txt", name="summary")],
         context_model=IssueGenerationContext,
+    )
+    provider_new_ticket = Notification(
+        key="provider_new_ticket",
+        description="Notify a provider helpdesk about a new ticket routed to them.",
+        context_model=ProviderTicketContext,
+    )
+    provider_ticket_withdrawn = Notification(
+        key="provider_ticket_withdrawn",
+        description="Notify a provider helpdesk that a ticket previously routed to them was rerouted away.",
+        context_model=ProviderTicketContext,
+    )
+    provider_escalation = Notification(
+        key="provider_escalation",
+        description="Notify a provider helpdesk that a routed ticket has been escalated.",
+        context_model=ProviderEscalationContext,
+    )
+    provider_email_new_ticket = Notification(
+        key="provider_email_new_ticket",
+        description="Email a provider a new ticket via the email support backend.",
+        context_model=ProviderTicketContext,
+    )
+    provider_email_comment = Notification(
+        key="provider_email_comment",
+        description="Email a provider a customer comment via the email support backend.",
+        context_model=ProviderCommentContext,
     )
 
 
@@ -831,6 +970,18 @@ class ReviewAssignedContext(BaseModel):
     )
 
 
+class ReviewDeadlineApproachingContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    reviewer_name: str = Field(description="Full name of the reviewer.")
+    proposal_name: str = Field(description="Name of the proposal under review.")
+    call_name: str = Field(description="Name of the call.")
+    review_deadline: Any = Field(description="The review due date and time.")
+    time_remaining_days: int = Field(
+        description="Whole number of days remaining until the review deadline."
+    )
+    review_url: str = Field(description="A URL where the reviewer can continue review.")
+
+
 class ProposalDecisionForReviewerContext(BaseModel):
     site_name: str = Field(description="Name of the site from settings.")
     proposal_state: str = Field(
@@ -888,6 +1039,26 @@ class RoundClosingForManagersContext(BaseModel):
     round_url: str = Field(description="A URL to the round management page.")
 
 
+class ProposalSubmissionDeadlineApproachingContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    proposal_creator_name: str = Field(
+        description="Full name of the proposal creator receiving the reminder."
+    )
+    proposal_name: str = Field(description="Name of the draft proposal.")
+    call_name: str = Field(description="Name of the call for proposals.")
+    round_name: str = Field(description="Name of the round containing the proposal.")
+    deadline_date: Any = Field(
+        description="Proposal submission deadline date and time."
+    )
+    time_remaining_days: int = Field(
+        description="Whole number of days remaining until the submission deadline."
+    )
+    time_remaining_hours: int = Field(
+        description="Whole number of hours remaining after remaining days are excluded."
+    )
+    proposal_url: str = Field(description="A URL to the proposal details page.")
+
+
 class ReviewsCompleteContext(BaseModel):
     site_name: str = Field(description="The name of the site from settings.")
     proposal_name: str = Field(
@@ -906,6 +1077,17 @@ class ReviewsCompleteContext(BaseModel):
     )
     proposal_url: str = Field(
         description="A direct URL for the call manager to view the proposal and its completed reviews."
+    )
+
+
+class ReviewerInvitationContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    call_name: str = Field(description="Name of the call the reviewer is invited to.")
+    invited_by_name: str = Field(
+        description="Full name of the user who sent the invitation."
+    )
+    invitation_link: str = Field(
+        description="URL for the invitee to accept or decline the invitation."
     )
 
 
@@ -938,6 +1120,11 @@ class ProposalSection(NotificationSection):
         description="A notification about the proposal state changes (submitted → in review → accepted/rejected).",
         context_model=ProposalStateChangedContext,
     )
+    proposal_submission_deadline_approaching = Notification(
+        key="proposal_submission_deadline_approaching",
+        description="Reminds proposal creators to submit draft proposals during the last 3 days before the round cutoff.",
+        context_model=ProposalSubmissionDeadlineApproachingContext,
+    )
     requested_offering_decision = Notification(
         key="requested_offering_decision",
         description="A notification to call manager about the decision on requested offering (accepted/rejected).",
@@ -947,6 +1134,11 @@ class ProposalSection(NotificationSection):
         key="review_assigned",
         description="A notification to a reviewer about a new review assignment.",
         context_model=ReviewAssignedContext,
+    )
+    review_deadline_approaching = Notification(
+        key="review_deadline_approaching",
+        description="Reminds reviewers to submit in-review assignments 3 days before deadline.",
+        context_model=ReviewDeadlineApproachingContext,
     )
     review_rejected = Notification(
         key="review_rejected",
@@ -962,6 +1154,11 @@ class ProposalSection(NotificationSection):
         key="round_opening_for_reviewers",
         description="A notification to reviewers about a new call round opening.",
         context_model=RoundOpeningForReviewersContext,
+    )
+    reviewer_invitation = Notification(
+        key="reviewer_invitation",
+        description="Sent to a person invited to join the reviewer pool for a call.",
+        context_model=ReviewerInvitationContext,
     )
     reviews_complete = Notification(
         key="reviews_complete",
@@ -1023,4 +1220,33 @@ class UserActionsSection(NotificationSection):
         key="notification_digest",
         description="A daily digest notification sent to users with pending actions.",
         context_model=NotificationDigestContext,
+    )
+
+
+class ManagedProjectRejectedContext(BaseModel):
+    recipient_first_name: str = Field(
+        description="First name of the recipient being notified."
+    )
+    project_name: str = Field(
+        description="Name of the project whose allocation was rejected."
+    )
+    reviewer_full_name: str = Field(
+        description="Full name of the reviewer who rejected the request."
+    )
+    reviewer_email: str = Field(description="Email address of the reviewer.")
+    reviewer_organization: str = Field(description="Organization of the reviewer.")
+    review_comment: str = Field(
+        description="Optional comment provided with the rejection."
+    )
+    site_name: str = Field(description="Name of the site from settings.")
+
+
+class OpenPortalSection(NotificationSection):
+    class Meta:
+        key = "openportal"
+
+    managed_project_rejected = Notification(
+        key="managed_project_rejected",
+        description="Sent to Project admins and Project managers when their resource allocation request is rejected.",
+        context_model=ManagedProjectRejectedContext,
     )

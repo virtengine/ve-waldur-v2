@@ -12,7 +12,7 @@ from waldur_mastermind.marketplace.tests import factories
 from waldur_mastermind.marketplace.tests.fixtures import MarketplaceFixture
 
 
-class PrepaidBillingTestBase(test.APITransactionTestCase):
+class PrepaidBillingTestBase(test.APITestCase):
     """Base class for prepaid billing tests with a complete offering setup."""
 
     def setUp(self):
@@ -102,7 +102,8 @@ class TestPrepaidCreationBilling(PrepaidBillingTestBase):
             item.details["offering_component_type"], self.prepaid_component.type
         )
         self.assertEqual(item.unit_price, self.upfront_plan_component.price)
-        self.assertEqual(item.quantity, 1)
+        # Prepaid ONE_TIME with limits: quantity = limit value
+        self.assertEqual(item.quantity, 100)
 
     def test_upfront_fee_is_not_billed_on_resource_update(self):
         MarketplaceBillingService._register(

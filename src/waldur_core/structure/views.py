@@ -1,21 +1,22 @@
 import logging
 from datetime import datetime
 
+from constance import config as constance_config
 from dbtemplates.models import Template
-from dbtemplates.utils.cache import remove_cached_template
+from dbtemplates.utils.cache import add_template_to_cache
 from django.conf import settings as django_settings
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.core import exceptions as django_exceptions
 from django.db import transaction
-from django.db.models import Count, Prefetch, Q, QuerySet
-from django.db.models.functions import TruncMonth
+from django.db.models import Count, Prefetch, Q, QuerySet, Sum
+from django.db.models.functions import Length, TruncMonth
 from django.http import Http404
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
-from drf_spectacular.plumbing import OpenApiTypes
+from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import (
     OpenApiExample,
     OpenApiParameter,
@@ -42,8 +43,9 @@ from waldur_core.core import models as core_models
 from waldur_core.core import permissions as core_permissions
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
-from waldur_core.core.enums import CoreStates
-from waldur_core.core.serializers import EmptySerializer
+from waldur_core.core.enums import CoreStates, ReviewStates
+from waldur_core.core.permissions import PATScopeAwareIsAdminUser
+from waldur_core.core.serializers import DetailSerializer, ReviewCommentSerializer
 from waldur_core.core.user_attributes import get_profile_completeness_details
 from waldur_core.core.utils import get_ip_address, is_uuid_like
 from waldur_core.core.views import ActionsViewSet
@@ -57,7 +59,14 @@ from waldur_core.permissions.utils import (
     permission_factory,
 )
 from waldur_core.permissions.views import UserRoleMixin
-from waldur_core.structure import filters, models, permissions, serializers, utils
+from waldur_core.structure import (
+    filters,
+    managers,
+    models,
+    permissions,
+    serializers,
+    utils,
+)
 from waldur_core.structure.data_access import get_user_data_access_visibility
 from waldur_core.structure.digest_tasks import (
     render_project_preview,
@@ -75,12 +84,16 @@ from waldur_core.structure.serializers_data_access import (
     UserDataAccessLogSerializer,
     UserDataAccessSerializer,
 )
-from waldur_core.structure.utils import get_components_usage_data_from_resources
+from waldur_core.structure.utils import (
+    get_components_usage_data_from_resources,
+)
+from waldur_core.structure.utils_data_access import bulk_log_user_data_access
+from waldur_core.user_actions import serializers as user_action_serializers
+from waldur_core.user_actions import tasks as user_action_tasks
 from waldur_core.users import tasks as user_tasks
 from waldur_core.users.enums import InvitationState
 from waldur_core.users.models import Invitation
 from waldur_core.users.scim import tasks as scim_tasks
-from waldur_mastermind.billing import models as billing_models
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import serializers as marketplace_serializers
 from waldur_mastermind.marketplace.enums import ResourceStates
@@ -172,125 +185,49 @@ class CustomerViewSet(
     filterset_class = filters.CustomerFilter
 
     def get_queryset(self):
+        user = self.request.user
         queryset = super().get_queryset()
 
-        # Annotate with projects_count to avoid N+1 queries
-        queryset = queryset.annotate(
-            projects_count=Count("projects", filter=Q(projects__is_removed=False))
-        )
+        if user.is_staff or user.is_support:
+            queryset = queryset.annotate(
+                annotated_projects_count=Count(
+                    "projects", filter=Q(projects__is_removed=False), distinct=True
+                )
+            )
+        elif user.is_authenticated:
+            user_projects = managers.get_visible_projects(user)
 
-        # Add users_count annotation - we'll calculate this differently due to complexity
-        # For now, we'll use a simpler approach that can be optimized later
-        # The serializer will try to use the annotated value if available
-        queryset = queryset.extra(
-            select={
-                "users_count": "0"
-            }  # Placeholder - will be calculated efficiently in serializer
-        )
+            queryset = queryset.annotate(
+                annotated_projects_count=Count(
+                    "projects",
+                    filter=Q(
+                        projects__id__in=user_projects, projects__is_removed=False
+                    ),
+                    distinct=True,
+                )
+            )
+
+        # Prefetch projects securely based on user visibility
+        prefetch_projects = self._get_project_prefetch(user)
+        if prefetch_projects:
+            queryset = queryset.prefetch_related(prefetch_projects)
 
         return queryset
 
-    def paginate_queryset(self, queryset):
-        """Override to add bulk optimizations after pagination."""
-        page = super().paginate_queryset(queryset)
-        if page is not None:
-            # Only optimize expensive fields if they're actually requested
-            requested_fields = self.request.query_params.getlist("field")
-            if not requested_fields or "users_count" in requested_fields:
-                self._optimize_users_count(page)
-            if not requested_fields or "billing_price_estimate" in requested_fields:
-                self._optimize_billing_estimates(page)
-        return page
+    def _get_project_prefetch(self, user):
+        """Returns a Prefetch object restricted by user permissions"""
+        requested_fields = self.request.query_params.getlist("field")
+        if requested_fields and "projects" not in requested_fields:
+            return None
 
-    def _optimize_users_count(self, customers):
-        """Bulk calculate users_count for a list of customers to avoid N+1 queries."""
-        if not customers:
-            return
+        project_qs = models.Project.available_objects.all()
 
-        # Skip user count optimization for basic requests to reduce query load
-        # Only calculate if users_count field is explicitly requested
-        if hasattr(self.request, "query_params"):
-            fields = self.request.query_params.getlist("field")
-        else:
-            fields = getattr(self.request, "GET", {}).getlist("field")
+        if not (user.is_staff or user.is_support):
+            user_projects = managers.get_visible_projects(user)
+            project_qs = project_qs.filter(id__in=user_projects)
 
-        if "users_count" not in fields:
-            # Set default value and skip expensive calculation
-            for customer in customers:
-                customer._cached_users_count = 0
-            return
-
-        # Calculate users count for all customers in a single efficient operation
-        # Get all users with roles in these customers or their projects
-        customer_ct = ContentType.objects.get_for_model(models.Customer)
-        project_ct = ContentType.objects.get_for_model(models.Project)
-
-        # Use exact user counting that handles overlap between customer and project roles
-
-        # For each customer, count unique users with roles at customer OR project level
-        for customer in customers:
-            # Get project IDs for this customer
-            project_ids = list(
-                models.Project.available_objects.filter(
-                    customer_id=customer.id
-                ).values_list("id", flat=True)
-            )
-
-            # Count unique users with roles either at customer level or project level
-            user_roles_query = Q(
-                content_type=customer_ct, object_id=customer.id, is_active=True
-            )
-
-            if project_ids:
-                user_roles_query |= Q(
-                    content_type=project_ct, object_id__in=project_ids, is_active=True
-                )
-
-            # Count distinct users - this ensures no double counting
-            unique_user_count = (
-                UserRole.objects.filter(user_roles_query)
-                .values("user_id")
-                .distinct()
-                .count()
-            )
-
-            customer._cached_users_count = unique_user_count
-
-    def _optimize_billing_estimates(self, customers):
-        """Bulk load price estimates for customers to avoid N+1 queries."""
-        if not customers:
-            return
-
-        # Only optimize if billing_price_estimate field is requested
-        if hasattr(self.request, "query_params"):
-            fields = self.request.query_params.getlist("field")
-        else:
-            fields = self.request.GET.getlist("field")
-        if "billing_price_estimate" not in fields:
-            return
-
-        customer_ids = [c.id for c in customers]
-        customer_ct = ContentType.objects.get_for_model(models.Customer)
-
-        # Bulk load all price estimates for these customers
-        price_estimates = billing_models.PriceEstimate.objects.filter(
-            content_type=customer_ct, object_id__in=customer_ids
-        ).select_related("content_type")
-
-        # Create a mapping of customer_id -> price_estimate
-        estimates_by_customer = {}
-        for estimate in price_estimates:
-            estimates_by_customer[estimate.object_id] = estimate
-
-        # Cache the estimates on the request for use in serializers
-        if not hasattr(self.request, "_price_estimates_cache"):
-            self.request._price_estimates_cache = {}
-
-        # Add estimates to cache, including None for customers without estimates
-        for customer in customers:
-            self.request._price_estimates_cache[customer.id] = (
-                estimates_by_customer.get(customer.id)
-            )
+        # Use to_attr to keep it cleanly separated from the default 'projects' manager
+        return Prefetch("projects", queryset=project_qs, to_attr="visible_projects")
 
     def create(self, request, *args, **kwargs):
         return super().create(request, *args, **kwargs)
@@ -358,6 +295,35 @@ class CustomerViewSet(
         )
 
     @extend_schema(
+        summary="Update customer contact details",
+        description=(
+            "Update organization contact information. Requires "
+            "CUSTOMER_CONTACT_UPDATE or CUSTOMER.UPDATE permission."
+        ),
+        request=serializers.CustomerContactUpdateSerializer,
+        responses=serializers.CustomerContactUpdateSerializer,
+    )
+    @action(detail=True, methods=["post"], url_path="contact")
+    def contact(self, request, uuid=None):
+        customer: models.Customer = self.get_object()
+        if not (
+            request.user.is_staff
+            or has_permission(request, PermissionEnum.UPDATE_CUSTOMER, customer)
+            or has_permission(request, PermissionEnum.CUSTOMER_CONTACT_UPDATE, customer)
+        ):
+            raise PermissionDenied()
+
+        utils.check_customer_blocked_or_archived(customer)
+
+        serializer = serializers.CustomerContactUpdateSerializer(
+            customer, data=request.data, partial=True, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @extend_schema(
         summary="Get customer resource usage statistics",
         description="Provides statistics about the resource usage (e.g., CPU, RAM, storage) for all projects within a customer. Can be filtered to show usage for the current month only.",
         responses=serializers.ComponentsUsageStatsSerializer,
@@ -423,6 +389,9 @@ class CustomerViewSet(
         url_path="project-digest-config",
     )
     def project_digest_config(self, request, uuid=None):
+        if not constance_config.ENABLE_PROJECT_DIGEST:
+            raise ValidationError(_("Project digest feature is disabled."))
+
         customer = self.get_object()
         if not (
             request.user.is_staff
@@ -450,6 +419,9 @@ class CustomerViewSet(
         url_path="update-project-digest-config",
     )
     def update_project_digest_config(self, request, uuid=None):
+        if not constance_config.ENABLE_PROJECT_DIGEST:
+            raise ValidationError(_("Project digest feature is disabled."))
+
         customer = self.get_object()
         if not (
             request.user.is_staff
@@ -476,7 +448,7 @@ class CustomerViewSet(
         summary="Send a test digest email",
         description="Send a test digest email to the requesting user.",
         request=None,
-        responses={200: EmptySerializer},
+        responses={200: None},
     )
     @action(
         detail=True,
@@ -484,6 +456,9 @@ class CustomerViewSet(
         url_path="project-digest-config/send-test",
     )
     def project_digest_send_test(self, request, uuid=None):
+        if not constance_config.ENABLE_PROJECT_DIGEST:
+            raise ValidationError(_("Project digest feature is disabled."))
+
         customer = self.get_object()
         if not (
             request.user.is_staff
@@ -509,6 +484,9 @@ class CustomerViewSet(
         url_path="project-digest-config/preview",
     )
     def project_digest_preview(self, request, uuid=None):
+        if not constance_config.ENABLE_PROJECT_DIGEST:
+            raise ValidationError(_("Project digest feature is disabled."))
+
         customer = self.get_object()
         if not (
             request.user.is_staff
@@ -528,6 +506,32 @@ class CustomerViewSet(
 
         result = render_project_preview(project, customer)
         return Response(result)
+
+    @extend_schema(
+        summary="Update default affiliations for an organization",
+        description=(
+            "Replaces the organization's default affiliation list. "
+            "Project creators in the organization will be limited to choosing "
+            "from this list when affiliating a project. Staff-only."
+        ),
+        request=serializers.CustomerDefaultAffiliationsUpdateSerializer,
+        responses={200: None},
+    )
+    @action(detail=True, methods=["post"])
+    def update_default_affiliations(self, request, uuid=None):
+        if not request.user.is_staff:
+            raise PermissionDenied()
+        customer = self.get_object()
+        serializer = serializers.CustomerDefaultAffiliationsUpdateSerializer(
+            instance=customer, data=request.data, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(status=status.HTTP_200_OK)
+
+    update_default_affiliations_serializer_class = (
+        serializers.CustomerDefaultAffiliationsUpdateSerializer
+    )
 
 
 @extend_schema(
@@ -684,15 +688,6 @@ class ProjectViewSet(
         # Apply eager loading to prevent N+1 queries
         if getattr(self, "action", None) in ("list", "retrieve"):
             queryset = serializers.ProjectSerializer.eager_load(queryset, self.request)
-            # Annotate resources_count to avoid N+1 queries in serializer
-            queryset = queryset.annotate(
-                _resources_count=Count(
-                    "resource",
-                    filter=Q(
-                        resource__state__in=(ResourceStates.OK, ResourceStates.UPDATING)
-                    ),
-                )
-            )
 
         return queryset
 
@@ -800,40 +795,6 @@ class ProjectViewSet(
         except models.Customer.DoesNotExist:
             return None
 
-    def list(self, request, *args, **kwargs):
-        queryset = self.filter_queryset(self.get_queryset())
-
-        # Prefetch marketplace resource counts by category to avoid N+1 queries
-        project_ids = list(queryset.values_list("id", flat=True))
-        if project_ids:
-            category_counts = (
-                marketplace_models.Resource.objects.order_by()
-                .exclude(state=ResourceStates.TERMINATED)
-                .filter(project_id__in=project_ids)
-                .values("project_id", "offering__category__uuid")
-                .annotate(count=Count("*"))
-            )
-            # Build a nested dict: {project_id: {category_uuid: count}}
-            prefetched = {}
-            for item in category_counts:
-                project_id = item["project_id"]
-                category_uuid = str(item["offering__category__uuid"])
-                count = item["count"]
-                if project_id not in prefetched:
-                    prefetched[project_id] = {}
-                prefetched[project_id][category_uuid] = count
-            request._marketplace_resource_counts = prefetched
-        else:
-            request._marketplace_resource_counts = {}
-
-        page = self.paginate_queryset(queryset)
-        if page is not None:
-            serializer = self.get_serializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
-
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
-
     @extend_schema(
         summary="Create a new project",
         description="A new project can be created by users with staff privilege (is_staff=True) or customer owners. Project resource quota is optional.",
@@ -875,7 +836,7 @@ class ProjectViewSet(
 
     @extend_schema(
         summary="Move project to another customer",
-        description="Moves a project and its associated resources to a different customer. This is a staff-only action. You can choose whether to preserve existing project permissions for users. Terminated projects can also be moved.",
+        description="Moves a project and its associated resources to a different customer. You can choose whether to preserve existing project permissions for users. Terminated projects can also be moved.",
         request=serializers.MoveProjectSerializer,
         responses={
             200: serializers.ProjectSerializer,
@@ -883,7 +844,11 @@ class ProjectViewSet(
     )
     @action(detail=True, methods=["post"])
     def move_project(self, request, uuid=None):
-        project = self.get_object()
+        # Using get_object() would fail for org owners without direct project roles
+        try:
+            project = models.Project.objects.get(uuid=uuid)
+        except models.Project.DoesNotExist:
+            raise Http404("No Project matches the given query.")
 
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -899,7 +864,40 @@ class ProjectViewSet(
         return Response(serialized_project.data, status=status.HTTP_200_OK)
 
     move_project_serializer_class = serializers.MoveProjectSerializer
-    move_project_permissions = [permissions.is_staff]
+    move_project_permissions = [permissions.can_move_project]
+
+    @extend_schema(
+        summary="Update affiliation for a project",
+        description="Assigns the project to a single affiliation (or clears it when null).",
+        request=serializers.ProjectAffiliationUpdateSerializer,
+        responses={200: None},
+    )
+    @action(detail=True, methods=["post"])
+    def update_affiliation(self, request, uuid=None):
+        project = self.get_object()
+        serializer = serializers.ProjectAffiliationUpdateSerializer(
+            instance=project, data=request.data, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        affiliation = serializer.validated_data.get("affiliation")
+        if affiliation is not None and not request.user.is_staff:
+            if not project.customer.default_affiliations.filter(
+                pk=affiliation.pk
+            ).exists():
+                raise rf_serializers.ValidationError(
+                    {
+                        "affiliation": _(
+                            "Selected affiliation is not in this organization's default list."
+                        )
+                    }
+                )
+        serializer.save()
+        return Response(status=status.HTTP_200_OK)
+
+    update_affiliation_serializer_class = serializers.ProjectAffiliationUpdateSerializer
+    update_affiliation_permissions = [
+        permission_factory(PermissionEnum.UPDATE_PROJECT, ["*", "customer"])
+    ]
 
     @extend_schema(
         summary="Get project resource usage statistics",
@@ -1127,15 +1125,18 @@ class ProjectViewSet(
                         role_data["original_expiration_time"]
                     )
 
-                # Recreate the UserRole
-                user_role = UserRole.objects.create(
-                    user=user,
-                    role=role,
-                    scope=project,
+                # Recreate the UserRole through the grant primitive so the
+                # org-scoping policy is respected: a role that is now concealed or
+                # unavailable for this organization is skipped (logged), not
+                # silently re-granted on restore.
+                user_role = project.add_user_or_skip(
+                    user,
+                    role,
                     created_by=created_by,
                     expiration_time=expiration_time,
-                    is_active=True,
                 )
+                if user_role is None:
+                    continue
 
                 # Mark as restored in metadata
                 role_data["is_restored"] = True
@@ -1285,8 +1286,11 @@ class ProjectOtherUsersViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
 
 
 class UserViewSet(core_views.HistoryViewSetMixin, core_views.ActionsViewSet):
-    queryset = core_models.User.all_objects.select_related("auth_token")
+    queryset = core_models.User.all_objects.select_related(
+        "auth_token", "changeemailrequest"
+    )
     serializer_class = serializers.UserSerializer
+    me_serializer_class = serializers.UserMeSerializer
     lookup_field = "uuid"
     permission_classes = (
         rf_permissions.IsAuthenticated,
@@ -1324,7 +1328,13 @@ class UserViewSet(core_views.HistoryViewSetMixin, core_views.ActionsViewSet):
                 _("Identity manager is not allowed to list users."),
                 status=status.HTTP_403_FORBIDDEN,
             )
-        return super().list(request, *args, **kwargs)
+        response = super().list(request, *args, **kwargs)
+        # Flush buffered GDPR data access logs as a single bulk INSERT
+        entries = getattr(self, "_data_access_log_entries", None)
+        if entries:
+            bulk_log_user_data_access(entries, request.user, request)
+            del self._data_access_log_entries
+        return response
 
     @extend_schema(
         summary="Request email change",
@@ -1402,6 +1412,43 @@ class UserViewSet(core_views.HistoryViewSetMixin, core_views.ActionsViewSet):
         )
 
     @extend_schema(
+        summary="Pull SCIM attributes from external IdP for this user",
+        request=None,
+        responses=serializers.ScimPullAttributesResponseSerializer,
+        description=(
+            "Staff-only action that pulls the user's attributes from the "
+            "configured external SCIM 2.0 directory (SCIM_PULL_API_URL). "
+            "Pulled attributes are merged via the same source-aware policy as "
+            "inbound SCIM and the Identity Bridge."
+        ),
+    )
+    @action(
+        detail=True,
+        methods=["post"],
+        permission_classes=[rf_permissions.IsAuthenticated, core_permissions.IsStaff],
+    )
+    def pull_scim_attributes(self, request, uuid=None):
+        from waldur_core.users.scim.pull.client import ScimError
+        from waldur_core.users.scim.pull.service import (
+            ScimPullConfigError,
+            pull_user_attributes,
+        )
+
+        user = self.get_object()
+        try:
+            changed = pull_user_attributes(user)
+        except ScimPullConfigError as exc:
+            return Response(
+                {"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
+        except ScimError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response(
+            {"detail": _("SCIM pull complete."), "changed_fields": sorted(changed)},
+            status=status.HTTP_200_OK,
+        )
+
+    @extend_schema(
         summary="Confirm email change",
         request=serializers.ConfirmEmailRequestSerializer,
         responses=None,
@@ -1438,6 +1485,7 @@ class UserViewSet(core_views.HistoryViewSetMixin, core_views.ActionsViewSet):
         super().check_permissions(request)
 
     @extend_schema(
+        responses={status.HTTP_200_OK: serializers.UserMeSerializer},
         summary="Get current user details",
         description="Get current user details, including authentication token and profile completeness status.",
         parameters=[],
@@ -1589,6 +1637,64 @@ class UserViewSet(core_views.HistoryViewSetMixin, core_views.ActionsViewSet):
         return Response(status=status.HTTP_200_OK)
 
     @extend_schema(
+        summary="Recalculate user actions for a specific user",
+        request=user_action_serializers.UpdateActionsSerializer,
+        responses={202: user_action_serializers.UpdateActionsResponseSerializer},
+        description="Staff-only action to trigger recalculation of user actions for a specific user.",
+    )
+    @action(detail=True, methods=["post"])
+    def update_actions(self, request, uuid=None):
+        user = self.get_object()
+        serializer = user_action_serializers.UpdateActionsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        provider_action_type = serializer.validated_data.get("provider_action_type")
+
+        user_action_tasks.update_user_actions.delay(
+            user_uuid=user.uuid.hex,
+            provider_action_type=provider_action_type,
+        )
+
+        response_data = {
+            "status": "scheduled",
+            "message": f"User actions update for {user.username} has been scheduled",
+            "provider_action_type": provider_action_type,
+        }
+        response_serializer = user_action_serializers.UpdateActionsResponseSerializer(
+            response_data
+        )
+        return Response(response_serializer.data, status=status.HTTP_202_ACCEPTED)
+
+    update_actions_permissions = [permissions.is_staff]
+    update_actions_serializer_class = user_action_serializers.UpdateActionsSerializer
+
+    @extend_schema(
+        summary="Send action notification to a specific user",
+        request=None,
+        responses={202: user_action_serializers.SendNotificationResponseSerializer},
+        description="Staff-only action to send a pending actions digest notification to a specific user.",
+    )
+    @action(detail=True, methods=["post"])
+    def send_notification(self, request, uuid=None):
+        user = self.get_object()
+        if not user.email:
+            raise ValidationError(_("User does not have an email address."))
+
+        user_action_tasks.send_user_action_notification.delay(
+            user_uuid=user.uuid.hex,
+        )
+
+        response_data = {
+            "status": "scheduled",
+            "message": f"Notification for {user.username} has been scheduled",
+        }
+        response_serializer = (
+            user_action_serializers.SendNotificationResponseSerializer(response_data)
+        )
+        return Response(response_serializer.data, status=status.HTTP_202_ACCEPTED)
+
+    send_notification_permissions = [permissions.is_staff]
+
+    @extend_schema(
         summary="Change user password",
         request=serializers.PasswordChangeSerializer,
         responses=None,
@@ -1619,6 +1725,33 @@ class UserViewSet(core_views.HistoryViewSetMixin, core_views.ActionsViewSet):
     change_password_permissions = [permissions.is_staff]
 
     @extend_schema(
+        summary="Remove user password",
+        request=None,
+        responses=None,
+        description="Allows staff user to remove password for any user, making it unusable.",
+    )
+    @action(detail=True, methods=["post"])
+    def remove_password(self, request, uuid=None):
+        user = self.get_object()
+        user.set_unusable_password()
+        user.save(update_fields=["password"])
+
+        event_logger.emit(
+            "Password has been removed for user {affected_user_username} by %s."
+            % self.request.user,
+            event_type=EventType.USER_PASSWORD_REMOVED_BY_STAFF,
+            event_context={"affected_user": user},
+            scopes=[user],
+        )
+        logger.info(
+            f"Password has been removed for user {user} by {self.request.user}."
+        )
+
+        return Response({"status": "password removed"}, status=status.HTTP_200_OK)
+
+    remove_password_permissions = [permissions.is_staff]
+
+    @extend_schema(
         summary="Get user auth token",
         request=serializers.UserAuthTokenSerializer,
         responses=serializers.UserAuthTokenSerializer,
@@ -1632,7 +1765,7 @@ class UserViewSet(core_views.HistoryViewSetMixin, core_views.ActionsViewSet):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     @extend_schema(
-        request=serializers.UserAuthTokenSerializer,
+        request=None,
         responses=serializers.UserAuthTokenSerializer,
         summary="Refresh user auth token",
     )
@@ -1728,6 +1861,77 @@ class UserViewSet(core_views.HistoryViewSetMixin, core_views.ActionsViewSet):
 
     user_registration_trend_permissions = [permissions.is_staff_or_support]
 
+    @extend_schema(
+        summary="Get identity bridge status for a user",
+        responses={200: serializers.IdentityBridgeUserStatusSerializer},
+        description=(
+            "Returns diagnostic information about a user's identity bridge state: "
+            "active ISDs, per-attribute source tracking with staleness detection, "
+            "and effective bridge-writable fields. Staff only."
+        ),
+    )
+    @action(detail=True, methods=["get"])
+    def identity_bridge_status(self, request, uuid=None):
+        """Get identity bridge diagnostic info for a user."""
+        user = self.get_object()
+        attribute_sources = user.attribute_sources or {}
+        now = timezone.now()
+        stale_threshold_days = 7
+
+        enriched_sources = {}
+        stale_attributes = []
+        for field, info in attribute_sources.items():
+            if isinstance(info, dict):
+                source = info.get("source", "")
+                timestamp = info.get("timestamp", "")
+            else:
+                source = str(info)
+                timestamp = ""
+
+            if timestamp:
+                try:
+                    ts = datetime.fromisoformat(timestamp)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=now.tzinfo)
+                    age = now - ts
+                    age_days = round(age.total_seconds() / 86400, 1)
+                except (ValueError, TypeError):
+                    age_days = -1
+            else:
+                age_days = -1
+
+            is_stale = age_days > stale_threshold_days or age_days < 0
+            if is_stale:
+                stale_attributes.append(field)
+
+            enriched_sources[field] = {
+                "source": source,
+                "timestamp": timestamp,
+                "age_days": age_days,
+                "is_stale": is_stale,
+            }
+
+        from waldur_core.core.user_attributes import (
+            get_federated_identity_sync_allowed_fields,
+        )
+
+        data = {
+            "active_isds": user.active_isds or [],
+            "managed_isds": user.managed_isds or [],
+            "attribute_sources": enriched_sources,
+            "stale_attributes": sorted(stale_attributes),
+            "effective_bridge_fields": sorted(
+                get_federated_identity_sync_allowed_fields()
+            ),
+            "is_federated": bool(user.active_isds),
+        }
+        return Response(data, status=status.HTTP_200_OK)
+
+    identity_bridge_status_permissions = [permissions.is_staff]
+    identity_bridge_status_serializer_class = (
+        serializers.IdentityBridgeUserStatusSerializer
+    )
+
     def perform_create(self, serializer):
         user = serializer.save()
         event_logger.emit(
@@ -1806,6 +2010,92 @@ class ProjectPermissionReviewViewSet(
         return Response(status=status.HTTP_200_OK)
 
 
+def user_can_approve_project_end_date_change_request(
+    request, view, obj: models.ProjectEndDateChangeRequest | None = None
+):
+    """Only users with UPDATE_PROJECT on customer or project can approve/reject."""
+    if not obj:
+        return
+    if has_permission(
+        request.user, PermissionEnum.UPDATE_PROJECT, obj.project.customer
+    ) or has_permission(request.user, PermissionEnum.UPDATE_PROJECT, obj.project):
+        return
+    raise PermissionDenied()
+
+
+class ProjectEndDateChangeRequestViewSet(
+    core_mixins.EagerLoadMixin, core_views.ActionsViewSet
+):
+    queryset = models.ProjectEndDateChangeRequest.objects.all()
+    approve_permissions = reject_permissions = [
+        user_can_approve_project_end_date_change_request
+    ]
+    serializer_class = serializers.ProjectEndDateChangeRequestSerializer
+    create_serializer_class = serializers.ProjectEndDateChangeRequestCreateSerializer
+    filter_backends = [filters.GenericRoleFilter, DjangoFilterBackend]
+    filterset_class = filters.ProjectEndDateChangeRequestFilter
+    disabled_actions = ["update", "partial_update", "destroy"]
+    lookup_field = "uuid"
+
+    @extend_schema(
+        request=ReviewCommentSerializer,
+        responses=None,
+        description="Approve project end date change request",
+    )
+    @action(detail=True, methods=["post"])
+    def approve(self, request, **kwargs):
+        review_request: models.ProjectEndDateChangeRequest = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        comment = serializer.validated_data.get("comment")
+        with transaction.atomic():
+            review_request.approve(request.user, comment)
+            # Update project end_date on approval
+            review_request.project.end_date = review_request.requested_end_date
+            review_request.project.end_date_requested_by = request.user
+            review_request.project.save(
+                update_fields=["end_date", "end_date_requested_by"]
+            )
+        return Response(status=status.HTTP_200_OK)
+
+    @extend_schema(
+        request=ReviewCommentSerializer,
+        responses=None,
+        description="Reject project end date change request",
+    )
+    @action(detail=True, methods=["post"])
+    def reject(self, request, **kwargs):
+        review_request: models.ProjectEndDateChangeRequest = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        comment = serializer.validated_data.get("comment")
+        review_request.reject(request.user, comment)
+        return Response(status=status.HTTP_200_OK)
+
+    @extend_schema(
+        request=None,
+        responses=None,
+        description="Cancel project end date change request. Only the creator can cancel.",
+    )
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, **kwargs):
+        review_request: models.ProjectEndDateChangeRequest = self.get_object()
+        if review_request.created_by != request.user:
+            raise PermissionDenied(
+                _("You can only cancel your own project end date change requests.")
+            )
+        review_request.cancel()
+        return Response(
+            {"detail": _("Project end date change request has been canceled.")},
+            status=status.HTTP_200_OK,
+        )
+
+    approve_serializer_class = reject_serializer_class = ReviewCommentSerializer
+    approve_validators = reject_validators = cancel_validators = [
+        core_validators.StateValidator(ReviewStates.PENDING, state_enum=ReviewStates)
+    ]
+
+
 @extend_schema_view(
     create=extend_schema(
         examples=[
@@ -1837,7 +2127,7 @@ class SshKeyViewSet(
     Project administrators can select what SSH key will be injected into VM instance during instance provisioning.
     """
 
-    queryset = core_models.SshPublicKey.objects.all()
+    queryset = core_models.SshPublicKey.objects.select_related("user").all()
     serializer_class = serializers.SshKeySerializer
     lookup_field = "uuid"
     filter_backends = (DjangoFilterBackend,)
@@ -1912,8 +2202,6 @@ class ResourceViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
         core_validators.StateValidator(CoreStates.OK, CoreStates.ERRED)
     ]
 
-    pull_serializer_class = EmptySerializer
-
     @extend_schema(
         summary="Synchronize resource state",
         description=(
@@ -1922,7 +2210,10 @@ class ResourceViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
             "pull operation is not implemented for this resource type."
         ),
         request=None,
-        responses={202: None, 409: None},
+        responses={
+            202: DetailSerializer,
+            409: DetailSerializer,
+        },
     )
     @action(detail=True, methods=["post"])
     def pull(self, request, uuid=None):
@@ -1943,8 +2234,6 @@ class ResourceViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
         check_resource_backend_id,
     ]
 
-    unlink_serializer_class = EmptySerializer
-
     @extend_schema(
         summary="Unlink resource",
         description="""Delete resource from the database without scheduling operations on backend
@@ -1961,6 +2250,61 @@ class ResourceViewSet(core_mixins.ExecutorMixin, core_views.ActionsViewSet):
 
     unlink_permissions = [permissions.is_staff]
 
+    set_erred_serializer_class = serializers.SetErredSerializer
+
+    @extend_schema(
+        summary="Mark resource as ERRED",
+        description=(
+            "Manually transition the resource to ERRED state. "
+            "This is useful for resources stuck in transitional states "
+            "(CREATING, UPDATING, DELETING) that cannot be synced via pull. "
+            "Staff-only operation."
+        ),
+        responses={
+            200: DetailSerializer,
+        },
+    )
+    @action(detail=True, methods=["post"])
+    def set_erred(self, request, uuid=None):
+        resource = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        resource.error_message = serializer.validated_data.get("error_message", "")
+        resource.error_traceback = serializer.validated_data.get("error_traceback", "")
+        resource.set_erred()
+        resource.save(update_fields=["state", "error_message", "error_traceback"])
+        return Response(
+            {"detail": _("Resource has been marked as ERRED.")},
+            status=status.HTTP_200_OK,
+        )
+
+    set_erred_permissions = [permissions.is_staff]
+
+    @extend_schema(
+        summary="Mark resource as OK",
+        description=(
+            "Manually transition the resource to OK state and clear error fields. "
+            "Staff-only operation."
+        ),
+        request=None,
+        responses={
+            200: DetailSerializer,
+        },
+    )
+    @action(detail=True, methods=["post"])
+    def set_ok(self, request, uuid=None):
+        resource = self.get_object()
+        resource.error_message = ""
+        resource.error_traceback = ""
+        resource.set_ok()
+        resource.save(update_fields=["state", "error_message", "error_traceback"])
+        return Response(
+            {"detail": _("Resource has been marked as OK.")},
+            status=status.HTTP_200_OK,
+        )
+
+    set_ok_permissions = [permissions.is_staff]
+
 
 class OrganizationGroupViewSet(core_views.ActionsViewSet):
     queryset = (
@@ -1974,6 +2318,216 @@ class OrganizationGroupViewSet(core_views.ActionsViewSet):
     filterset_class = filters.OrganizationGroupFilter
     permission_classes = (core_permissions.IsAdminOrReadOnly,)
     ordering_fields = ("name", "customers_count")
+
+
+class AffiliatedOrganizationStatsSerializer(rf_serializers.Serializer):
+    active_projects_count = rf_serializers.IntegerField()
+    resources_count = rf_serializers.IntegerField()
+    estimated_monthly_cost = rf_serializers.DecimalField(
+        max_digits=22, decimal_places=10
+    )
+
+
+class AffiliatedOrganizationReportRowSerializer(rf_serializers.Serializer):
+    org_uuid = rf_serializers.UUIDField(allow_null=True)
+    org_name = rf_serializers.CharField()
+    org_abbreviation = rf_serializers.CharField()
+    projects_count = rf_serializers.IntegerField()
+    resources_count = rf_serializers.IntegerField()
+    estimated_cost = rf_serializers.DecimalField(max_digits=22, decimal_places=10)
+
+
+class AffiliatedOrganizationViewSet(core_views.ActionsViewSet):
+    queryset = (
+        models.AffiliatedOrganization.objects.all()
+        .order_by("name")
+        .annotate(
+            projects_count=Count(
+                "projects",
+                filter=Q(projects__is_removed=False),
+            )
+        )
+    )
+    serializer_class = serializers.AffiliatedOrganizationSerializer
+    lookup_field = "uuid"
+    filter_backends = (DjangoFilterBackend, rf_filters.OrderingFilter)
+    filterset_class = filters.AffiliatedOrganizationFilter
+    permission_classes = (core_permissions.IsAdminOrReadOnly,)
+    ordering_fields = ("name", "projects_count", "created")
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if not user.is_authenticated:
+            return qs.none()
+        if user.is_staff or user.is_support:
+            return qs
+        # Non-staff: only affiliations approved for at least one customer the
+        # user has a role in. The optional ?default_for_customer filter
+        # narrows further within this scope.
+        user_customers = get_connected_customers(user=user)
+        return qs.filter(default_for_customers__in=user_customers).distinct()
+
+    @extend_schema(
+        summary="Get affiliated organization statistics",
+        responses={200: AffiliatedOrganizationStatsSerializer},
+        description="Returns permission-filtered statistics for this affiliated organization.",
+    )
+    @action(detail=True, methods=["get"])
+    def stats(self, request, uuid=None):
+        org = self.get_object()
+        user = request.user
+        projects = org.projects.filter(is_removed=False)
+        if not (user.is_staff or user.is_support):
+            projects = filter_queryset_for_user(projects, user)
+
+        active_projects_count = projects.count()
+        resources_count = (
+            marketplace_models.Resource.objects.filter(
+                project__in=projects,
+            )
+            .exclude(state=ResourceStates.TERMINATED)
+            .count()
+        )
+        estimated_monthly_cost = (
+            marketplace_models.Resource.objects.filter(
+                project__in=projects,
+            )
+            .exclude(state=ResourceStates.TERMINATED)
+            .aggregate(total=Sum("cost"))["total"]
+            or 0
+        )
+
+        data = {
+            "active_projects_count": active_projects_count,
+            "resources_count": resources_count,
+            "estimated_monthly_cost": estimated_monthly_cost,
+        }
+        response_serializer = AffiliatedOrganizationStatsSerializer(data)
+        return Response(response_serializer.data, status=status.HTTP_200_OK)
+
+    @extend_schema(
+        summary="Get affiliated organizations report",
+        responses={200: AffiliatedOrganizationReportRowSerializer(many=True)},
+        description="Staff-only report showing aggregated data for all affiliated organizations plus an unaffiliated row.",
+    )
+    @action(detail=False, methods=["get"])
+    def report(self, request):
+        if not request.user.is_staff:
+            raise PermissionDenied()
+        rows = []
+        for org in models.AffiliatedOrganization.objects.all().order_by("name"):
+            projects = org.projects.filter(is_removed=False)
+            resources = marketplace_models.Resource.objects.filter(
+                project__in=projects,
+            ).exclude(state=ResourceStates.TERMINATED)
+            rows.append(
+                {
+                    "org_uuid": org.uuid,
+                    "org_name": org.name,
+                    "org_abbreviation": org.abbreviation,
+                    "projects_count": projects.count(),
+                    "resources_count": resources.count(),
+                    "estimated_cost": resources.aggregate(total=Sum("cost"))["total"]
+                    or 0,
+                }
+            )
+
+        # Unaffiliated row
+        unaffiliated_projects = models.Project.available_objects.filter(
+            affiliation__isnull=True
+        )
+        unaffiliated_resources = marketplace_models.Resource.objects.filter(
+            project__in=unaffiliated_projects,
+        ).exclude(state=ResourceStates.TERMINATED)
+        rows.append(
+            {
+                "org_uuid": None,
+                "org_name": "Unaffiliated",
+                "org_abbreviation": "",
+                "projects_count": unaffiliated_projects.count(),
+                "resources_count": unaffiliated_resources.count(),
+                "estimated_cost": unaffiliated_resources.aggregate(total=Sum("cost"))[
+                    "total"
+                ]
+                or 0,
+            }
+        )
+        response_serializer = AffiliatedOrganizationReportRowSerializer(rows, many=True)
+        return Response(response_serializer.data, status=status.HTTP_200_OK)
+
+    report_permissions = [permissions.is_staff]
+
+
+class ScienceDomainViewSet(core_views.ActionsViewSet):
+    queryset = (
+        models.ScienceDomain.objects.all()
+        .order_by(Length("code"), "code", "name")
+        .annotate(subdomains_count=Count("subdomains"))
+    )
+    serializer_class = serializers.ScienceDomainSerializer
+    lookup_field = "uuid"
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.ScienceDomainFilter
+    permission_classes = (core_permissions.IsAdminOrReadOnly,)
+
+    @extend_schema(
+        summary="List available science domain presets",
+        responses={200: serializers.ScienceDomainPresetSerializer(many=True)},
+    )
+    @action(detail=False, methods=["get"])
+    def presets(self, request):
+        from waldur_core.structure.presets import SCIENCE_DOMAIN_PRESETS
+
+        data = [
+            {
+                "name": name,
+                "label": preset["label"],
+                "description": preset["description"],
+            }
+            for name, preset in SCIENCE_DOMAIN_PRESETS.items()
+        ]
+        serializer = serializers.ScienceDomainPresetSerializer(data, many=True)
+        return Response(serializer.data)
+
+    @extend_schema(
+        summary="Load a science domain preset",
+        request=serializers.LoadScienceDomainPresetSerializer,
+        responses={200: serializers.LoadScienceDomainPresetResponseSerializer},
+    )
+    @action(detail=False, methods=["post"])
+    def load_preset(self, request):
+        serializer = serializers.LoadScienceDomainPresetSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        from waldur_core.structure.presets import load_preset
+
+        result = load_preset(serializer.validated_data["preset"])
+        response_serializer = serializers.LoadScienceDomainPresetResponseSerializer(
+            result
+        )
+        return Response(response_serializer.data)
+
+    load_preset_permissions = [permissions.is_staff]
+
+
+class ScienceSubDomainViewSet(core_views.ActionsViewSet):
+    queryset = (
+        models.ScienceSubDomain.objects.all()
+        .select_related("domain")
+        .order_by(Length("code"), "code")
+        .annotate(
+            projects_count=Count(
+                "projects",
+                filter=Q(projects__is_removed=False),
+            )
+        )
+    )
+    serializer_class = serializers.ScienceSubDomainSerializer
+    lookup_field = "uuid"
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.ScienceSubDomainFilter
+    permission_classes = (core_permissions.IsAdminOrReadOnly,)
 
 
 @extend_schema_view(
@@ -2043,7 +2597,7 @@ class UserAgreementsViewSet(ActionsViewSet):
 class NotificationViewSet(ActionsViewSet):
     queryset = core_models.Notification.objects.all().order_by("id")
     serializer_class = serializers.NotificationSerializer
-    permission_classes = (rf_permissions.IsAdminUser,)
+    permission_classes = (PATScopeAwareIsAdminUser,)
     filterset_class = filters.NotificationFilter
     lookup_field = "uuid"
 
@@ -2113,7 +2667,13 @@ class NotificationTemplateViewSet(ActionsViewSet):
                 name=name, content=new_content
             )
 
-        remove_cached_template(template_dbtemplates)
+        # Explicitly refresh the dbtemplates cache entry.  remove_cached_template()
+        # would be a no-op here because a freshly-created Template has no sites yet,
+        # and it never clears the "notfound" sentinel the loader plants on a DB miss.
+        # add_template_to_cache() does all three steps: removes the old positive entry,
+        # removes the notfound sentinel, and writes the new content into cache — so the
+        # override takes effect on the very next email send without a process restart.
+        add_template_to_cache(template_dbtemplates)
         logger.info(message)
         return Response({"detail": _(message)}, status=status.HTTP_200_OK)
 

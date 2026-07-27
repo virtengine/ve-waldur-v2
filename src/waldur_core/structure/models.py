@@ -1,3 +1,4 @@
+import logging
 import re
 from datetime import timedelta
 from decimal import Decimal
@@ -17,6 +18,7 @@ from django.core.validators import (
 from django.db import models, transaction
 from django.db.models import Model, Q, signals
 from django.utils import timezone
+from django.utils.text import slugify
 from django.utils.translation import gettext_lazy as _
 from model_utils import FieldTracker
 from model_utils.fields import AutoCreatedField
@@ -29,7 +31,9 @@ from reversion import revisions as reversion
 from waldur_core.checklist import models as checklist_models
 from waldur_core.checklist.enums import ChecklistTypes
 from waldur_core.core import fields as core_fields
+from waldur_core.core import mixins as core_mixins
 from waldur_core.core import models as core_models
+from waldur_core.core.enums import ReviewStates
 from waldur_core.core.fields import COUNTRIES_DICT, JSONField
 from waldur_core.core.models import User
 from waldur_core.core.validators import (
@@ -283,6 +287,144 @@ class OrganizationGroup(core_models.UuidMixin, core_models.NameMixin, models.Mod
         return " -> ".join(full_path[::-1])
 
 
+class AffiliatedOrganization(
+    core_models.UuidMixin,
+    core_models.NameMixin,
+    core_models.DescribableMixin,
+    TimeStampedModel,
+):
+    """
+    External organization (affiliation) that a project can be tied to.
+
+    Flat registry separate from Customer. Each project can be affiliated with
+    at most one entry. Staff manages the registry; per-Customer staff selects
+    which affiliations are surfaced as defaults to project creators.
+    """
+
+    code = models.CharField(
+        max_length=20,
+        unique=True,
+        help_text=_("Unique short identifier, e.g. CERN, EMBL."),
+    )
+    abbreviation = models.CharField(max_length=12, blank=True)
+    email = models.EmailField(max_length=75, blank=True)
+    homepage = models.URLField(max_length=255, blank=True)
+    country = models.CharField(max_length=2, blank=True)
+    address = models.CharField(max_length=300, blank=True)
+
+    class Meta:
+        verbose_name = _("affiliation")
+        verbose_name_plural = _("affiliations")
+        ordering = ("name",)
+
+    @classmethod
+    def get_url_name(cls):
+        return "affiliated-organization"
+
+    def __str__(self):
+        return self.name
+
+
+class ScienceDomain(
+    core_models.UuidMixin,
+    core_models.NameMixin,
+    TimeStampedModel,
+):
+    """
+    Top-level science domain for classifying projects (e.g. Physics, Life Science).
+
+    Part of a two-level taxonomy: ScienceDomain → ScienceSubDomain.
+    Staff-managed; any authenticated user can read.
+    """
+
+    code = models.CharField(
+        max_length=20,
+        blank=True,
+        verbose_name=_("code"),
+        help_text=_("Domain code (e.g. '1'). Auto-derived if left blank."),
+    )
+
+    class Meta:
+        verbose_name = _("science domain")
+        ordering = ("code", "name")
+
+    @classmethod
+    def get_url_name(cls):
+        return "science-domain"
+
+    def save(self, *args, **kwargs):
+        if not self.code:
+            max_code = (
+                ScienceDomain.objects.exclude(pk=self.pk)
+                .exclude(code="")
+                .order_by("-code")
+                .values_list("code", flat=True)
+                .first()
+            )
+            next_num = int(max_code) + 1 if max_code and max_code.isdigit() else 1
+            self.code = str(next_num)
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.code} {self.name}"
+
+
+class ScienceSubDomain(
+    core_models.UuidMixin,
+    core_models.NameMixin,
+    TimeStampedModel,
+):
+    """
+    Sub-domain within a science domain (e.g. Astrophysics & Cosmology under Physics).
+
+    Projects and proposals reference a ScienceSubDomain; the parent domain
+    is always derivable from the FK.
+    """
+
+    domain = models.ForeignKey(
+        ScienceDomain,
+        on_delete=models.CASCADE,
+        related_name="subdomains",
+    )
+    code = models.CharField(
+        max_length=20,
+        blank=True,
+        verbose_name=_("code"),
+        help_text=_(
+            "Sub-domain code (e.g. '1.1'). Auto-derived from domain code if left blank."
+        ),
+    )
+
+    class Meta:
+        verbose_name = _("science sub-domain")
+        ordering = ("code", "name")
+
+    @classmethod
+    def get_url_name(cls):
+        return "science-sub-domain"
+
+    def save(self, *args, **kwargs):
+        if not self.code:
+            prefix = self.domain.code or "0"
+            max_code = (
+                ScienceSubDomain.objects.filter(domain=self.domain)
+                .exclude(pk=self.pk)
+                .exclude(code="")
+                .order_by("-code")
+                .values_list("code", flat=True)
+                .first()
+            )
+            if max_code and "." in max_code:
+                next_num = int(max_code.split(".")[-1]) + 1
+            else:
+                next_num = 1
+            self.code = f"{prefix}.{next_num}"
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.code} {self.name}"
+
+
 CUSTOMER_DETAILS_FIELDS = (
     "name",
     "slug",
@@ -306,6 +448,14 @@ CUSTOMER_DETAILS_FIELDS = (
     "bank_account",
     "country",
     "notification_emails",
+    "city",
+    "state",
+    "parish",
+    "street",
+    "house_nr",
+    "apartment_nr",
+    "household",
+    "project_slug_template",
 )
 
 
@@ -351,7 +501,28 @@ class AccessSubnet(core_models.UuidMixin, core_models.DescribableMixin, Loggable
         return "description", "inet", "customer"
 
 
-class CustomerDetailsMixin(core_models.NameMixin, VATMixin, CoordinatesMixin):
+class CustomerAddressDetailsMixin(models.Model):
+    """
+    Mixin contains customer address detail fields.
+    """
+
+    class Meta:
+        abstract = True
+
+    address = models.CharField(blank=True, max_length=300)
+    contact_details = models.TextField(blank=True, validators=[MaxLengthValidator(500)])
+    city = models.CharField(blank=True, max_length=100)
+    state = models.CharField(blank=True, max_length=100)
+    parish = models.CharField(blank=True, max_length=100)
+    street = models.CharField(blank=True, max_length=200)
+    house_nr = models.CharField(blank=True, max_length=100)
+    apartment_nr = models.CharField(blank=True, max_length=100)
+    household = models.CharField(blank=True, max_length=100)
+
+
+class CustomerDetailsMixin(
+    core_models.NameMixin, VATMixin, CoordinatesMixin, CustomerAddressDetailsMixin
+):
     """
     Mixin containing customer detail fields.
 
@@ -365,7 +536,6 @@ class CustomerDetailsMixin(core_models.NameMixin, VATMixin, CoordinatesMixin):
 
     native_name = models.CharField(max_length=160, default="", blank=True)
     abbreviation = models.CharField(max_length=12, blank=True)
-    contact_details = models.TextField(blank=True, validators=[MaxLengthValidator(500)])
 
     agreement_number = models.CharField(max_length=160, default="", blank=True)
     sponsor_number = models.PositiveIntegerField(
@@ -399,7 +569,6 @@ class CustomerDetailsMixin(core_models.NameMixin, VATMixin, CoordinatesMixin):
     homepage = models.URLField(max_length=255, blank=True)
     domain = models.CharField(max_length=255, blank=True)
 
-    address = models.CharField(blank=True, max_length=300)
     postal = models.CharField(blank=True, max_length=20)
     bank_name = models.CharField(blank=True, max_length=150)
     bank_account = models.CharField(blank=True, max_length=50)
@@ -516,6 +685,25 @@ class Customer(
         blank=True,
         help_text=_(
             "Number of extra days after project end date before resources are terminated"
+        ),
+    )
+    project_slug_template = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        help_text=(
+            "Template for project slugs. Supports: {customer_slug}, {project_name}, "
+            "{year}, {month}, {counter}, {counter_padded}. "
+            "Default: slugified project name"
+        ),
+    )
+    default_affiliations = models.ManyToManyField(
+        to=AffiliatedOrganization,
+        related_name="default_for_customers",
+        blank=True,
+        help_text=_(
+            "Affiliations offered to project creators of this organization. "
+            "Staff users can select any affiliation; non-staff are limited to this list."
         ),
     )
     tracker = cast(
@@ -785,6 +973,11 @@ class Project(
         null=True,
         related_name="+",
     )
+    end_date_updated_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=_("Timestamp of the last end_date change."),
+    )
     type = models.ForeignKey(
         ProjectType,
         verbose_name=_("project type"),
@@ -827,6 +1020,21 @@ class Project(
             "Number of extra days after project end date before resources are terminated. Overrides customer-level setting."
         ),
     )
+    affiliation = models.ForeignKey(
+        AffiliatedOrganization,
+        related_name="projects",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+    )
+    science_sub_domain = models.ForeignKey(
+        ScienceSubDomain,
+        verbose_name=_("science sub-domain"),
+        blank=True,
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name="projects",
+    )
 
     tracker = cast(FieldInstanceTracker, FieldTracker())
     # Entities returned in manager available_objects are limited to not-deleted instances.
@@ -834,6 +1042,85 @@ class Project(
     available_objects = SoftDeletableManager()
     objects = models.Manager()
     id: int
+
+    def save(self, *args, **kwargs):
+        end_date_changed = not self._state.adding and self.tracker.has_changed(
+            "end_date"
+        )
+        super().save(*args, **kwargs)
+        if end_date_changed:
+            Project.objects.filter(pk=self.pk).update(
+                end_date_updated_at=timezone.now()
+            )
+
+    def generate_slug(self):
+        if self.customer and self.customer.project_slug_template:
+            return self._generate_template_slug()
+        return super().generate_slug()
+
+    def _generate_template_slug(self):
+        logger = logging.getLogger(__name__)
+        template = self.customer.project_slug_template
+        if not template:
+            return super().generate_slug()
+        context = self._get_slug_context()
+
+        try:
+            raw_slug = template.format(**context)
+        except (KeyError, ValueError) as e:
+            logger.error(
+                "Failed to format project slug template '%s' "
+                "for project '%s' in customer '%s': %s. "
+                "Falling back to default slug generation.",
+                template,
+                self.name,
+                self.customer,
+                e,
+            )
+            return super().generate_slug()
+
+        base_slug = core_models.clean_slug_hyphens(slugify(raw_slug))
+        return self._ensure_slug_unique(base_slug)
+
+    def _get_slug_context(self):
+        now = timezone.now()
+        counter = self._calculate_project_counter()
+        return {
+            "customer_slug": self.customer.slug if self.customer else "",
+            "project_name": slugify(self.name) if self.name else "",
+            "year": now.strftime("%Y"),
+            "month": now.strftime("%m"),
+            "counter": str(counter),
+            "counter_padded": f"{counter:03d}",
+        }
+
+    def _calculate_project_counter(self):
+        existing_count = (
+            Project.objects.filter(customer=self.customer)
+            .exclude(pk=self.pk if self.pk else None)
+            .count()
+        )
+        return existing_count + 1
+
+    def _ensure_slug_unique(self, base_slug):
+        existing_slugs = Project.objects.filter(slug__startswith=base_slug).values_list(
+            "slug", flat=True
+        )
+
+        if base_slug not in existing_slugs:
+            return base_slug
+
+        max_num = 1
+        for slug in existing_slugs:
+            if slug == base_slug:
+                continue
+            try:
+                num = int(slug.split("-")[-1])
+                if num > max_num:
+                    max_num = num
+            except ValueError:
+                pass
+        return f"{base_slug}-{max_num + 1}"
 
     def get_grace_period_days(self):
         """Get the grace period days, with project-level setting overriding customer-level."""
@@ -1518,3 +1805,47 @@ class ProjectDigestConfiguration(
 
     def __str__(self):
         return f"Digest config for {self.customer} ({self.frequency})"
+
+
+class ProjectEndDateChangeRequest(core_models.UuidMixin, core_mixins.ReviewMixin):
+    """
+    Request from project member (without UPDATE_PROJECT) to change project end date.
+    Organization owners can approve or reject.
+    """
+
+    class Meta:
+        ordering = ["created"]
+        verbose_name = _("Project end date change request")
+        verbose_name_plural = _("Project end date change requests")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project", "requested_end_date"],
+                condition=Q(state=ReviewStates.PENDING),
+                name="unique_pending_request_per_project_date",
+            )
+        ]
+
+    tracker = cast(FieldInstanceTracker, FieldTracker())
+    project = models.ForeignKey(
+        Project,
+        on_delete=models.CASCADE,
+        related_name="end_date_change_requests",
+    )
+    requested_end_date = models.DateField(
+        help_text=_("The requested new end date for the project"),
+    )
+    created_by = models.ForeignKey(
+        "core.User",
+        on_delete=models.SET_NULL,
+        related_name="+",
+        null=True,
+    )
+    comment = models.TextField(
+        blank=True,
+        null=True,
+        help_text=_("Optional comment from the requester"),
+    )
+
+    class Permissions:
+        customer_path = "project__customer"
+        project_path = "project"

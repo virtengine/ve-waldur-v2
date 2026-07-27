@@ -15,12 +15,27 @@ def get_secret_attributes():
 
 
 def components_filter(offering, qs):
+    # These imports must stay inside the function:
+    # - waldur_openstack.utils imports models which require app registry
+    # - same-package import would cause circular import at module level
+    from waldur_openstack.utils import is_valid_volume_type_name
+
     from . import AVAILABLE_LIMITS, STORAGE_MODE_FIXED, STORAGE_TYPE
 
     storage_mode = offering.plugin_options.get("storage_mode") or STORAGE_MODE_FIXED
     if storage_mode == STORAGE_MODE_FIXED:
-        qs = qs.filter(type__in=AVAILABLE_LIMITS)
+        # Include builtin infrastructure limits (cores, ram, storage)
+        # Exclude volume type components (gigabytes_*) — they're for dynamic mode
+        # Include any custom provider-added components
+        all_types = set(qs.values_list("type", flat=True))
+        allowed_types = set(AVAILABLE_LIMITS)
+        for t in all_types:
+            if t not in allowed_types and not is_valid_volume_type_name(t):
+                allowed_types.add(t)
+        qs = qs.filter(type__in=allowed_types)
     else:
+        # Dynamic storage mode: exclude fixed "storage" component,
+        # keep volume types (gigabytes_*) and custom components
         qs = qs.exclude(type=STORAGE_TYPE)
     return qs
 
@@ -240,6 +255,13 @@ class MarketplaceOpenStackConfig(AppConfig):
             sender=openstack_models.Tenant,
             dispatch_uid="waldur_mastermind.marketplace_openstack."
             "import_instances_and_volumes_if_tenant_has_been_imported_if_tenant_has_been_pulled",
+        )
+
+        openstack_signals.tenant_quotas_pulled.connect(
+            handlers.import_usage_on_tenant_quotas_pulled,
+            sender=openstack_models.Tenant,
+            dispatch_uid="waldur_mastermind.marketplace_openstack."
+            "import_usage_on_tenant_quotas_pulled",
         )
 
         signals.post_save.connect(

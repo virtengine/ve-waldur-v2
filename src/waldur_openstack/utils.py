@@ -1,9 +1,11 @@
-from django.utils.topological_sort import stable_topological_sort
 from django.utils.translation import gettext_lazy as _
 
 from waldur_core.core import exceptions as core_exceptions
+from waldur_core.core.utils import stable_topological_sort
+from waldur_core.permissions.fixtures import CustomerRole
 from waldur_openstack.models import (
     CustomerOpenStack,
+    ExternalNetwork,
     Flavor,
     Image,
     Instance,
@@ -43,15 +45,85 @@ def get_valid_availability_zones(instance):
     )
 
 
+def is_openstack_service_provider(user, service_settings) -> bool:
+    """User is staff or owner of the customer that owns the OpenStack service settings.
+
+    Provider users can manage provider-internal resources (non-shared externals,
+    advanced gateway options); consumer-side users may not.
+    """
+    if user.is_staff:
+        return True
+    customer = service_settings.customer
+    if customer is None:
+        return False
+    return customer.has_user(user, CustomerRole.OWNER)
+
+
+def get_tenant_external_networks(tenant: Tenant, user):
+    """Global ExternalNetwork rows usable as gateway by `user` on routers in `tenant`.
+
+    Non-shared external networks are provider-internal (e.g. management or
+    upstream-peering pools) and must not be exposed to consumer-side users, even
+    if Neutron has synced them into the deployment-wide catalog. Providers
+    (staff or service settings customer owners) still see the full set.
+    """
+    qs = ExternalNetwork.objects.filter(settings=tenant.service_settings)
+    if not is_openstack_service_provider(user, tenant.service_settings):
+        qs = qs.filter(is_shared=True)
+    return qs
+
+
+def get_external_network(tenant: Tenant) -> ExternalNetwork | None:
+    """
+    Fetch ExternalNetwork instance for a tenant.
+    Priority order:
+    1. Tenant's external_network_ref FK (if set)
+    2. CustomerOpenStack external_network_ref FK (if exists)
+    3. Lookup by service settings external_network_id option
+    Falls back to string-based lookup if FK is not set.
+    """
+    # Priority 1: tenant's own FK
+    if tenant.external_network_ref_id:
+        return tenant.external_network_ref
+
+    service_settings = tenant.service_settings
+    customer = tenant.project.customer
+
+    # Priority 2: CustomerOpenStack FK
+    try:
+        customer_openstack = CustomerOpenStack.objects.get(
+            settings=service_settings, customer=customer
+        )
+        if customer_openstack.external_network_ref_id:
+            return customer_openstack.external_network_ref
+    except CustomerOpenStack.DoesNotExist:
+        pass
+
+    # Priority 3: fall back to string-based lookup via service settings option
+    external_network_id = service_settings.get_option("external_network_id")
+    if external_network_id:
+        return ExternalNetwork.objects.filter(
+            settings=service_settings, backend_id=external_network_id
+        ).first()
+
+    return None
+
+
 def get_external_network_id(tenant: Tenant):
     """
     Fetch external network ID from tenant, service settings or customer settings.
     Priority order:
-    1. Tenant's external_network_id field (if set)
-    2. CustomerOpenStack external_network_id (if exists)
-    3. Service settings external_network_id option
+    1. Tenant's external_network_ref FK backend_id (if set)
+    2. Tenant's external_network_id field (if set, legacy)
+    3. CustomerOpenStack external_network_id (if exists)
+    4. Service settings external_network_id option
     """
-    # First priority: tenant's own external_network_id
+    # Try FK-based resolution first
+    ext_net = get_external_network(tenant)
+    if ext_net:
+        return ext_net.backend_id
+
+    # Legacy fallback: direct string fields
     if tenant.external_network_id:
         return tenant.external_network_id
 

@@ -3,7 +3,9 @@
 import logging
 from decimal import Decimal
 
+import structlog
 from constance import config
+from django.dispatch import Signal
 
 from waldur_core.core.middleware import get_skip_side_effects
 from waldur_core.logging import models
@@ -19,6 +21,8 @@ from waldur_core.logging.mixins import LoggableMixin
 
 logger = logging.getLogger(__name__)
 
+event_emitted = Signal()
+
 event_logger = EventLoggerAdapter(logger)
 
 
@@ -28,6 +32,13 @@ def compile_context(**kwargs):
     event_context = get_event_context()
     if event_context:
         context.update(event_context)
+
+    # request_id is bound onto structlog contextvars by django_structlog's
+    # RequestMiddleware, which runs after CaptureEventContextMiddleware, so we
+    # have to read it at emit time rather than at request entry.
+    request_id = structlog.contextvars.get_contextvars().get("request_id")
+    if request_id and "request_id" not in context:
+        context["request_id"] = str(request_id)
 
     for entity_name, entity in kwargs.items():
         if isinstance(entity, LoggableMixin):
@@ -79,6 +90,8 @@ def emit(
         for scope in scopes or []:
             if scope and scope.id:
                 models.Feed.objects.create(scope=scope, event=event)
+
+    event_emitted.send(sender=type(event), instance=event)
 
 
 def get_valid_events():
