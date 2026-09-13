@@ -9355,16 +9355,15 @@ class ConsumerResourceViewSet(UserRoleMixin, BaseResourceViewSet):
             "enable_membership_sync_status"
         ):
             context["member_sync_index"] = {
-                (
-                    row.user_id,
-                    row.scope_type,
-                    row.resource_project_id,
-                    row.role_name,
-                ): row
+                row.report_key: row
                 for row in models.ResourceMemberSyncStatus.objects.filter(
                     resource=resource
                 )
             }
+            report = models.ResourceMemberSyncReport.objects.filter(
+                resource=resource
+            ).first()
+            context["member_sync_reported_at"] = report and report.reported_at
         serializer = serializers.ResourceTeamMemberSerializer(
             page,
             many=True,
@@ -10079,9 +10078,11 @@ class ProviderResourceViewSet(UserRoleMixin, BaseResourceViewSet):
     @extend_schema(
         summary="Report per-member sync statuses for a resource",
         description=(
-            "Full-replace report from the site agent: replaces every "
-            "previously stored member sync status of this resource with "
-            "the submitted set. Requires the offering to opt in via the "
+            "Complete report from the site agent: afterwards the resource's "
+            "stored member sync statuses are exactly the submitted set. Only "
+            "the differences are written; unchanged statuses are left as "
+            "they are, and the report time is recorded once per resource. "
+            "Requires the offering to opt in via the "
             "enable_membership_sync_status plugin option. Entries whose "
             "user cannot be resolved are skipped and echoed back in the "
             "response instead of failing the whole report."
@@ -10127,7 +10128,7 @@ class ProviderResourceViewSet(UserRoleMixin, BaseResourceViewSet):
             )
         }
 
-        rows = []
+        rows: dict[tuple, models.ResourceMemberSyncStatus] = {}
         skipped = []
         for entry in statuses:
             user = None
@@ -10147,21 +10148,65 @@ class ProviderResourceViewSet(UserRoleMixin, BaseResourceViewSet):
                 if resource_project is None:
                     skipped.append(entry["resource_project_uuid"].hex)
                     continue
-            rows.append(
-                models.ResourceMemberSyncStatus(
-                    resource=resource,
-                    user=user,
-                    scope_type=entry["scope_type"],
-                    resource_project=resource_project,
-                    role_name=entry["role_name"],
-                    state=entry["state"],
-                    message=entry.get("message", ""),
-                )
+            row = models.ResourceMemberSyncStatus(
+                resource=resource,
+                user=user,
+                scope_type=entry["scope_type"],
+                resource_project=resource_project,
+                role_name=entry["role_name"],
+                state=entry["state"],
+                message=entry.get("message", ""),
+            )
+            # A grant listed twice keeps its last entry.
+            rows[row.report_key] = row
+
+        # The agent reports every cycle and most reports change nothing, so
+        # only the differences are written rather than replacing every row.
+        now = timezone.now()
+        with transaction.atomic():
+            # Serialize reports for one resource: two diffs taken against the
+            # same snapshot would both insert the same new rows.
+            models.Resource.objects.select_for_update(of=("self",)).only("id").get(
+                pk=resource.pk
+            )
+            existing: dict[tuple, models.ResourceMemberSyncStatus] = {}
+            stale_ids = []
+            for current in models.ResourceMemberSyncStatus.objects.filter(
+                resource=resource
+            ):
+                if current.report_key in existing:
+                    stale_ids.append(current.id)  # duplicate left by a past report
+                else:
+                    existing[current.report_key] = current
+
+            to_create = []
+            to_update = []
+            for key, row in rows.items():
+                current = existing.get(key)
+                if current is None:
+                    to_create.append(row)
+                elif (current.state, current.message) != (row.state, row.message):
+                    current.state = row.state
+                    current.message = row.message
+                    current.modified = now
+                    to_update.append(current)
+            stale_ids.extend(
+                current.id for key, current in existing.items() if key not in rows
             )
 
-        with transaction.atomic():
-            models.ResourceMemberSyncStatus.objects.filter(resource=resource).delete()
-            models.ResourceMemberSyncStatus.objects.bulk_create(rows)
+            if stale_ids:
+                models.ResourceMemberSyncStatus.objects.filter(
+                    id__in=stale_ids
+                ).delete()
+            if to_update:
+                models.ResourceMemberSyncStatus.objects.bulk_update(
+                    to_update, ["state", "message", "modified"]
+                )
+            if to_create:
+                models.ResourceMemberSyncStatus.objects.bulk_create(to_create)
+            models.ResourceMemberSyncReport.objects.update_or_create(
+                resource=resource, defaults={"reported_at": now}
+            )
 
         result = serializers.MemberSyncStatusReportResultSerializer(
             {"stored": len(rows), "skipped": skipped}

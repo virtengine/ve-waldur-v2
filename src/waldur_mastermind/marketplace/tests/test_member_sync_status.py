@@ -1,17 +1,21 @@
 """Per-member sync status reporting, reading, and resync triggering.
 
 The site agent reports how each role grant propagated to the provider
-backend (set_membership_sync_statuses, full-replace semantics), the
-team_members endpoint joins those rows onto roles[] / resource_projects[]
-entries, and providers can trigger a resource-scoped user role resync.
+backend (set_membership_sync_statuses: a complete report that writes only
+what changed), the team_members endpoint joins those rows onto roles[] /
+resource_projects[] entries, and providers can trigger a resource-scoped
+user role resync.
 The whole feature is opt-in per offering via the
 enable_membership_sync_status plugin option.
 """
+
+import datetime
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.cache import cache
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
+from freezegun import freeze_time
 from rest_framework import status, test
 from rest_framework.reverse import reverse
 
@@ -371,3 +375,168 @@ class TeamMembersQueryCountTest(_Base):
             f"vs {len(large_ctx.captured_queries)} for {large_members}) — "
             "per-member N+1 regression",
         )
+
+
+T1 = datetime.datetime(2026, 1, 1, 10, 0, tzinfo=datetime.UTC)
+T2 = datetime.datetime(2026, 1, 1, 11, 0, tzinfo=datetime.UTC)
+STATUS_TABLE = models.ResourceMemberSyncStatus._meta.db_table
+
+
+class ReportDiffTest(_Base):
+    """A report writes only what changed; the report time is kept per resource.
+
+    The agent reports on every sync cycle and most reports change nothing,
+    so an unchanged report must not rewrite the resource's rows.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.client.force_authenticate(self.fixture.staff)
+        self.other = UserFactory()
+        self.resource.add_user(self.other, self.custom_role)
+        self.team_url = factories.ResourceFactory.get_url(
+            self.resource, action="team_members"
+        )
+
+    def _rows(self):
+        return {
+            row.user_id: row
+            for row in models.ResourceMemberSyncStatus.objects.filter(
+                resource=self.resource
+            )
+        }
+
+    def _reported_at(self):
+        return models.ResourceMemberSyncReport.objects.get(
+            resource=self.resource
+        ).reported_at
+
+    def _entries(self):
+        return [
+            self._entry(),
+            self._entry(username=self.other.username, state="error", message="boom"),
+        ]
+
+    def test_unchanged_report_writes_no_rows_and_records_the_report(self):
+        with freeze_time(T1):
+            self._report(self._entries())
+        before = {uid: (row.id, row.modified) for uid, row in self._rows().items()}
+
+        with freeze_time(T2), CaptureQueriesContext(connection) as ctx:
+            response = self._report(self._entries())
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.data)
+        self.assertEqual(2, response.data["stored"])
+        after = {uid: (row.id, row.modified) for uid, row in self._rows().items()}
+        self.assertEqual(before, after)
+        self.assertEqual(T2, self._reported_at())
+        row_writes = [
+            query["sql"]
+            for query in ctx.captured_queries
+            if STATUS_TABLE in query["sql"]
+            and query["sql"].lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+        ]
+        self.assertEqual([], row_writes)
+
+    def test_changed_state_updates_the_row_in_place(self):
+        with freeze_time(T1):
+            self._report([self._entry(state="pending")])
+        row_id = self._rows()[self.member.id].id
+
+        with freeze_time(T2):
+            self._report([self._entry(state="synced")])
+
+        row = self._rows()[self.member.id]
+        self.assertEqual(row_id, row.id)
+        self.assertEqual("synced", row.state)
+        self.assertEqual(T2, row.modified)
+
+    def test_changed_message_alone_updates_the_row(self):
+        self._report([self._entry(state="error", message="first")])
+        self._report([self._entry(state="error", message="second")])
+        self.assertEqual("second", self._rows()[self.member.id].message)
+
+    def test_dropped_grant_is_deleted_and_new_grant_created(self):
+        self._report([self._entry()])
+        self._report([self._entry(username=self.other.username)])
+        self.assertEqual({self.other.id}, set(self._rows()))
+
+    def test_grant_listed_twice_is_stored_once(self):
+        response = self._report(
+            [self._entry(state="pending"), self._entry(state="synced")]
+        )
+        self.assertEqual(1, response.data["stored"])
+        rows = models.ResourceMemberSyncStatus.objects.filter(resource=self.resource)
+        self.assertEqual(1, rows.count())
+        self.assertEqual("synced", rows.get().state)
+
+    def test_duplicate_rows_left_by_earlier_reports_are_collapsed(self):
+        for _ in range(2):
+            models.ResourceMemberSyncStatus.objects.create(
+                resource=self.resource,
+                user=self.member,
+                scope_type="resource",
+                role_name="cluster_owner",
+                state="pending",
+            )
+        self._report([self._entry(state="synced")])
+        rows = models.ResourceMemberSyncStatus.objects.filter(resource=self.resource)
+        self.assertEqual(1, rows.count())
+        self.assertEqual("synced", rows.get().state)
+
+    def test_empty_report_clears_rows_and_records_the_report(self):
+        self._report([self._entry()])
+        with freeze_time(T2):
+            response = self._report([])
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        self.assertEqual({}, self._rows())
+        self.assertEqual(T2, self._reported_at())
+
+    def _grant(self):
+        response = self.client.get(self.team_url, {"field": ["full_name", "roles"]})
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        member = next(
+            row for row in response.data if row["full_name"] == self.member.full_name
+        )
+        return member["roles"][0]
+
+    def test_team_members_shows_the_last_report_time(self):
+        with freeze_time(T1):
+            self._report([self._entry()])
+        with freeze_time(T2):
+            self._report([self._entry()])
+        self.assertEqual(T2, self._grant()["sync_reported_at"])
+
+    def test_rows_without_a_report_record_fall_back_to_their_own_time(self):
+        with freeze_time(T1):
+            models.ResourceMemberSyncStatus.objects.create(
+                resource=self.resource,
+                user=self.member,
+                scope_type="resource",
+                role_name="cluster_owner",
+                state="synced",
+            )
+        self.assertEqual(T1, self._grant()["sync_reported_at"])
+
+
+class ReportValidationTest(_Base):
+    """Malformed entries from an agent are rejected with 400, never a 500."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.client.force_authenticate(self.fixture.staff)
+
+    def test_role_name_longer_than_the_column_is_rejected(self):
+        response = self._report([self._entry(role_name="r" * 151)])
+
+        self.assertEqual(status.HTTP_400_BAD_REQUEST, response.status_code)
+        self.assertFalse(
+            models.ResourceMemberSyncStatus.objects.filter(
+                resource=self.resource
+            ).exists()
+        )
+
+    def test_role_name_at_the_column_limit_is_accepted(self):
+        response = self._report([self._entry(role_name="r" * 150)])
+
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.data)
