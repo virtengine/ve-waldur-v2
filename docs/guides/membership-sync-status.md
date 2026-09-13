@@ -24,9 +24,23 @@ One row per reported role grant.
   `role_name`, `state`, `message`, `modified`
 - **`scope_type`**: `resource` or `resource_project`
 - **`state`**: `synced`, `pending`, `missing_in_idp`, `error`
-- Reports are **full-replace** per resource: each report deletes the
-  resource's existing rows and stores the submitted set. A grant with no row
-  means "the agent has not reported on it" (distinct from any real state).
+- Reports are **complete** per resource: after a report, the resource's rows
+  are exactly the submitted set. A grant with no row means "the agent has
+  not reported on it" (distinct from any real state).
+- Only the differences are written. Rows for grants the report no longer
+  lists are deleted, new grants are inserted, and a row is updated only
+  when its `state` or `message` changed. So `modified` is when that
+  grant's state last changed. The agent reports every cycle, and most
+  reports change nothing.
+
+### ResourceMemberSyncReport
+
+One row per resource: `reported_at`, when the agent last reported, updated
+by every report even when nothing changed. `sync_reported_at` in the team
+view comes from here (falling back to the row's `modified` for rows stored
+before this record existed). It is a separate table rather than a
+`Resource` column so that a full `Resource.save()` from a stale instance
+cannot roll it back.
 
 ## API Endpoints
 
@@ -34,7 +48,7 @@ One row per reported role grant.
 
 | Endpoint | Description |
 |----------|-------------|
-| `POST /api/marketplace-provider-resources/{uuid}/set_membership_sync_statuses/` | Full-replace report of a resource's member sync statuses |
+| `POST /api/marketplace-provider-resources/{uuid}/set_membership_sync_statuses/` | Complete report of a resource's member sync statuses; writes only the differences |
 
 Request body:
 

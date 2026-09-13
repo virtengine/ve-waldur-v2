@@ -10929,7 +10929,12 @@ class MemberSyncFieldsMixin(serializers.Serializer):
     @extend_schema_field(serializers.DateTimeField(allow_null=True))
     def get_sync_reported_at(self, user_role):
         row = self._sync_row(user_role)
-        return row and row.modified
+        if row is None:
+            return None
+        # A report leaves unchanged rows untouched, so when the agent last
+        # reported lives on the resource. Rows stored before that record
+        # existed fall back to their own timestamp.
+        return self.context.get("member_sync_reported_at") or row.modified
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -11003,7 +11008,13 @@ class MemberSyncStatusEntrySerializer(serializers.Serializer):
         choices=models.ResourceMemberSyncStatus.ScopeTypes.CHOICES
     )
     resource_project_uuid = serializers.UUIDField(required=False)
-    role_name = serializers.CharField()
+    # Bounded by the column: a longer name used to reach the INSERT and fail
+    # there with a DataError (HTTP 500) instead of a 400.
+    role_name = serializers.CharField(
+        max_length=models.ResourceMemberSyncStatus._meta.get_field(
+            "role_name"
+        ).max_length
+    )
     state = serializers.ChoiceField(
         choices=models.ResourceMemberSyncStatus.States.CHOICES
     )

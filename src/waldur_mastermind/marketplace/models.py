@@ -5258,14 +5258,15 @@ class ResourceMemberSyncStatus(core_models.UuidMixin, TimeStampedModel):
     """Agent-reported propagation state of a single role grant.
 
     One row per (resource, user, scope, role name), written by the site
-    agent via ``set_membership_sync_statuses`` with full-replace-per-
-    resource semantics: the agent owns these rows, a report replaces the
-    resource's previous rows atomically, so a revoked grant's row cannot
-    outlive the grant. Enabled per offering via the
-    ``enable_membership_sync_status`` plugin option.
+    agent via ``set_membership_sync_statuses``. The agent owns these rows
+    and every report is complete: rows for grants it no longer lists are
+    deleted, so a revoked grant's row cannot outlive the grant. Enabled per
+    offering via the ``enable_membership_sync_status`` plugin option.
 
-    ``modified`` (TimeStampedModel) doubles as the reported-at
-    timestamp because rows are recreated on every report.
+    A report writes only what changed, so an unchanged grant's row is left
+    as it is: ``modified`` (TimeStampedModel) is when this grant's state
+    last changed. When the agent last reported is
+    ``ResourceMemberSyncReport.reported_at``.
     """
 
     class States:
@@ -5321,6 +5322,34 @@ class ResourceMemberSyncStatus(core_models.UuidMixin, TimeStampedModel):
 
     def __str__(self):
         return f"{self.user.username} @ {self.resource.name} [{self.role_name}]: {self.state}"
+
+    @property
+    def report_key(self) -> tuple:
+        """The grant this row reports on; a resource holds one row per key."""
+        return (self.user_id, self.scope_type, self.resource_project_id, self.role_name)
+
+
+class ResourceMemberSyncReport(models.Model):
+    """When the site agent last reported a resource's member sync statuses.
+
+    Kept apart from the status rows so that an unchanged report does not
+    rewrite them, and apart from Resource so that a full ``Resource.save()``
+    from a stale instance cannot roll it back.
+    """
+
+    resource = models.OneToOneField(
+        Resource,
+        on_delete=models.CASCADE,
+        related_name="member_sync_report",
+    )
+    reported_at = models.DateTimeField()
+
+    class Meta:
+        verbose_name = "Resource member sync report"
+        verbose_name_plural = "Resource member sync reports"
+
+    def __str__(self):
+        return f"{self.resource.name}: {self.reported_at}"
 
 
 class IntegrationStatus(core_models.UuidMixin):
