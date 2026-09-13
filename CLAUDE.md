@@ -58,8 +58,8 @@ whenever they sit on a startup import path — that is exactly where the wins in
 - **Function-local import** — put `from heavy_pkg import X` inside the method that
   uses it. This is the default; prefer it.
 - **`except` clauses across many methods** — add one lazy helper returning the
-  exception tuple: `def _azure_exceptions(): from azure.core.exceptions import
-  AzureError, HttpResponseError; return AzureError, HttpResponseError`.
+  exception tuple: `def _sdk_exceptions(): from heavy_sdk.exceptions import
+  SdkError, HttpResponseError; return SdkError, HttpResponseError`.
 - **Annotation-only symbols** — add `from __future__ import annotations` and import
   them under `if TYPE_CHECKING:` (also silences ruff `F821` for the runtime names).
 - **A symbol used pervasively across one module** (dozens of names) — a single
@@ -99,8 +99,7 @@ whenever they sit on a startup import path — that is exactly where the wins in
 the dep still loads. The `Check startup memory budget` CI job runs this and can
 gate on `MEMORY_BUDGET_MB`.
 
-Reference implementations: `src/waldur_azure/client.py` + `backend.py` (original);
-and the startup sweep — `marketplace_remote` (`waldur_api_client`),
+Reference implementations (the startup sweep): `marketplace_remote` (`waldur_api_client`),
 `waldur_auth_saml2` (`pysaml2`/`xmlschema`), `support` (`atlassian-python-api`),
 `matrix_chat` (`matrix-nio`), `chat/llm_streamer.py` (`openai`).
 

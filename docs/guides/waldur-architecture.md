@@ -32,7 +32,7 @@
 
 ### Provider Integration Layer
 
-- **Cloud Providers**: OpenStack, AWS, Azure, VMware, DigitalOcean
+- **Cloud Providers**: OpenStack, AWS, VMware, DigitalOcean
 - **Compute Platforms**: Rancher, SLURM, Kubernetes
 - **Identity Management**: Keycloak (generic offering-level integration)
 - **Authentication**: SAML2, Social/OAuth, Valimo

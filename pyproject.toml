@@ -14,11 +14,6 @@ classifiers = [
 ]
 dependencies = [
   "apache-libcloud==3.7.0",
-  "azure-mgmt-compute>=37.1.0,<38.0.0",
-  "azure-mgmt-network>=30.1.0,<31.0.0",
-  "azure-mgmt-resource>=24.0.0,<25.0.0",
-  "azure-mgmt-storage>=24.0.0,<25.0.0",
-  "azure-identity>=1.25.1,<2.0.0",
   "celery==5.6.3",
   "django-auth-ldap>=5.2.0,<6.0.0",
   "django-filter==24.3",
@@ -105,14 +100,12 @@ waldur_auth_saml2 = "waldur_auth_saml2.extension:SAML2Extension"
 waldur_auth_social = "waldur_auth_social.extension:AuthSocialExtension"
 waldur_auth_valimo = "waldur_auth_valimo.extension:AuthValimoExtension"
 waldur_aws = "waldur_aws.extension:AWSExtension"
-waldur_azure = "waldur_azure.extension:AzureExtension"
 waldur_billing = "waldur_mastermind.billing.extension:BillingExtension"
 waldur_booking = "waldur_mastermind.booking.extension:BookingExtension"
 waldur_digitalocean = "waldur_digitalocean.extension:DigitalOceanExtension"
 waldur_freeipa = "waldur_freeipa.extension:FreeIPAExtension"
 waldur_invoices = "waldur_mastermind.invoices.extension:InvoicesExtension"
 waldur_marketplace = "waldur_mastermind.marketplace.extension:MarketplaceExtension"
-waldur_marketplace_azure = "waldur_mastermind.marketplace_azure.extension:MarketplaceAzureExtension"
 waldur_marketplace_openportal = "waldur_mastermind.marketplace_openportal.extension:MarketplaceOpenPortalExtension"
 waldur_marketplace_openportal_remote = "waldur_mastermind.marketplace_openportal_remote.extension:MarketplaceOpenPortalRemoteExtension"
 waldur_marketplace_openstack = "waldur_mastermind.marketplace_openstack.extension:MarketplaceOpenStackExtension"
@@ -161,7 +154,6 @@ packages = [
   "src/waldur_auth_valimo",
   "src/waldur_autoprovisioning",
   "src/waldur_aws",
-  "src/waldur_azure",
   "src/waldur_core",
   "src/waldur_digitalocean",
   "src/waldur_firecrest",
