@@ -64,6 +64,7 @@ from waldur_mastermind.marketplace.enums import (
 from waldur_mastermind.marketplace.utils import (
     evaluate_usage_limit_restriction,
     get_consumer_approvers,
+    get_new_order_notification_recipients,
     get_provider_approvers,
 )
 
@@ -230,6 +231,39 @@ def notify_provider_about_pending_order(order_uuid):
 
 
 @shared_task
+def notify_about_new_order(order_uuid):
+    order = models.Order.objects.get(uuid=order_uuid)
+
+    recipients = get_new_order_notification_recipients(order)
+    if not recipients:
+        return
+
+    link = core_utils.format_homeport_link(
+        "marketplace-order-details/{order_uuid}/",
+        order_uuid=order.uuid,
+    )
+
+    context = {
+        "order_url": link,
+        "order": order,
+        "order_type": order.get_type_display().lower(),
+        "order_attributes": utils.format_order_attributes(order),
+        "order_limits": utils.format_order_limits(order),
+        "site_name": config.SITE_NAME,
+    }
+
+    logger.info(
+        "About to send email regarding new order %s to recipients: %s",
+        order,
+        recipients,
+    )
+
+    core_utils.broadcast_mail(
+        "marketplace", "notify_about_new_order", context, recipients
+    )
+
+
+@shared_task
 def notify_consumer_about_provider_info(order_uuid):
     order = models.Order.objects.get(uuid=order_uuid)
 
@@ -339,74 +373,6 @@ def notify_about_resource_change(event_type, context, resource_uuid):
     resource = models.Resource.objects.get(uuid=resource_uuid)
     emails = resource.project.get_user_mails()
     core_utils.broadcast_mail("marketplace", event_type, context, emails)
-
-
-def filter_aggregate_by_scope(queryset, scope):
-    scope_path = None
-
-    if isinstance(scope, structure_models.Project):
-        scope_path = "resource__project"
-
-    if isinstance(scope, structure_models.Customer):
-        scope_path = "resource__project__customer"
-
-    if scope_path:
-        queryset = queryset.filter(**{scope_path: scope})
-
-    return queryset
-
-
-def aggregate_reported_usage(start, end, scope):
-    queryset = models.ComponentUsage.objects.filter(
-        date__date__gte=start, date__date__lte=end
-    ).exclude(component__parent=None)
-
-    queryset = filter_aggregate_by_scope(queryset, scope)
-
-    queryset = queryset.values("component__parent_id").annotate(total=Sum("usage"))
-
-    return {row["component__parent_id"]: row["total"] for row in queryset}
-
-
-def aggregate_fixed_usage(start, end, scope):
-    queryset = models.ResourcePlanPeriod.objects.filter(
-        # Resource has been active during billing period
-        Q(start__gte=start, end__lte=end)
-        | Q(end__isnull=True)  # Resource is still active
-        | Q(
-            end__gte=start, end__lte=end
-        )  # Resource has been launched in previous billing period and stopped in current
-    )
-    queryset = filter_aggregate_by_scope(queryset, scope)
-
-    queryset = queryset.values("plan__components__component__parent_id").annotate(
-        total=Sum("plan__components__amount")
-    )
-
-    return {
-        row["plan__components__component__parent_id"]: row["total"] for row in queryset
-    }
-
-
-def calculate_usage_for_scope(start, end, scope):
-    reported_usage = aggregate_reported_usage(start, end, scope)
-    fixed_usage = aggregate_fixed_usage(start, end, scope)
-    # It needs to cover a case when a key is None because OfferingComponent.parent can be None.
-    fixed_usage.pop(None, None)
-    components = set(reported_usage.keys()) | set(fixed_usage.keys())
-    content_type = ContentType.objects.get_for_model(scope)
-
-    for component_id in components:
-        models.CategoryComponentUsage.objects.update_or_create(
-            content_type=content_type,
-            object_id=scope.id,
-            component_id=component_id,
-            date=start,
-            defaults={
-                "reported_usage": reported_usage.get(component_id),
-                "fixed_usage": fixed_usage.get(component_id),
-            },
-        )
 
 
 def _bulk_aggregate_reported_usage(start, end, scope_field):
@@ -1062,6 +1028,40 @@ def notify_about_stale_resource():
             {"resources": value},
             [key],
         )
+
+
+@shared_task(name="waldur_mastermind.marketplace.delete_expired_project")
+def delete_expired_project(project_uuid):
+    """Delete an expired project once all of its resources are terminated."""
+    try:
+        project = structure_models.Project.available_objects.select_related(
+            "customer"
+        ).get(uuid=project_uuid)
+    except structure_models.Project.DoesNotExist:
+        return
+    # Re-validate: state may have changed between scheduling and execution.
+    if not project.is_expired:
+        return
+    has_active_resources = (
+        models.Resource.objects.filter(project=project)
+        .exclude(
+            state__in=(
+                ResourceStates.ERRED,
+                ResourceStates.TERMINATED,
+            )
+        )
+        .exists()
+    )
+    if has_active_resources:
+        return
+    event_logger.emit(
+        "Project {project_name} is going to be deleted because end date has been reached and there are no active resources.",
+        event_type=EventType.PROJECT_DELETION_TRIGGERED,
+        event_context={"project": project},
+        scopes=[project, project.customer],
+    )
+    project.delete()
+    logger.info("Expired project %s has been deleted.", project_uuid)
 
 
 @shared_task(name="waldur_mastermind.marketplace.terminate_expired_resources")
@@ -2115,9 +2115,96 @@ def request_offering_user_deletion_for_user(user_uuid: str):
         offering_user.set_deleted()
         offering_user.save(update_fields=["state"])
 
+    request_provider_account_deletion_for_user(user)
+
+
+def request_provider_account_deletion_for_user(user) -> None:
+    """Release a provider account once the user's last offering account is gone.
+
+    The account is the provider's whole directory entry, so it must outlive the
+    individual offering associations: losing access to one of a provider's
+    offerings while still holding another must not delete the entry that the
+    other one depends on. Only when nothing live still reads through it does the
+    account itself move to DELETION_REQUESTED.
+    """
+    live_states = list(OfferingUserStates.LIVE_STATES)
+    pending_states = [
+        OfferingUserStates.DELETION_REQUESTED,
+        OfferingUserStates.DELETING,
+        OfferingUserStates.ERROR_DELETING,
+    ]
+    accounts = models.ServiceProviderAccount.objects.filter(
+        user=user,
+        state__in=live_states + pending_states,
+    ).annotate(
+        has_live_offering_users=Exists(
+            models.OfferingUser.objects.filter(
+                service_provider_account=OuterRef("pk"),
+                state__in=live_states,
+            )
+        ),
+        has_pending_offering_users=Exists(
+            models.OfferingUser.objects.filter(
+                service_provider_account=OuterRef("pk"),
+                state__in=pending_states,
+            )
+        ),
+    )
+    for account in accounts.filter(has_live_offering_users=False):
+        old_state = account.state
+        if account.state == OfferingUserStates.CREATION_REQUESTED:
+            # An account still waiting for a username was never provisioned
+            # anywhere, so there is nothing for a provider to tear down: it goes
+            # straight to DELETED. CREATION_REQUESTED is not a legal source for
+            # request_deletion, so calling it here would raise rather than clean
+            # up. Mirrors request_offering_user_deletion_for_user.
+            logger.info(
+                "Provider account %s of user %s was never provisioned and no "
+                "offering account reads through it any more, marking it deleted.",
+                account,
+                user,
+            )
+            account.set_deleted()
+        elif not account.has_pending_offering_users:
+            # Every reader is gone for good. The provider tore the directory
+            # entry down (or parked it) when it acknowledged the last offering
+            # account, and nothing exposes provider-account state actions to it,
+            # so the account is a projection to complete here rather than a
+            # request to leave open indefinitely.
+            logger.info(
+                "Every offering account of user %s reading through provider account "
+                "%s is deleted, completing its deletion.",
+                user,
+                account,
+            )
+            if account.state in live_states:
+                account.request_deletion()
+            if account.state != OfferingUserStates.DELETING:
+                account.set_deleting()
+            account.set_deleted()
+        elif account.state in live_states:
+            # Some offering account is still being torn down: request, and let
+            # the last acknowledgement complete it.
+            logger.info(
+                "No offering account of user %s reads through provider account %s any "
+                "more, requesting its deletion.",
+                user,
+                account,
+            )
+            account.request_deletion()
+        if account.state != old_state:
+            account.save(update_fields=["state"])
+
 
 def _get_eligible_offerings_for_project(project):
-    """Return offerings in a project that support offering user creation."""
+    """Offerings with a live resource in the project whose type has offering users.
+
+    Whether an account may be *minted* for them is decided per offering by
+    ``service_provider_can_create_offering_user`` in
+    :func:`_create_or_restore_offering_user`; an account that already exists is
+    restored regardless of that flag, because the flag gates creation, not the
+    return of a member whose account was parked on departure.
+    """
     from waldur_mastermind.marketplace.handlers import (
         OFFERING_USER_ALLOWED_OFFERING_TYPES,
     )
@@ -2140,13 +2227,7 @@ def _get_eligible_offerings_for_project(project):
         .distinct()
     )
     offering_ids = set(resources.values_list("offering_id", flat=True))
-    offerings = models.Offering.objects.filter(id__in=offering_ids)
-
-    return [
-        o
-        for o in offerings
-        if o.plugin_options.get("service_provider_can_create_offering_user")
-    ]
+    return list(models.Offering.objects.filter(id__in=offering_ids))
 
 
 def _create_or_restore_offering_user(user, offering):
@@ -2157,70 +2238,13 @@ def _create_or_restore_offering_user(user, offering):
     ).first()
 
     if offering_user:
-        # Restore offering user if it's in deletion flow
-        if offering_user.state in [
-            OfferingUserStates.DELETION_REQUESTED,
-            OfferingUserStates.DELETING,
-            OfferingUserStates.ERROR_DELETING,
-        ]:
-            old_state = offering_user.get_state_display()
-            if offering_user.username:
-                # Account exists on service provider - restore to OK
-                offering_user.set_ok()
-                offering_user.save(update_fields=["state"])
-                event_logger.emit(
-                    f"Account for user {offering_user.user.username} in offering {offering_user.offering.name} has been restored from {old_state} to OK because user regained project access.",
-                    event_type=EventType.MARKETPLACE_OFFERING_USER_UPDATED,
-                    event_context={"offering_user": offering_user},
-                    scopes=[
-                        offering_user.offering,
-                        offering_user.offering.customer,
-                    ],
-                )
-            else:
-                offering_user.state = OfferingUserStates.CREATION_REQUESTED
-                offering_user.save(update_fields=["state"])
-                event_logger.emit(
-                    f"Account creation for user {offering_user.user.username} in offering {offering_user.offering.name} has been requested (was in {old_state}) because user regained project access.",
-                    event_type=EventType.MARKETPLACE_OFFERING_USER_UPDATED,
-                    event_context={"offering_user": offering_user},
-                    scopes=[
-                        offering_user.offering,
-                        offering_user.offering.customer,
-                    ],
-                )
-        elif offering_user.state == OfferingUserStates.DELETED:
-            # DELETED state - request new account creation
-            offering_user.state = OfferingUserStates.CREATION_REQUESTED
-            offering_user.save(update_fields=["state"])
-            event_logger.emit(
-                f"New account creation for user {offering_user.user.username} in offering {offering_user.offering.name} has been requested because user regained project access after offering user was deleted.",
-                event_type=EventType.MARKETPLACE_OFFERING_USER_UPDATED,
-                event_context={"offering_user": offering_user},
-                scopes=[offering_user.offering, offering_user.offering.customer],
-            )
-        else:
+        if not utils.restore_offering_user(offering_user):
             logger.info("An offering user for %s in %s already exists", user, offering)
         return
 
-    # Create new offering user
-    username = utils.generate_username(user, offering)
-    state = OfferingUserStates.OK if username else OfferingUserStates.CREATION_REQUESTED
-    offering_user, created = models.OfferingUser.objects.get_or_create(
-        offering=offering,
-        user=user,
-        defaults={
-            "username": username,
-            "state": state,
-        },
-    )
-    if not created:
-        logger.info("An offering user for %s in %s already exists", user, offering)
+    if not offering.plugin_options.get("service_provider_can_create_offering_user"):
         return
-    utils.setup_linux_related_data(offering_user, offering)
-    offering_user.save(update_fields=["backend_metadata"])
-
-    logger.info("The offering user %s has been created", offering_user)
+    utils.create_offering_user(user, offering)
 
 
 @shared_task(

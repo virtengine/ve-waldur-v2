@@ -87,6 +87,12 @@ class IssueSerializer(
         + [marketplace_models.Resource],
         required=False,
     )
+    offering = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=marketplace_models.Offering.objects.all(),
+        required=False,
+        allow_null=True,
+    )
     caller = serializers.HyperlinkedRelatedField(
         view_name="user-detail",
         lookup_field="uuid",
@@ -133,6 +139,7 @@ class IssueSerializer(
     feedback = NestedFeedbackSerializer(required=False, read_only=True, allow_null=True)
     update_is_available = serializers.SerializerMethodField()
     destroy_is_available = serializers.SerializerMethodField()
+    available_statuses = serializers.SerializerMethodField()
     add_comment_is_available = serializers.SerializerMethodField()
     add_attachment_is_available = serializers.SerializerMethodField()
     order_uuid = serializers.SerializerMethodField()
@@ -177,6 +184,7 @@ class IssueSerializer(
             "resource",
             "resource_type",
             "resource_name",
+            "offering",
             "created",
             "modified",
             "is_reported_manually",
@@ -185,6 +193,7 @@ class IssueSerializer(
             "resolved",
             "update_is_available",
             "destroy_is_available",
+            "available_statuses",
             "add_comment_is_available",
             "add_attachment_is_available",
             "processing_log",
@@ -331,6 +340,26 @@ class IssueSerializer(
 
     def get_destroy_is_available(self, obj: models.Issue) -> bool:
         return backend.get_active_backend().destroy_is_available(obj)
+
+    @cached_property
+    def _active_backend(self):
+        """One backend instance for the whole (possibly list) serialization.
+
+        DRF reuses a single child serializer across every object in a list, so
+        caching here lets the backend memoize the status workflow once instead
+        of querying it per issue.
+        """
+        return backend.get_active_backend()
+
+    @extend_schema_field(serializers.ListField(child=serializers.CharField()))
+    def get_available_statuses(self, obj: models.Issue) -> list[str]:
+        # An issue routed to a provider helpdesk belongs to that provider: its
+        # status arrives over their webhook, and `set_status` refuses it. Report
+        # no transitions rather than advertising ones the API would reject —
+        # this is the field clients decide whether to offer a control from.
+        if obj.provider_helpdesk_id:
+            return []
+        return self._active_backend.get_available_statuses(obj)
 
     def get_add_comment_is_available(self, obj: models.Issue) -> bool:
         return backend.get_active_backend().comment_create_is_available(obj)
@@ -1199,6 +1228,9 @@ class ProviderTicketSerializer(
 ):
     parent_issue_key = serializers.ReadOnlyField(source="parent_issue.key")
     parent_issue_uuid = serializers.ReadOnlyField(source="parent_issue.uuid")
+    provider_helpdesk_uuid = serializers.ReadOnlyField(
+        source="provider_helpdesk.uuid", allow_null=True
+    )
     provider_assignee_name = serializers.ReadOnlyField(
         source="provider_assignee.user.full_name"
     )
@@ -1221,6 +1253,7 @@ class ProviderTicketSerializer(
             "modified",
             "parent_issue_key",
             "parent_issue_uuid",
+            "provider_helpdesk_uuid",
             "is_escalated",
             "escalated_at",
             "provider_assignee",
@@ -1323,6 +1356,14 @@ class ProviderSupportUserSerializer(
     @extend_schema_field(serializers.BooleanField())
     def get_has_capacity(self, obj):
         return obj.has_capacity
+
+    # Declared explicitly so the schema renders an array; a bare JSONField is
+    # mapped to a free-form object by JSONFieldExtension.
+    skills = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        help_text=_("List of skill tags for routing."),
+    )
 
     class Meta:
         model = models.ProviderSupportUser
@@ -1490,6 +1531,30 @@ class CannedResponseRenderSerializer(serializers.Serializer):
     context = serializers.DictField(required=False, default=dict)
 
 
+class CannedResponseRenderResponseSerializer(serializers.Serializer):
+    rendered_text = serializers.CharField()
+
+
+class SetIssueStatusSerializer(serializers.Serializer):
+    status = serializers.CharField(help_text="Name of the status to move to.")
+
+    def validate_status(self, value):
+        issue = self.context["issue"]
+        available = backend.get_active_backend().get_available_statuses(issue)
+        if value not in available:
+            raise serializers.ValidationError(
+                _(
+                    "Issue cannot be moved from '%(current)s' to '%(target)s'. Available: %(available)s."
+                )
+                % {
+                    "current": issue.status,
+                    "target": value,
+                    "available": ", ".join(available) or _("none"),
+                }
+            )
+        return value
+
+
 class BulkUpdateIssueSerializer(serializers.Serializer):
     issue_uuids = serializers.ListField(
         child=serializers.UUIDField(),
@@ -1598,13 +1663,19 @@ class AtlassianCredentialsSerializer(serializers.Serializer):
 
     api_url = serializers.URLField(
         required=True,
-        help_text="Atlassian API URL (e.g., https://your-domain.atlassian.net)",
+        help_text="Atlassian site or API URL (e.g., https://your-domain.atlassian.net). "
+        "With OAuth 2.0 client credentials a Cloud site URL is resolved to the "
+        "API gateway URL.",
     )
     auth_method = serializers.ChoiceField(
         choices=[
             ("api_token", "API Token (Cloud)"),
             ("personal_access_token", "Personal Access Token (Server)"),
             ("basic", "Basic Authentication"),
+            (
+                "oauth2_client_credentials",
+                "OAuth 2.0 client credentials (Cloud service account)",
+            ),
         ],
         required=True,
         help_text="Authentication method to use",
@@ -1622,6 +1693,12 @@ class AtlassianCredentialsSerializer(serializers.Serializer):
     # Basic authentication
     username = serializers.CharField(required=False, allow_blank=True)
     password = serializers.CharField(required=False, allow_blank=True, write_only=True)
+
+    # OAuth 2.0 client credentials (Cloud service account)
+    client_id = serializers.CharField(required=False, allow_blank=True)
+    client_secret = serializers.CharField(
+        required=False, allow_blank=True, write_only=True
+    )
 
     # Optional SSL verification toggle
     verify_ssl = serializers.BooleanField(default=True)
@@ -1648,6 +1725,14 @@ class AtlassianCredentialsSerializer(serializers.Serializer):
                     {
                         "username": "Username is required for Basic authentication",
                         "password": "Password is required for Basic authentication",
+                    }
+                )
+        elif auth_method == "oauth2_client_credentials":
+            if not attrs.get("client_id") or not attrs.get("client_secret"):
+                raise serializers.ValidationError(
+                    {
+                        "client_id": "Client ID is required for OAuth 2.0 client credentials",
+                        "client_secret": "Client secret is required for OAuth 2.0 client credentials",
                     }
                 )
 
@@ -1728,27 +1813,11 @@ class AtlassianPriorityResponseSerializer(serializers.Serializer):
 # Preview and Save serializers
 
 
-class AtlassianSettingsPreviewSerializer(serializers.Serializer):
-    """Request serializer for previewing settings to be saved."""
+class AtlassianSettingsPreviewSerializer(AtlassianCredentialsSerializer):
+    """Request serializer for previewing settings to be saved.
 
-    # Credentials (inline, not nested for easier API usage)
-    api_url = serializers.URLField(required=True)
-    auth_method = serializers.ChoiceField(
-        choices=[
-            ("api_token", "API Token (Cloud)"),
-            ("personal_access_token", "Personal Access Token (Server)"),
-            ("basic", "Basic Authentication"),
-        ],
-        required=True,
-    )
-    email = serializers.EmailField(required=False, allow_blank=True)
-    token = serializers.CharField(required=False, allow_blank=True, write_only=True)
-    personal_access_token = serializers.CharField(
-        required=False, allow_blank=True, write_only=True
-    )
-    username = serializers.CharField(required=False, allow_blank=True)
-    password = serializers.CharField(required=False, allow_blank=True, write_only=True)
-    verify_ssl = serializers.BooleanField(default=True)
+    Credentials are inline (not nested) for easier API usage.
+    """
 
     # Selected configuration
     project_id = serializers.CharField(required=True)
@@ -1783,33 +1852,6 @@ class AtlassianSettingsPreviewSerializer(serializers.Serializer):
     # Options
     use_old_api = serializers.BooleanField(default=False)
     custom_field_mapping_enabled = serializers.BooleanField(default=True)
-
-    def validate(self, attrs):
-        auth_method = attrs.get("auth_method")
-
-        if auth_method == "api_token":
-            if not attrs.get("email") or not attrs.get("token"):
-                raise serializers.ValidationError(
-                    {
-                        "email": "Email is required for API Token authentication",
-                        "token": "Token is required for API Token authentication",
-                    }
-                )
-        elif auth_method == "personal_access_token":
-            if not attrs.get("personal_access_token"):
-                raise serializers.ValidationError(
-                    {"personal_access_token": "Personal Access Token is required"}
-                )
-        elif auth_method == "basic":
-            if not attrs.get("username") or not attrs.get("password"):
-                raise serializers.ValidationError(
-                    {
-                        "username": "Username is required for Basic authentication",
-                        "password": "Password is required for Basic authentication",
-                    }
-                )
-
-        return attrs
 
 
 class AtlassianSettingsSaveSerializer(AtlassianSettingsPreviewSerializer):

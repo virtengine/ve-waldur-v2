@@ -52,6 +52,8 @@ from waldur_core.core.authentication import (
 )
 from waldur_core.core.exceptions import ExtensionDisabled, IncorrectStateException
 from waldur_core.core.features import FEATURES
+from waldur_core.core.fields import COUNTRIES
+from waldur_core.core.handlers import emit_user_blocked_event
 from waldur_core.core.logos import DEFAULT_LOGOS, LOGO_MAP, build_logo_url
 from waldur_core.core.metadata import WaldurConfiguration
 from waldur_core.core.metadata_schemas import (
@@ -64,6 +66,7 @@ from waldur_core.core.mixins import ensure_atomic_transaction
 from waldur_core.core.models import DailyTableSizeHistory, TokenExchangeCode
 from waldur_core.core.permissions import PATScopeAwareIsAdminUser
 from waldur_core.core.serializers import (
+    AuthTokenChallengeSerializer,
     AvailableBindingTargetSerializer,
     AvailableScopeSerializer,
     CeleryStatsResponseSerializer,
@@ -75,6 +78,7 @@ from waldur_core.core.serializers import (
     ObtainAuthTokenSerializer,
     PersonalAccessTokenCreatedSerializer,
     PersonalAccessTokenCreateSerializer,
+    PersonalAccessTokenNetworkAclSerializer,
     PersonalAccessTokenSerializer,
     QuerySerializer,
     TableGrowthStatsResponseSerializer,
@@ -89,6 +93,9 @@ from waldur_core.core.utils import format_homeport_link
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
 from waldur_core.logging.event_logger import get_event_groups
+from waldur_core.passkeys import models as passkey_models
+from waldur_core.passkeys import policy as passkey_policy
+from waldur_core.passkeys import services as passkey_services
 from waldur_core.permissions.enums import (
     CREATE_PERMISSIONS,
     PERMISSION_DESCRIPTION,
@@ -98,7 +105,9 @@ from waldur_core.permissions.enums import (
     RoleEnum,
 )
 from waldur_core.permissions.models import UserRole
+from waldur_core.permissions.utils import check_pat_support_scope
 from waldur_core.structure.permissions import IsStaffOrSupportUser
+from waldur_core.web_shell import tickets as web_shell_tickets
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +122,24 @@ def count_action(func):
     WaldurOpenApiInspector reads the flag when generating the schema.
     """
     func.count_enabled = True
+    return func
+
+
+def no_count_action(func):
+    """Opt a collection-scoped @action out of its HEAD `count` companion.
+
+    The inverse of :func:`count_action`. Collection endpoints get a `_count`
+    HEAD operation automatically, which reaches the SDK as a `*Count` method
+    described as "Get number of items in the collection". That is a dead method
+    for an action that does not paginate — one returning a single object, or a
+    list built with a plain ``Response`` so no ``X-Result-Count`` header is ever
+    set.
+
+    An action that paginates has a working count and should **not** use this;
+    let it keep the companion and short-circuit ``request.method == "HEAD"``
+    before serialising the page, as ``list_users`` does.
+    """
+    func.count_disabled = True
     return func
 
 
@@ -151,7 +178,9 @@ class ObtainAuthToken(APIView):
         request=ObtainAuthTokenSerializer,
         responses={
             200: CoreAuthTokenSerializer,
-            401: None,
+            # A 401 is either a rejected credential or a correct password that
+            # still owes a passkey; the body discriminates.
+            401: AuthTokenChallengeSerializer,
         },
         examples=[
             OpenApiExample(
@@ -198,8 +227,9 @@ class ObtainAuthToken(APIView):
         auth_failure_key = f"LOGIN_FAILURES_OF_{username}_AT_{source_ip}"
         auth_failures = cache.get(auth_failure_key) or 0
         lockout_time_in_mins = 10
+        max_auth_failures = 4
 
-        if auth_failures >= 4:
+        if auth_failures >= max_auth_failures:
             logger.debug(
                 "Not returning auth token: "
                 f"username {username} from {source_ip} is locked out"
@@ -227,6 +257,12 @@ class ObtainAuthToken(APIView):
                 scopes=[],
             )
 
+            # Emit a block event when the failure counter reaches the lockout
+            # threshold. emit_user_blocked_event dedups within the lockout
+            # window, so subsequent attempts do not produce duplicate events.
+            if auth_failures + 1 >= max_auth_failures:
+                emit_user_blocked_event(username, source_ip, lockout_time_in_mins * 60)
+
             return Response(
                 data={"detail": _("Invalid username/password.")},
                 status=status.HTTP_401_UNAUTHORIZED,
@@ -238,6 +274,36 @@ class ObtainAuthToken(APIView):
             logger.debug("Not returning auth token: user %s is disabled", username)
             return Response(
                 data={"detail": _("User account is disabled.")},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        # A correct password is not, on its own, a completed login when a
+        # second factor is required. Nothing below this point may run until
+        # the passkey has verified: refresh_token() bumps token.created, so
+        # calling it here would let a password alone extend the life of an
+        # existing — possibly attacker-held — token, and last_login and the
+        # AUTH_LOGGED_IN event would both record a session that has not begun.
+        if passkey_services.user_requires_mfa(user):
+            ceremony = passkey_services.create_mfa_ceremony(user)
+            logger.debug(
+                "Password accepted for %s; awaiting passkey second factor", user
+            )
+            # 401 rather than a 200 carrying the handle. A 200 would make
+            # `token` optional in the shared response schema, which churns the
+            # generated clients for every consumer — including the ones that
+            # never enable passkeys — and turns a missing field into a silent
+            # KeyError for non-browser callers. A status they already handle
+            # is the honest answer: authentication is genuinely incomplete.
+            #
+            # The handle rides in the body, and is not redeemable for
+            # anything; `passkey_required` discriminates this from a rejected
+            # password, which is also a 401.
+            return Response(
+                data={
+                    "detail": _("Passkey verification required."),
+                    "passkey_required": True,
+                    "pending_passkey_ceremony": ceremony.uuid,
+                },
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
@@ -625,6 +691,12 @@ def get_public_settings(request=None):
                     "client_id": provider.client_id,
                     "auth_url": provider.auth_url,
                 }
+    if "WALDUR_CORE" in public_settings:
+        # The effective state, not the raw setting: the web shell also needs
+        # DEBUG, and its URL is handed out to staff only, by the ticket endpoint.
+        public_settings["WALDUR_CORE"]["WEB_SHELL_ENABLED"] = (
+            web_shell_tickets.is_enabled()
+        )
     public_settings["WALDUR_SUPPORT"] = get_constance_plugin_settings(
         all_constance_values,
         "WALDUR_SUPPORT",
@@ -1840,17 +1912,16 @@ def get_latest_github_tag(timeout=5):
 
 @extend_schema(
     summary="Get application version",
-    description="Retrieves the current installed version of the application and the latest available version from GitHub (if available). Requires staff or support user permissions.",
+    description=(
+        "Retrieves the current installed version of the application. "
+        "Staff and support users additionally receive the latest available "
+        "version from GitHub when update checks are enabled."
+    ),
     request=None,
     responses=VersionSerializer,
 )
 @api_view(["GET"])
-@permission_classes(
-    (
-        rf_permissions.IsAuthenticated,
-        IsStaffOrSupportUser,
-    )
-)
+@permission_classes((rf_permissions.IsAuthenticated,))
 def version_detail(request):
     """Retrieve version of the application"""
 
@@ -1858,9 +1929,13 @@ def version_detail(request):
         "version": __version__,
     }
 
-    latest_version = get_latest_github_tag()
-    if latest_version:
-        response_data["latest_version"] = latest_version
+    if (request.user.is_staff or request.user.is_support) and check_pat_support_scope(
+        request
+    ):
+        latest_version = get_latest_github_tag()
+        if latest_version:
+            response_data["latest_version"] = latest_version
+
     serializer = VersionSerializer(response_data)
     return Response(serializer.data)
 
@@ -2049,7 +2124,13 @@ class PermissionMetadataView(APIView):
 
 
 class EventMetadataView(APIView):
-    """Provides event metadata grouped by event categories."""
+    """Provides event metadata grouped by event categories.
+
+    Deliberately NOT narrowed by waldur_core.logging.availability, unlike
+    /api/events/event_groups/. This endpoint is the static enum export, and it
+    is unauthenticated: narrowing it would publish which plugins a deployment
+    runs to anonymous callers. Discovery UIs should read the events endpoint.
+    """
 
     permission_classes = []
     authentication_classes = []
@@ -2141,11 +2222,18 @@ class SettingsMetadataView(APIView):
                         "type": formatted_type,
                     }
 
+                    choices = None
                     if (
                         hasattr(settings, "CONSTANCE_CONFIG_CHOICES")
                         and key in settings.CONSTANCE_CONFIG_CHOICES
                     ):
                         choices = settings.CONSTANCE_CONFIG_CHOICES[key]
+                    elif formatted_type == "country_list_field":
+                        # The default is only the shipped subset; expose every
+                        # valid country so clients can offer all of them.
+                        choices = COUNTRIES
+
+                    if choices:
                         item_data["options"] = [
                             {"value": c[0], "label": c[1]} for c in choices
                         ]
@@ -2160,6 +2248,8 @@ class SettingsMetadataView(APIView):
 class PersonalAccessTokenViewSet(ActionsViewSet):
     """Manage personal access tokens for programmatic API access."""
 
+    # Declared so the model stays introspectable; get_queryset() narrows it.
+    queryset = models.PersonalAccessToken.objects.all()
     serializer_class = PersonalAccessTokenSerializer
     create_serializer_class = PersonalAccessTokenCreateSerializer
     lookup_field = "uuid"
@@ -2173,11 +2263,28 @@ class PersonalAccessTokenViewSet(ActionsViewSet):
     def initial(self, request, *args, **kwargs):
         super().initial(request, *args, **kwargs)
         # Block PAT-via-PAT for management endpoints
-        if self.action in ("create", "destroy", "rotate"):
+        if self.action in ("create", "destroy", "rotate", "set_network_acl"):
             auth = getattr(request, "auth", None)
             if auth and hasattr(auth, "token_hash"):
                 raise exceptions.PermissionDenied(
                     "PAT management requires session or token authentication."
+                )
+        # Minting a personal access token turns a session into a long-lived,
+        # passkey-free credential — so under enforcement it is only available
+        # to a session that satisfied a passkey. Reading and revoking stay
+        # open: neither creates access, and locking revocation behind the
+        # factor would strand a user who has lost their authenticator.
+        if self.action in ("create", "rotate"):
+            if passkey_policy.is_enforced_for(
+                request.user
+            ) and not passkey_models.is_session_verified(
+                getattr(request, "auth", None)
+            ):
+                raise exceptions.PermissionDenied(
+                    _(
+                        "Creating a personal access token requires a "
+                        "passkey-verified session."
+                    )
                 )
 
     @extend_schema(
@@ -2190,10 +2297,15 @@ class PersonalAccessTokenViewSet(ActionsViewSet):
         serializer.is_valid(raise_exception=True)
         pat = serializer.save()
 
+        # pat.name is user-controlled and emit() runs .format() over the
+        # template, so it is passed as a context value rather than inlined —
+        # a name with braces would otherwise raise inside emit and turn a
+        # succeeded create into a 500.
         event_logger.emit(
-            f"Personal access token {pat.name} has been created for user {{affected_user_username}}.",
+            "Personal access token {pat_name} has been created for user "
+            "{affected_user_username}.",
             event_type=EventType.PAT_CREATED,
-            event_context={"affected_user": request.user},
+            event_context={"affected_user": request.user, "pat_name": pat.name},
             scopes=[request.user],
         )
 
@@ -2204,6 +2316,7 @@ class PersonalAccessTokenViewSet(ActionsViewSet):
                 "token": pat._plaintext_token,
                 "scopes": pat.scopes,
                 "allowed_scopes": _serialize_allowed_scopes(pat.allowed_scopes),
+                "allowed_networks": pat.allowed_networks,
                 "expires_at": pat.expires_at,
                 "created": pat.created,
             }
@@ -2222,10 +2335,13 @@ class PersonalAccessTokenViewSet(ActionsViewSet):
         pat.is_active = False
         pat.save(update_fields=["is_active"])
 
+        # See the create emitter: name is user-controlled and emit() formats
+        # the template, so it goes through a placeholder, not the template body.
         event_logger.emit(
-            f"Personal access token {pat.name} has been revoked for user {{affected_user_username}}.",
+            "Personal access token {pat_name} has been revoked for user "
+            "{affected_user_username}.",
             event_type=EventType.PAT_REVOKED,
-            event_context={"affected_user": request.user},
+            event_context={"affected_user": request.user, "pat_name": pat.name},
             scopes=[request.user],
         )
 
@@ -2239,11 +2355,9 @@ class PersonalAccessTokenViewSet(ActionsViewSet):
     @action(detail=True, methods=["post"])
     def rotate(self, request, uuid=None):
         """Atomically revoke the old token and create a new one with the same scopes and bindings."""
-        from django.db import transaction as db_transaction
-
         old_pat = self.get_object()
 
-        with db_transaction.atomic():
+        with transaction.atomic():
             # Lock the row
             locked = models.PersonalAccessToken.objects.select_for_update().get(
                 pk=old_pat.pk
@@ -2262,6 +2376,7 @@ class PersonalAccessTokenViewSet(ActionsViewSet):
                 token_hash=token_hash,
                 scopes=locked.scopes,
                 allowed_scopes=locked.allowed_scopes,
+                allowed_networks=locked.allowed_networks,
                 expires_at=locked.expires_at,
             )
 
@@ -2269,10 +2384,13 @@ class PersonalAccessTokenViewSet(ActionsViewSet):
             locked.is_active = False
             locked.save(update_fields=["is_active"])
 
+        # See the create emitter: name is user-controlled and emit() formats
+        # the template, so it goes through a placeholder, not the template body.
         event_logger.emit(
-            f"Personal access token {new_pat.name} has been rotated for user {{affected_user_username}}.",
+            "Personal access token {pat_name} has been rotated for user "
+            "{affected_user_username}.",
             event_type=EventType.PAT_ROTATED,
-            event_context={"affected_user": request.user},
+            event_context={"affected_user": request.user, "pat_name": new_pat.name},
             scopes=[request.user],
         )
 
@@ -2283,6 +2401,7 @@ class PersonalAccessTokenViewSet(ActionsViewSet):
                 "token": full_token,
                 "scopes": new_pat.scopes,
                 "allowed_scopes": _serialize_allowed_scopes(new_pat.allowed_scopes),
+                "allowed_networks": new_pat.allowed_networks,
                 "expires_at": new_pat.expires_at,
                 "created": new_pat.created,
             }
@@ -2291,6 +2410,59 @@ class PersonalAccessTokenViewSet(ActionsViewSet):
         response = Response(response_data, status=status.HTTP_201_CREATED)
         response["Cache-Control"] = "no-store"
         return response
+
+    @extend_schema(
+        summary="Replace the network ACL of a personal access token",
+        request=PersonalAccessTokenNetworkAclSerializer,
+        responses={200: PersonalAccessTokenSerializer},
+    )
+    @action(detail=True, methods=["post"])
+    def set_network_acl(self, request, uuid=None):
+        """Replace the token's source-network allowlist.
+
+        A dedicated action rather than PATCH: update/partial_update stay
+        disabled on this viewset, and the change gets its own audit event.
+        """
+        pat = self.get_object()
+        serializer = PersonalAccessTokenNetworkAclSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        new_networks = serializer.validated_data["allowed_networks"]
+
+        with transaction.atomic():
+            # Same lock rotate takes. Without it a concurrent rotate can copy
+            # the pre-edit ACL onto the new token while the user believes they
+            # tightened it. Serialised, the loser either reads the fresh ACL or
+            # fails cleanly on a token that is no longer active.
+            locked = models.PersonalAccessToken.objects.select_for_update().get(
+                pk=pat.pk
+            )
+            if not locked.is_active:
+                raise ValidationError(
+                    "Cannot change the network ACL of an inactive token."
+                )
+            old_networks = list(locked.allowed_networks or [])
+            locked.allowed_networks = new_networks
+            locked.save(update_fields=["allowed_networks"])
+
+        pat = locked
+
+        # See the create emitter: name is user-controlled and emit() formats
+        # the template, so it goes through a placeholder, not the template body.
+        event_logger.emit(
+            "Network ACL of personal access token {pat_name} has been updated "
+            "for user {affected_user_username}.",
+            event_type=EventType.PAT_NETWORK_ACL_UPDATED,
+            event_context={
+                "affected_user": request.user,
+                "pat_uuid": pat.uuid.hex,
+                "pat_name": pat.name,
+                "old_allowed_networks": old_networks,
+                "new_allowed_networks": new_networks,
+            },
+            scopes=[request.user],
+        )
+
+        return Response(PersonalAccessTokenSerializer(pat).data)
 
     @extend_schema(
         summary="List available scopes for PAT creation",

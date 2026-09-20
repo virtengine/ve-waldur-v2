@@ -14,6 +14,7 @@ from django.utils.deconstruct import deconstructible
 from django.utils.translation import gettext_lazy as _
 
 from waldur_core.core import exceptions
+from waldur_core.core.countries import ISO_3166_1
 from waldur_core.core.enums import GENDER_CHOICES, CoreStates
 
 logger = logging.getLogger(__name__)
@@ -137,6 +138,58 @@ def validate_cidr_list(value):
         )
 
 
+def normalize_network_acl(entries: list[str]) -> list[str]:
+    """Validate and canonicalise a list of CIDR strings for a network ACL.
+
+    Bare addresses are widened to /32 or /128. Entries with host bits set are
+    rejected rather than silently masked — in an access-control list, silently
+    turning 203.0.113.5/24 into a whole /24 would grant far more than intended.
+    """
+    if not isinstance(entries, list):
+        raise ValidationError(
+            _("Network ACL must be a list of CIDR strings."),
+            code="invalid_network_acl",
+        )
+
+    normalized = []
+    for entry in entries:
+        if not isinstance(entry, str) or not entry.strip():
+            raise ValidationError(
+                _("Network ACL entries must be non-empty strings."),
+                code="invalid_network_acl",
+            )
+        item = entry.strip()
+        try:
+            network = ipaddress.ip_network(item, strict=True)
+        except ValueError:
+            try:
+                suggestion = ipaddress.ip_network(item, strict=False)
+            except ValueError:
+                raise ValidationError(
+                    _("%(entry)s is not a valid IP address or CIDR network."),
+                    code="invalid_network_acl",
+                    params={"entry": item},
+                ) from None
+            raise ValidationError(
+                _("%(entry)s has host bits set; use %(suggestion)s instead."),
+                code="invalid_network_acl",
+                params={"entry": item, "suggestion": str(suggestion)},
+            ) from None
+
+        if network.prefixlen == 0:
+            raise ValidationError(
+                _("%(entry)s allows every address; leave the list empty instead."),
+                code="invalid_network_acl",
+                params={"entry": item},
+            )
+
+        text = str(network)
+        if text not in normalized:
+            normalized.append(text)
+
+    return normalized
+
+
 @deconstructible
 class BlacklistValidator:
     message = _("This value is blacklisted.")
@@ -186,261 +239,8 @@ def validate_x509_certificate(data):
         raise ValidationError(_("Invalid X509 certificate."))
 
 
-# ISO 3166-1 alpha-2 country codes (common subset, can be extended)
-# This is a subset - full validation can be done with pycountry if needed
-ISO_3166_1_ALPHA_2_CODES = {
-    "AD",
-    "AE",
-    "AF",
-    "AG",
-    "AI",
-    "AL",
-    "AM",
-    "AO",
-    "AQ",
-    "AR",
-    "AS",
-    "AT",
-    "AU",
-    "AW",
-    "AX",
-    "AZ",
-    "BA",
-    "BB",
-    "BD",
-    "BE",
-    "BF",
-    "BG",
-    "BH",
-    "BI",
-    "BJ",
-    "BL",
-    "BM",
-    "BN",
-    "BO",
-    "BQ",
-    "BR",
-    "BS",
-    "BT",
-    "BV",
-    "BW",
-    "BY",
-    "BZ",
-    "CA",
-    "CC",
-    "CD",
-    "CF",
-    "CG",
-    "CH",
-    "CI",
-    "CK",
-    "CL",
-    "CM",
-    "CN",
-    "CO",
-    "CR",
-    "CU",
-    "CV",
-    "CW",
-    "CX",
-    "CY",
-    "CZ",
-    "DE",
-    "DJ",
-    "DK",
-    "DM",
-    "DO",
-    "DZ",
-    "EC",
-    "EE",
-    "EG",
-    "EH",
-    "ER",
-    "ES",
-    "ET",
-    "FI",
-    "FJ",
-    "FK",
-    "FM",
-    "FO",
-    "FR",
-    "GA",
-    "GB",
-    "GD",
-    "GE",
-    "GF",
-    "GG",
-    "GH",
-    "GI",
-    "GL",
-    "GM",
-    "GN",
-    "GP",
-    "GQ",
-    "GR",
-    "GS",
-    "GT",
-    "GU",
-    "GW",
-    "GY",
-    "HK",
-    "HM",
-    "HN",
-    "HR",
-    "HT",
-    "HU",
-    "ID",
-    "IE",
-    "IL",
-    "IM",
-    "IN",
-    "IO",
-    "IQ",
-    "IR",
-    "IS",
-    "IT",
-    "JE",
-    "JM",
-    "JO",
-    "JP",
-    "KE",
-    "KG",
-    "KH",
-    "KI",
-    "KM",
-    "KN",
-    "KP",
-    "KR",
-    "KW",
-    "KY",
-    "KZ",
-    "LA",
-    "LB",
-    "LC",
-    "LI",
-    "LK",
-    "LR",
-    "LS",
-    "LT",
-    "LU",
-    "LV",
-    "LY",
-    "MA",
-    "MC",
-    "MD",
-    "ME",
-    "MF",
-    "MG",
-    "MH",
-    "MK",
-    "ML",
-    "MM",
-    "MN",
-    "MO",
-    "MP",
-    "MQ",
-    "MR",
-    "MS",
-    "MT",
-    "MU",
-    "MV",
-    "MW",
-    "MX",
-    "MY",
-    "MZ",
-    "NA",
-    "NC",
-    "NE",
-    "NF",
-    "NG",
-    "NI",
-    "NL",
-    "NO",
-    "NP",
-    "NR",
-    "NU",
-    "NZ",
-    "OM",
-    "PA",
-    "PE",
-    "PF",
-    "PG",
-    "PH",
-    "PK",
-    "PL",
-    "PM",
-    "PN",
-    "PR",
-    "PS",
-    "PT",
-    "PW",
-    "PY",
-    "QA",
-    "RE",
-    "RO",
-    "RS",
-    "RU",
-    "RW",
-    "SA",
-    "SB",
-    "SC",
-    "SD",
-    "SE",
-    "SG",
-    "SH",
-    "SI",
-    "SJ",
-    "SK",
-    "SL",
-    "SM",
-    "SN",
-    "SO",
-    "SR",
-    "SS",
-    "ST",
-    "SV",
-    "SX",
-    "SY",
-    "SZ",
-    "TC",
-    "TD",
-    "TF",
-    "TG",
-    "TH",
-    "TJ",
-    "TK",
-    "TL",
-    "TM",
-    "TN",
-    "TO",
-    "TR",
-    "TT",
-    "TV",
-    "TW",
-    "TZ",
-    "UA",
-    "UG",
-    "UM",
-    "US",
-    "UY",
-    "UZ",
-    "VA",
-    "VC",
-    "VE",
-    "VG",
-    "VI",
-    "VN",
-    "VU",
-    "WF",
-    "WS",
-    "YE",
-    "YT",
-    "ZA",
-    "ZM",
-    "ZW",
-    # Also include EU as it's commonly used
-    "EU",
-}
+# ISO 3166-1 alpha-2 country codes plus "EU", matching the choices exposed on the API
+ISO_3166_1_ALPHA_2_CODES = frozenset(code for code, _name in ISO_3166_1) | {"EU"}
 
 
 @deconstructible
@@ -626,9 +426,15 @@ def validate_unix_path(path):
             )
 
 
+# Quantifier, either a bare one or a bounded repetition: +, *, {2}, {2,}, {2,5}
+_QUANTIFIER = r"(?:[+*]|\{\d+,?\d*\})"
+
 # Patterns that indicate potential ReDoS vulnerability
 _REDOS_PATTERNS = [
-    r"\(\?P?<[^>]*>[^)]*[+*][^)]*\)[+*]",  # Nested quantifiers: (a+)+
+    # Nested quantifiers: (a+)+, (?P<x>a+)+, (?:a{2,})*. The group prefix is
+    # optional - an earlier revision required "(?", which let the plain (a+)+
+    # form, the textbook catastrophic-backtracking case, pass unnoticed.
+    rf"\((?:\?P?<[^>]*>|\?:)?[^)]*{_QUANTIFIER}[^)]*\){_QUANTIFIER}",
     r"\([^)]*\|[^)]*\)[+*]{2,}",  # Overlapping alternations with quantifiers
     r"[+*]\?[+*]",  # Adjacent quantifiers
 ]
@@ -645,3 +451,78 @@ def is_potentially_dangerous_regex(pattern: str) -> bool:
     if len(pattern) > _MAX_REGEX_PATTERN_LENGTH:
         return True
     return bool(_REDOS_REGEX.search(pattern))
+
+
+def collect_access_email_pattern_errors(patterns) -> list[str]:
+    """Collect human-readable problems with a list of access-control email patterns.
+
+    Returns an empty list when every pattern is a usable regular expression.
+    """
+    if not isinstance(patterns, list | tuple):
+        return ["Value must be a list of regular expressions."]
+
+    invalid_patterns = []
+    dangerous_patterns = []
+
+    for pattern in patterns:
+        if not pattern or not isinstance(pattern, str):
+            invalid_patterns.append(pattern)
+            continue
+        try:
+            re.compile(pattern)
+        except re.error:
+            invalid_patterns.append(pattern)
+            continue
+        if is_potentially_dangerous_regex(pattern):
+            dangerous_patterns.append(pattern)
+
+    errors = []
+    if invalid_patterns:
+        errors.append(f"Invalid regex patterns: {invalid_patterns}")
+    if dangerous_patterns:
+        errors.append(
+            "Potentially dangerous patterns (nested quantifiers or too long): "
+            f"{dangerous_patterns}"
+        )
+    return errors
+
+
+def validate_access_email_patterns(patterns) -> None:
+    """Reject email patterns that cannot be used as an access-control allowlist."""
+    errors = collect_access_email_pattern_errors(patterns)
+    if errors:
+        raise ValidationError(errors)
+
+
+def matches_access_email_pattern(patterns, email) -> bool:
+    """Check whether an email is allowed by any of the access-control patterns.
+
+    Unlike :meth:`UserDetailsMatchMixin._is_pattern_match`, which is a convenience
+    filter, this is an authorization decision, so matching is deliberately strict:
+
+    * the whole email must match the pattern (``fullmatch``), otherwise a pattern
+      such as ``.*@example\\.com`` would also admit ``user@example.com.attacker.net``;
+    * matching is case-insensitive, mirroring how emails are compared elsewhere
+      (``email__iexact``);
+    * an unusable pattern (not a string, invalid regex, potential ReDoS) never
+      matches, so a broken configuration denies access rather than granting it.
+    """
+    if not email or not isinstance(email, str):
+        return False
+    if not isinstance(patterns, list | tuple):
+        return False
+
+    for pattern in patterns:
+        if not pattern or not isinstance(pattern, str):
+            continue
+        if is_potentially_dangerous_regex(pattern):
+            logger.warning(
+                "Potentially dangerous regex pattern rejected: '%s'", pattern[:50]
+            )
+            continue
+        try:
+            if re.fullmatch(pattern, email, re.IGNORECASE):
+                return True
+        except re.error as e:
+            logger.warning("Invalid regex pattern '%s': %s", pattern, e)
+    return False

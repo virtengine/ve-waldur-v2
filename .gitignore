@@ -7,6 +7,7 @@
 *.mo
 .DS_Store
 src/waldur_core/server/settings.py
+src/waldur_core/server/settings_local.py
 
 # Editor artifacts
 /.idea
@@ -38,3 +39,6 @@ docker/matrix-dev/appservices/
 scratchpad/
 waldur-typescript-sdk/
 waldur-openapi-schema.yaml
+
+# UI review screenshot artifacts (not for commit)
+.ui-review-shots/

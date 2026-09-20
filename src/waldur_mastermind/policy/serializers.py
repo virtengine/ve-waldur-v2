@@ -1,3 +1,5 @@
+import datetime
+import decimal
 import json
 import logging
 from typing import cast
@@ -7,6 +9,7 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from waldur_core.core import serializers as core_serializers
@@ -14,6 +17,7 @@ from waldur_core.permissions.fixtures import CustomerRole
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.managers import filter_queryset_for_user
 from waldur_core.structure.permissions import _get_customer
+from waldur_mastermind.invoices import compensations as invoices_compensations
 from waldur_mastermind.invoices.models import CustomerCredit, PeriodMixin, ProjectCredit
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.enums import BillingTypes, ResourceStates
@@ -200,15 +204,107 @@ class PolicySerializer(serializers.HyperlinkedModelSerializer):
         }
 
 
-class EstimatedCostPolicySerializer(PolicySerializer):
+class EstimatedCostPolicySerializer(
+    core_serializers.RestrictedSerializerMixin, PolicySerializer
+):
     period_name = serializers.CharField(read_only=True, source="get_period_display")
+    current_cost = serializers.SerializerMethodField()
+    eta_days = serializers.SerializerMethodField()
+    eta_date = serializers.SerializerMethodField()
 
     class Meta(PolicySerializer.Meta):
         fields = PolicySerializer.Meta.fields + (
             "limit_cost",
             "period",
             "period_name",
+            "current_cost",
+            "eta_days",
+            "eta_date",
         )
+
+    @extend_schema_field(
+        serializers.DecimalField(
+            max_digits=16,
+            decimal_places=2,
+            help_text=(
+                "The cost this policy compares against limit_cost right now: the period's invoice total, less the credit already applied and the credit still to be drawn. Do not re-derive it — only the server can simulate the pending draw, and a figure computed from the invoice alone will not match what the policy evaluates."
+            ),
+        )
+    )
+    def get_current_cost(self, instance) -> decimal.Decimal:
+        """The cost the policy compares against `limit_cost` right now.
+
+        Clients showing saturation must not re-derive this: the figure is the
+        period's invoice total less the credit still to be drawn, and only the
+        server can simulate the latter. Pass `?field=` without `current_cost`
+        to skip the simulation on requests that do not need it.
+        """
+        # Building a MonthlyCompensation costs two queries before it is asked
+        # anything, so skip it for policies that deduct no credit.
+        compensation = (
+            self._compensation_for(instance)
+            if instance.uses_credit_compensation
+            else None
+        )
+        return instance.get_current_cost(compensation)
+
+    @extend_schema_field(
+        serializers.IntegerField(
+            allow_null=True,
+            help_text=(
+                "Days until the policy fires, or null when no projection exists. 0 means the threshold is already crossed and the policy is triggered — measured, not projected. Null must be rendered as no date, never as 'now': it is the common case, and it is also what an unprojectable or more-than-a-year-away policy reports. Nothing is projected beyond 365 days, because the rate comes from the current month's spend. Note that a cost policy does not fire on cost alone — it also waits for the credit balance to fall to limit_cost — so a policy far over its cap can still report a future date or null."
+            ),
+        )
+    )
+    def get_eta_days(self, instance) -> int | None:
+        """Days until the policy crosses `limit_cost`; null when unprojectable.
+
+        0 means the limit is already exceeded. Null is the common case and must
+        be rendered as "no date", never as "now": the projection needs both the
+        gross cost and the credit still to be drawn, and a client holding only
+        their difference cannot derive it — waldur/waldur-homeport#244 is what
+        happens when one tries. Costs the same simulation as `current_cost`, so
+        it is excluded by the same `?field=` as that one.
+        """
+        # Memoised per response: `eta_date` is the same projection formatted,
+        # and the simulation behind it is the expensive part.
+        cache = self.context.setdefault("_policy_eta_cache", {})
+        key = (type(instance).__name__, instance.pk)
+        if key not in cache:
+            compensation = (
+                self._compensation_for(instance)
+                if instance.uses_credit_compensation
+                else None
+            )
+            cache[key] = instance.get_eta_days(compensation)
+        return cache[key]
+
+    @extend_schema_field(
+        serializers.DateField(
+            allow_null=True,
+            help_text=(
+                "eta_days as a calendar date, so clients do not each re-derive it. Null whenever eta_days is null; today when eta_days is 0."
+            ),
+        )
+    )
+    def get_eta_date(self, instance) -> datetime.date | None:
+        """`eta_days` as a date, so clients do not each re-derive the calendar."""
+        eta_days = self.get_eta_days(instance)
+        if eta_days is None:
+            return None
+        return datetime.date.today() + datetime.timedelta(days=eta_days)
+
+    def _compensation_for(self, instance):
+        """One MonthlyCompensation per customer, shared across the response."
+
+        Serializing a list of policies for one customer would otherwise re-run
+        the same simulation for every row.
+        """
+        customer = getattr(instance.scope, "customer", instance.scope)
+        cache = self.context.setdefault("_monthly_compensations", {})
+        if customer.id not in cache:
+            cache[customer.id] = invoices_compensations.MonthlyCompensation(customer)
+        return cache[customer.id]
 
 
 class ProjectEstimatedCostPolicySerializer(
@@ -675,8 +771,16 @@ class SlurmPeriodicUsagePolicySerializer(OfferingUsagePolicySerializer):
         ).exists()
         if not queue_exists:
             data["warnings"] = [
-                "No site agent has registered a queue for periodic limits updates on this offering. "
-                "Ensure the site agent has periodic_limits.enabled set to true and is running."
+                "No site agent has registered a queue for periodic limits updates on "
+                "this offering. Periodic settings are delivered over STOMP only, so "
+                "the policy cannot be enforced until a queue is registered.",
+                "Queues are registered exclusively by a site agent running in "
+                "event_process mode — the order_process, membership_sync and report "
+                "modes never register one. Check that such an agent is running for "
+                "this offering, that the offering has stomp_enabled: true and "
+                "backend_settings.periodic_limits.enabled: true in the agent "
+                "configuration, and restart the event_process agent after changing "
+                "its configuration. Requires site agent 0.8.0 or newer.",
             ]
         return data
 

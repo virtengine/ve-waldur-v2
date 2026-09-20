@@ -1,3 +1,4 @@
+import ipaddress
 import logging
 import re
 from datetime import timedelta
@@ -270,7 +271,7 @@ class OrganizationGroup(core_models.UuidMixin, core_models.NameMixin, models.Mod
 
     class Meta:
         verbose_name = _("organization group")
-        ordering = ("name",)
+        ordering = ["name", "id"]
 
     @classmethod
     def get_url_name(cls):
@@ -315,7 +316,7 @@ class AffiliatedOrganization(
     class Meta:
         verbose_name = _("affiliation")
         verbose_name_plural = _("affiliations")
-        ordering = ("name",)
+        ordering = ["name", "id"]
 
     @classmethod
     def get_url_name(cls):
@@ -346,7 +347,7 @@ class ScienceDomain(
 
     class Meta:
         verbose_name = _("science domain")
-        ordering = ("code", "name")
+        ordering = ["code", "name", "id"]
 
     @classmethod
     def get_url_name(cls):
@@ -397,7 +398,7 @@ class ScienceSubDomain(
 
     class Meta:
         verbose_name = _("science sub-domain")
-        ordering = ("code", "name")
+        ordering = ["code", "name", "id"]
 
     @classmethod
     def get_url_name(cls):
@@ -476,29 +477,90 @@ def validate_cidr_32(value):
         raise ValidationError("Only /32 mask is allowed.")
 
 
+def validate_access_subnet_cidr(value):
+    """
+    Validate a CIDR address usable as an access-subnet entry.
+
+    Rejects a zero-length prefix outright: ``0.0.0.0/0`` (or ``::/0``) matches
+    every address, which would silently neutralise any restriction built on
+    these entries. Every other width is accepted here — the narrower "single
+    host only" rule that applies to non-staff users is enforced in the
+    serializer, which is the only layer that knows who is making the request.
+
+    Args:
+        value: CIDR address string to validate
+
+    Raises:
+        ValidationError: If the value is malformed or has a /0 prefix
+    """
+    try:
+        network = ipaddress.ip_network(str(value), strict=False)
+    except ValueError as e:
+        raise ValidationError(str(e))
+    if network.prefixlen == 0:
+        raise ValidationError("A /0 mask is not allowed: it matches every address.")
+
+
 class AccessSubnet(core_models.UuidMixin, core_models.DescribableMixin, LoggableMixin):
     """
     Model for customer access subnets.
 
-    Stores CIDR addresses with /32 mask validation for IP-based access control.
-    Used to restrict access to customer resources based on source IP addresses.
+    One trusted network for the organization, plus what it is trusted for.
+
+    A single entry can apply to portal sign-in (``applies_to_portal``) and/or to
+    the organization's resources of particular offerings, the latter recorded
+    outside this app so that structure keeps no knowledge of the marketplace.
+    Keeping it as one row per address means a consumer describes a network once
+    ("office egress") rather than maintaining parallel lists.
+
+    ``applies_to_portal`` defaults to False deliberately. Any portal-scoped
+    entry restricts sign-in for the whole organization, so adding a network in
+    order to reach a bucket must not quietly lock people out of the portal.
+
+    Non-staff users may only enter single hosts (``/32``); staff may enter wider
+    ranges, which are then flagged ``is_staff_managed`` so consumers cannot edit
+    or remove them. Both rules live in the serializer, which is the layer that
+    knows the acting user.
     """
 
     customer = models.ForeignKey["Customer"](
         on_delete=models.CASCADE, to="Customer", related_name="access_subnet_set"
     )
-    inet = CidrAddressField(null=True, blank=True, validators=[validate_cidr_32])
+    inet = CidrAddressField(
+        null=True, blank=True, validators=[validate_access_subnet_cidr]
+    )
+    applies_to_portal = models.BooleanField(
+        default=False,
+        help_text="Whether this network may sign in to the portal on behalf of "
+        "the organization. Off by default: any portal-scoped entry restricts "
+        "sign-in for everyone in the organization.",
+    )
+    is_staff_managed = models.BooleanField(
+        default=False,
+        help_text="Set when staff created the entry. Such entries are read-only "
+        "for everyone else, regardless of mask width.",
+    )
     tracker = cast(FieldInstanceTracker, FieldTracker())
+    # Queries now start from this model rather than joining in from Customer
+    # (which carries its own NetManager), so the netfields lookups —
+    # inet__net_contains_or_equals — have to be available here too.
+    objects = NetManager()
 
     class Meta:
         unique_together = ("customer", "inet")
-        ordering = ["inet"]
+        ordering = ["inet", "id"]
 
     def __str__(self):
         return self.customer.name + " | " + str(self.inet)
 
     def get_log_fields(self):
-        return "description", "inet", "customer"
+        return (
+            "description",
+            "inet",
+            "customer",
+            "applies_to_portal",
+            "is_staff_managed",
+        )
 
 
 class CustomerAddressDetailsMixin(models.Model):
@@ -713,7 +775,7 @@ class Customer(
 
     class Meta:
         verbose_name = _("organization")
-        ordering = ("name",)
+        ordering = ["name", "id"]
 
     class Quotas(quotas_models.QuotaModelMixin.Quotas):
         enable_fields_caching = False
@@ -814,7 +876,7 @@ class ProjectType(
     class Meta:
         verbose_name = _("Project type")
         verbose_name_plural = _("Project types")
-        ordering = ["name"]
+        ordering = ["name", "id"]
 
     @classmethod
     def get_url_name(cls):
@@ -1213,7 +1275,7 @@ class Project(
 
     class Meta:
         base_manager_name = "objects"
-        ordering = ["name"]
+        ordering = ["name", "id"]
 
 
 class PermissionReview(core_models.UuidMixin, LoggableMixin):
@@ -1249,6 +1311,9 @@ class CustomerPermissionReview(PermissionReview):
     Inherits from PermissionReview and adds customer-specific fields.
     """
 
+    class Meta:
+        ordering = ["-created", "id"]
+
     class Permissions:
         customer_path = "customer"
         list_permission = PermissionEnum.LIST_CUSTOMER_PERMISSION_REVIEWS
@@ -1271,6 +1336,9 @@ class ProjectPermissionReview(PermissionReview):
 
     Inherits from PermissionReview and adds project-specific fields.
     """
+
+    class Meta:
+        ordering = ["-created", "id"]
 
     class Permissions:
         customer_path = "project__customer"
@@ -1323,7 +1391,7 @@ class ServiceSettings(
     class Meta:
         verbose_name = "Service settings"
         verbose_name_plural = "Service settings"
-        ordering = ("name",)
+        ordering = ["name", "id"]
 
     class Permissions:
         customer_path = "customer"
@@ -1340,16 +1408,18 @@ class ServiceSettings(
     )
     backend_url = core_fields.BackendURLField(max_length=200, blank=True, null=True)
     username = models.CharField(max_length=100, blank=True, null=True)
-    password = models.CharField(max_length=100, blank=True, null=True)
+    password = core_fields.EncryptedTextField(blank=True, null=True)
     domain = models.CharField(max_length=200, blank=True, null=True)
-    token = models.CharField(max_length=255, blank=True, null=True)
+    token = core_fields.EncryptedTextField(blank=True, null=True)
     certificate = models.FileField(
         upload_to="certs", blank=True, null=True, validators=[CertificateValidator]
     )
     type = models.CharField(
         max_length=255, db_index=True, validators=[validate_service_type]
     )
-    options = JSONField(default=dict, help_text=_("Extra options"), blank=True)
+    options = core_fields.EncryptedOptionsField(
+        default=dict, help_text=_("Extra options"), blank=True
+    )
     shared = models.BooleanField(default=False, help_text=_("Anybody can use it"))
     terms_of_services = models.URLField(max_length=255, blank=True)
 
@@ -1518,7 +1588,7 @@ class BaseResource(
 
     class Meta:
         abstract = True
-        ordering = ["-created"]
+        ordering = ["-created", "id"]
 
     class Permissions:
         customer_path = "project__customer"
@@ -1610,7 +1680,7 @@ class VirtualMachine(IPCoordinatesMixin, core_models.RuntimeStateMixin, BaseReso
     for all VM implementations across different cloud providers.
     """
 
-    class Meta:
+    class Meta(BaseResource.Meta):
         abstract = True
 
     cores = models.PositiveSmallIntegerField(
@@ -1682,7 +1752,7 @@ class Storage(core_models.RuntimeStateMixin, BaseResource):
 
     size = models.PositiveIntegerField(help_text=_("Size in MiB"))
 
-    class Meta:
+    class Meta(BaseResource.Meta):
         abstract = True
 
 
@@ -1720,7 +1790,7 @@ class UserAgreement(core_models.UuidMixin, LoggableMixin, TimeStampedModel):
     )
 
     class Meta:
-        ordering = ["created"]
+        ordering = ["created", "id"]
         unique_together = [("agreement_type", "language")]
 
     def __str__(self):
@@ -1749,7 +1819,7 @@ class ExternalLink(
     class Meta:
         verbose_name = _("External link")
         verbose_name_plural = _("External links")
-        ordering = ("name",)
+        ordering = ["name", "id"]
 
     link = models.URLField(max_length=500)
 
@@ -1814,7 +1884,7 @@ class ProjectEndDateChangeRequest(core_models.UuidMixin, core_mixins.ReviewMixin
     """
 
     class Meta:
-        ordering = ["created"]
+        ordering = ["created", "id"]
         verbose_name = _("Project end date change request")
         verbose_name_plural = _("Project end date change requests")
         constraints = [

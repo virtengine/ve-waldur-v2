@@ -1,6 +1,10 @@
+import uuid
+
 from ddt import data, ddt
 from django import template
+from django.db import connection
 from django.template.loader import get_template
+from django.test import utils as django_test
 from django.utils.translation import gettext_lazy as _
 from rest_framework import status, test
 
@@ -75,6 +79,25 @@ class PlanCreateTest(test.APITestCase):
     def test_can_not_create_plan(self, user):
         response = self.create_plan(user)
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_can_not_create_plan_for_child_offering(self):
+        self.offering = factories.OfferingFactory(
+            customer=self.customer,
+            parent=factories.OfferingFactory(customer=self.customer),
+        )
+        response = self.create_plan("owner")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(models.Plan.objects.filter(offering=self.offering).exists())
+
+    def test_can_create_plan_for_non_billable_offering(self):
+        # A top-level offering that is not invoiced still needs a plan of its
+        # own: activation requires one and there is no parent to inherit it from.
+        self.offering = factories.OfferingFactory(
+            customer=self.customer, billable=False
+        )
+        response = self.create_plan("owner")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertTrue(models.Plan.objects.filter(offering=self.offering).exists())
 
     def create_plan(self, user):
         user = getattr(self.fixture, user)
@@ -460,6 +483,51 @@ class OfferingUpdatePlansTest(BaseOfferingUpdateTest):
         # Assert
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_quotas_are_not_allowed_for_child_offering(self):
+        # Arrange
+        plan = factories.PlanFactory(offering=self.offering)
+        factories.OfferingComponentFactory(offering=self.offering, type="ram")
+        self.offering.parent = factories.OfferingFactory(customer=self.customer)
+        self.offering.save()
+
+        # Act
+        response = self.update_quotas(plan, "owner", {"quotas": {"ram": 20}})
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_prices_are_not_allowed_for_child_offering(self):
+        # Arrange
+        plan = factories.PlanFactory(offering=self.offering)
+        factories.OfferingComponentFactory(offering=self.offering, type="ram")
+        self.offering.parent = factories.OfferingFactory(customer=self.customer)
+        self.offering.save()
+
+        # Act
+        response = self.update_prices(plan, "owner", {"prices": {"ram": 2}})
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_prices_are_allowed_for_non_billable_offering(self):
+        # Arrange
+        plan = factories.PlanFactory(offering=self.offering)
+        offering_component = factories.OfferingComponentFactory(
+            offering=self.offering, type="ram"
+        )
+        self.offering.billable = False
+        self.offering.save()
+
+        # Act
+        response = self.update_prices(plan, "owner", {"prices": {"ram": 2}})
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        plan_component = models.PlanComponent.objects.get(
+            plan=plan, component=offering_component
+        )
+        self.assertEqual(plan_component.price, 2)
+
     def test_if_there_are_no_resources_using_plan_price_is_updated(self):
         # Arrange
         plan = factories.PlanFactory(offering=self.offering)
@@ -496,6 +564,72 @@ class OfferingUpdatePlansTest(BaseOfferingUpdateTest):
             plan=plan, component=offering_component
         )
         self.assertEqual(plan_component.future_price, 2)
+
+    def test_future_price_can_be_set_to_zero(self):
+        # Arrange
+        plan = factories.PlanFactory(offering=self.offering)
+        factories.ResourceFactory(offering=self.offering, plan=plan)
+        offering_component = factories.OfferingComponentFactory(
+            offering=self.offering, type="ram"
+        )
+        models.PlanComponent.objects.create(
+            plan=plan, component=offering_component, price=10
+        )
+
+        # Act
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.update_prices(plan, "owner", {"prices": {"ram": 0}})
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        plan_component = models.PlanComponent.objects.get(
+            plan=plan, component=offering_component
+        )
+        self.assertEqual(plan_component.future_price, 0)
+        self.assertEqual(plan_component.price, 10)
+
+    def test_price_can_be_set_to_zero_if_there_are_no_resources(self):
+        # Arrange
+        plan = factories.PlanFactory(offering=self.offering)
+        offering_component = factories.OfferingComponentFactory(
+            offering=self.offering, type="ram"
+        )
+        models.PlanComponent.objects.create(
+            plan=plan, component=offering_component, price=10
+        )
+
+        # Act
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.update_prices(plan, "owner", {"prices": {"ram": 0}})
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        plan_component = models.PlanComponent.objects.get(
+            plan=plan, component=offering_component
+        )
+        self.assertEqual(plan_component.price, 0)
+
+    def test_future_price_is_not_set_if_new_price_matches_current_price(self):
+        # Arrange
+        plan = factories.PlanFactory(offering=self.offering)
+        factories.ResourceFactory(offering=self.offering, plan=plan)
+        offering_component = factories.OfferingComponentFactory(
+            offering=self.offering, type="ram"
+        )
+        models.PlanComponent.objects.create(
+            plan=plan, component=offering_component, price=10
+        )
+
+        # Act
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.update_prices(plan, "owner", {"prices": {"ram": 10}})
+
+        # Assert
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        plan_component = models.PlanComponent.objects.get(
+            plan=plan, component=offering_component
+        )
+        self.assertIsNone(plan_component.future_price)
 
     def test_it_should_be_possible_to_archive_plan(self):
         # Arrange
@@ -668,3 +802,149 @@ class PlanSumComponentsTest(test.APITestCase):
         )
 
         self.assertEqual(self.plan.init_price, 150)  # 0 + 150
+
+
+class PublicOfferingPlanQueryCountTest(test.APITestCase):
+    """Serializing plans must not cost queries proportional to plan count.
+
+    ``BasePlanSerializer`` exposes six method fields that each iterate
+    ``plan.components.all()`` and dereference ``component``, plus a
+    per-plan resource count, so without prefetching the public offering
+    endpoint scales with plans x components.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.offering = factories.OfferingFactory(
+            customer=self.fixture.customer, state=models.Offering.States.ACTIVE
+        )
+
+    def _add_plan(self, component_count=4):
+        plan = factories.PlanFactory(offering=self.offering)
+        for _i in range(component_count):
+            component = factories.OfferingComponentFactory(
+                offering=self.offering, type=f"comp-{uuid.uuid4().hex[:8]}"
+            )
+            factories.PlanComponentFactory(plan=plan, component=component)
+        return plan
+
+    def _get(self):
+        url = factories.OfferingFactory.get_public_url(self.offering)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return response
+
+    def test_query_count_does_not_grow_with_number_of_plans(self):
+        self._add_plan()
+        # Warm ContentType and permission caches; they otherwise skew the count.
+        self._get()
+
+        with django_test.CaptureQueriesContext(connection) as baseline:
+            self._get()
+
+        for _i in range(4):
+            self._add_plan()
+
+        with self.assertNumQueries(len(baseline)):
+            self._get()
+
+    def test_plan_payload_is_unchanged_by_prefetching(self):
+        plan = self._add_plan()
+        response = self._get()
+
+        (payload,) = [p for p in response.data["plans"] if p["uuid"] == plan.uuid.hex]
+        self.assertEqual(len(payload["prices"]), 4)
+        self.assertEqual(len(payload["quotas"]), 4)
+        self.assertEqual(payload["resources_count"], 0)
+        self.assertEqual(payload["plan_type"], "fixed")
+
+
+class QuotaUpdateComponentTypesTest(BaseOfferingUpdateTest):
+    """Which components accept an amount.
+
+    Restricted to FIXED, this endpoint rejected the whole request whenever the
+    form offered a one-time component beside a fixed one, so nothing could be
+    saved and every setup fee sat at the field's default of zero.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.plan = factories.PlanFactory(offering=self.offering)
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_PLAN)
+        self.url = factories.PlanFactory.get_url(self.plan, "update_quotas")
+        self.client.force_authenticate(self.fixture.owner)
+
+    def _component(self, comp_type, billing_type, is_prepaid=False):
+        component = factories.OfferingComponentFactory(
+            offering=self.offering,
+            type=comp_type,
+            billing_type=billing_type,
+            is_prepaid=is_prepaid,
+        )
+        factories.PlanComponentFactory(
+            plan=self.plan, component=component, price=10, amount=0
+        )
+        return component
+
+    def _amount(self, comp_type):
+        return models.PlanComponent.objects.get(
+            plan=self.plan, component__type=comp_type
+        ).amount
+
+    def test_a_setup_fee_accepts_an_amount(self):
+        self._component("setup", BillingTypes.ONE_TIME)
+
+        response = self.client.post(self.url, {"quotas": {"setup": 3}})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(self._amount("setup"), 3)
+
+    def test_a_switch_fee_accepts_an_amount(self):
+        self._component("migration", BillingTypes.ON_PLAN_SWITCH)
+
+        response = self.client.post(self.url, {"quotas": {"migration": 2}})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(self._amount("migration"), 2)
+
+    def test_a_fixed_component_still_accepts_one(self):
+        self._component("licence", BillingTypes.FIXED)
+
+        response = self.client.post(self.url, {"quotas": {"licence": 4}})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(self._amount("licence"), 4)
+
+    def test_a_setup_fee_beside_a_fixed_one_no_longer_fails_the_request(self):
+        # The form shows both, so it sends both. Rejecting the pair left the
+        # fixed component unsettable too.
+        self._component("setup", BillingTypes.ONE_TIME)
+        self._component("licence", BillingTypes.FIXED)
+
+        response = self.client.post(self.url, {"quotas": {"setup": 3, "licence": 4}})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(self._amount("setup"), 3)
+        self.assertEqual(self._amount("licence"), 4)
+
+    def test_a_prepaid_component_is_refused(self):
+        # Its quantity comes from the requested limit and the subscription's
+        # length; an amount here would be settable and then ignored.
+        self._component("support", BillingTypes.ONE_TIME, is_prepaid=True)
+
+        response = self.client.post(self.url, {"quotas": {"support": 3}})
+
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
+        self.assertEqual(self._amount("support"), 0)
+
+    def test_a_component_the_form_did_not_show_keeps_its_amount(self):
+        self._component("setup", BillingTypes.ONE_TIME)
+        self._component("licence", BillingTypes.FIXED)
+        self.client.post(self.url, {"quotas": {"setup": 3, "licence": 4}})
+
+        self.client.post(self.url, {"quotas": {"setup": 5}})
+
+        self.assertEqual(self._amount("setup"), 5)
+        self.assertEqual(self._amount("licence"), 4)

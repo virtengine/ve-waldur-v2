@@ -1,9 +1,8 @@
 import logging
 from datetime import datetime
 
+import reversion
 from constance import config as constance_config
-from dbtemplates.models import Template
-from dbtemplates.utils.cache import add_template_to_cache
 from django.conf import settings as django_settings
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
@@ -38,11 +37,14 @@ from waldur_auth_social.utils import pull_remote_eduteams_user
 from waldur_core.checklist import mixins as checklist_mixins
 from waldur_core.checklist import models as checklist_models
 from waldur_core.checklist.models import Answer, ChecklistCompletion, Question
+from waldur_core.checklist.utils import latest_answers_by_question
 from waldur_core.core import mixins as core_mixins
 from waldur_core.core import models as core_models
 from waldur_core.core import permissions as core_permissions
+from waldur_core.core import utils as core_utils
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
+from waldur_core.core.db_template_cache import add_template_to_cache
 from waldur_core.core.enums import CoreStates, ReviewStates
 from waldur_core.core.permissions import PATScopeAwareIsAdminUser
 from waldur_core.core.serializers import DetailSerializer, ReviewCommentSerializer
@@ -52,6 +54,9 @@ from waldur_core.core.views import ActionsViewSet
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
 from waldur_core.logging.models import UserDataAccessLog
+from waldur_core.onboarding.enums import VerificationStatus
+from waldur_core.onboarding.models import OnboardingVerification
+from waldur_core.passkeys import policy as passkey_policy
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.models import Role, UserRole
 from waldur_core.permissions.utils import (
@@ -88,12 +93,18 @@ from waldur_core.structure.utils import (
     get_components_usage_data_from_resources,
 )
 from waldur_core.structure.utils_data_access import bulk_log_user_data_access
+from waldur_core.user_actions import providers as user_action_providers
 from waldur_core.user_actions import serializers as user_action_serializers
 from waldur_core.user_actions import tasks as user_action_tasks
+from waldur_core.user_actions.providers import (
+    DASHBOARD_LIST_LIMIT,
+    DASHBOARD_VARIANT_ORDER,
+)
 from waldur_core.users import tasks as user_tasks
 from waldur_core.users.enums import InvitationState
 from waldur_core.users.models import Invitation
 from waldur_core.users.scim import tasks as scim_tasks
+from waldur_core.users.utils import get_manageable_permission_requests
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import serializers as marketplace_serializers
 from waldur_mastermind.marketplace.enums import ResourceStates
@@ -118,11 +129,21 @@ PROJECT_UUID_PARAMETER = OpenApiParameter(
 @extend_schema_view(
     list=extend_schema(
         summary="List customers",
-        description="Retrieve a list of customers. The list is filtered based on the user's permissions.",
+        description=(
+            "Retrieve a list of customers. The list is filtered based on the user's permissions. "
+            "A user whose only link to an organization is a role on its service provider sees it "
+            "with a restricted field set: url, uuid, name, native_name, display_name, abbreviation, "
+            "slug, image, country, country_name, is_service_provider, service_provider and "
+            "service_provider_uuid. All other fields are omitted for that row."
+        ),
     ),
     retrieve=extend_schema(
         summary="Retrieve customer details",
-        description="Fetch the details of a specific customer by its UUID.",
+        description=(
+            "Fetch the details of a specific customer by its UUID. "
+            "A user whose only link to the organization is a role on its service provider "
+            "receives the restricted field set described on the list operation."
+        ),
     ),
     create=extend_schema(
         summary="Create a new customer",
@@ -164,8 +185,8 @@ class CustomerViewSet(
     serializer_class = serializers.CustomerSerializer
     lookup_field = "uuid"
     filter_backends = (
-        filters.GenericUserFilter,
-        filters.GenericRoleFilter,
+        filters.CustomerUserFilter,
+        filters.CustomerRoleFilter,
         DjangoFilterBackend,
         rf_filters.OrderingFilter,
         filters.AccountingStartDateFilter,
@@ -213,6 +234,21 @@ class CustomerViewSet(
             queryset = queryset.prefetch_related(prefetch_projects)
 
         return queryset
+
+    def get_object(self):
+        customer = super().get_object()
+        # A service provider manager may read the provider's organization, but
+        # every other action on it stays out of reach, exactly as before it
+        # became visible to them.
+        if (
+            self.action != "retrieve"
+            and customer.id
+            in managers.get_service_provider_manager_only_customer_ids(
+                self.request.user, [customer.id]
+            )
+        ):
+            raise Http404
+        return customer
 
     def _get_project_prefetch(self, user):
         """Returns a Prefetch object restricted by user permissions"""
@@ -359,6 +395,38 @@ class CustomerViewSet(
             },
             status=status.HTTP_200_OK,
         )
+
+    @extend_schema(
+        summary="List service providers serving this customer",
+        description="Returns service providers with at least one active resource provisioned for this customer.",
+        responses=marketplace_serializers.ServiceProviderSerializer(many=True),
+    )
+    @action(detail=True)
+    def providers(self, request, *args, **kwargs):
+        customer: models.Customer = self.get_object()
+
+        resources = marketplace_models.Resource.objects.filter(
+            project__customer=customer
+        ).exclude(state=ResourceStates.TERMINATED)
+        resources = filter_queryset_for_user(resources, request.user)
+
+        provider_customer_ids = resources.values_list(
+            "offering__customer_id", flat=True
+        ).distinct()
+
+        providers = marketplace_models.ServiceProvider.objects.filter(
+            customer_id__in=provider_customer_ids
+        ).order_by("customer__name")
+
+        page = self.paginate_queryset(providers)
+        serializer = marketplace_serializers.ServiceProviderSerializer(
+            page if page is not None else providers,
+            many=True,
+            context=self.get_serializer_context(),
+        )
+        if page is not None:
+            return self.get_paginated_response(serializer.data)
+        return Response(serializer.data)
 
     @extend_schema(
         summary="Update organization groups for a customer",
@@ -596,13 +664,178 @@ class AccessSubnetViewSet(core_views.ActionsViewSet):
     serializer_class = serializers.AccessSubnetSerializer
     lookup_field = "uuid"
     filterset_class = filters.AccessSubnetFilter
-    filter_backends = (DjangoFilterBackend, filters.GenericRoleFilter)
+    filter_backends = (
+        DjangoFilterBackend,
+        filters.GenericRoleFilter,
+        filters.AccessSubnetOrderingFilter,
+    )
+    # Every column the portal renders is sortable. The offering columns are not
+    # listed here because their sort key carries an offering uuid; the ordering
+    # backend resolves `o=offering:<uuid>` into an annotation instead.
+    ordering_fields = ("inet", "description", "applies_to_portal", "is_staff_managed")
     destroy_permissions = [
         permission_factory(PermissionEnum.DELETE_ACCESS_SUBNET, ["customer"])
     ]
     update_permissions = partial_update_permissions = [
         permission_factory(PermissionEnum.UPDATE_ACCESS_SUBNET, ["customer"])
     ]
+
+    @extend_schema(
+        summary="Show which resources the access subnets reach",
+        description="For each of the organization's live resources of an "
+        "offering that supports access subnets, the addresses that may reach "
+        "it, where each came from, and whether the list is enforced or merely "
+        "advisory. Resources of offerings without access subnet support are "
+        "omitted: no allow-list can apply to them. Pass access_subnet_uuid to "
+        "narrow it to the resources one address reaches.",
+        parameters=[
+            OpenApiParameter(
+                name="customer_uuid",
+                type=OpenApiTypes.UUID,
+                required=True,
+                location=OpenApiParameter.QUERY,
+                description="Organization whose resources to report on.",
+                extensions={"x-waldur-operation-id": "customers_retrieve"},
+            ),
+            OpenApiParameter(
+                name="access_subnet_uuid",
+                type=OpenApiTypes.UUID,
+                required=False,
+                location=OpenApiParameter.QUERY,
+                description="Limit to the resources this one address reaches.",
+                extensions={"x-waldur-operation-id": "access_subnets_retrieve"},
+            ),
+        ],
+        responses=serializers.AccessSubnetImpactSerializer,
+    )
+    @action(detail=False, methods=["get"], filter_backends=[])
+    def resource_impact(self, request):
+        # Lazy: structure must not import the marketplace at module load.
+        from waldur_mastermind.marketplace import models as marketplace_models
+
+        customer_uuid = request.query_params.get("customer_uuid")
+        if not customer_uuid or not core_utils.is_uuid_like(customer_uuid):
+            raise ValidationError(
+                {"customer_uuid": _("A valid customer_uuid is required.")}
+            )
+        customer = get_object_or_404(models.Customer, uuid=customer_uuid)
+        if not (request.user.is_staff or request.user.is_support):
+            # Membership is tested with the same `__in` idiom get_queryset uses.
+            # `customer in get_connected_customers(...)` looks equivalent and is
+            # not: the queryset yields ids, so the comparison never matched and
+            # denied every non-staff caller, including a customer's own owner.
+            if not models.Customer.objects.filter(
+                pk=customer.pk, id__in=get_connected_customers(user=request.user)
+            ).exists():
+                raise PermissionDenied()
+
+        subnet_uuid = request.query_params.get("access_subnet_uuid")
+        if subnet_uuid and not core_utils.is_uuid_like(subnet_uuid):
+            raise ValidationError(
+                {"access_subnet_uuid": _("A valid access_subnet_uuid is required.")}
+            )
+
+        # Only offerings that opted into access subnets. A resource whose
+        # offering does not support them has no allow-list to report and none
+        # that could be built, so listing it says nothing the reader can act on
+        # — it just buries the resources whose exposure is actually in question.
+        resources = (
+            marketplace_models.Resource.objects.filter(
+                project__customer=customer,
+                offering__plugin_options__has_key="enable_resource_access_subnets",
+                offering__plugin_options__enable_resource_access_subnets=True,
+            )
+            .exclude(state=marketplace_models.Resource.States.TERMINATED)
+            .select_related("offering", "project")
+            .order_by("offering__name", "name")
+        )
+
+        # Gather per offering once rather than per resource: every resource of an
+        # offering shares the same address list by construction.
+        scopes = marketplace_models.AccessSubnetOfferingScope.objects.filter(
+            access_subnet__customer=customer,
+            access_subnet__inet__isnull=False,
+        ).select_related("access_subnet")
+        if subnet_uuid:
+            scopes = scopes.filter(access_subnet__uuid=subnet_uuid)
+        org_addresses: dict[int, list] = {}
+        for scope in scopes:
+            org_addresses.setdefault(scope.offering_id, []).append(scope.access_subnet)
+
+        defaults: dict[int, list] = {}
+        for default in marketplace_models.OfferingAccessSubnet.objects.filter(
+            offering__in=resources.values("offering_id"),
+            inet__isnull=False,
+        ):
+            defaults.setdefault(default.offering_id, []).append(default)
+
+        rows = []
+        for resource in resources:
+            offering = resource.offering
+            options = offering.plugin_options or {}
+            own = org_addresses.get(offering.id, [])
+            provider = defaults.get(offering.id, [])
+
+            # Narrowing to one address should not imply the other offerings'
+            # resources are unreachable — they are simply not being asked about.
+            if subnet_uuid and not own:
+                continue
+
+            addresses = [
+                {
+                    "inet": str(subnet.inet),
+                    "description": subnet.description,
+                    "source": "organization",
+                    "is_staff_managed": subnet.is_staff_managed,
+                }
+                for subnet in own
+            ] + [
+                {
+                    "inet": str(default.inet),
+                    "description": default.description,
+                    "source": "provider_default",
+                    "is_staff_managed": False,
+                }
+                for default in provider
+            ]
+            packed = [
+                str(network)
+                for network in core_utils.merge_access_subnets(
+                    [subnet.inet for subnet in own] + [d.inet for d in provider]
+                )
+            ]
+            rows.append(
+                {
+                    "resource_uuid": resource.uuid.hex,
+                    "resource_name": resource.name,
+                    "project_name": resource.project.name,
+                    "offering_uuid": offering.uuid.hex,
+                    "offering_name": offering.name,
+                    "concealment_enabled": bool(
+                        options.get("conceal_subnet_restricted_resources")
+                    ),
+                    "unrestricted": not addresses,
+                    "addresses": addresses,
+                    "packed": packed,
+                }
+            )
+
+        serializer = serializers.AccessSubnetImpactSerializer({"resources": rows})
+        return Response(serializer.data)
+
+    def destroy(self, request, *args, **kwargs):
+        """Block a non-staff caller from removing an entry staff pinned.
+
+        The serializer covers updates; deletion never reaches it. This cannot be
+        a ``destroy_validators`` entry either — those are called with the object
+        alone and run for every caller, so they could not let staff through.
+        """
+        subnet = self.get_object()
+        if subnet.is_staff_managed and not request.user.is_staff:
+            raise ValidationError(
+                _("This entry is managed by staff and cannot be deleted.")
+            )
+        return super().destroy(request, *args, **kwargs)
 
     def get_queryset(self):
         user = self.request.user
@@ -1285,6 +1518,36 @@ class ProjectOtherUsersViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
         return core_models.User.objects.filter(id__in=get_project_users(projects))
 
 
+# What a feed item carries beyond the eight keys every provider has always
+# returned. Declared once here rather than per provider: only queue-backed
+# items set them, and the serializer needs the keys present either way.
+DASHBOARD_ITEM_DEFAULTS = {
+    "uuid": None,
+    "urgency": None,
+    "route_name": None,
+    "route_params": {},
+    "can_silence": False,
+    "actions": [],
+}
+
+
+def _dashboard_feed_sort_key(item):
+    """Order the feed by severity, then by how soon it is due.
+
+    The queue sorted on due_date and the feed had no tiebreak at all, so
+    merging them without one would interleave dated and undated rows of equal
+    severity in provider-registration order. Undated rows sort last within
+    their severity; the second element keeps datetimes and None out of the same
+    comparison.
+    """
+    deadline = item.get("deadline")
+    return (
+        DASHBOARD_VARIANT_ORDER.get(item.get("variant"), 99),
+        0 if deadline else 1,
+        deadline,
+    )
+
+
 class UserViewSet(core_views.HistoryViewSetMixin, core_views.ActionsViewSet):
     queryset = core_models.User.all_objects.select_related(
         "auth_token", "changeemailrequest"
@@ -1316,6 +1579,15 @@ class UserViewSet(core_views.HistoryViewSetMixin, core_views.ActionsViewSet):
             to_attr="prefetched_permissions",
         )
         qs = qs.prefetch_related(permissions_prefetch)
+        # Only when passkeys are switched on: otherwise this adds a join and a
+        # grouping to every user listing for a column that always reads zero.
+        if passkey_policy.is_enabled():
+            qs = qs.annotate(
+                active_passkey_count=Count(
+                    "passkey_credentials",
+                    filter=Q(passkey_credentials__is_active=True),
+                )
+            )
         if self.request.user.is_staff or self.request.user.is_support:
             return qs
         return qs.filter(is_active=True)
@@ -1514,6 +1786,123 @@ class UserViewSet(core_views.HistoryViewSetMixin, core_views.ActionsViewSet):
         """Check if user profile is complete with all mandatory attributes."""
         completeness = get_profile_completeness_details(request.user)
         return Response(completeness, status=status.HTTP_200_OK)
+
+    @extend_schema(
+        summary="Get pending dashboard actions feed",
+        description=(
+            "Returns a typed feed of actions the current user should take, "
+            "aggregating pending orders, failed resources, overdue invoices, "
+            "missing Terms of Service consents, and incomplete profile state. "
+            "Where USER_ACTIONS_ENABLED is set, the persistent UserAction "
+            "queue is folded in as well; those items carry a uuid addressing "
+            "the user-actions endpoints, along with any corrective actions "
+            "and the route recorded for them."
+        ),
+        responses={200: serializers.DashboardPendingActionSerializer(many=True)},
+    )
+    @core_views.no_count_action
+    @action(detail=False, methods=["get"], url_path="dashboard-pending-actions")
+    def dashboard_pending_actions(self, request):
+        # Aggregate dashboard feed items contributed by registered
+        # ``BaseDashboardProvider`` instances. Each owning app exposes its own
+        # provider via ``<app>.user_actions``; this view stays agnostic of
+        # what those apps actually surface (orders, invoices, ToS, etc.).
+        feed: list[dict] = []
+        for provider in user_action_providers.get_all_dashboard_providers().values():
+            try:
+                items = provider.get_dashboard_pending_actions(request.user)
+            except Exception:
+                logger.exception(
+                    "Dashboard provider %s failed for user %s",
+                    provider.action_type,
+                    request.user.pk,
+                )
+                continue
+            # Capped per provider as well as in aggregate. This does not change
+            # what the caller sees — the sort and slice below decide that — it
+            # bounds the work: most providers aggregate into a single item, but
+            # one that emits a row per object (ToS consent, one per offering)
+            # would otherwise build and sort an unbounded list to render ten.
+            feed.extend(items[:DASHBOARD_LIST_LIMIT])
+        # Providers that predate the UserAction bridge return only the original
+        # eight keys. Filling the rest here keeps them untouched: without it
+        # every live provider would have to learn about corrective actions it
+        # never offers. Merged into new dicts rather than set on the originals,
+        # which belong to the provider and may well be reused across calls.
+        feed = [{**DASHBOARD_ITEM_DEFAULTS, **item} for item in feed]
+        # Severity decides what survives the cap, rather than provider
+        # registration order — that order is an accident of
+        # apps.get_app_configs(), so without this an "error" row silently falls
+        # off the end as soon as an extension is reordered. Within one severity
+        # the sort falls through to the deadline, so provider order only decides
+        # between items that match on both.
+        feed.sort(key=_dashboard_feed_sort_key)
+        serializer = serializers.DashboardPendingActionSerializer(
+            feed[:DASHBOARD_LIST_LIMIT], many=True
+        )
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @extend_schema(
+        summary="Get general dashboard stats",
+        description=(
+            "Returns counts shown on the general dashboard for the current "
+            "user: pending permission requests they can act on, active "
+            "invitations addressed to them, and their pending onboarding "
+            "applications."
+        ),
+        responses={200: serializers.DashboardGeneralStatsSerializer},
+    )
+    @core_views.no_count_action
+    @action(detail=False, methods=["get"], url_path="dashboard-general-stats")
+    def dashboard_general_stats(self, request):
+        user = request.user
+        # Whether a request can be approved is decided per object by
+        # users.utils.can_manage_permission_request — project-scoped group
+        # invitations and auto_create_project ones answer to different
+        # authorities. Counting by a single customer permission badged requests
+        # the user cannot act on and missed ones they can.
+        pending_permission_requests = len(get_manageable_permission_requests(request))
+        # Only PENDING invitations can be accepted: PENDING_PROJECT means the
+        # invitation has not been sent yet (the project start date is still in
+        # the future) and Invitation.accept rejects it with a 404, so counting
+        # it produced a badge the user had no way to clear. Recipient matching
+        # mirrors the "addressed to me" branch of InvitationFilterBackend —
+        # note that filter_pending_invitations is an accept-time authorisation
+        # gate, not a listing predicate: its Q(civil_number="") arm matches
+        # every blank-civil-number invitation on the platform.
+        # Each identifier is only an arm when the user actually has it.
+        # User.civil_number is nullable with default=None while
+        # Invitation.civil_number is NOT NULL (blank meaning "anyone may
+        # accept"), so feeding None straight into the Q made Django emit
+        # `civil_number IS NULL` — an always-false arm that read as if it
+        # matched something. User.email is blank=True and gets the same
+        # treatment.
+        addressed_to_user = Q()
+        if user.email:
+            addressed_to_user |= Q(email__iexact=user.email)
+        if user.civil_number:
+            addressed_to_user |= Q(civil_number=user.civil_number)
+        # An empty Q() matches every row, so a user carrying neither identifier
+        # has to short-circuit rather than be counted the whole platform's
+        # pending invitations.
+        active_invitations = (
+            Invitation.objects.filter(
+                addressed_to_user, state=InvitationState.PENDING
+            ).count()
+            if addressed_to_user
+            else 0
+        )
+        pending_onboarding_applications = OnboardingVerification.objects.filter(
+            user=user, status=VerificationStatus.PENDING
+        ).count()
+        return Response(
+            {
+                "pending_permission_requests": pending_permission_requests,
+                "active_invitations": active_invitations,
+                "pending_onboarding_applications": pending_onboarding_applications,
+            },
+            status=status.HTTP_200_OK,
+        )
 
     @extend_schema(
         summary="Get user data access visibility",
@@ -2595,7 +2984,11 @@ class UserAgreementsViewSet(ActionsViewSet):
 
 
 class NotificationViewSet(ActionsViewSet):
-    queryset = core_models.Notification.objects.all().order_by("id")
+    queryset = (
+        core_models.Notification.objects.all()
+        .prefetch_related("templates")
+        .order_by("id")
+    )
     serializer_class = serializers.NotificationSerializer
     permission_classes = (PATScopeAwareIsAdminUser,)
     filterset_class = filters.NotificationFilter
@@ -2655,25 +3048,18 @@ class NotificationTemplateViewSet(ActionsViewSet):
         template: core_models.NotificationTemplate = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        new_content = serializer.validated_data["content"]
-        name = template.path
-        message = f"The template {name} has been overridden"
-        try:
-            template_dbtemplates = Template.objects.get(name=name)
-            template_dbtemplates.content = new_content
-            template_dbtemplates.save()
-        except Template.DoesNotExist:
-            template_dbtemplates = Template.objects.create(
-                name=name, content=new_content
-            )
+        template.content = serializer.validated_data["content"]
+        with reversion.create_revision():
+            template.save(update_fields=["content"])
+            reversion.set_user(request.user)
+            reversion.set_comment(f"Overridden via API by {request.user.username}")
 
-        # Explicitly refresh the dbtemplates cache entry.  remove_cached_template()
-        # would be a no-op here because a freshly-created Template has no sites yet,
-        # and it never clears the "notfound" sentinel the loader plants on a DB miss.
-        # add_template_to_cache() does all three steps: removes the old positive entry,
-        # removes the notfound sentinel, and writes the new content into cache — so the
-        # override takes effect on the very next email send without a process restart.
-        add_template_to_cache(template_dbtemplates)
+        # Refresh the cache so the override takes effect on the very next render
+        # without a process restart - this also clears the "notfound" sentinel the
+        # loader plants on a miss, so a template that had never been rendered yet
+        # is not silently bypassed the first time it is.
+        add_template_to_cache(template)
+        message = f"The template {template.path} has been overridden"
         logger.info(message)
         return Response({"detail": _(message)}, status=status.HTTP_200_OK)
 
@@ -3022,7 +3408,9 @@ class CustomerProjectMetadataComplianceDetailsViewSet(
                 answers = []
                 answered_question_ids = set()
 
-                for answer in completion.answers.all():
+                # Answers are per-user rows; list each question once, by its latest.
+                latest_answers = latest_answers_by_question(completion.answers.all())
+                for answer in latest_answers.values():
                     question_id = answer.question_id
                     answered_question_ids.add(question_id)
 
@@ -3336,13 +3724,18 @@ class CustomerProjectMetadataQuestionAnswersViewSet(
 
         # Bulk query for all answers for questions on this page
         question_ids = [q.id for q in questions]
-        answers = Answer.objects.filter(
-            question_id__in=question_ids,
-            completion__scope_content_type=project_ct,
-            completion__scope_object_id__in=project_ids,
-        ).select_related("user", "completion")
+        answers = (
+            Answer.objects.filter(
+                question_id__in=question_ids,
+                completion__scope_content_type=project_ct,
+                completion__scope_object_id__in=project_ids,
+            )
+            .select_related("user", "completion")
+            .order_by("modified", "id")
+        )
 
-        # Group answers by question_id
+        # Group answers by question_id. Answers are per-user rows; later rows
+        # overwrite earlier ones, so each project keeps its latest answer.
         answers_by_question = {}
         for answer in answers:
             question_id = answer.question_id

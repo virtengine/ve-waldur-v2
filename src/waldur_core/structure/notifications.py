@@ -199,8 +199,24 @@ class InvitationCreatedContext(BaseInvitationContext):
     reminder: bool = Field(
         description="A boolean flag, set to `True` if this is a reminder for a pending invitation."
     )
+    scope_link: str = Field(description="The URL of the scope the user is invited to.")
     invitation: Any = Field(
         description="The GroupInvitation instance. Used to access `invitation.get_expiration_time`."
+    )
+
+
+class CallInvitationCreatedContext(InvitationCreatedContext):
+    organizer_name: str = Field(
+        description="The name of the organization managing the call."
+    )
+
+
+class ProposalInvitationCreatedContext(InvitationCreatedContext):
+    call_name: str = Field(
+        description="The name of the call the proposal is submitted to."
+    )
+    round_cutoff_time: Any = Field(
+        description="The submission deadline of the round the proposal belongs to."
     )
 
 
@@ -266,6 +282,16 @@ class UserSection(NotificationSection):
         key="invitation_created",
         description="Sent to an invited user so they can accept the invitation.",
         context_model=InvitationCreatedContext,
+    )
+    call_invitation_created = Notification(
+        key="call_invitation_created",
+        description="Sent to a user invited to a call for proposals so they can accept the invitation.",
+        context_model=CallInvitationCreatedContext,
+    )
+    proposal_invitation_created = Notification(
+        key="proposal_invitation_created",
+        description="Sent to a user invited to a proposal team so they can accept the invitation.",
+        context_model=ProposalInvitationCreatedContext,
     )
     invitation_expired = Notification(
         key="invitation_expired",
@@ -362,6 +388,12 @@ class NotifyConsumerAboutPendingOrderContext(BaseOrderContext):
 class NotifyProviderAboutPendingOrderContext(BaseOrderContext):
     order_url: str = Field(
         description="A URL to the order details page for the provider."
+    )
+
+
+class NewOrderNotificationContext(NotifyProviderAboutPendingOrderContext):
+    order_type: str = Field(
+        description="The display name of the order type (e.g., 'create', 'update', 'terminate')."
     )
 
 
@@ -581,6 +613,12 @@ class MarketplaceSection(NotificationSection):
         description="A notification about usages. The recipients are organization owners.",
         context_model=UsagesNotificationContext,
     )
+    notify_about_new_order = Notification(
+        key="notify_about_new_order",
+        description="Notifies the recipients configured on the offering about every "
+        "new order for it, regardless of whether the order needs approval.",
+        context_model=NewOrderNotificationContext,
+    )
     notify_consumer_about_pending_order = Notification(
         key="notify_consumer_about_pending_order",
         description="Notifies project members with approval permissions about a pending order.",
@@ -770,6 +808,16 @@ class IssueUpdatedContext(BaseIssueContext):
     )
 
 
+class IssueCreatedContext(BaseModel):
+    issue: Any = Field(description="The newly created Issue model instance.")
+
+
+class CommentAddedStaffContext(BaseModel):
+    issue: Any = Field(description="The Issue model instance that was commented on.")
+    comment: Any = Field(description="The Comment model instance the caller added.")
+    issue_url: str = Field(description="Link to the issue in Homeport.")
+
+
 class ProviderTicketContext(BaseModel):
     issue: Any = Field(
         description="The Issue model instance routed to (or withdrawn from) the provider helpdesk."
@@ -787,6 +835,11 @@ class ProviderCommentContext(BaseModel):
     provider_helpdesk: Any = Field(
         description="The ProviderHelpdesk model instance the ticket relates to."
     )
+
+
+class IssueEscalatedContext(BaseModel):
+    issue: Any = Field(description="The Issue model instance that was escalated.")
+    reason: str = Field(description="The escalation reason.")
 
 
 class ProviderEscalationContext(BaseModel):
@@ -807,10 +860,31 @@ class SupportSection(NotificationSection):
         templates=[NotificationTemplate(path="description.txt", name="description")],
         context_model=IssueGenerationContext,
     )
+    notification_issue_created = Notification(
+        key="notification_issue_created",
+        description="Notification to staff and support users about a newly "
+        "created support request. Sent only by the built-in service desk — the "
+        "Atlassian, Zammad and SMAX backends notify their own agents.",
+        context_model=IssueCreatedContext,
+    )
+    notification_issue_escalated = Notification(
+        key="notification_issue_escalated",
+        description="Notification to staff and support users that a support "
+        "request has been escalated. Sent only by the built-in service desk.",
+        context_model=IssueEscalatedContext,
+    )
     notification_comment_added = Notification(
         key="notification_comment_added",
         description="Notification about a new comment in the issue. The recipient is issue caller.",
         context_model=CommentAddedContext,
+    )
+    notification_comment_added_staff = Notification(
+        key="notification_comment_added_staff",
+        description="Notification to the assignee, or to all staff and support "
+        "users when the ticket is unassigned, about a comment the issue caller "
+        "added. Sent only by the built-in service desk — the Atlassian, Zammad "
+        "and SMAX backends notify their own agents.",
+        context_model=CommentAddedStaffContext,
     )
     notification_comment_updated = Notification(
         key="notification_comment_updated",
@@ -848,6 +922,18 @@ class SupportSection(NotificationSection):
         description="Notify a provider helpdesk that a routed ticket has been escalated.",
         context_model=ProviderEscalationContext,
     )
+    provider_customer_comment = Notification(
+        key="provider_customer_comment",
+        description="Notify a provider helpdesk that the customer commented on "
+        "a ticket routed to them.",
+        context_model=ProviderCommentContext,
+    )
+    provider_sla_warning = Notification(
+        key="provider_sla_warning",
+        description="Notify a provider helpdesk that a routed ticket is "
+        "approaching its SLA deadline.",
+        context_model=ProviderTicketContext,
+    )
     provider_email_new_ticket = Notification(
         key="provider_email_new_ticket",
         description="Email a provider a new ticket via the email support backend.",
@@ -875,13 +961,28 @@ class ProposalStateChangedContext(BaseModel):
     project_name: str | None = Field(
         default=None, description="Name of the created project."
     )
-    allocation_date: Any | None = Field(default=None)
-    duration: int | None = Field(default=None)
+    allocation_date: Any | None = Field(
+        default=None, description="The day the granted project starts running."
+    )
+    duration: int | None = Field(
+        default=None,
+        description=(
+            "How long the granted project runs, in days. None where the grant "
+            "does not expire, in which case the line is not rendered."
+        ),
+    )
     proposal_name: str = Field(description="Name of the proposal.")
     proposal_creator_name: str = Field(
         description="Full name of the proposal's creator."
     )
-    call_name: str = Field(description="Name of the call for proposals.")
+    call_name: str | None = Field(
+        default=None,
+        description=(
+            "Name of the call for proposals. Absent, along with review_period, "
+            "for the access_request_* templates: those name no call, so they "
+            "are not given one to name."
+        ),
+    )
     rejection_feedback: str | None = Field(
         default=None,
         description="Comments from the manager if the proposal was rejected.",
@@ -1031,10 +1132,8 @@ class RoundClosingForManagersContext(BaseModel):
     start_date: Any = Field(description="The round start date.")
     close_date: Any = Field(description="The round close date.")
     total_reviews: int = Field(
-        description="The total number of review assignments created for this round."
-    )
-    review_strategy: str = Field(
-        description="The display name of the review strategy (e.g., 'After round')."
+        description="The number of reviews recorded against this round's proposals, "
+        "excluding rejected ones."
     )
     round_url: str = Field(description="A URL to the round management page.")
 
@@ -1091,10 +1190,51 @@ class ReviewerInvitationContext(BaseModel):
     )
 
 
+class WorkflowStepEventContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    trigger: str = Field(
+        description=(
+            "Workflow event: step_started, step_completed, step_rejected, "
+            "step_expired or deadline_approaching."
+        )
+    )
+    step_name: str = Field(description="Human-readable workflow step name.")
+    proposal_name: str = Field(description="Name of the proposal.")
+    proposal_url: str = Field(
+        description="Link to the proposal, applicant- or manager-side depending on audience."
+    )
+    call_name: str = Field(description="Name of the call.")
+    round_name: str = Field(description="Name of the round.")
+    deadline: Any = Field(
+        default=None, description="Step deadline, if the step has one."
+    )
+    days_before: int | None = Field(
+        default=None, description="Lead time in days for deadline_approaching."
+    )
+    outcome: str | None = Field(
+        default=None, description="Step outcome; omitted for the applicant audience."
+    )
+    outcome_reason: str = Field(
+        default="", description="Outcome reason; omitted for the applicant audience."
+    )
+    is_applicant: bool = Field(
+        description="True when the mail goes to the applicant side (status-only wording)."
+    )
+
+
 class ProposalSection(NotificationSection):
     class Meta:
         key = "proposal"
 
+    workflow_step_event = Notification(
+        key="workflow_step_event",
+        description=(
+            "Sent when a call's workflow notification rule fires: a workflow "
+            "step started, completed, was rejected, expired, or its deadline is "
+            "approaching. Audience is configured per call and step."
+        ),
+        context_model=WorkflowStepEventContext,
+    )
     new_proposal_submitted = Notification(
         key="new_proposal_submitted",
         description="Notifies call managers about a new proposal submission.",
@@ -1117,8 +1257,23 @@ class ProposalSection(NotificationSection):
     )
     proposal_state_changed = Notification(
         key="proposal_state_changed",
-        description="A notification about the proposal state changes (submitted → in review → accepted/rejected).",
+        description=(
+            "A notification about the proposal state changes (submitted → in "
+            "review → accepted/rejected). Deployments that hide calls from "
+            "applicants (SERVICE_ACCESS_MODE = 'marketplace') send the "
+            "access_request_* templates below instead, which say the same "
+            "thing without naming a call or a round. One event, one switch, "
+            "two sets of words — a deployment only ever sends one of them."
+        ),
         context_model=ProposalStateChangedContext,
+        templates=[
+            NotificationTemplate(path=f"{base}_{suffix}", name=f"{base}_{suffix}")
+            for base in (
+                "proposal_state_changed",
+                "access_request_state_changed",
+            )
+            for suffix in ("subject.txt", "message.txt", "message.html")
+        ],
     )
     proposal_submission_deadline_approaching = Notification(
         key="proposal_submission_deadline_approaching",

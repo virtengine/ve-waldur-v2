@@ -6,6 +6,8 @@ from io import StringIO
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.management import call_command
+from django.core.management.base import CommandError
+from django.db import connection
 from django.test import TestCase
 
 from waldur_core.core.models import User
@@ -43,7 +45,9 @@ from waldur_mastermind.policy.models import (
     SlurmPeriodicUsagePolicy,
 )
 from waldur_mastermind.policy.tests import factories as policy_factories
+from waldur_mastermind.proposal.enums import COITypes
 from waldur_mastermind.proposal.models import (
+    CallCOIConfiguration,
     CallWorkflowStep,
     ProposalWorkflowStepInstance,
 )
@@ -74,6 +78,151 @@ class ImportStructureCommandTest(TestCase):
         kwargs.setdefault("stdout", output)
         call_command("import_structure", *args, **kwargs)
         return output.getvalue()
+
+    def test_import_does_not_overwrite_a_provider_backed_username(self):
+        """QuerySet.update() bypasses the model guard, so the import filters itself.
+
+        Model.save() refuses a delegated write on a backed account, but the two
+        update paths in this command go through QuerySet.update(), which does
+        not call save() at all. They are the only way a backed row's cached
+        username could end up diverged from its provider account in the
+        database, and a dump is exactly where a stale one would come from.
+        """
+        from waldur_core.structure.tests import factories as structure_factories
+        from waldur_mastermind.marketplace import models
+        from waldur_mastermind.marketplace.tests import factories
+
+        offering = factories.OfferingFactory()
+        provider = factories.ServiceProviderFactory(customer=offering.customer)
+        user = structure_factories.UserFactory()
+        account = models.ServiceProviderAccount.objects.create(
+            service_provider=provider, user=user, username="owned_by_provider"
+        )
+        offering_user = models.OfferingUser.objects.create(
+            offering=offering, user=user, service_provider_account=account
+        )
+
+        self._create_test_json(
+            {
+                "offering_users": [
+                    {
+                        "uuid": offering_user.uuid.hex,
+                        "offering_uuid": offering.uuid.hex,
+                        "user_uuid": user.uuid.hex,
+                        "username": "from_the_dump",
+                    }
+                ]
+            }
+        )
+        self._call_import_command("-i", self.test_file_path, "--update")
+
+        offering_user.refresh_from_db()
+        self.assertEqual(offering_user.username, "owned_by_provider")
+
+    def test_import_still_sets_the_username_on_an_unbacked_account(self):
+        from waldur_core.structure.tests import factories as structure_factories
+        from waldur_mastermind.marketplace import models
+        from waldur_mastermind.marketplace.tests import factories
+
+        offering = factories.OfferingFactory()
+        user = structure_factories.UserFactory()
+        offering_user = models.OfferingUser.objects.create(
+            offering=offering, user=user, username="before"
+        )
+
+        self._create_test_json(
+            {
+                "offering_users": [
+                    {
+                        "uuid": offering_user.uuid.hex,
+                        "offering_uuid": offering.uuid.hex,
+                        "user_uuid": user.uuid.hex,
+                        "username": "after",
+                    }
+                ]
+            }
+        )
+        self._call_import_command("-i", self.test_file_path, "--update")
+
+        offering_user.refresh_from_db()
+        self.assertEqual(offering_user.username, "after")
+
+    # UUID validation tests
+
+    def test_import_aborts_on_malformed_uuid(self):
+        """A uuid UUIDField cannot parse must stop the import, not become NULL.
+
+        UUIDField coerces an unparseable value to None rather than raising, so
+        without this check the row reaches the database as NULL and fails with
+        "null value in column uuid violates not-null constraint" -- naming
+        neither the bad value nor the collection it came from.
+        """
+        self._create_test_json(
+            {
+                "users": [
+                    {
+                        "uuid": "1111111111111111111111111111111111",
+                        "username": "toolonguuid",
+                        "email": "toolong@example.com",
+                    }
+                ]
+            }
+        )
+
+        with self.assertRaises(CommandError):
+            self._call_import_command("-i", self.test_file_path)
+
+        self.assertFalse(User.objects.filter(username="toolonguuid").exists())
+
+    def test_import_reports_every_malformed_uuid_collection(self):
+        """The abort message must name each offending collection and field."""
+        self._create_test_json(
+            {
+                "users": [
+                    {
+                        "uuid": "o1111111111111111111111111111111",
+                        "username": "nonhex",
+                        "email": "nonhex@example.com",
+                    }
+                ],
+                "customers": [
+                    {"uuid": "222222222222222222222222222222222", "name": "Too long"}
+                ],
+            }
+        )
+
+        output = StringIO()
+        with self.assertRaises(CommandError):
+            call_command("import_structure", "-i", self.test_file_path, stdout=output)
+
+        rendered = output.getvalue()
+        self.assertIn("malformed UUID", rendered)
+        self.assertIn("$.users.uuid", rendered)
+        self.assertIn("$.customers.uuid", rendered)
+
+    def test_import_accepts_hyphenated_and_bare_uuids(self):
+        """Both renderings are valid input and must survive validation."""
+        self._create_test_json(
+            {
+                "users": [
+                    {
+                        "uuid": "33333333-3333-3333-3333-333333333333",
+                        "username": "hyphenated",
+                        "email": "hyphenated@example.com",
+                    },
+                    {
+                        "uuid": "44444444444444444444444444444444",
+                        "username": "bare",
+                        "email": "bare@example.com",
+                    },
+                ]
+            }
+        )
+
+        self._call_import_command("-i", self.test_file_path)
+
+        self.assertTrue(User.objects.filter(username="hyphenated").exists())
+        self.assertTrue(User.objects.filter(username="bare").exists())
 
     # Basic Import Tests
 
@@ -209,7 +358,6 @@ class ImportStructureCommandTest(TestCase):
                 "backend_id": "vm",
                 "default_vm_category": True,
                 "default_volume_category": False,
-                "default_tenant_category": False,
             }
         ]
 
@@ -271,6 +419,56 @@ class ImportStructureCommandTest(TestCase):
         self.assertTrue(offering.shared)
         self.assertFalse(offering.billable)
         self.assertEqual(offering.attributes, {"key": "value"})
+
+    def test_update_existing_offering_encrypts_secret_options(self):
+        """--update must save through the instance so secret_options is encrypted,
+        not stored verbatim from the (plaintext) export dump via .update()."""
+        customer = structure_factories.CustomerFactory(
+            uuid="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        )
+        category = marketplace_factories.CategoryFactory(
+            uuid="cccccccc-cccc-cccc-cccc-cccccccccccc"
+        )
+        offering = marketplace_factories.OfferingFactory(
+            uuid="dddddddd-dddd-dddd-dddd-dddddddddddd",
+            customer=customer,
+            category=category,
+            type="Test.Type",
+            secret_options={},
+        )
+        data = {
+            "offerings": [
+                {
+                    "uuid": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+                    "name": "Updated",
+                    "type": "Test.Type",
+                    "state": 1,
+                    "customer_uuid": str(customer.uuid),
+                    "category_uuid": str(category.uuid),
+                    "attributes": {},
+                    "options": {},
+                    "resource_options": {},
+                    "plugin_options": {},
+                    "secret_options": {"token": "imported-secret"},
+                }
+            ]
+        }
+        self._create_test_json(data)
+
+        self._call_import_command("-i", self.test_file_path, "--update")
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT secret_options FROM marketplace_offering WHERE id = %s",
+                [offering.id],
+            )
+            raw = cursor.fetchone()[0]
+        raw = json.loads(raw) if isinstance(raw, str) else raw
+        self.assertTrue(raw["token"].startswith("gAAAA"))
+        self.assertEqual(
+            Offering.objects.get(pk=offering.pk).secret_options["token"],
+            "imported-secret",
+        )
 
     # Update Mode Tests
 
@@ -1231,7 +1429,7 @@ class ImportStructureCommandTest(TestCase):
                 "usage": "100.50",
                 "date": "2024-03-15T10:30:00Z",
                 "billing_period": "2024-03-01",
-                "recurring": True,
+                "missing_usage_policy": "zero",
                 "description": "CPU usage for March",
             },
             {
@@ -1241,7 +1439,8 @@ class ImportStructureCommandTest(TestCase):
                 "usage": "500.00",
                 "date": "2024-03-15T10:30:00Z",
                 "billing_period": "2024-03-01",
-                "recurring": False,
+                # legacy dumps only carry the deprecated boolean
+                "recurring": True,
                 "description": "Storage usage for March",
             },
         ]
@@ -1258,12 +1457,12 @@ class ImportStructureCommandTest(TestCase):
         self.assertEqual(usage1.resource.uuid, resource.uuid)
         self.assertEqual(usage1.component.uuid, component1.uuid)
         self.assertEqual(float(usage1.usage), 100.5)
-        self.assertTrue(usage1.recurring)
+        self.assertEqual(usage1.missing_usage_policy, "zero")
         self.assertEqual(usage1.description, "CPU usage for March")
 
         usage2 = ComponentUsage.objects.get(uuid="dddddddd-eeee-ffff-aaaa-222222222222")
         self.assertEqual(float(usage2.usage), 500.0)
-        self.assertFalse(usage2.recurring)
+        self.assertEqual(usage2.missing_usage_policy, "reuse")
 
     def test_import_invoices_creates_new_invoices(self):
         """Test that importing invoices creates new invoice objects."""
@@ -2081,11 +2280,16 @@ class ImportStructureCommandTest(TestCase):
         customer1 = structure_factories.CustomerFactory()
         customer2 = structure_factories.CustomerFactory()
 
-        # Create data with invalid invoice (missing customer) and valid offering users
+        # Create data with an invoice and an offering user whose references do not
+        # resolve, so both rows fail while the customers around them still import.
+        # Their own uuids are well formed on purpose: a malformed identity uuid is
+        # rejected up front by _validate_uuids and would abort the whole run.
+        failing_invoice_uuid = "aaaaaaaaaaaa4aaaaaaaaaaaaaaaaaa1"
+        failing_offering_user_uuid = "aaaaaaaaaaaa4aaaaaaaaaaaaaaaaaa2"
         data = {
             "invoices": [
                 {
-                    "uuid": "invalid-invoice-uuid",
+                    "uuid": failing_invoice_uuid,
                     "customer_uuid": "nonexistent-customer-uuid",  # This will fail
                     "month": 1,
                     "year": 2024,
@@ -2094,7 +2298,7 @@ class ImportStructureCommandTest(TestCase):
             ],
             "offering_users": [
                 {
-                    "uuid": "valid-offering-user-uuid",
+                    "uuid": failing_offering_user_uuid,
                     "offering_uuid": "nonexistent-offering-uuid",  # This will also fail
                     "user_uuid": "nonexistent-user-uuid",
                     "username": "testuser",
@@ -2128,11 +2332,13 @@ class ImportStructureCommandTest(TestCase):
 
         # Verify error messages are shown for failed individual objects
         self.assertIn(
-            "Skipping invoice invalid-invoice-uuid: customer nonexistent-customer-uuid not found",
+            f"Skipping invoice {failing_invoice_uuid}: "
+            "customer nonexistent-customer-uuid not found",
             output,
         )
         self.assertIn(
-            "Skipping offering user valid-offering-user-uuid: offering nonexistent-offering-uuid not found",
+            f"Skipping offering user {failing_offering_user_uuid}: "
+            "offering nonexistent-offering-uuid not found",
             output,
         )
 
@@ -3487,3 +3693,73 @@ class ImportWorkflowEngineStateTest(TestCase):
         self.assertEqual(
             ProposalWorkflowStepInstance.objects.filter(proposal=proposal).count(), 0
         )
+
+
+class ImportCallCOIConfigurationTest(TestCase):
+    """The importer writes the COI type-handling rules straight to the ORM, so
+    it has to enforce the same invariant the API serializer does (WAL-9601).
+    """
+
+    CONFIG_UUID = "cc100000-0000-0000-0000-000000000001"
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.test_file_path = os.path.join(self.temp_dir, "test_structure.json")
+        self.call = proposal_factories.CallFactory()
+
+    def tearDown(self):
+        if os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir)
+
+    def _run(self, **rules):
+        data = {
+            "call_coi_configurations": [
+                {
+                    "uuid": self.CONFIG_UUID,
+                    "call_uuid": self.call.uuid.hex,
+                    **rules,
+                }
+            ]
+        }
+        with open(self.test_file_path, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        output = StringIO()
+        call_command("import_structure", input=self.test_file_path, stdout=output)
+        return output.getvalue()
+
+    def test_disjoint_rules_are_imported(self):
+        self._run(
+            recusal_required_types=[COITypes.INST_SAME],
+            management_allowed_types=[COITypes.COMPET],
+        )
+
+        config = CallCOIConfiguration.objects.get(call=self.call)
+        self.assertEqual(config.recusal_required_types, [COITypes.INST_SAME])
+        self.assertEqual(config.management_allowed_types, [COITypes.COMPET])
+
+    def test_type_used_in_two_rules_is_skipped(self):
+        output = self._run(
+            recusal_required_types=[COITypes.INST_SAME],
+            management_allowed_types=[COITypes.INST_SAME],
+        )
+
+        self.assertFalse(CallCOIConfiguration.objects.filter(call=self.call).exists())
+        self.assertIn("only be assigned to one rule", output)
+        self.assertIn(COITypes.INST_SAME, output)
+
+    def test_unknown_conflict_type_is_skipped(self):
+        output = self._run(recusal_required_types=["NOT_A_REAL_COI_TYPE"])
+
+        self.assertFalse(CallCOIConfiguration.objects.filter(call=self.call).exists())
+        self.assertIn("unknown conflict types", output)
+        self.assertIn("NOT_A_REAL_COI_TYPE", output)
+
+    def test_every_problem_is_reported_in_one_pass(self):
+        """A preset author should not have to fix one error to discover the next."""
+        output = self._run(
+            recusal_required_types=[COITypes.INST_SAME, "NOT_A_REAL_COI_TYPE"],
+            management_allowed_types=[COITypes.INST_SAME],
+        )
+
+        self.assertIn("unknown conflict types", output)
+        self.assertIn("only be assigned to one rule", output)

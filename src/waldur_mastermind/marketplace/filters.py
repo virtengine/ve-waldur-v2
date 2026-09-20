@@ -46,15 +46,17 @@ from waldur_core.structure.managers import (
     get_project_users,
 )
 from waldur_mastermind.invoices import models as invoices_models
-from waldur_mastermind.marketplace import plugins
+from waldur_mastermind.marketplace import billing_mode, plugins
 from waldur_mastermind.marketplace.enums import (
     BillingTypes,
     CourseAccountState,
+    MissingUsagePolicies,
     OfferingStates,
     OfferingUserRuntimeStates,
     OfferingUserStates,
     OrderStates,
     OrderTypes,
+    ResourceApiKeyStates,
     ResourceStates,
     RobotAccountStates,
     ServiceAccountState,
@@ -64,14 +66,16 @@ from waldur_mastermind.marketplace.managers import (
     get_connected_offerings,
 )
 from waldur_mastermind.proposal import models as proposal_models
-from waldur_mastermind.proposal.enums import CallStates, RequestedOfferingStates
 from waldur_openstack import models as openstack_models
 from waldur_pid import models as pid_models
 
 from . import models, utils
 
 
-class ServiceProviderFilter(django_filters.FilterSet):
+class ServiceProviderFilter(
+    core_filters.CreatedModifiedFilter,
+    django_filters.FilterSet,
+):
     customer = core_filters.URLFilter(
         view_name="customer-detail",
         field_name="customer__uuid",
@@ -133,6 +137,11 @@ class OfferingFilter(
         view_name="customer-detail",
         method="filter_allowed_customer",
         label="Allowed customer UUID",
+    )
+    consumer_customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        method="filter_consumer_customer",
+        label="Consumer customer UUID",
     )
     service_manager_uuid = core_filters.RelatedUUIDFilter(
         view_name="user-detail",
@@ -203,7 +212,22 @@ class OfferingFilter(
         label="Scope UUID",
     )
     accessible_via_calls = django_filters.BooleanFilter(
-        label="Accessible via calls", method="filter_accessible_via_calls"
+        label="Accessible via calls",
+        method="filter_accessible_via_calls",
+        help_text=(
+            "Deprecated: offerings accepted on an active call, regardless of "
+            "whether a proposal can actually be submitted for them. Use "
+            "open_for_proposals instead."
+        ),
+    )
+    open_for_proposals = django_filters.BooleanFilter(
+        label="Open for proposals",
+        method="filter_open_for_proposals",
+        help_text=(
+            "Offerings that can be requested through a call right now: accepted "
+            "on an active call with a round that is open, and covered by a "
+            "resource template when the call defines any."
+        ),
     )
     accessible = django_filters.BooleanFilter(
         label="Only offerings the current user can order",
@@ -269,6 +293,28 @@ class OfferingFilter(
 
     def filter_service_manager(self, queryset, name, value):
         return queryset.filter_for_service_manager(value)
+
+    def filter_consumer_customer(self, queryset, name, value):
+        """Offerings the given customer actually consumes.
+
+        Note this is the consumer side: ``customer_uuid`` above matches the
+        *provider* that publishes an offering, and ``allowed_customer_uuid``
+        matches who is permitted to order one. Neither answers "which offerings
+        does this organization already hold resources of".
+
+        Terminated resources are excluded, and the offering must have opted into
+        access subnets. Both conditions are deliberately the same ones the
+        access-subnet serializer enforces on write: without the plugin-option
+        check the picker offered offerings whose creation then failed with
+        "Access subnets are not enabled for this offering".
+        """
+        return queryset.filter(
+            plugin_options__has_key="enable_resource_access_subnets",
+            plugin_options__enable_resource_access_subnets=True,
+            id__in=models.Resource.objects.filter(project__customer__uuid=value)
+            .exclude(state=models.Resource.States.TERMINATED)
+            .values("offering_id"),
+        ).distinct()
 
     def filter_project(self, queryset, name, value):
         return queryset.filter_for_project(value)
@@ -347,14 +393,28 @@ class OfferingFilter(
         return queryset.filter_accessible_for_user(self.request.user)
 
     def filter_accessible_via_calls(self, queryset, name, value):
+        # Deliberately loose and frozen: this filter is published API surface, so
+        # it keeps the meaning it shipped with. open_for_proposals is the one that
+        # answers "can a proposal be submitted for this offering right now".
         if value is None:
             return queryset
 
-        from waldur_mastermind.proposal.models import RequestedOffering
+        offerings_ids = (
+            proposal_models.RequestedOffering.objects.offering_ids_in_active_calls()
+        )
 
-        offerings_ids = RequestedOffering.objects.filter(
-            state=RequestedOfferingStates.ACCEPTED, call__state=CallStates.ACTIVE
-        ).values_list("offering_id", flat=True)
+        if value:
+            return queryset.filter(id__in=offerings_ids)
+        else:
+            return queryset.exclude(id__in=offerings_ids)
+
+    def filter_open_for_proposals(self, queryset, name, value):
+        if value is None:
+            return queryset
+
+        offerings_ids = (
+            proposal_models.RequestedOffering.objects.offering_ids_open_for_proposals()
+        )
 
         if value:
             return queryset.filter(id__in=offerings_ids)
@@ -481,15 +541,19 @@ class OfferingCustomersFilterBackend(BaseFilterBackend):
 
 class ResourceAccessSubnetConcealmentFilterBackend(BaseFilterBackend):
     """Hide resources whose offering opted into subnet-based concealment when the
-    caller's IP is not covered by the resource's access subnets.
+    caller's IP is not covered by the applicable access subnets.
 
     Mirrors the organization-level ``filter_queryset_by_user_ip`` semantics:
     staff/support and requests without a resolvable IP bypass the check. A
     resource is hidden only when its offering enabled
-    ``conceal_subnet_restricted_resources`` AND it is restricted (it has at least
-    one own subnet, or its offering has at least one provider-default subnet) AND
-    the caller's IP is in none of the resource's own subnets nor the offering's
-    default subnets. The provider defaults widen the allow-list.
+    ``conceal_subnet_restricted_resources`` AND it is restricted (its owning
+    customer has at least one subnet for that offering, or the offering has at
+    least one provider-default subnet) AND the caller's IP is in neither set.
+    The provider defaults widen the allow-list.
+
+    Note the fail-open default this preserves: a customer that has defined no
+    subnets for an offering with no provider defaults is not restricted at all.
+    Concealment is opt-in by having a list, not by the flag alone.
     """
 
     FLAG = "conceal_subnet_restricted_resources"
@@ -502,35 +566,46 @@ class ResourceAccessSubnetConcealmentFilterBackend(BaseFilterBackend):
         if user.is_staff or user.is_support or not user_ip:
             return queryset
 
-        concealing = {
-            "offering__plugin_options__has_key": self.FLAG,
-            f"offering__plugin_options__{self.FLAG}": True,
-        }
-        # Resources restricted because they have their own subnet(s).
-        restricted_own = models.ResourceAccessSubnet.objects.filter(
-            **{f"resource__{k}": v for k, v in concealing.items()},
-            inet__isnull=False,
-        ).values_list("resource_id", flat=True)
-        # Concealing offerings that carry provider-default subnets: every resource
-        # of such an offering is restricted (checked against the defaults).
+        concealing = Q(
+            **{
+                "offering__plugin_options__has_key": self.FLAG,
+                f"offering__plugin_options__{self.FLAG}": True,
+            }
+        )
+
+        def customer_list(**lookups):
+            # Correlated on both columns, so one organization's list never
+            # restricts — or admits — another organization's resources of the
+            # same offering. A subquery rather than an enumerated set of pairs:
+            # the pair count grows with customers x offerings and must not be
+            # inlined into the SQL on every resource listing.
+            return Exists(
+                models.AccessSubnetOfferingScope.objects.filter(
+                    access_subnet__customer_id=OuterRef("project__customer_id"),
+                    offering_id=OuterRef("offering_id"),
+                    **{
+                        f"access_subnet__{key}": value for key, value in lookups.items()
+                    },
+                )
+            )
+
+        # Offerings carrying provider-default subnets: every resource of such an
+        # offering is restricted, and checked against those defaults.
         offerings_with_defaults = models.OfferingAccessSubnet.objects.filter(
-            **concealing,
             inet__isnull=False,
         ).values_list("offering_id", flat=True)
-
-        # Resources allowed because one of their own subnets covers the IP.
-        allowed_own = models.ResourceAccessSubnet.objects.filter(
-            inet__net_contains_or_equals=user_ip,
-        ).values_list("resource_id", flat=True)
         # Offerings whose provider-default subnets cover the IP.
         offerings_allowing_ip = models.OfferingAccessSubnet.objects.filter(
             inet__net_contains_or_equals=user_ip,
         ).values_list("offering_id", flat=True)
 
-        restricted = Q(pk__in=restricted_own) | Q(
-            offering_id__in=offerings_with_defaults
+        restricted = concealing & (
+            Q(customer_list(inet__isnull=False))
+            | Q(offering_id__in=offerings_with_defaults)
         )
-        allowed = Q(pk__in=allowed_own) | Q(offering_id__in=offerings_allowing_ip)
+        allowed = Q(customer_list(inet__net_contains_or_equals=user_ip)) | Q(
+            offering_id__in=offerings_allowing_ip
+        )
         return queryset.exclude(restricted & ~allowed)
 
 
@@ -1522,6 +1597,10 @@ class ResourceFilter(
             ("name", "name"),
             ("created", "created"),
             ("project__name", "project_name"),
+            ("project__customer__name", "customer_name"),
+            ("offering__name", "offering_name"),
+            ("plan__name", "plan_name"),
+            ("backend_id", "backend_id"),
             ("state", "state"),
             ("end_date", "end_date"),
         )
@@ -1621,25 +1700,17 @@ class ResourceFilter(
         if value is None:
             return queryset
         if value:
-            return queryset.filter(
-                offering__components__billing_type=BillingTypes.USAGE
-            ).distinct()
+            return queryset.filter(billing_mode.usage_resource_q()).distinct()
         else:
-            return queryset.exclude(
-                offering__components__billing_type=BillingTypes.USAGE
-            ).distinct()
+            return queryset.exclude(billing_mode.usage_resource_q()).distinct()
 
     def filter_limit_based(self, queryset: ResourceQuerySet, name, value):
         if value is None:
             return queryset
         if value:
-            return queryset.filter(
-                offering__components__billing_type=BillingTypes.LIMIT
-            ).distinct()
+            return queryset.filter(billing_mode.limit_resource_q()).distinct()
         else:
-            return queryset.exclude(
-                offering__components__billing_type=BillingTypes.LIMIT
-            ).distinct()
+            return queryset.exclude(billing_mode.limit_resource_q()).distinct()
 
     def filter_only_limit_based(self, queryset: ResourceQuerySet, name, value):
         if value is None:
@@ -1737,38 +1808,6 @@ class ResourceFilter(
         return queryset
 
 
-class ResourceAccessSubnetFilter(django_filters.FilterSet):
-    resource = core_filters.URLFilter(
-        view_name="marketplace-resource-detail",
-        field_name="resource__uuid",
-        label="Resource URL",
-    )
-    resource_uuid = core_filters.RelatedUUIDFilter(
-        view_name="marketplace-resource-detail",
-        field_name="resource__uuid",
-        label="Resource UUID",
-    )
-    offering_uuid = core_filters.RelatedUUIDFilter(
-        view_name="marketplace-provider-offering-detail",
-        field_name="resource__offering__uuid",
-        label="Offering UUID",
-    )
-    inet = django_filters.CharFilter(lookup_expr="icontains", label="Inet")
-    description = django_filters.CharFilter(
-        lookup_expr="icontains", label="Description"
-    )
-
-    class Meta:
-        model = models.ResourceAccessSubnet
-        fields = [
-            "resource",
-            "resource_uuid",
-            "offering_uuid",
-            "inet",
-            "description",
-        ]
-
-
 class OfferingAccessSubnetFilter(django_filters.FilterSet):
     offering = core_filters.URLFilter(
         view_name="marketplace-provider-offering-detail",
@@ -1851,10 +1890,23 @@ class ResourceApiKeyFilter(django_filters.FilterSet):
         field_name="resource__uuid",
         label="Resource UUID",
     )
+    # The site agent's reconciliation pass sweeps a whole offering for keys stuck
+    # mid-rotation; without these it would have to list keys per resource.
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="resource__offering__uuid",
+        label="Offering UUID",
+    )
+    state = core_filters.MappedMultipleChoiceFilter(
+        ResourceApiKeyStates.CHOICES, label="API key state"
+    )
+    modified_before = django_filters.IsoDateTimeFilter(
+        field_name="modified", lookup_expr="lte", label="Modified before"
+    )
 
     class Meta:
         model = models.ResourceApiKey
-        fields = ("resource_uuid",)
+        fields = ("resource_uuid", "offering_uuid", "state", "modified_before")
 
 
 class RobotAccountFilter(core_filters.CreatedModifiedFilter, django_filters.FilterSet):
@@ -2029,11 +2081,16 @@ class ComponentUsageFilter(django_filters.FilterSet):
     type = django_filters.CharFilter(
         field_name="component__type", label="Component type"
     )
+    missing_usage_policy = django_filters.MultipleChoiceFilter(
+        choices=MissingUsagePolicies.CHOICES,
+        label="Missing usage policy",
+    )
 
     o = django_filters.OrderingFilter(
         fields=(
             "billing_period",
             "usage",
+            "missing_usage_policy",
         )
     )
 
@@ -2359,6 +2416,62 @@ class OfferingUserFilter(OfferingFilterMixin, core_filters.CreatedModifiedFilter
             ).distinct()
 
 
+class ServiceProviderAccountFilter(core_filters.CreatedModifiedFilter):
+    user_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail", field_name="user__uuid", label="User UUID"
+    )
+    user_username = django_filters.CharFilter(
+        field_name="user__username", lookup_expr="iexact", label="User username"
+    )
+    provider_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-service-provider-detail",
+        field_name="service_provider__uuid",
+        label="Service provider UUID",
+    )
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        field_name="service_provider__customer__uuid",
+        label="Provider organization UUID",
+    )
+    is_restricted = django_filters.BooleanFilter(
+        field_name="is_restricted", label="Is restricted"
+    )
+    state = core_filters.MappedMultipleChoiceFilter(
+        OfferingUserStates.CHOICES, label="Account state"
+    )
+    runtime_state = core_filters.MappedMultipleChoiceFilter(
+        OfferingUserRuntimeStates.CHOICES, label="Account runtime state"
+    )
+
+    o = django_filters.OrderingFilter(
+        fields=(
+            "created",
+            "modified",
+            "username",
+            ("user__first_name", "user_first_name"),
+            ("user__last_name", "user_last_name"),
+        )
+    )
+    query = django_filters.CharFilter(
+        method="filter_query",
+        label="Search by username, user name, UID or primary GID",
+    )
+
+    class Meta:
+        model = models.ServiceProviderAccount
+        fields = []
+
+    def filter_query(self, queryset, name, value):
+        return queryset.filter(
+            Q(username__icontains=value)
+            | Q(user__first_name__icontains=value)
+            | Q(user__last_name__icontains=value)
+            | Q(user__username__icontains=value)
+            | Q(backend_metadata__uidnumber__icontains=value)
+            | Q(backend_metadata__primarygroup__icontains=value)
+        )
+
+
 class OfferingUserChecklistCompletionsFilter(core_filters.CreatedModifiedFilter):
     """Filter for checklist completions related to offering users."""
 
@@ -2469,6 +2582,21 @@ class PosixIdPoolFilter(django_filters.FilterSet):
 
 
 class PosixIdentityFilter(django_filters.FilterSet):
+    """Filters for the POSIX identity audit list.
+
+    A pool covers a whole numeric range, so the list is paginated and has to be
+    narrowed server-side: filtering the page the client happens to hold would
+    report "not found" for values that exist further down the range.
+    """
+
+    # Non-user principals whose identity can be looked up by consumer kind. The
+    # user-scoped rows are keyed on ``user`` instead of a content type.
+    CONSUMER_TYPES = {
+        "robotaccount": models.RobotAccount,
+        "offeringusergroup": models.OfferingUserGroup,
+        "offeringrolegroup": models.OfferingRoleGroup,
+    }
+
     class Meta:
         model = models.PosixIdentity
         fields = []
@@ -2483,9 +2611,81 @@ class PosixIdentityFilter(django_filters.FilterSet):
         field_name="offering__uuid",
         label="Offering UUID",
     )
+    user_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail",
+        field_name="user__uuid",
+        label="User UUID",
+    )
     is_released = django_filters.BooleanFilter(
         field_name="released_at", lookup_expr="isnull", exclude=True
     )
+    recyclable = django_filters.BooleanFilter(
+        field_name="recyclable",
+        label="Recyclable (false lists released values withheld from the pool)",
+    )
+    uid = django_filters.NumberFilter(field_name="uid", label="UID")
+    gid = django_filters.NumberFilter(field_name="gid", label="GID")
+    uid_min = django_filters.NumberFilter(
+        field_name="uid", lookup_expr="gte", label="Minimum UID"
+    )
+    uid_max = django_filters.NumberFilter(
+        field_name="uid", lookup_expr="lte", label="Maximum UID"
+    )
+    gid_min = django_filters.NumberFilter(
+        field_name="gid", lookup_expr="gte", label="Minimum GID"
+    )
+    gid_max = django_filters.NumberFilter(
+        field_name="gid", lookup_expr="lte", label="Maximum GID"
+    )
+    consumer_type = django_filters.ChoiceFilter(
+        method="filter_consumer_type",
+        label="Principal kind",
+        choices=[
+            ("user", "User"),
+            ("robotaccount", "Robot account"),
+            ("offeringusergroup", "Project group"),
+            ("offeringrolegroup", "Role group"),
+        ],
+    )
+    keyword = django_filters.CharFilter(
+        method="filter_keyword",
+        label="Keyword (account username, first or last name, robot account name)",
+    )
+    o = django_filters.OrderingFilter(
+        fields=("uid", "gid", "created", "released_at"),
+        field_labels={
+            "uid": "UID",
+            "gid": "GID",
+            "created": "Issued",
+            "released_at": "Released",
+        },
+    )
+
+    def filter_consumer_type(self, queryset, name, value):
+        if value == "user":
+            return queryset.filter(user__isnull=False)
+        model = self.CONSUMER_TYPES.get(value)
+        if model is None:
+            return queryset.none()
+        return queryset.filter(content_type=ContentType.objects.get_for_model(model))
+
+    def filter_keyword(self, queryset, name, value):
+        # Only two principal kinds carry a name: the Waldur user behind an
+        # offering account, and a robot account. Groups are found by their GID.
+        # The generic FK cannot be joined, so robot accounts are matched through
+        # a subquery on their own table.
+        robot_accounts = models.RobotAccount.objects.filter(
+            username__icontains=value
+        ).values("id")
+        return queryset.filter(
+            Q(user__username__icontains=value)
+            | Q(user__first_name__icontains=value)
+            | Q(user__last_name__icontains=value)
+            | Q(
+                content_type=ContentType.objects.get_for_model(models.RobotAccount),
+                object_id__in=robot_accounts,
+            )
+        )
 
 
 class CategoryFilter(django_filters.FilterSet):
@@ -3002,18 +3202,18 @@ class UserOfferingConsentFilter(django_filters.FilterSet):
             return queryset.exclude(revocation_date__isnull=True)
 
     def filter_requires_reconsent(self, queryset, name, value):
+        outdated_consent = models.OfferingTermsOfService.objects.filter(
+            offering=OuterRef("offering"),
+            is_active=True,
+            requires_reconsent=True,
+        ).exclude(version=OuterRef("version"))
+        requires_reconsent_q = Q(revocation_date__isnull=True) & Q(
+            Exists(outdated_consent)
+        )
+
         if value:
-            return queryset.filter(
-                revocation_date__isnull=True,
-                offering__terms_of_service_configs__is_active=True,
-                offering__terms_of_service_configs__requires_reconsent=True,
-            )
-        else:
-            return queryset.exclude(
-                revocation_date__isnull=True,
-                offering__terms_of_service_configs__is_active=True,
-                offering__terms_of_service_configs__requires_reconsent=True,
-            )
+            return queryset.filter(requires_reconsent_q)
+        return queryset.exclude(requires_reconsent_q)
 
     o = django_filters.OrderingFilter(
         fields=(
@@ -3274,4 +3474,40 @@ class ResourceLimitChangeRequestFilter(django_filters.FilterSet):
 
     class Meta:
         model = models.ResourceLimitChangeRequest
+        fields = []
+
+
+class ResourceEndDateChangeRequestFilter(django_filters.FilterSet):
+    resource_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-resource-detail",
+        field_name="resource__uuid",
+        label="Resource UUID",
+    )
+    customer_uuid = core_filters.RelatedUUIDFilter(
+        view_name="customer-detail",
+        field_name="resource__project__customer__uuid",
+        label="Customer UUID",
+    )
+    project_uuid = core_filters.RelatedUUIDFilter(
+        view_name="project-detail",
+        field_name="resource__project__uuid",
+        label="Project UUID",
+    )
+    # An external approval system watches the offerings it is configured for, so
+    # it needs to ask for requests one offering at a time, the way it already
+    # does for orders.
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        field_name="resource__offering__uuid",
+        label="Offering UUID",
+    )
+    created_by_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail",
+        field_name="created_by__uuid",
+        label="Created by UUID",
+    )
+    state = ReviewStateFilter()
+
+    class Meta:
+        model = models.ResourceEndDateChangeRequest
         fields = []

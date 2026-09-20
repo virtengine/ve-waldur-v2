@@ -14,27 +14,24 @@ classifiers = [
 ]
 dependencies = [
   "apache-libcloud==3.7.0",
-  "azure-mgmt-compute>=37.1.0,<38.0.0",
-  "azure-mgmt-network>=30.1.0,<31.0.0",
-  "azure-mgmt-rdbms>=10.1.1,<11.0.0",
-  "azure-mgmt-resource>=24.0.0,<25.0.0",
-  "azure-mgmt-sql>=3.0.1,<4.0.0",
-  "azure-mgmt-storage>=24.0.0,<25.0.0",
-  "azure-identity>=1.25.1,<2.0.0",
-  "celery==5.5.3",
+  "celery==5.6.3",
   "django-auth-ldap>=5.2.0,<6.0.0",
   "django-filter==24.3",
   "django-fsm==2.8.1",
   "django-jsoneditor==0.2.3",
-  "django-model-utils @ git+https://github.com/waldur/django-model-utils@handle-instance-model-field-name",
+  # Pinned to a commit, not to the branch: a branch ref lets an upstream push
+  # change what a build installs without any change here or in uv.lock.
+  "django-model-utils @ git+https://github.com/waldur/django-model-utils@50cc7a1f1ed209ea7328d4672ad894a1bb9e74c6",
   "django-reversion==6.1.0",
   "djangorestframework>=3.16.0,<4.0.0",
   "djangosaml2>=1.11.0,<2.0.0",
   "docker==7.1.0",
   "lxml>=6.1.0",
-  "openportal>=0.28.0",
+  "openportal>=0.91.0",
   "Pillow>=12.2.0,<13.0.0",
-  "pycountry @ git+https://github.com/pycountry/pycountry.git@main",
+  # Was pinned to git main in August 2025 because the ISO data in the then-latest
+  # release (24.6.1) was stale. Upstream released 26.2.16 in February 2026, which
+  # carries that data, so the git dependency is no longer needed.
   "PyJWT>=2.12.1,<3.0.0",
   "pysaml2==7.4.2",
   "python-cinderclient>=7.0.0,<8.0.0",
@@ -44,7 +41,7 @@ dependencies = [
   "python-keystoneclient>=5.0.0,<6.0.0",
   "python-neutronclient>=11.0.0,<12.0.0",
   "python-novaclient>=18.0.0,<19.0.0",
-  "pyvmomi==8.0.3.0.1",
+  "pyvmomi==9.1.0.0",
   "PyYAML==6.0.2",
   "requests[socks]>=2.32.4,<3.0.0",
   "sentry-sdk>=2.8.0,<3.0.0",
@@ -55,16 +52,14 @@ dependencies = [
   "google-api-python-client>=2.176.0,<3.0.0",
   "google-auth-oauthlib>=1.2.2,<2.0.0",
   "django-health-check>=3.20.0,<4.0.0",
-  "django-dbtemplates @ git+https://github.com/jazzband/django-dbtemplates@master",
   "pydantic>=2.10.6,<3.0.0",
-  "cryptography==48.0.1",
+  "cryptography==50.0.0",
   "kubernetes>=31.0.0",
   "django>=6.0.4,<7.0",
-  "azure-mgmt-consumption>=10.0.0,<11.0.0",
   "django-netfields>=1.3.0,<2.0.0",
   "django-constance>=4.0.0,<5.0.0",
   "zammad-py==1.1.0",
-  "html2text>=2024.2.26,<2025.0.0",
+  "markdownify>=1.2.0,<2.0.0",
   "textile>=4.0.2,<5.0.0",
   "ua-parser>=0.18.0,<1.0.0",
   "sqlalchemy>=2.0.31,<3.0.0",
@@ -79,7 +74,7 @@ dependencies = [
   "hvac>=2.3.0,<3.0.0",
   "python-keycloak>=5.5.0,<6.0.0",
   "django-stubs-ext>=5.1.3,<6.0.0",
-  "waldur-api-client>=8.0.5",
+  "waldur-api-client>=8.0.9,<8.1",
   "atlassian-python-api>=4.0.7",
   "httpx[socks]>=0.28.1",
   "django-cors-headers>=4.5.0,<5.0.0",
@@ -89,6 +84,8 @@ dependencies = [
   "openstacksdk>=4.7.1",
   "scim2-models>=0.4.0",
   "tomli-w>=1.2.0",
+  "webauthn>=3.0.0",
+  "aiohttp>=3.14",
 ]
 
 [project.urls]
@@ -104,20 +101,17 @@ waldur_auth_saml2 = "waldur_auth_saml2.extension:SAML2Extension"
 waldur_auth_social = "waldur_auth_social.extension:AuthSocialExtension"
 waldur_auth_valimo = "waldur_auth_valimo.extension:AuthValimoExtension"
 waldur_aws = "waldur_aws.extension:AWSExtension"
-waldur_azure = "waldur_azure.extension:AzureExtension"
 waldur_billing = "waldur_mastermind.billing.extension:BillingExtension"
 waldur_booking = "waldur_mastermind.booking.extension:BookingExtension"
 waldur_digitalocean = "waldur_digitalocean.extension:DigitalOceanExtension"
 waldur_freeipa = "waldur_freeipa.extension:FreeIPAExtension"
 waldur_invoices = "waldur_mastermind.invoices.extension:InvoicesExtension"
 waldur_marketplace = "waldur_mastermind.marketplace.extension:MarketplaceExtension"
-waldur_marketplace_azure = "waldur_mastermind.marketplace_azure.extension:MarketplaceAzureExtension"
 waldur_marketplace_openportal = "waldur_mastermind.marketplace_openportal.extension:MarketplaceOpenPortalExtension"
 waldur_marketplace_openportal_remote = "waldur_mastermind.marketplace_openportal_remote.extension:MarketplaceOpenPortalRemoteExtension"
 waldur_marketplace_openstack = "waldur_mastermind.marketplace_openstack.extension:MarketplaceOpenStackExtension"
 waldur_marketplace_rancher = "waldur_mastermind.marketplace_rancher.extension:MarketplaceRancherExtension"
 waldur_marketplace_script = "waldur_mastermind.marketplace_script.extension:MarketplaceScriptExtension"
-waldur_marketplace_slurm = "waldur_mastermind.marketplace_slurm.extension:MarketplaceSlurmExtension"
 waldur_marketplace_site_agent = "waldur_mastermind.marketplace_site_agent.extension:MarketplaceSiteAgentExtension"
 waldur_marketplace_support = "waldur_mastermind.marketplace_support.extension:MarketplaceSupportExtension"
 waldur_marketplace_vmware = "waldur_mastermind.marketplace_vmware.extension:MarketplaceVMwareExtension"
@@ -133,13 +127,13 @@ waldur_notifications = "waldur_mastermind.notifications.extension:NotificationsE
 waldur_policy = "waldur_mastermind.policy.extension:PolicyExtension"
 waldur_proposal = "waldur_mastermind.proposal.extension:ProposalExtension"
 waldur_rancher = "waldur_rancher.extension:RancherExtension"
-waldur_slurm = "waldur_slurm.extension:SlurmExtension"
 waldur_support = "waldur_mastermind.support.extension:SupportExtension"
 waldur_vmware = "waldur_vmware.extension:VMwareExtension"
 waldur_pid = "waldur_pid.extension:PIDExtension"
 waldur_google = "waldur_mastermind.google.extension:GoogleExtension"
 waldur_hpc = "waldur_hpc.extension:HPCExtension"
 waldur_autoprovisioning = "waldur_autoprovisioning.extension:AutoprovisioningExtension"
+waldur_sram = "waldur_sram.extension:SramExtension"
 waldur_firecrest = "waldur_firecrest.extension:FirecrestExtension"
 waldur_lexis = "waldur_lexis.extension:LexisExtension"
 waldur_marketplace_reppu = "waldur_mastermind.marketplace_reppu.extension:MarketplaceReppuExtension"
@@ -162,7 +156,6 @@ packages = [
   "src/waldur_auth_valimo",
   "src/waldur_autoprovisioning",
   "src/waldur_aws",
-  "src/waldur_azure",
   "src/waldur_core",
   "src/waldur_digitalocean",
   "src/waldur_firecrest",
@@ -177,7 +170,7 @@ packages = [
   "src/waldur_openstack_tenant",
   "src/waldur_pid",
   "src/waldur_rancher",
-  "src/waldur_slurm",
+  "src/waldur_sram",
   "src/waldur_vmware",
 ]
 sources = ["src"]
@@ -204,6 +197,7 @@ target-version = "py313"
 # perform conditional imports after computing values, so ignore the related codes.
 "src/waldur_core/server/settings.py" = ["F403", "F405", "E402"]
 "src/waldur_core/server/base_settings.py" = ["F403", "F405", "E402"]
+"docker/rootfs/etc/waldur/settings.py" = ["F403", "F405", "E402"]
 # Extension registration runs imports after a guard clause, so the import is not
 # at the top of the module by design.
 "src/waldur_core/core/openapi_extensions.py" = ["E402"]
@@ -237,8 +231,8 @@ dev = [
     "respx>=0.22.0,<1.0.0",
     "django-types>=0.22.0,<1.0.0",
     "pyright>=1.1.399,<2.0.0",
-    "djangorestframework-types @ git+https://github.com/waldur/djangorestframework-types.git",
-    "celery-types>=0.23.0,<1.0.0",
+    "djangorestframework-types @ git+https://github.com/waldur/djangorestframework-types.git@a244bb689e07b1a5cf7aa13e890f2f9f652abc71",
+    "celery-types>=0.26.0,<1.0.0",
     "django-stubs-ext>=5.2.2,<6.0.0",
     "libcst>=1.8.6",
     "memray>=1.19.3",

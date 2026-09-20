@@ -1,11 +1,13 @@
+import calendar
 import json
 import os
-from datetime import UTC, datetime, timedelta
+import re
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from uuid import UUID
 
 from django.contrib.contenttypes.models import ContentType
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from django.db.models import F
 from django.utils import timezone
@@ -19,6 +21,7 @@ from waldur_core.checklist.models import (
     QuestionDependency,
     QuestionOption,
 )
+from waldur_core.core import encryption
 from waldur_core.core.features import FEATURES
 from waldur_core.core.middleware import skip_side_effects
 from waldur_core.core.models import Feature, SshPublicKey, User
@@ -42,7 +45,11 @@ from waldur_mastermind.invoices.models import (
     InvoiceItem,
     ProjectCredit,
 )
-from waldur_mastermind.marketplace.enums import LimitPeriods, RobotAccountStates
+from waldur_mastermind.marketplace.enums import (
+    LimitPeriods,
+    MissingUsagePolicies,
+    RobotAccountStates,
+)
 from waldur_mastermind.marketplace.models import (
     Category,
     CategoryGroup,
@@ -69,6 +76,8 @@ from waldur_mastermind.marketplace.models import (
     ResourceProject,
     RobotAccount,
     ServiceProvider,
+    SlurmOfferingQoS,
+    SlurmPartitionQoS,
     SoftwareCatalog,
 )
 from waldur_mastermind.policy.models import (
@@ -110,6 +119,42 @@ from waldur_mastermind.proposal.models import (
 )
 from waldur_openstack.models import Flavor, Image, Instance, Tenant, Volume
 
+OPENSTACK_TENANT_OFFERING = "OpenStack.Tenant"
+VOLUME_TYPE_COMPONENT_PREFIX = "gigabytes_"
+
+
+def is_plugin_provided_component(offering_type, component_type):
+    """The rule ``OfferingComponent.billed_per_plan`` replaced.
+
+    Used only for dumps taken before the field existed, so that importing one
+    reproduces what the offering would have resolved to at the time.
+    """
+    from waldur_mastermind.marketplace import plugins
+
+    if component_type in plugins.manager.get_component_types(offering_type):
+        return True
+    return offering_type == OPENSTACK_TENANT_OFFERING and component_type.startswith(
+        VOLUME_TYPE_COMPONENT_PREFIX
+    )
+
+
+def _without_delegated(defaults: dict, offering_user) -> dict:
+    """Drop the columns a provider account owns, when this row is backed by one.
+
+    These two updates go through ``QuerySet.update()``, which bypasses
+    ``Model.save()`` and so bypasses the refusal there. They are the only paths
+    that could leave a backed account's cached username diverged from its
+    parent in the database, and a dump is exactly where a stale one would come
+    from.
+    """
+    if not offering_user.is_provider_backed:
+        return defaults
+    return {
+        key: value
+        for key, value in defaults.items()
+        if key not in ("username", "backend_metadata")
+    }
+
 
 class Command(BaseCommand):
     help = """
@@ -146,6 +191,72 @@ class Command(BaseCommand):
         if uuid_str is None:
             return None
         return str(uuid_str).replace("-", "")
+
+    @classmethod
+    def _collect_invalid_uuids(cls, data):
+        """Find identity uuids in the payload that UUIDField cannot parse.
+
+        core.fields.UUIDField._parse_uuid returns None for anything UUID() rejects,
+        so a malformed identity uuid is silently coerced to NULL and only surfaces
+        as "null value in column uuid violates not-null constraint" -- an error
+        naming neither the offending value nor the row it came from. Checking up
+        front turns that into an actionable message.
+
+        Only the object's own "uuid" is checked. Reference fields ("customer_uuid",
+        "component_usage_uuid", ...) are deliberately left alone: an unresolvable
+        reference is already handled by each importer, which skips the row and says
+        which target was not found. Rejecting those here would break that path.
+
+        Returns a list of (path, key, value) tuples.
+        """
+        invalid = []
+
+        def visit(node, path):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    child = f"{path}.{key}"
+                    if key == "uuid" and isinstance(value, str) and value:
+                        try:
+                            UUID(cls._normalize_uuid(value))
+                        except (ValueError, AttributeError, TypeError):
+                            invalid.append((path, key, value))
+                    else:
+                        visit(value, child)
+            elif isinstance(node, list):
+                for index, item in enumerate(node):
+                    visit(item, f"{path}[{index}]")
+
+        visit(data, "$")
+        return invalid
+
+    def _validate_uuids(self, data):
+        """Report malformed uuids in the payload. Returns True when the data is usable."""
+        invalid = self._collect_invalid_uuids(data)
+        if not invalid:
+            return True
+
+        self.stdout.write(
+            self.style.ERROR(
+                f"Found {len(invalid)} malformed UUID value(s) in the input. "
+                "These would be silently stored as NULL and fail on insert."
+            )
+        )
+        # Group by collection and key so a systematic generator bug reads as one
+        # problem rather than hundreds of identical lines.
+        grouped = {}
+        for path, key, value in invalid:
+            collection = path.split("[")[0]
+            grouped.setdefault((collection, key), []).append(value)
+
+        for (collection, key), values in sorted(grouped.items()):
+            sample = values[0]
+            self.stdout.write(
+                self.style.ERROR(
+                    f"  {collection}.{key}: {len(values)} value(s), "
+                    f"e.g. {sample!r} ({len(str(sample))} chars)"
+                )
+            )
+        return False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -485,6 +596,18 @@ class Command(BaseCommand):
                 "skipped": 0,
                 "errors": 0,
             },
+            "slurm_offering_qos": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
+            "slurm_partition_qos": {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "errors": 0,
+            },
             "offering_software_catalogs": {
                 "created": 0,
                 "updated": 0,
@@ -596,6 +719,12 @@ class Command(BaseCommand):
         except Exception as e:
             self.stdout.write(self.style.ERROR(f"Failed to read file: {e}"))
             return
+
+        if not self._validate_uuids(data):
+            self.stdout.write(
+                self.style.ERROR("Aborting import: fix the UUID values above first.")
+            )
+            raise CommandError("Input contains malformed UUID values")
 
         if self.dry_run:
             self.stdout.write(
@@ -770,19 +899,25 @@ class Command(BaseCommand):
             ),
         )
 
+        # Import SLURM QoS profiles (depends on offerings)
+        self._safe_import(
+            "slurm_offering_qos",
+            lambda: self.import_slurm_offering_qos(data.get("slurm_offering_qos", [])),
+        )
+
+        # Import partition QoS allow-list links (depends on partitions and QoS)
+        self._safe_import(
+            "slurm_partition_qos",
+            lambda: self.import_slurm_partition_qos(
+                data.get("slurm_partition_qos", [])
+            ),
+        )
+
         # Import offering-software-catalog links
         self._safe_import(
             "offering_software_catalogs",
             lambda: self.import_offering_software_catalogs(
                 data.get("offering_software_catalogs", [])
-            ),
-        )
-
-        # Import SLURM periodic policies (depends on offerings)
-        self._safe_import(
-            "slurm_periodic_policies",
-            lambda: self.import_slurm_periodic_policies(
-                data.get("slurm_periodic_policies", [])
             ),
         )
 
@@ -811,6 +946,17 @@ class Command(BaseCommand):
         self._safe_import(
             "plan_components",
             lambda: self.import_plan_components(data.get("plan_components", [])),
+        )
+
+        # Import SLURM periodic policies after offering components: a policy's
+        # component limits are resolved by component type against the offering,
+        # so importing it earlier silently dropped every limit and left the
+        # policy with no thresholds at all.
+        self._safe_import(
+            "slurm_periodic_policies",
+            lambda: self.import_slurm_periodic_policies(
+                data.get("slurm_periodic_policies", [])
+            ),
         )
 
         # Import OpenStack instances and volumes (before resources, so resource scope linking works)
@@ -1075,6 +1221,13 @@ class Command(BaseCommand):
             "project_credits",
             lambda: self.import_project_credits(data.get("project_credits", [])),
         )
+
+        self._safe_import(
+            "customer_credit_drawdown",
+            lambda: self.apply_customer_credit_drawdown(
+                data.get("customer_credits", [])
+            ),
+        )
         self._safe_import(
             "invoices", lambda: self.import_invoices(data.get("invoices", []))
         )
@@ -1217,6 +1370,47 @@ class Command(BaseCommand):
             if not flags:
                 continue
             Resource.objects.filter(uuid=uuid).update(**flags)
+
+    def _parse_date(self, value):
+        """Parse a date, supporting ISO dates and relative offsets.
+
+        Beyond `relative:+30days`, a date may be expressed in months and
+        anchored to the start of a month:
+
+            relative:+2months            same day of month, two months out
+            relative:+0months@month_start  the 1st of the current month
+
+        Scenario presets need this: a credit that expires "this month" or a
+        project that ends "in twelve days" is only that if it moves with the
+        clock. Hard-coded dates make such a preset wrong within weeks.
+        """
+        if not value or not isinstance(value, str):
+            return None
+
+        if value.startswith("relative:"):
+            spec = value[9:]
+            anchor_month_start = spec.endswith("@month_start")
+            if anchor_month_start:
+                spec = spec[: -len("@month_start")]
+            match = re.match(r"([+-]?\d+)(day|month)s?$", spec)
+            if not match:
+                return None
+            amount = int(match.group(1))
+            today = timezone.localtime(timezone.now()).date()
+            if match.group(2) == "day":
+                result = today + timedelta(days=amount)
+            else:
+                month_index = today.month - 1 + amount
+                year = today.year + month_index // 12
+                month = month_index % 12 + 1
+                day = min(today.day, calendar.monthrange(year, month)[1])
+                result = date(year, month, day)
+            return result.replace(day=1) if anchor_month_start else result
+
+        try:
+            return datetime.fromisoformat(value).date()
+        except (ValueError, TypeError):
+            return None
 
     def _parse_datetime(self, value):
         """Parse a datetime string, supporting both ISO format and relative offsets.
@@ -2366,6 +2560,166 @@ class Command(BaseCommand):
                 )
                 self.stats["offering_partitions"]["errors"] += 1
 
+    def import_slurm_offering_qos(self, qos_data):
+        """Import SLURM QoS profiles (offering-scoped QoS catalog)."""
+        self.stdout.write("Importing SLURM QoS profiles...")
+
+        for profile in qos_data:
+            try:
+                uuid = profile.get("uuid")
+                offering_uuid = profile.get("offering_uuid")
+                name = profile.get("name")
+
+                if not uuid or not offering_uuid or not name:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            "Skipping SLURM QoS without UUID, offering_uuid, or name"
+                        )
+                    )
+                    self.stats["slurm_offering_qos"]["errors"] += 1
+                    continue
+
+                offering = Offering.objects.filter(uuid=offering_uuid).first()
+                if not offering:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping QoS {uuid}: Offering {offering_uuid} not found"
+                        )
+                    )
+                    self.stats["slurm_offering_qos"]["errors"] += 1
+                    continue
+
+                defaults = {
+                    "offering": offering,
+                    "name": name,
+                    "description": profile.get("description", ""),
+                    "max_nodes": profile.get("max_nodes"),
+                    "min_nodes": profile.get("min_nodes"),
+                    "default_time": profile.get("default_time"),
+                    "max_time": profile.get("max_time"),
+                    "grace_time": profile.get("grace_time"),
+                    "priority": profile.get("priority"),
+                    "grp_tres": profile.get("grp_tres", ""),
+                    "max_tres_per_job": profile.get("max_tres_per_job", ""),
+                    "max_tres_per_node": profile.get("max_tres_per_node", ""),
+                    "max_tres_per_user": profile.get("max_tres_per_user", ""),
+                    "min_tres_per_job": profile.get("min_tres_per_job", ""),
+                    "flags": profile.get("flags", ""),
+                }
+
+                if not self.dry_run:
+                    existing = SlurmOfferingQoS.objects.filter(uuid=uuid).first()
+                    if existing:
+                        if self.update_existing:
+                            with transaction.atomic():
+                                SlurmOfferingQoS.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
+                            self.stats["slurm_offering_qos"]["updated"] += 1
+                        else:
+                            self.stats["slurm_offering_qos"]["skipped"] += 1
+                    else:
+                        with transaction.atomic():
+                            SlurmOfferingQoS.objects.create(uuid=uuid, **defaults)
+                        self.stats["slurm_offering_qos"]["created"] += 1
+                else:
+                    existing = SlurmOfferingQoS.objects.filter(uuid=uuid).exists()
+                    if existing:
+                        if self.update_existing:
+                            self.stats["slurm_offering_qos"]["updated"] += 1
+                        else:
+                            self.stats["slurm_offering_qos"]["skipped"] += 1
+                    else:
+                        self.stats["slurm_offering_qos"]["created"] += 1
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import SLURM QoS {profile.get('uuid')}: {e}"
+                    )
+                )
+                self.stats["slurm_offering_qos"]["errors"] += 1
+
+    def import_slurm_partition_qos(self, links_data):
+        """Import partition QoS allow-list links (SLURM AllowQos gate)."""
+        self.stdout.write("Importing partition QoS links...")
+
+        for link_data in links_data:
+            try:
+                uuid = link_data.get("uuid")
+                partition_uuid = link_data.get("partition_uuid")
+                qos_uuid = link_data.get("qos_uuid")
+
+                if not uuid or not partition_uuid or not qos_uuid:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            "Skipping partition QoS link without UUID, partition_uuid, or qos_uuid"
+                        )
+                    )
+                    self.stats["slurm_partition_qos"]["errors"] += 1
+                    continue
+
+                partition = OfferingPartition.objects.filter(
+                    uuid=partition_uuid
+                ).first()
+                if not partition:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping link {uuid}: Partition {partition_uuid} not found"
+                        )
+                    )
+                    self.stats["slurm_partition_qos"]["errors"] += 1
+                    continue
+
+                qos = SlurmOfferingQoS.objects.filter(uuid=qos_uuid).first()
+                if not qos:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping link {uuid}: QoS {qos_uuid} not found"
+                        )
+                    )
+                    self.stats["slurm_partition_qos"]["errors"] += 1
+                    continue
+
+                defaults = {
+                    "partition": partition,
+                    "qos": qos,
+                    "is_default": link_data.get("is_default", False),
+                }
+
+                if not self.dry_run:
+                    existing = SlurmPartitionQoS.objects.filter(uuid=uuid).first()
+                    if existing:
+                        if self.update_existing:
+                            with transaction.atomic():
+                                SlurmPartitionQoS.objects.filter(uuid=uuid).update(
+                                    **defaults
+                                )
+                            self.stats["slurm_partition_qos"]["updated"] += 1
+                        else:
+                            self.stats["slurm_partition_qos"]["skipped"] += 1
+                    else:
+                        with transaction.atomic():
+                            SlurmPartitionQoS.objects.create(uuid=uuid, **defaults)
+                        self.stats["slurm_partition_qos"]["created"] += 1
+                else:
+                    existing = SlurmPartitionQoS.objects.filter(uuid=uuid).exists()
+                    if existing:
+                        if self.update_existing:
+                            self.stats["slurm_partition_qos"]["updated"] += 1
+                        else:
+                            self.stats["slurm_partition_qos"]["skipped"] += 1
+                    else:
+                        self.stats["slurm_partition_qos"]["created"] += 1
+
+            except Exception as e:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Failed to import partition QoS link {link_data.get('uuid')}: {e}"
+                    )
+                )
+                self.stats["slurm_partition_qos"]["errors"] += 1
+
     def import_offering_software_catalogs(self, links_data):
         """Import offering-to-software-catalog links."""
         self.stdout.write("Importing offering software catalog links...")
@@ -2496,18 +2850,11 @@ class Command(BaseCommand):
                 start_date = None
                 end_date = None
                 if project_data.get("start_date"):
-                    try:
-                        start_date = datetime.fromisoformat(
-                            project_data["start_date"]
-                        ).date()
-                    except (ValueError, TypeError):
-                        pass
+                    start_date = self._parse_date(project_data["start_date"])
 
                 if project_data.get("end_date"):
                     try:
-                        end_date = datetime.fromisoformat(
-                            project_data["end_date"]
-                        ).date()
+                        end_date = self._parse_date(project_data["end_date"])
                     except (ValueError, TypeError):
                         pass
 
@@ -2521,6 +2868,8 @@ class Command(BaseCommand):
                     "oecd_fos_2007_code": project_data.get("oecd_fos_2007_code", ""),
                     "slug": project_data.get("slug", ""),
                     "backend_id": project_data.get("backend_id", ""),
+                    # Opt-in for the credit dashboards. A preset built to
+                    # demonstrate them cannot do so without it.
                 }
 
                 if not self.dry_run:
@@ -2651,9 +3000,6 @@ class Command(BaseCommand):
                     ),
                     "default_volume_category": category_data.get(
                         "default_volume_category", False
-                    ),
-                    "default_tenant_category": category_data.get(
-                        "default_tenant_category", False
                     ),
                     "group": group,
                 }
@@ -2823,7 +3169,19 @@ class Command(BaseCommand):
                     if existing_offering:
                         if self.update_existing:
                             with transaction.atomic():
-                                Offering.objects.filter(uuid=uuid).update(**defaults)
+                                # .update() never calls pre_save, so secret_options
+                                # would be stored as the imported plaintext; encrypt
+                                # it here. Saving through the instance instead would
+                                # also encrypt, but it would fire the whole Offering
+                                # post_save chain (event log, reversion revision,
+                                # OpenStack IP re-sync, Google Calendar rename,
+                                # Celery fan-out) for every row of a bulk import,
+                                # which this command has never done.
+                                Offering.objects.filter(uuid=uuid).update(
+                                    **encryption.encrypt_defaults_for_update(
+                                        Offering, defaults
+                                    )
+                                )
                             self.stats["offerings"]["updated"] += 1
                         else:
                             self.stats["offerings"]["skipped"] += 1
@@ -4022,6 +4380,7 @@ class Command(BaseCommand):
                     "max_amount": plan_data.get("max_amount"),
                     "article_code": plan_data.get("article_code", ""),
                     "backend_id": plan_data.get("backend_id", ""),
+                    "billing_mode": plan_data.get("billing_mode", "inherit"),
                 }
 
                 if not self.dry_run:
@@ -4096,6 +4455,9 @@ class Command(BaseCommand):
                     "limit_period": component_data.get("limit_period")
                     or LimitPeriods.MONTH,
                     "limit_amount": component_data.get("limit_amount"),
+                    "limit_decimal_places": component_data.get(
+                        "limit_decimal_places", 0
+                    ),
                     "min_value": component_data.get("min_value"),
                     "max_value": component_data.get("max_value"),
                     "min_prepaid_duration": component_data.get("min_prepaid_duration"),
@@ -4109,6 +4471,15 @@ class Command(BaseCommand):
                         "renewal_duration_step"
                     ),
                     "is_prepaid": component_data.get("is_prepaid", False),
+                    # A dump taken before this field existed has no value for
+                    # it, and defaulting to False would leave an imported
+                    # builtin component no longer following its plan's billing
+                    # mode. Fall back to the rule the field replaced: a
+                    # component the plugin provides for this offering type.
+                    "billed_per_plan": component_data.get(
+                        "billed_per_plan",
+                        is_plugin_provided_component(offering.type, component_type),
+                    ),
                     "article_code": component_data.get("article_code", ""),
                     "backend_id": component_data.get("backend_id", ""),
                 }
@@ -4619,7 +4990,14 @@ class Command(BaseCommand):
                     "date": date or timezone.now(),
                     "billing_period": billing_period or timezone.now().date(),
                     "plan_period": plan_period,
-                    "recurring": usage_data.get("recurring", False),
+                    "missing_usage_policy": usage_data.get(
+                        "missing_usage_policy",
+                        # dumps produced before the policy field existed only
+                        # carry the deprecated `recurring` boolean
+                        MissingUsagePolicies.REUSE
+                        if usage_data.get("recurring")
+                        else MissingUsagePolicies.NONE,
+                    ),
                     "description": usage_data.get("description", ""),
                     "backend_id": usage_data.get("backend_id", ""),
                 }
@@ -5367,7 +5745,9 @@ class Command(BaseCommand):
                         if self.update_existing:
                             with transaction.atomic():
                                 OfferingUser.objects.filter(uuid=uuid).update(
-                                    **defaults
+                                    **_without_delegated(
+                                        defaults, existing_offering_user
+                                    )
                                 )
                             self.stats["offering_users"]["updated"] += 1
                         else:
@@ -5382,7 +5762,9 @@ class Command(BaseCommand):
                                 with transaction.atomic():
                                     OfferingUser.objects.filter(
                                         pk=existing_by_pair.pk
-                                    ).update(**defaults)
+                                    ).update(
+                                        **_without_delegated(defaults, existing_by_pair)
+                                    )
                                 self.stats["offering_users"]["updated"] += 1
                             else:
                                 self.stats["offering_users"]["skipped"] += 1
@@ -6770,6 +7152,30 @@ class Command(BaseCommand):
                 )
                 self.stats["permission_requests"]["errors"] += 1
 
+    def apply_customer_credit_drawdown(self, customer_credits_data):
+        """Lower an organization credit below what its projects already hold.
+
+        `ProjectCredit.save()` refuses an allocation larger than the
+        organization credit, so a fixture cannot create that state directly —
+        yet it is a real one, and the one the dashboard warns about: the
+        organization balance is drawn down *after* the allocation was made, and
+        from then on only part of the allocation can be spent. A preset
+        declares the end state with `value_after_allocations`, applied here with
+        a queryset update, which is the only way past the model guard.
+        """
+        for credit_data in customer_credits_data:
+            final_value = credit_data.get("value_after_allocations")
+            if final_value is None:
+                continue
+            updated = CustomerCredit.objects.filter(
+                uuid=credit_data.get("uuid")
+            ).update(value=Decimal(str(final_value)))
+            if updated:
+                self.stdout.write(
+                    f"Drew organization credit {credit_data.get('uuid')} "
+                    f"down to {final_value}"
+                )
+
     def import_customer_credits(self, customer_credits_data):
         """Import customer credit data."""
         self.stdout.write("Importing customer credits...")
@@ -6801,9 +7207,7 @@ class Command(BaseCommand):
                 end_date = None
                 if credit_data.get("end_date"):
                     try:
-                        end_date = datetime.fromisoformat(
-                            credit_data["end_date"]
-                        ).date()
+                        end_date = self._parse_date(credit_data["end_date"])
                         if end_date.day != 1:
                             original = end_date
                             if end_date.month == 12:
@@ -6961,16 +7365,22 @@ class Command(BaseCommand):
                     )
                     self.stats["customer_affiliates"][key] += 1
                     continue
-                existing = CustomerAffiliate.objects.filter(uuid=uuid).first()
-                if existing:
-                    if self.update_existing:
-                        CustomerAffiliate.objects.filter(uuid=uuid).update(**defaults)
-                        self.stats["customer_affiliates"]["updated"] += 1
+                # A savepoint per link: a constraint violation (e.g. a second
+                # active link for one customer) must not abort the step's
+                # outer transaction and take every other link with it.
+                with transaction.atomic():
+                    existing = CustomerAffiliate.objects.filter(uuid=uuid).first()
+                    if existing:
+                        if self.update_existing:
+                            CustomerAffiliate.objects.filter(uuid=uuid).update(
+                                **defaults
+                            )
+                            self.stats["customer_affiliates"]["updated"] += 1
+                        else:
+                            self.stats["customer_affiliates"]["skipped"] += 1
                     else:
-                        self.stats["customer_affiliates"]["skipped"] += 1
-                else:
-                    CustomerAffiliate.objects.create(uuid=uuid, **defaults)
-                    self.stats["customer_affiliates"]["created"] += 1
+                        CustomerAffiliate.objects.create(uuid=uuid, **defaults)
+                        self.stats["customer_affiliates"]["created"] += 1
             except Exception as e:
                 self.stdout.write(
                     self.style.WARNING(f"Failed to import affiliate {uuid}: {e}")
@@ -7086,9 +7496,7 @@ class Command(BaseCommand):
                 end_date = None
                 if credit_data.get("end_date"):
                     try:
-                        end_date = datetime.fromisoformat(
-                            credit_data["end_date"]
-                        ).date()
+                        end_date = self._parse_date(credit_data["end_date"])
                         if end_date.day != 1:
                             original = end_date
                             if end_date.month == 12:
@@ -7582,6 +7990,17 @@ class Command(BaseCommand):
                     "created_by": created_by,
                     "approved_by": approved_by,
                     "description": ro_data.get("description", ""),
+                    # Omitted means "whatever the offering asks for": the model
+                    # seeds it from require_purchase_order_upload on create, and
+                    # the call manager owns it from then on.
+                    "require_purchase_order": ro_data.get(
+                        "require_purchase_order",
+                        bool(
+                            (offering.plugin_options or {}).get(
+                                "require_purchase_order_upload"
+                            )
+                        ),
+                    ),
                 }
 
                 if not self.dry_run:
@@ -7843,15 +8262,10 @@ class Command(BaseCommand):
                     "project": project,
                     "created_by": created_by,
                     "approved_by": approved_by,
-                    "duration_in_days": proposal_data.get("duration_in_days"),
+                    # Dumps written before #324 carry "duration_in_days"; the
+                    # column is gone, so the key is ignored.
                     "project_summary": proposal_data.get("project_summary", ""),
                     "project_duration": proposal_data.get("project_duration"),
-                    "project_is_confidential": proposal_data.get(
-                        "project_is_confidential", False
-                    ),
-                    "project_has_civilian_purpose": proposal_data.get(
-                        "project_has_civilian_purpose", False
-                    ),
                     "allocation_comment": proposal_data.get("allocation_comment", ""),
                 }
 
@@ -8105,12 +8519,6 @@ class Command(BaseCommand):
                     ),
                     "comment_project_duration": review_data.get(
                         "comment_project_duration"
-                    ),
-                    "comment_project_is_confidential": review_data.get(
-                        "comment_project_is_confidential"
-                    ),
-                    "comment_project_has_civilian_purpose": review_data.get(
-                        "comment_project_has_civilian_purpose"
                     ),
                     "comment_project_supporting_documentation": review_data.get(
                         "comment_project_supporting_documentation"
@@ -8912,8 +9320,43 @@ class Command(BaseCommand):
                     self.stats["call_coi_configurations"]["errors"] += 1
                     continue
 
+                # This path writes the type-handling rules straight to the ORM,
+                # so the serializer's checks never run. Apply the model's own
+                # invariant here too, otherwise an imported preset can produce a
+                # configuration the API would have rejected.
+                rules = {
+                    field: config_data.get(field, [])
+                    for field in CallCOIConfiguration.RULE_FIELDS
+                }
+                problems = []
+                unknown = CallCOIConfiguration.find_unknown_types(rules)
+                if unknown:
+                    listed = "; ".join(
+                        f"{field}: {', '.join(types)}"
+                        for field, types in sorted(unknown.items())
+                    )
+                    problems.append(f"unknown conflict types ({listed})")
+                overlaps = CallCOIConfiguration.find_rule_overlaps(rules)
+                if overlaps:
+                    listed = "; ".join(
+                        f"{coi_type} in {', '.join(sorted(fields))}"
+                        for coi_type, fields in sorted(overlaps.items())
+                    )
+                    problems.append(
+                        f"each conflict type may only be assigned to one rule ({listed})"
+                    )
+                if problems:
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Skipping COI config {uuid}: {'; '.join(problems)}"
+                        )
+                    )
+                    self.stats["call_coi_configurations"]["errors"] += 1
+                    continue
+
                 defaults = {
                     "call": call,
+                    **rules,
                     "coauthorship_lookback_years": config_data.get(
                         "coauthorship_lookback_years", 3
                     ),
@@ -8928,15 +9371,6 @@ class Command(BaseCommand):
                     ),
                     "include_same_institution": config_data.get(
                         "include_same_institution", True
-                    ),
-                    "recusal_required_types": config_data.get(
-                        "recusal_required_types", []
-                    ),
-                    "management_allowed_types": config_data.get(
-                        "management_allowed_types", []
-                    ),
-                    "disclosure_only_types": config_data.get(
-                        "disclosure_only_types", []
                     ),
                     "auto_detect_coauthorship": config_data.get(
                         "auto_detect_coauthorship", True
@@ -9985,8 +10419,15 @@ class Command(BaseCommand):
                     if existing:
                         if self.update_existing:
                             with transaction.atomic():
+                                # .update() never calls pre_save, so password, token
+                                # and the credential values inside options would be
+                                # stored as the imported plaintext; encrypt them here
+                                # rather than saving through the instance, which would
+                                # fire signal handlers this bulk import never ran.
                                 ServiceSettings.objects.filter(uuid=uuid).update(
-                                    **defaults
+                                    **encryption.encrypt_defaults_for_update(
+                                        ServiceSettings, defaults
+                                    )
                                 )
                             self.stats["openstack_service_settings"]["updated"] += 1
                         else:

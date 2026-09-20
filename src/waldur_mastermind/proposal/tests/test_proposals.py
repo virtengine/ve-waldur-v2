@@ -2,20 +2,26 @@ import datetime
 from unittest import mock
 
 from constance.test.unittest import override_config
-from ddt import data, ddt
+from ddt import data, ddt, unpack
 from django.core import mail
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 from django.utils import timezone
 from rest_framework import status, test
 
 from waldur_core.core import utils as core_utils
-from waldur_core.media.utils import dummy_image
+from waldur_core.core.models import DESCRIPTION_LENGTH
+from waldur_core.core.tests.helpers import EXPANDING_DESCRIPTION
 from waldur_core.permissions.fixtures import CallRole, ProposalRole
 from waldur_core.permissions.utils import has_user
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.proposal import models, tasks, utils
 from waldur_mastermind.proposal.enums import AllocationTimes, CallStates, ProposalStates
 from waldur_mastermind.proposal.tests import factories, fixtures
+
+SVG_WITH_SCRIPT = (
+    b'<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>'
+)
 
 
 @ddt
@@ -115,6 +121,39 @@ class ProposalCreateTest(test.APITestCase):
         response = self.create_proposal("staff", name="x" * 32)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
 
+    def move_round(self, start_offset_days, cutoff_offset_days):
+        call_round = self.fixture.round
+        call_round.start_time = timezone.now() + datetime.timedelta(
+            days=start_offset_days
+        )
+        call_round.cutoff_time = timezone.now() + datetime.timedelta(
+            days=cutoff_offset_days
+        )
+        call_round.save()
+
+    def test_can_not_create_before_the_round_opens(self):
+        """A proposal exists only while its round is open.
+
+        This used to be allowed, on the reasoning that a draft could be
+        prepared ahead of the round; the rule is now the same as for
+        submission, so a proposal can never be created into a state it could
+        not then be sent from.
+        """
+        self.move_round(start_offset_days=5, cutoff_offset_days=10)
+
+        response = self.create_proposal("staff")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(models.Proposal.objects.filter(name="new").exists())
+
+    def test_can_not_create_after_the_round_has_closed(self):
+        self.move_round(start_offset_days=-10, cutoff_offset_days=-1)
+
+        response = self.create_proposal("staff")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(models.Proposal.objects.filter(name="new").exists())
+
     def create_proposal(self, user, **kwargs):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
@@ -122,11 +161,49 @@ class ProposalCreateTest(test.APITestCase):
         payload = {
             "name": "new",
             "round_uuid": self.fixture.round.uuid.hex,
-            "duration_in_days": 10,
         }
         payload.update(kwargs)
 
         return self.client.post(self.url, payload)
+
+
+class ProposalDescriptionLengthTest(test.APITestCase):
+    """Oversized proposal descriptions must be rejected with 400, not blow up in the database."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProposalFixture()
+        self.url = factories.ProposalFactory.get_list_url()
+        self.client.force_authenticate(self.fixture.staff)
+
+    def create_proposal(self, description):
+        return self.client.post(
+            self.url,
+            {
+                "name": "new",
+                "round_uuid": self.fixture.round.uuid.hex,
+                "description": description,
+            },
+        )
+
+    def test_description_over_limit_is_rejected(self):
+        response = self.create_proposal("a" * (DESCRIPTION_LENGTH + 904))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("description", response.data)
+
+    def test_description_expanded_by_html_clean_is_rejected(self):
+        self.assertLess(len(EXPANDING_DESCRIPTION), DESCRIPTION_LENGTH)
+
+        response = self.create_proposal(EXPANDING_DESCRIPTION)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("description", response.data)
+        self.assertIn("sanitisation", str(response.data["description"]))
+
+    def test_description_within_limit_is_accepted(self):
+        response = self.create_proposal("a" * DESCRIPTION_LENGTH)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        proposal = models.Proposal.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(len(proposal.description), DESCRIPTION_LENGTH)
 
 
 @ddt
@@ -155,9 +232,11 @@ class UpdateProposalProjectDetailsTest(test.APITestCase):
         response = self.update_proposal(user)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
-    def _upload_proposal_document(self):
+    def _upload_proposal_document(self, file=None):
         url = factories.ProposalFactory.get_url(self.proposal, action="attach_document")
-        payload = {"file": dummy_image()}
+        if file is None:
+            file = SimpleUploadedFile("proposal.pdf", b"%PDF-1.4\n%%EOF\n")
+        payload = {"file": file}
         return self.client.post(url, payload, format="multipart")
 
     @data("staff", "call_manager")
@@ -168,6 +247,19 @@ class UpdateProposalProjectDetailsTest(test.APITestCase):
         proposal = models.Proposal.objects.get(uuid=self.proposal.uuid)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(proposal.proposaldocumentation_set.count(), 1)
+
+    @data(
+        ("diagram.svg", SVG_WITH_SCRIPT),
+        # The type is sniffed from the content, so renaming the file is no help.
+        ("diagram.png", SVG_WITH_SCRIPT),
+        ("animation.gif", b"GIF89a\x01\x00\x01\x00\x80\x00\x00"),
+    )
+    @unpack
+    def test_non_document_upload_is_rejected(self, name, content):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self._upload_proposal_document(SimpleUploadedFile(name, content))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(self.proposal.proposaldocumentation_set.exists())
 
     def _detach_proposal_document(self, doc_uuids):
         url = factories.ProposalFactory.get_url(
@@ -218,11 +310,57 @@ class UpdateProposalProjectDetailsTest(test.APITestCase):
 
         payload = {
             "name": "new",
-            "duration_in_days": 10,
         }
         response = self.client.post(self.url, payload)
         self.proposal.refresh_from_db()
         return response
+
+    def test_update_project_details_ignores_duration_in_days(self):
+        # Older clients still send the retired field; it is neither rejected
+        # nor echoed back.
+        self.client.force_authenticate(self.fixture.proposal_creator)
+
+        response = self.client.post(
+            self.url, {"name": self.proposal.name, "duration_in_days": 99}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        proposal = self.client.get(factories.ProposalFactory.get_url(self.proposal))
+        self.assertNotIn("duration_in_days", proposal.data)
+
+    def test_science_sub_domain_can_be_set(self):
+        sub_domain = structure_factories.ScienceSubDomainFactory()
+        self.client.force_authenticate(self.fixture.proposal_creator)
+
+        response = self.client.post(
+            self.url,
+            {
+                "name": self.proposal.name,
+                "science_sub_domain": sub_domain.uuid.hex,
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.proposal.refresh_from_db()
+        self.assertEqual(self.proposal.science_sub_domain, sub_domain)
+
+    def test_science_sub_domain_can_be_cleared(self):
+        self.proposal.science_sub_domain = structure_factories.ScienceSubDomainFactory()
+        self.proposal.save()
+        self.client.force_authenticate(self.fixture.proposal_creator)
+
+        response = self.client.post(
+            self.url,
+            {
+                "name": self.proposal.name,
+                "science_sub_domain": None,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.proposal.refresh_from_db()
+        self.assertIsNone(self.proposal.science_sub_domain)
 
 
 @ddt
@@ -305,6 +443,12 @@ class ActionTest(test.APITestCase):
     @override_settings(task_always_eager=True)
     @data("proposal_creator")
     def test_notifications_are_sent_after_submission(self, user):
+        # Pinned to a call-managed deployment, which is what this test has
+        # always meant by "proposal": 0258_derive_service_access_mode leaves a
+        # database with no call-management feature flags — every fresh one,
+        # test databases included — in marketplace mode, where the applicant's
+        # mail says "access request" instead.
+        self.enterContext(override_config(SERVICE_ACCESS_MODE="both"))
         user = getattr(self.fixture, user)
         call_manager = self.fixture.call_manager
         self.proposal.round.call.add_user(call_manager, CallRole.MANAGER)
@@ -350,6 +494,42 @@ class ActionTest(test.APITestCase):
         self.client.force_authenticate(user)
         response = self.client.post(self.submit_url)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def move_round(self, start_offset_days, cutoff_offset_days):
+        call_round = self.proposal.round
+        call_round.start_time = timezone.now() + datetime.timedelta(
+            days=start_offset_days
+        )
+        call_round.cutoff_time = timezone.now() + datetime.timedelta(
+            days=cutoff_offset_days
+        )
+        call_round.save()
+
+    def test_can_not_submit_after_the_round_has_closed(self):
+        """The cutoff is a hard deadline, enforced when the proposal is sent.
+
+        Before, this returned 200: the call managers were notified and the
+        proposal entered review, only to be cancelled by the hourly sweeper.
+        """
+        self.move_round(start_offset_days=-10, cutoff_offset_days=-1)
+
+        self.client.force_authenticate(self.fixture.proposal_creator)
+        response = self.client.post(self.submit_url)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.proposal.refresh_from_db()
+        self.assertEqual(self.proposal.state, ProposalStates.DRAFT)
+
+    def test_can_not_submit_before_the_round_opens(self):
+        """A draft may be prepared ahead of the round, but not sent early."""
+        self.move_round(start_offset_days=5, cutoff_offset_days=10)
+
+        self.client.force_authenticate(self.fixture.proposal_creator)
+        response = self.client.post(self.submit_url)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.proposal.refresh_from_db()
+        self.assertEqual(self.proposal.state, ProposalStates.DRAFT)
 
     def test_set_project_start_date_on_fixed_date_allocation(self):
         new_proposal = factories.ProposalFactory(

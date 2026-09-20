@@ -74,6 +74,12 @@ class EventFilter(django_filters.FilterSet):
     user_uuid = core_filters.RelatedUUIDFilter(
         view_name="user-detail", method="filter_user_uuid", label="User UUID"
     )
+    auth_method = django_filters.CharFilter(
+        method="filter_auth_method", label="Authentication method"
+    )
+    pat_uuid = django_filters.CharFilter(
+        method="filter_pat_uuid", label="Personal access token UUID"
+    )
     o = django_filters.OrderingFilter(fields=("created",))
 
     class Meta:
@@ -88,6 +94,12 @@ class EventFilter(django_filters.FilterSet):
 
     def filter_user_uuid(self, queryset, name, value):
         return queryset.filter(context__user_uuid=value.hex)
+
+    def filter_auth_method(self, queryset, name, value):
+        return queryset.filter(context__auth_method=value)
+
+    def filter_pat_uuid(self, queryset, name, value):
+        return queryset.filter(context__pat_uuid=value)
 
 
 class EventFilterBackend(filters.BaseFilterBackend):
@@ -220,6 +232,30 @@ class EventSubscriptionFilter(django_filters.FilterSet):
     class Meta:
         model = models.EventSubscription
         fields = []
+
+
+class EventConsumerFilter(django_filters.FilterSet):
+    o = django_filters.OrderingFilter(fields=["created"])
+    user_uuid = core_filters.RelatedUUIDFilter(
+        view_name="user-detail", field_name="user__uuid", label="Owner UUID"
+    )
+    user_username = django_filters.CharFilter(field_name="user__username")
+    is_global = django_filters.BooleanFilter(
+        method="filter_is_global",
+        widget=BooleanWidget,
+        label="Consumer is bound to no scope and therefore receives every event",
+    )
+
+    class Meta:
+        model = models.EventConsumer
+        fields = []
+
+    def filter_is_global(self, queryset, name, value):
+        # is_global is a property (no bindings = unrestricted), so it is
+        # expressed here as the absence of EventConsumerScope rows.
+        if value:
+            return queryset.filter(scopes__isnull=True)
+        return queryset.filter(scopes__isnull=False).distinct()
 
 
 class EventSubscriptionQueueFilter(django_filters.FilterSet):

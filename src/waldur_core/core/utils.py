@@ -24,7 +24,7 @@ from dateutil.relativedelta import relativedelta
 from django.apps import apps
 from django.conf import settings
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.core.mail import EmailMultiAlternatives
+from django.core.mail import EmailMultiAlternatives, get_connection
 from django.core.management.base import BaseCommand
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db.models import F, Subquery
@@ -195,10 +195,35 @@ def format_text(template_name, context):
     return template.render(Context(context, autoescape=False)).strip()
 
 
-def find_template_from_registry(app, event_type, template_suffix):
+def find_template_from_registry(app, event_type, template_suffix, variant=None):
+    """The template path for an event, optionally one of its variants.
+
+    A notification may declare more than the three templates named after its
+    own key — a deployment that presents the same event in different words
+    sends a different message, not the same message with conditionals threaded
+    through it, but it is still one event and so still one switch. Passing
+    ``variant`` selects such an alternative set, and it is honoured only when
+    the notification actually declares it, so a typo resolves to nothing rather
+    than to a template belonging to something else.
+    """
     app_dict = NOTIFICATIONS.get(app)
     for section in app_dict:
         if event_type == section.get("path"):
+            if not variant:
+                return f"{app}/{event_type}_{template_suffix}"
+            # Declared paths are relative to their section, as everywhere else
+            # in the registry; the app prefix is added where a path is used.
+            path = f"{variant}_{template_suffix}"
+            declared = {tpl["path"] for tpl in section.get("templates", [])}
+            if path in declared:
+                return f"{app}/{path}"
+            logger.warning(
+                "Notification '%s.%s' does not declare template '%s'; "
+                "falling back to its own.",
+                app,
+                event_type,
+                f"{app}/{path}",
+            )
             return f"{app}/{event_type}_{template_suffix}"
 
 
@@ -214,6 +239,7 @@ def send_mail(
     bcc: list[str] | None = None,
     reply_to: str | None = None,
     fail_silently: bool = False,
+    connection=None,
 ) -> int:
     from waldur_core.logging.models import EmailLog
 
@@ -226,6 +252,7 @@ def send_mail(
         from_email=from_email,
         bcc=bcc,
         reply_to=[reply_to],
+        connection=connection,
     )
 
     footer_text = config.COMMON_FOOTER_TEXT
@@ -266,6 +293,7 @@ def broadcast_mail(
     attachment=None,
     content_type="text/plain",
     bcc=None,
+    template_variant=None,
 ):
     """
     Shorthand to format email message from template file and sent it to all recipients.
@@ -290,6 +318,10 @@ def broadcast_mail(
     :param attachment: content of attachment
     :param content_type: the content type of attachment
     :param bcc: list of emails for sending as bcc
+    :param template_variant: alternative template set declared by the same
+        notification, used where a deployment words the same event differently.
+        The notification, and therefore the operator's on/off switch, is still
+        the one named by ``event_type``.
     """
     from .models import Notification
 
@@ -301,29 +333,45 @@ def broadcast_mail(
 
     if notification.enabled:
         subject_template_name = find_template_from_registry(
-            app, event_type, "subject.txt"
+            app, event_type, "subject.txt", template_variant
         )
-        text_template_name = find_template_from_registry(app, event_type, "message.txt")
+        text_template_name = find_template_from_registry(
+            app, event_type, "message.txt", template_variant
+        )
         html_template_name = find_template_from_registry(
-            app, event_type, "message.html"
+            app, event_type, "message.html", template_variant
         )
 
         subject = format_text(subject_template_name, context)
         text_message = format_text(text_template_name, context)
         html_message = render_to_string(html_template_name, context)
 
-        for recipient in recipient_list:
-            logger.info(f"About to send {event_type} notification to {recipient}")
-            send_mail(
-                subject,
-                text_message,
-                to=[recipient],
-                html_message=html_message,
-                filename=filename,
-                attachment=attachment,
-                content_type=content_type,
-                bcc=bcc,
-            )
+        # One shared SMTP connection for the whole batch (a fresh connection
+        # per recipient can trip relay rate limits), and per-recipient error
+        # isolation so one undeliverable address cannot block the rest.
+        connection = get_connection()
+        try:
+            connection.open()
+            for recipient in recipient_list:
+                logger.info(f"About to send {event_type} notification to {recipient}")
+                try:
+                    send_mail(
+                        subject,
+                        text_message,
+                        to=[recipient],
+                        html_message=html_message,
+                        filename=filename,
+                        attachment=attachment,
+                        content_type=content_type,
+                        bcc=bcc,
+                        connection=connection,
+                    )
+                except Exception:
+                    logger.exception(
+                        f"Failed to send {event_type} notification to {recipient}"
+                    )
+        finally:
+            connection.close()
 
 
 def get_ordering(request):
@@ -541,6 +589,87 @@ def get_ip_address(request: HttpRequest) -> str | None:
     return None
 
 
+def _strip_port(value: str) -> str:
+    """Drop a ``host:port`` suffix, leaving a bare address.
+
+    Azure Application Gateway writes ``1.2.3.4:5678`` into X-Forwarded-For, and
+    under fail-closed enforcement an unparseable hop denies a valid token. Only
+    the two unambiguous forms are stripped: a bracketed IPv6 literal, and a
+    single-colon IPv4 pair — a bare IPv6 address is itself full of colons, so
+    the colon count is what stops us truncating one into garbage. A non-numeric
+    port is left in place so the address fails to parse rather than being
+    silently accepted.
+    """
+    if value.startswith("["):
+        host, separator, port = value.partition("]:")
+        if separator and port.isdigit():
+            return host[1:]
+        return value
+    if value.count(":") == 1:
+        host, _, port = value.partition(":")
+        try:
+            ipaddress.IPv4Address(host)
+        except ValueError:
+            return value
+        if port.isdigit():
+            return host
+    return value
+
+
+def _normalize_ip(
+    value: str | None,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Parse an address, unwrapping IPv4-mapped IPv6, or return None.
+
+    A dual-stack listener reports IPv4 clients as ``::ffff:203.0.113.5``.
+    Unwrapping means such a client matches an IPv4 ACL entry and gets logged
+    under its real address, instead of being denied on a version mismatch.
+    """
+    if not value:
+        return None
+    try:
+        addr = ipaddress.ip_address(_strip_port(value))
+    except ValueError:
+        return None
+    if addr.version == 6 and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+    return addr
+
+
+def ip_in_networks(address: str | None, networks: list[str]) -> bool:
+    """Return True when ``address`` falls inside any of ``networks``.
+
+    Malformed input never matches — this backs an allowlist, so anything we
+    cannot parse must not be treated as permitted.
+    """
+    if not address or not networks:
+        return False
+    addr = _normalize_ip(address)
+    if addr is None:
+        return False
+    for entry in networks:
+        try:
+            if addr in ipaddress.ip_network(entry, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def normalize_ip_address(value: str | None) -> str | None:
+    """Canonical string form of an IP address, or None if it does not parse.
+
+    Unwraps IPv4-mapped IPv6 and strips a ``host:port`` suffix, so the
+    ingress-provided address is stored and logged in one canonical form.
+    Anything unparseable becomes None — callers treat that as "no address"
+    and, for a security control, fail closed. Keeping the value clean also
+    matters because it flows on into event-message ``.format()`` templates,
+    cache keys and ``last_used_ip`` (an inet column) unescaped.
+    """
+    address = _normalize_ip(value)
+    return str(address) if address is not None else None
+
+
 def merge_access_subnets(inet_values):
     """Collapse CIDR strings into the minimal list of networks.
 
@@ -563,6 +692,38 @@ def merge_access_subnets(inet_values):
     for _version, version_networks in groupby(networks, key=lambda n: n.version):
         merged.extend(ipaddress.collapse_addresses(list(version_networks)))
     return merged
+
+
+def validate_access_subnet_for_user(value, user):
+    """Normalise and validate an access-subnet CIDR for the acting user.
+
+    Non-staff users may only enter a single host, so a bare address is widened
+    to ``/32`` (``/128`` for IPv6) and anything wider is rejected: these lists
+    are how a consumer grants itself access, and an unbounded mask would let it
+    open far more than intended. Staff may enter any width except ``/0``, which
+    matches every address and would silently neutralise every restriction built
+    on these entries.
+
+    Networks with host bits set are rejected rather than silently masked —
+    quietly turning ``203.0.113.5/24`` into ``203.0.113.0/24`` would grant a
+    whole range where a single host was written.
+
+    Returns the normalised CIDR string.
+    """
+    try:
+        network = ipaddress.ip_network(str(value), strict=True)
+    except ValueError as e:
+        raise ValidationError(str(e))
+
+    if network.prefixlen == 0:
+        raise ValidationError("A /0 mask is not allowed: it matches every address.")
+
+    if not user.is_staff and network.prefixlen != network.max_prefixlen:
+        raise ValidationError(
+            "Only a single IP address (/%s) is allowed." % network.max_prefixlen
+        )
+
+    return str(network)
 
 
 def get_user_agent(request):

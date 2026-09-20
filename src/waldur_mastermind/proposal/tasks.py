@@ -9,14 +9,17 @@ from django.db.models import Avg, Count, Q
 from django.utils import timezone
 
 from waldur_core.core import utils as core_utils
+from waldur_core.core.service_access import names_calls
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
 from waldur_core.structure.permissions import _get_customer
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.proposal import models as proposal_models
-from waldur_mastermind.proposal import utils, workflow_service
+from waldur_mastermind.proposal import notification_rules, utils, workflow_service
 from waldur_mastermind.proposal.enums import (
+    WORKFLOW_STEPS_MAP,
     CallStates,
+    NotificationRuleTriggers,
     ProposalStates,
     WorkflowStepInstanceStatuses,
 )
@@ -90,28 +93,36 @@ def notify_user_about_proposal_state_update(proposal_uuid, previous_state, new_s
     )
     project_link = None
     allocated_resources = None
-    if new_state == ProposalStates.ACCEPTED:
-        try:
-            project_link = core_utils.format_homeport_link(
-                "projects/{project_uuid}/",
-                project_uuid=proposal.project.uuid,  # type: ignore
-            )
-            resources = marketplace_models.Resource.objects.filter(
-                project=proposal.project
-            ).select_related("offering", "plan")
+    allocation_date = None
+    granted_duration = None
+    # The guard replaces a bare `except AttributeError`, which existed only to
+    # swallow `proposal.project` being None and hid every other attribute error
+    # with it.
+    if new_state == ProposalStates.ACCEPTED and proposal.project:
+        project_link = core_utils.format_homeport_link(
+            "projects/{project_uuid}/",
+            project_uuid=proposal.project.uuid,
+        )
+        # The day the grant starts running: the project's own start where the
+        # call dates allocation forward, otherwise the day it was created.
+        allocation_date = proposal.project.start_date or timezone.localdate(
+            proposal.project.created
+        )
+        granted_duration = utils.granted_duration_in_days(proposal)
+        resources = marketplace_models.Resource.objects.filter(
+            project=proposal.project
+        ).select_related("offering", "plan")
 
-            allocated_resources = [
-                {
-                    "name": resource.name,
-                    "provider_name": resource.offering.customer.name
-                    if resource.offering.customer
-                    else "N/A",
-                    "plan_name": resource.plan.name if resource.plan else "Default",
-                }
-                for resource in resources
-            ]
-        except AttributeError:
-            pass
+        allocated_resources = [
+            {
+                "name": resource.name,
+                "provider_name": resource.offering.customer.name
+                if resource.offering.customer
+                else "N/A",
+                "plan_name": resource.plan.name if resource.plan else "Default",
+            }
+            for resource in resources
+        ]
 
     context = {
         "site_name": config.SITE_NAME,
@@ -124,15 +135,36 @@ def notify_user_about_proposal_state_update(proposal_uuid, previous_state, new_s
         "proposal_creator_name": proposal.created_by.full_name
         if proposal.created_by
         else "Unknown",
-        "call_name": proposal.round.call.name,
         "update_date": proposal.modified,
-        "duration": proposal.duration_in_days,
+        # Declared on the context model and rendered by both bodies since day
+        # one, but never actually passed — the line shipped blank until now.
+        "allocation_date": allocation_date,
         "rejection_feedback": proposal.allocation_comment,
-        "review_period": proposal.round.review_duration_in_days,
         "allocated_resources": allocated_resources
         if new_state == ProposalStates.ACCEPTED
         else None,
     }
+
+    # A separate set of templates rather than conditionals threaded through
+    # one: a deployment that hides calls from applicants sends a different
+    # message, and each set can be reworded and overridden without disturbing
+    # the other. Still one event and one notification, so an operator has a
+    # single switch for "tell the applicant their request changed state" —
+    # a deployment is in one mode and only ever sends one of the two.
+    template_variant = None
+    if names_calls():
+        # Only the call-managed wording names these, so only it is handed them.
+        context["call_name"] = proposal.round.call.name
+        context["review_period"] = proposal.round.review_duration_in_days
+        # Unit included, and None when nothing is known: the applicant is no
+        # longer asked for a duration, so the template guards the line.
+        context["duration"] = utils.requested_duration_label(proposal)
+    else:
+        template_variant = "access_request_state_changed"
+        # Nothing asks a marketplace applicant for a duration, so the only
+        # honest figure is the one they were granted — and None where the grant
+        # does not expire, which that wording's template omits.
+        context["duration"] = granted_duration
 
     core_utils.broadcast_mail(
         "proposal",
@@ -141,6 +173,7 @@ def notify_user_about_proposal_state_update(proposal_uuid, previous_state, new_s
         [proposal.created_by.email]
         if proposal.created_by and proposal.created_by.email
         else [],
+        template_variant=template_variant,
     )
 
 
@@ -1025,3 +1058,127 @@ def send_reviewer_invitation_email(pool_member_uuid):
         context,
         [pool_member.invited_email],
     )
+
+
+def _step_event_context(instance, trigger, audience_is_applicant, days_before=None):
+    proposal = instance.proposal
+    call = proposal.round.call
+    step_def = WORKFLOW_STEPS_MAP.get(instance.step)
+    if audience_is_applicant:
+        proposal_url = core_utils.format_homeport_link(
+            "proposals/{proposal_uuid}/", proposal_uuid=proposal.uuid
+        )
+    else:
+        proposal_url = core_utils.format_homeport_link(
+            "call-management/{customer_uuid}/proposals/{proposal_uuid}/",
+            customer_uuid=call.manager.customer.uuid,
+            proposal_uuid=proposal.uuid,
+        )
+    return {
+        "site_name": config.SITE_NAME,
+        "trigger": trigger,
+        "step_name": step_def.name if step_def else instance.step,
+        "proposal_name": proposal.name,
+        "proposal_url": proposal_url,
+        "call_name": call.name,
+        "round_name": proposal.round.name,
+        "deadline": instance.deadline,
+        "days_before": days_before,
+        # Outcome and reason are evaluation detail: never shown to the applicant
+        # side, whose mail is status-only.
+        "outcome": None if audience_is_applicant else instance.outcome,
+        "outcome_reason": "" if audience_is_applicant else instance.outcome_reason,
+        "is_applicant": audience_is_applicant,
+    }
+
+
+def _send_step_event(instance, trigger, rules, days_before=None):
+    """One mail per rule audience. Recipients addressed by several rules get one copy."""
+    already_addressed = set()
+    for rule in rules:
+        users = notification_rules.resolve_recipients(rule, instance.proposal)
+        emails = sorted(set(users.values_list("email", flat=True)) - already_addressed)
+        if not emails:
+            continue
+        already_addressed.update(emails)
+        context = _step_event_context(
+            instance,
+            trigger,
+            notification_rules.is_applicant_audience(rule, instance.proposal),
+            days_before=days_before,
+        )
+        core_utils.broadcast_mail("proposal", "workflow_step_event", context, emails)
+
+
+@shared_task(name="waldur_mastermind.proposal.notify_workflow_step_event")
+def notify_workflow_step_event(instance_uuid, trigger):
+    """Deliver a status-change event (started / completed / rejected / expired).
+
+    Enqueued by ``notification_rules.dispatch_step_event`` after commit; the
+    rules are re-read here so a rule disabled in the meantime is honoured.
+    """
+    instance = proposal_models.ProposalWorkflowStepInstance.objects.select_related(
+        "proposal__round__call__manager__customer"
+    ).get(uuid=instance_uuid)
+    rules = list(notification_rules.enabled_rules(instance, trigger))
+    if not rules:
+        return
+    _send_step_event(instance, trigger, rules)
+
+
+@shared_task(name="waldur_mastermind.proposal.send_workflow_step_deadline_reminders")
+def send_workflow_step_deadline_reminders():
+    """Fire ``deadline_approaching`` rules for active steps whose lead time is today.
+
+    A reminder is sent when ``(deadline - now).days == days_before`` and is
+    recorded in the instance ledger so the daily beat cannot repeat it. Steps
+    already past their deadline are left to ``mark_expired_workflow_steps``.
+    """
+    now = timezone.now()
+    sent = 0
+    instances = proposal_models.ProposalWorkflowStepInstance.objects.filter(
+        status=WorkflowStepInstanceStatuses.ACTIVE, deadline__gt=now
+    ).select_related("proposal__round__call__manager__customer")
+    for instance in instances:
+        if instance.deadline is None:
+            continue
+        days_left = (instance.deadline.date() - now.date()).days
+        rules = [
+            rule
+            for rule in notification_rules.enabled_rules(
+                instance, NotificationRuleTriggers.DEADLINE_APPROACHING
+            )
+            if rule.days_before == days_left
+        ]
+        if not rules:
+            continue
+        key = notification_rules.ledger_key(
+            NotificationRuleTriggers.DEADLINE_APPROACHING, days_left
+        )
+        with transaction.atomic():
+            locked = (
+                proposal_models.ProposalWorkflowStepInstance.objects.select_for_update()
+                .filter(pk=instance.pk, status=WorkflowStepInstanceStatuses.ACTIVE)
+                .first()
+            )
+            if locked is None or key in locked.sent_notifications:
+                continue
+            locked.sent_notifications = [*locked.sent_notifications, key]
+            locked.save(update_fields=["sent_notifications"])
+        try:
+            _send_step_event(
+                instance,
+                NotificationRuleTriggers.DEADLINE_APPROACHING,
+                rules,
+                days_before=days_left,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to send deadline reminder for workflow step instance %s",
+                instance.uuid,
+            )
+            continue
+        sent += 1
+    if sent:
+        logger.info("Sent %d workflow step deadline reminder(s)", sent)
+    return sent

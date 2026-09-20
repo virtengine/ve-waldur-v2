@@ -7,24 +7,27 @@ import uuid
 from itertools import product
 from unittest import mock
 
+import reversion
 from constance.test.unittest import override_config
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
-from ddt import data, ddt, idata
+from ddt import data, ddt, idata, unpack
 from django.core.exceptions import ObjectDoesNotExist
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import connection as db_connection
 from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
 from rest_framework import exceptions as rest_exceptions
 from rest_framework import status, test
 
 from waldur_core.checklist import enums as checklist_enums
 from waldur_core.core import utils as core_utils
+from waldur_core.core.models import DESCRIPTION_LENGTH
 from waldur_core.core.pagination import RESULT_COUNT_HEADER
-from waldur_core.core.tests.helpers import load_json_resource
+from waldur_core.core.tests.helpers import EXPANDING_DESCRIPTION, load_json_resource
 from waldur_core.logging.enums import EventType
 from waldur_core.logging.models import Event
 from waldur_core.media.models import File
@@ -63,6 +66,13 @@ from waldur_mastermind.marketplace.management.commands.import_offering import (
 from waldur_mastermind.marketplace.plugins import manager
 from waldur_mastermind.marketplace.tests import factories
 from waldur_mastermind.marketplace.tests.factories import OFFERING_OPTIONS
+from waldur_mastermind.proposal import models as proposal_models
+from waldur_mastermind.proposal.enums import (
+    CallStates,
+    RequestedOfferingStates,
+    RoundStatuses,
+)
+from waldur_mastermind.proposal.tests import factories as proposal_factories
 
 from . import fixtures as marketplace_fixtures
 
@@ -148,6 +158,8 @@ class OfferingExtraFieldsTest(test.APITestCase):
         )
 
         self._check_field_after_set_of_it("total_customers", 1)
+        self._check_field_requested_via_field_param("total_customers", 1)
+        self._check_field_is_not_annotated_by_default("total_customers")
 
     def test_total_cost_estimated(self):
         self.client.force_authenticate(self.fixture.staff)
@@ -164,6 +176,8 @@ class OfferingExtraFieldsTest(test.APITestCase):
         invoice_item.save()
 
         self._check_field_after_set_of_it("total_cost_estimated", 20)
+        self._check_field_requested_via_field_param("total_cost_estimated", 20)
+        self._check_field_is_not_annotated_by_default("total_cost_estimated")
 
     def test_total_cost(self):
         self.client.force_authenticate(self.fixture.staff)
@@ -185,6 +199,22 @@ class OfferingExtraFieldsTest(test.APITestCase):
         invoice_item.invoice.save()
 
         self._check_field_after_set_of_it("total_cost", 30)
+        self._check_field_requested_via_field_param("total_cost", 30)
+        self._check_field_is_not_annotated_by_default("total_cost")
+
+    def test_extra_field_is_annotated_when_ordering_by_several_fields(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        factories.ResourceFactory(
+            offering=self.offering_2,
+            state=ResourceStates.OK,
+        )
+
+        response = self.client.get(self.url, {"o": "-total_customers,name"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.json()), 2)
+        self.assertEqual(response.json()[0]["total_customers"], 1)
+        self.assertEqual(response.json()[1]["total_customers"], 0)
 
     def _check_field_before_set_of_it(self, field_name):
         response = self.client.get(self.url)
@@ -195,6 +225,22 @@ class OfferingExtraFieldsTest(test.APITestCase):
         response = self.client.get(self.detail_url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(field_name in response.json().keys())
+
+    def _check_field_requested_via_field_param(self, field_name, value):
+        response = self.client.get(self.url, {"field": ["uuid", field_name]})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.json()), 2)
+        values = [offering[field_name] for offering in response.json()]
+        self.assertEqual(sorted(values), [0, value])
+
+    def _check_field_is_not_annotated_by_default(self, field_name):
+        """Without ordering by the field and without asking for it explicitly
+        the expensive annotation is skipped, so the value is None."""
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.json()), 2)
+        for offering in response.json():
+            self.assertIsNone(offering[field_name])
 
     def _check_field_after_set_of_it(self, field_name, value):
         response = self.client.get(self.url, {"o": "-%s" % field_name})
@@ -293,12 +339,30 @@ class OfferingPlanInfoTest(test.APITestCase):
 
 @ddt
 class SecretOptionsTests(test.APITestCase):
+    """Reading secret_options is gated on the permission that changes them.
+
+    Whoever may edit an offering's integration settings may read them back —
+    anything narrower means editing a field rendered empty and overwriting a
+    value that was never displayed.
+    """
+
     def setUp(self):
         self.fixture = fixtures.ProjectFixture()
         self.offering = factories.OfferingFactory(
             shared=True, customer=self.fixture.customer, project=self.fixture.project
         )
         self.url = factories.OfferingFactory.get_url(self.offering)
+        self.update_url = factories.OfferingFactory.get_url(
+            self.offering, "update_integration"
+        )
+        # Mirrors the shipped default role permissions.
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_INTEGRATION)
+        OfferingRole.MANAGER.add_permission(PermissionEnum.UPDATE_OFFERING_INTEGRATION)
+
+    def _offering_manager(self):
+        user = structure_factories.UserFactory()
+        self.offering.add_user(user, OfferingRole.MANAGER)
+        return user
 
     @data("staff", "owner")
     def test_secret_options_are_visible_to_authorized_user(self, user):
@@ -315,6 +379,247 @@ class SecretOptionsTests(test.APITestCase):
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertFalse("secret_options" in response.data)
+
+    def test_secret_options_are_visible_to_offering_scoped_role(self):
+        self.client.force_authenticate(self._offering_manager())
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue("secret_options" in response.data)
+
+    def test_secret_options_are_hidden_when_the_permission_is_not_granted(self):
+        OfferingRole.MANAGER.delete_permission(
+            PermissionEnum.UPDATE_OFFERING_INTEGRATION
+        )
+        self.client.force_authenticate(self._offering_manager())
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse("secret_options" in response.data)
+
+    @data("staff", "owner")
+    def test_everyone_who_may_write_secret_options_may_read_them(self, user):
+        """The invariant the gate exists to hold, asserted on both directions."""
+        user = getattr(self.fixture, user)
+        self.client.force_authenticate(user)
+
+        write = self.client.post(
+            self.update_url,
+            {"secret_options": {"order_notification_emails": ["ops@example.com"]}},
+        )
+        self.assertEqual(write.status_code, status.HTTP_200_OK)
+
+        read = self.client.get(self.url)
+        self.assertEqual(
+            read.data["secret_options"]["order_notification_emails"],
+            ["ops@example.com"],
+        )
+
+    def test_secret_options_are_rendered_in_a_list_for_an_entitled_row(self):
+        """A list is gated the same way a detail is, not more coarsely."""
+        self.client.force_authenticate(self.fixture.owner)
+
+        detail = self.client.get(self.url)
+        self.assertIn("secret_options", detail.data)
+
+        listing = self.client.get(factories.OfferingFactory.get_list_url())
+        self.assertEqual(listing.status_code, status.HTTP_200_OK)
+        row = next(row for row in listing.data if row["uuid"] == self.offering.uuid.hex)
+        self.assertIn("secret_options", row)
+
+    def test_a_page_is_gated_row_by_row(self):
+        """The regression: entitlement on one row used to decide the whole page."""
+        other = fixtures.ProjectFixture()
+        their_offering = factories.OfferingFactory(
+            shared=True,
+            customer=other.customer,
+            project=other.project,
+            secret_options={"order_notification_emails": ["theirs@example.com"]},
+        )
+        # Enough for filter_for_user to put their offering on the same page,
+        # without granting any provider rights over it.
+        other.customer.add_user(self.fixture.owner, CustomerRole.SUPPORT)
+
+        self.client.force_authenticate(self.fixture.owner)
+        listing = self.client.get(factories.OfferingFactory.get_list_url())
+        self.assertEqual(listing.status_code, status.HTTP_200_OK)
+        rows = {row["uuid"]: row for row in listing.data}
+        self.assertEqual(len(rows), 2)
+
+        mine = rows[self.offering.uuid.hex]
+        self.assertIn("secret_options", mine)
+
+        theirs = rows[their_offering.uuid.hex]
+        self.assertNotIn("secret_options", theirs)
+        self.assertNotIn("service_attributes", theirs)
+
+    def test_offering_scoped_writer_may_read_back_what_it_wrote(self):
+        self.client.force_authenticate(self._offering_manager())
+
+        write = self.client.post(
+            self.update_url,
+            {"secret_options": {"order_notification_emails": ["ops@example.com"]}},
+        )
+        self.assertEqual(write.status_code, status.HTTP_200_OK)
+
+        read = self.client.get(self.url)
+        self.assertEqual(
+            read.data["secret_options"]["order_notification_emails"],
+            ["ops@example.com"],
+        )
+
+
+@ddt
+class OfferingAdminFlagsTests(test.APITestCase):
+    """The detail payload says what the caller may change on this offering.
+
+    The client assembles the offering-update page from these flags. They answer
+    the question the write actions ask — the same permission over the same three
+    scopes — so a control is offered only where a save would be accepted.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.offering = factories.OfferingFactory(
+            shared=True, customer=self.fixture.customer, project=self.fixture.project
+        )
+        self.url = factories.OfferingFactory.get_url(self.offering)
+        # Mirrors the shipped default role permissions.
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_INTEGRATION)
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_OPTIONS)
+        OfferingRole.MANAGER.add_permission(PermissionEnum.UPDATE_OFFERING_INTEGRATION)
+        OfferingRole.MANAGER.add_permission(PermissionEnum.UPDATE_OFFERING_OPTIONS)
+
+    def _offering_manager(self):
+        user = structure_factories.UserFactory()
+        self.offering.add_user(user, OfferingRole.MANAGER)
+        return user
+
+    def _get(self, user):
+        self.client.force_authenticate(user)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return response.data
+
+    @data("staff", "owner")
+    def test_both_flags_are_true_for_an_authorized_user(self, user):
+        data = self._get(getattr(self.fixture, user))
+        self.assertTrue(data["can_update_integration"])
+        self.assertTrue(data["can_update_options"])
+
+    def test_both_flags_are_true_for_an_offering_scoped_role(self):
+        """The permission held on the offering itself, not on its organization."""
+        data = self._get(self._offering_manager())
+        self.assertTrue(data["can_update_integration"])
+        self.assertTrue(data["can_update_options"])
+
+    @data("customer_support", "admin", "manager")
+    def test_both_flags_are_false_for_a_user_who_may_only_read(self, user):
+        data = self._get(getattr(self.fixture, user))
+        self.assertFalse(data["can_update_integration"])
+        self.assertFalse(data["can_update_options"])
+        # The same verdict that drops the provider-only fields, so a client
+        # cannot mistake "not permitted" for "nothing configured".
+        self.assertNotIn("secret_options", data)
+        self.assertNotIn("service_attributes", data)
+
+    def test_the_two_flags_answer_independently(self):
+        """Backend ID rules are gated on options, the rest of the tab on integration."""
+        CustomerRole.OWNER.delete_permission(PermissionEnum.UPDATE_OFFERING_OPTIONS)
+        data = self._get(self.fixture.owner)
+        self.assertTrue(data["can_update_integration"])
+        self.assertFalse(data["can_update_options"])
+
+    def test_a_page_is_flagged_row_by_row(self):
+        """One entitled row must not vouch for the rest of the page."""
+        other = fixtures.ProjectFixture()
+        their_offering = factories.OfferingFactory(
+            shared=True, customer=other.customer, project=other.project
+        )
+        # Enough for filter_for_user to put their offering on the same page,
+        # without granting any provider rights over it.
+        other.customer.add_user(self.fixture.owner, CustomerRole.SUPPORT)
+
+        self.client.force_authenticate(self.fixture.owner)
+        listing = self.client.get(factories.OfferingFactory.get_list_url())
+        self.assertEqual(listing.status_code, status.HTTP_200_OK)
+        rows = {row["uuid"]: row for row in listing.data}
+
+        self.assertTrue(rows[self.offering.uuid.hex]["can_update_integration"])
+        self.assertFalse(rows[their_offering.uuid.hex]["can_update_integration"])
+        self.assertFalse(rows[their_offering.uuid.hex]["can_update_options"])
+
+    @data(
+        ("owner", status.HTTP_200_OK),
+        ("customer_support", status.HTTP_403_FORBIDDEN),
+    )
+    @unpack
+    def test_the_flag_predicts_whether_the_write_is_accepted(self, user, expected):
+        """The invariant behind the flag, asserted against the action itself."""
+        user = getattr(self.fixture, user)
+        data = self._get(user)
+
+        write = self.client.post(
+            factories.OfferingFactory.get_url(self.offering, "update_integration"),
+            {"secret_options": {"order_notification_emails": ["ops@example.com"]}},
+        )
+        self.assertEqual(write.status_code, expected)
+        self.assertEqual(data["can_update_integration"], expected == status.HTTP_200_OK)
+
+
+class OfferingQuotasVisibilityTest(test.APITestCase):
+    """Total quotas of a top-level offering are the provider's own capacity.
+
+    The public endpoint exposes them only for a child offering, whose scope is a
+    single customer's tenant; the provider view keeps them in both cases.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.offering = factories.OfferingFactory(
+            shared=True,
+            customer=self.fixture.customer,
+            scope=self._scope_with_quota("vcpu", limit=10, usage=4),
+        )
+        factories.PlanFactory(offering=self.offering)
+
+    def _scope_with_quota(self, name, limit, usage):
+        scope = structure_factories.ServiceSettingsFactory()
+        scope.set_quota_limit(name, limit)
+        scope.set_quota_usage(name, usage)
+        return scope
+
+    def _child_offering(self):
+        return factories.OfferingFactory(
+            shared=False,
+            customer=self.fixture.customer,
+            project=self.fixture.project,
+            parent=self.offering,
+            scope=self._scope_with_quota("vcpu", limit=6, usage=2),
+        )
+
+    def test_provider_view_exposes_total_quotas(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(factories.OfferingFactory.get_url(self.offering))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["quotas"], [{"name": "vcpu", "usage": 4, "limit": 10}]
+        )
+
+    def test_public_view_conceals_quotas_of_a_top_level_offering(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(
+            factories.OfferingFactory.get_public_url(self.offering)
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["quotas"], [])
+
+    def test_public_view_exposes_quotas_of_a_child_offering(self):
+        child = self._child_offering()
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(factories.OfferingFactory.get_public_url(child))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["quotas"], [{"name": "vcpu", "usage": 2, "limit": 6}]
+        )
 
 
 class OfferingFilterTest(test.APITestCase):
@@ -930,6 +1235,21 @@ class OfferingCreateTest(test.APITestCase):
         )
         self.assertEqual(offering.plugin_options["heappe_username"], "test_user")
 
+    def test_heappe_identifier_can_be_cleared(self):
+        """Clearing the field in Homeport submits an empty string."""
+        offering = factories.OfferingFactory(
+            customer=self.customer,
+            plugin_options={"heappe_identifier": "example-cluster"},
+        )
+        self.client.force_authenticate(self.fixture.staff)
+
+        url = factories.OfferingFactory.get_url(offering, "update_integration")
+        response = self.client.post(url, {"plugin_options": {"heappe_identifier": ""}})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        offering.refresh_from_db()
+        self.assertEqual(offering.plugin_options["heappe_identifier"], "")
+
     def test_update_offering_plugin_options_with_openstack_max_security_groups(self):
         """Test that offering plugin options can be updated with max_security_groups"""
         offering = factories.OfferingFactory(customer=self.customer)
@@ -968,6 +1288,42 @@ class OfferingCreateTest(test.APITestCase):
             offering.plugin_options["latest_date_for_resource_termination"],
             "2026-02-28",
         )
+
+    def test_update_offering_plugin_options_heappe_cluster_id_allows_blank(self):
+        """Clearing heappe_cluster_id must accept empty string."""
+        offering = factories.OfferingFactory(
+            customer=self.customer,
+            plugin_options={"heappe_cluster_id": "1"},
+        )
+        self.client.force_authenticate(self.fixture.staff)
+
+        url = factories.OfferingFactory.get_url(offering, "update_integration")
+        response = self.client.post(
+            url,
+            {"plugin_options": {"heappe_cluster_id": ""}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        offering.refresh_from_db()
+        self.assertEqual(offering.plugin_options["heappe_cluster_id"], "")
+
+    def test_update_offering_plugin_options_heappe_cluster_id_allows_null(self):
+        """Clearing heappe_cluster_id must accept null."""
+        offering = factories.OfferingFactory(
+            customer=self.customer,
+            plugin_options={"heappe_cluster_id": "1"},
+        )
+        self.client.force_authenticate(self.fixture.staff)
+
+        url = factories.OfferingFactory.get_url(offering, "update_integration")
+        response = self.client.post(
+            url,
+            {"plugin_options": {"heappe_cluster_id": None}},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        offering.refresh_from_db()
+        self.assertIsNone(offering.plugin_options["heappe_cluster_id"])
 
     def test_update_offering_plugin_options_required_team_role_allows_blank(self):
         """Clearing required_team_role_for_provisioning must accept empty string."""
@@ -1122,12 +1478,12 @@ class OfferingCreateTest(test.APITestCase):
             "auto_approve_marketplace_script": True,
             "backend_id_display_label": "Backend ID",
             "enable_display_of_order_actions_for_service_provider": True,
+            "enforce_qos": False,
             "expose_inference_playground": False,
             "highlight_backend_id_display": False,
             "require_effective_id_for_highlighted_display": False,
+            "show_ssh_key_loss_warning": False,
             "enable_posix_account": True,
-            "homedir_prefix": "/home/",
-            "login_shell": "/bin/bash",
             "uid_source": "pool",
             "gid_source": "pool",
             "emit_display_name": False,
@@ -1141,8 +1497,6 @@ class OfferingCreateTest(test.APITestCase):
             "resource_role_group_template": "${resource_slug}_${role_name}",
             "resource_role_map": {},
             "slurm_periodic_policy_enabled": False,
-            "username_anonymized_prefix": "waldur_",
-            "username_generation_policy": "service_provider",
         }
         self.assertEqual(offering.plugin_options, default_plugin_options)
 
@@ -1285,6 +1639,84 @@ class OfferingUpdateOverviewTest(BaseOfferingUpdateTest):
 
         response = self.update_overview("owner")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class OfferingDescriptionLengthTest(BaseOfferingUpdateTest):
+    """Oversized descriptions must be rejected with 400, not blow up in the database."""
+
+    def setUp(self):
+        super().setUp()
+        self.client.force_authenticate(self.fixture.staff)
+
+    def update_overview(self, description):
+        url = factories.OfferingFactory.get_url(self.offering, "update_overview")
+        return self.client.post(
+            url, {"name": self.offering.name, "description": description}
+        )
+
+    def test_description_over_limit_is_rejected(self):
+        response = self.update_overview("a" * (DESCRIPTION_LENGTH + 904))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("description", response.data)
+
+    def test_description_expanded_by_html_clean_is_rejected(self):
+        self.assertLess(len(EXPANDING_DESCRIPTION), DESCRIPTION_LENGTH)
+
+        response = self.update_overview(EXPANDING_DESCRIPTION)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("description", response.data)
+        self.assertIn("sanitisation", str(response.data["description"]))
+
+    def test_description_within_limit_is_accepted(self):
+        response = self.update_overview("a" * DESCRIPTION_LENGTH)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        self.offering.refresh_from_db()
+        self.assertEqual(len(self.offering.description), DESCRIPTION_LENGTH)
+
+    def test_full_description_is_not_length_limited(self):
+        # full_description is backed by a TextField, so it stays unbounded.
+        url = factories.OfferingFactory.get_url(self.offering, "update_overview")
+        response = self.client.post(
+            url,
+            {
+                "name": self.offering.name,
+                "full_description": "a" * (DESCRIPTION_LENGTH * 2),
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+
+class OfferingCreateDescriptionLengthTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.customer = self.fixture.customer
+        factories.ServiceProviderFactory(customer=self.customer)
+        self.category = factories.CategoryFactory()
+        self.client.force_authenticate(self.fixture.staff)
+
+    def create_offering(self, description):
+        return self.client.post(
+            factories.OfferingFactory.get_list_url(),
+            {
+                "name": "offering",
+                "category": factories.CategoryFactory.get_url(self.category),
+                "customer": structure_factories.CustomerFactory.get_url(self.customer),
+                "type": "Support.OfferingTemplate",
+                "description": description,
+            },
+        )
+
+    def test_description_over_limit_is_rejected(self):
+        response = self.create_offering("a" * (DESCRIPTION_LENGTH + 904))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("description", response.data)
+
+    def test_description_expanded_by_html_clean_is_rejected(self):
+        response = self.create_offering(EXPANDING_DESCRIPTION)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("description", response.data)
+        self.assertIn("sanitisation", str(response.data["description"]))
 
 
 @ddt
@@ -4716,6 +5148,27 @@ class CheckUniqueBackendIdWithRulesTest(test.APITestCase):
         self.assertTrue(response.data["is_valid_format"])
 
 
+class ShowSshKeyLossWarningTest(test.APITestCase):
+    def test_child_offering_serves_parent_flag(self):
+        fixture = fixtures.ProjectFixture()
+        parent = factories.OfferingFactory(
+            customer=fixture.customer,
+            state=OfferingStates.ACTIVE,
+            shared=True,
+            plugin_options={"show_ssh_key_loss_warning": True},
+        )
+        child = factories.OfferingFactory(
+            customer=fixture.customer,
+            state=OfferingStates.ACTIVE,
+            parent=parent,
+        )
+        self.client.force_authenticate(fixture.staff)
+        url = factories.OfferingFactory.get_public_url(child)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["plugin_options"]["show_ssh_key_loss_warning"])
+
+
 class BackendIdRulesNotInPublicAPITest(test.APITestCase):
     def test_backend_id_rules_not_exposed_in_public_offering(self):
         fixture = fixtures.ProjectFixture()
@@ -5089,3 +5542,317 @@ class RestrictedOfferingVisibilityModeTest(test.APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(response.data["is_accessible"])
+
+
+class OfferingOpenForProposalsTest(test.APITestCase):
+    def setUp(self):
+        self.offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
+
+    def get_offering(self):
+        url = factories.OfferingFactory.get_public_url(self.offering)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return response.data
+
+    def test_not_open_without_requested_offering(self):
+        self.assertFalse(self.get_offering()["open_for_proposals"])
+
+    def test_open_when_accepted_in_active_call_with_open_round(self):
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+            call__state=CallStates.ACTIVE,
+        )
+        proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+        self.assertTrue(self.get_offering()["open_for_proposals"])
+
+    def test_not_open_when_the_round_has_not_started(self):
+        """Advertising an offering whose round opens later hands the applicant
+        a deadline they cannot act on — and the write path would refuse it
+        anyway, since a proposal can only be created while its round is open.
+        """
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+            call__state=CallStates.ACTIVE,
+        )
+        # The factory default is a round starting in five days.
+        scheduled = proposal_factories.RoundFactory(call=requested_offering.call)
+        self.assertEqual(scheduled.status, RoundStatuses.SCHEDULED)
+
+        self.assertFalse(self.get_offering()["open_for_proposals"])
+
+    def test_not_open_when_call_templates_do_not_cover_the_offering(self):
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+            call__state=CallStates.ACTIVE,
+        )
+        proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+        proposal_factories.CallResourceTemplateFactory(
+            call=requested_offering.call,
+            requested_offering=proposal_factories.RequestedOfferingFactory(
+                call=requested_offering.call
+            ),
+        )
+        self.assertFalse(self.get_offering()["open_for_proposals"])
+
+    def test_open_when_a_call_template_covers_the_offering(self):
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+            call__state=CallStates.ACTIVE,
+        )
+        proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+        proposal_factories.CallResourceTemplateFactory(
+            call=requested_offering.call,
+            requested_offering=requested_offering,
+        )
+        self.assertTrue(self.get_offering()["open_for_proposals"])
+
+    def test_not_open_when_template_covers_offering_on_another_call(self):
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+            call__state=CallStates.ACTIVE,
+        )
+        proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+        proposal_factories.CallResourceTemplateFactory(
+            call=requested_offering.call,
+            requested_offering=proposal_factories.RequestedOfferingFactory(
+                call=requested_offering.call
+            ),
+        )
+        proposal_factories.CallResourceTemplateFactory(
+            requested_offering=requested_offering,
+        )
+        self.assertFalse(self.get_offering()["open_for_proposals"])
+
+    def test_not_open_when_call_is_draft(self):
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+        )
+        proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+        self.assertFalse(self.get_offering()["open_for_proposals"])
+
+    def test_not_open_when_request_is_not_accepted(self):
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+            call__state=CallStates.ACTIVE,
+            state=RequestedOfferingStates.REQUESTED,
+        )
+        proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+        self.assertFalse(self.get_offering()["open_for_proposals"])
+
+    def test_not_open_when_all_rounds_ended(self):
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+            call__state=CallStates.ACTIVE,
+        )
+        proposal_factories.RoundFactory(
+            call=requested_offering.call,
+            start_time=timezone.now() - datetime.timedelta(days=10),
+            cutoff_time=timezone.now() - datetime.timedelta(days=5),
+        )
+        self.assertFalse(self.get_offering()["open_for_proposals"])
+
+    def test_not_open_when_call_has_no_rounds(self):
+        proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+            call__state=CallStates.ACTIVE,
+        )
+        self.assertFalse(self.get_offering()["open_for_proposals"])
+
+    def test_not_open_via_another_offering_request(self):
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            call__state=CallStates.ACTIVE,
+        )
+        proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+        self.assertFalse(self.get_offering()["open_for_proposals"])
+
+    def test_several_live_rounds_do_not_duplicate_the_offering(self):
+        # Callers feed open_for_proposals() to Exists() and __in with no distinct().
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+            call__state=CallStates.ACTIVE,
+        )
+        for _ in range(2):
+            proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+
+        self.assertEqual(
+            proposal_models.RequestedOffering.objects.open_for_proposals().count(), 1
+        )
+
+        url = factories.OfferingFactory.get_public_list_url()
+        response = self.client.get(url, {"open_for_proposals": "true"})
+        self.assertEqual(len(response.json()), 1)
+
+    def test_falls_back_to_a_query_when_queryset_is_not_annotated(self):
+        # The script plugin and nested representations serialize unannotated rows.
+        requested_offering = proposal_factories.RequestedOfferingFactory(
+            offering=self.offering,
+            call__state=CallStates.ACTIVE,
+        )
+        proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+
+        offering = models.Offering.objects.get(pk=self.offering.pk)
+        self.assertFalse(hasattr(offering, "open_for_proposals"))
+        serializer = serializers.PublicOfferingDetailsSerializer()
+        self.assertTrue(serializer.get_open_for_proposals(offering))
+
+    def test_list_does_not_run_a_query_per_offering(self):
+        self.client.force_authenticate(structure_factories.UserFactory(is_staff=True))
+        url = factories.OfferingFactory.get_public_list_url()
+        query = {"field": ["uuid", "open_for_proposals"]}
+
+        # Warm up one-off lookups so the measurements differ only in row count.
+        self.client.get(url, query)
+
+        with CaptureQueriesContext(db_connection) as ctx_one:
+            self.client.get(url, query)
+
+        for _ in range(3):
+            requested_offering = proposal_factories.RequestedOfferingFactory(
+                offering=factories.OfferingFactory(state=OfferingStates.ACTIVE),
+                call__state=CallStates.ACTIVE,
+            )
+            proposal_factories.RoundFactory(call=requested_offering.call, opened=True)
+
+        with CaptureQueriesContext(db_connection) as ctx_many:
+            response = self.client.get(url, query)
+
+        self.assertEqual(len(response.data), 4)
+        self.assertEqual(len(ctx_one), len(ctx_many))
+
+
+class OfferingHistorySecretOptionsTest(test.APITestCase):
+    """Offering history is open to support users, but secret_options is not:
+    can_see_secret_options allows only staff, owners and service managers."""
+
+    def setUp(self):
+        self.fixture = marketplace_fixtures.MarketplaceFixture()
+        self.offering = self.fixture.offering
+        self.offering.secret_options = {"backend_url": "https://backend.example.com"}
+        self.offering.save(update_fields=["secret_options"])
+        with reversion.create_revision():
+            reversion.add_to_revision(self.offering)
+
+    def test_secret_options_are_not_exposed_in_history(self):
+        self.client.force_authenticate(self.fixture.global_support)
+
+        response = self.client.get(
+            factories.OfferingFactory.get_url(self.offering, "history")
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data)
+        for version in response.data:
+            self.assertNotIn("secret_options", version["serialized_data"])
+        self.assertNotIn("backend.example.com", json.dumps(response.data, default=str))
+
+
+class OfferingScopeResourceTest(test.APITestCase):
+    """If offering scope is also a scope of a marketplace resource, the resource
+    is exposed in the offering serializer. The lookup is done in detail view only."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.service_settings = structure_factories.ServiceSettingsFactory()
+        self.offering = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+            scope=self.service_settings,
+        )
+        self.scope_resource = factories.ResourceFactory(
+            project=self.fixture.project, scope=self.service_settings
+        )
+        self.staff = structure_factories.UserFactory(is_staff=True)
+
+    def test_scope_resource_is_exposed_in_provider_detail_view(self):
+        self.client.force_authenticate(self.staff)
+
+        response = self.client.get(factories.OfferingFactory.get_url(self.offering))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["scope_resource_uuid"], self.scope_resource.uuid.hex
+        )
+        self.assertEqual(response.data["scope_resource_name"], self.scope_resource.name)
+        self.assertTrue(
+            response.data["scope_resource"].endswith(
+                factories.ResourceFactory.get_url(self.scope_resource)
+            )
+        )
+        # The scope itself is a different object with its own URL.
+        self.assertNotEqual(response.data["scope_resource"], response.data["scope"])
+
+    def test_scope_resource_is_exposed_in_public_detail_view(self):
+        self.client.force_authenticate(self.fixture.user)
+
+        response = self.client.get(
+            factories.OfferingFactory.get_public_url(self.offering)
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["scope_resource_uuid"], self.scope_resource.uuid.hex
+        )
+        self.assertEqual(response.data["scope_resource_name"], self.scope_resource.name)
+        self.assertTrue(
+            response.data["scope_resource"].endswith(
+                factories.ResourceFactory.get_url(self.scope_resource)
+            )
+        )
+
+    def test_scope_resource_is_not_exposed_in_provider_list_view(self):
+        self.client.force_authenticate(self.staff)
+
+        response = self.client.get(
+            factories.OfferingFactory.get_list_url(),
+            {"name_exact": self.offering.name},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertIsNone(response.data[0]["scope_resource_uuid"])
+        self.assertIsNone(response.data[0]["scope_resource_name"])
+        self.assertIsNone(response.data[0]["scope_resource"])
+
+    def test_scope_resource_is_not_exposed_in_public_list_view(self):
+        self.client.force_authenticate(self.fixture.user)
+
+        response = self.client.get(
+            factories.OfferingFactory.get_public_list_url(),
+            {"name_exact": self.offering.name},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertIsNone(response.data[0]["scope_resource_uuid"])
+        self.assertIsNone(response.data[0]["scope_resource_name"])
+        self.assertIsNone(response.data[0]["scope_resource"])
+
+    def test_scope_resource_is_empty_if_scope_is_not_related_to_resource(self):
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer,
+            state=OfferingStates.ACTIVE,
+            scope=structure_factories.ServiceSettingsFactory(),
+        )
+        self.client.force_authenticate(self.staff)
+
+        response = self.client.get(factories.OfferingFactory.get_url(offering))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNone(response.data["scope_resource_uuid"])
+        self.assertIsNone(response.data["scope_resource_name"])
+        self.assertIsNone(response.data["scope_resource"])
+
+    def test_scope_resource_is_empty_if_offering_has_no_scope(self):
+        offering = factories.OfferingFactory(
+            customer=self.fixture.customer, state=OfferingStates.ACTIVE
+        )
+        # A resource without scope must not be matched against a scopeless offering.
+        factories.ResourceFactory(project=self.fixture.project)
+        self.client.force_authenticate(self.staff)
+
+        response = self.client.get(factories.OfferingFactory.get_url(offering))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNone(response.data["scope_resource_uuid"])
+        self.assertIsNone(response.data["scope_resource_name"])
+        self.assertIsNone(response.data["scope_resource"])

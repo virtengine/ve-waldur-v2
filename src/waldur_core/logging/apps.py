@@ -14,7 +14,7 @@ class EventsConfig(AppConfig):
         from rest_framework.authtoken.models import Token
         from rest_framework.views import APIView
 
-        from waldur_core.logging import handlers, models
+        from waldur_core.logging import checks, handlers, models  # noqa: F401
         from waldur_core.logging.event_logger import event_emitted
 
         def _bind_user_uuid(request, logger, **kwargs):
@@ -31,7 +31,7 @@ class EventsConfig(AppConfig):
 
         # Patch APIView.initial so all DRF views (incl. token-authenticated) bind user_uuid
         # after perform_authentication; middleware signals fire before that for token auth
-        from waldur_core.logging.middleware import set_current_user
+        from waldur_core.logging.middleware import set_current_auth, set_current_user
 
         _original_api_view_initial = APIView.initial
 
@@ -45,6 +45,9 @@ class EventsConfig(AppConfig):
                 # For token-authenticated DRF requests, request.user isn't set
                 # when CaptureEventContextMiddleware.process_request runs.
                 set_current_user(request.user)
+                # request.auth only exists after perform_authentication, which
+                # is why this cannot live in the middleware.
+                set_current_auth(getattr(request, "auth", None))
 
         APIView.initial = _patched_api_view_initial
 

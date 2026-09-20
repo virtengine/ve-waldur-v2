@@ -40,6 +40,11 @@ def register_in(router):
         basename="proposal-requested-resource",
     )
     router.register(
+        r"proposal-my-requested-resources",
+        views.UserRequestedResourceViewSet,
+        basename="proposal-my-requested-resource",
+    )
+    router.register(
         r"call-rounds",
         views.RoundViewSet,
         basename="call-round",
@@ -48,6 +53,11 @@ def register_in(router):
         r"call-proposal-project-role-mappings",
         views.ProposalProjectRoleMappingViewSet,
         basename="call-proposal-project-role-mapping",
+    )
+    router.register(
+        r"call-workflow-step-notification-rules",
+        views.CallWorkflowStepNotificationRuleViewSet,
+        basename="call-workflow-step-notification-rule",
     )
     # Reviewer Profile endpoints
     router.register(
@@ -155,7 +165,17 @@ urlpatterns += [
         r"^api/proposal-protected-calls/(?P<uuid>[a-f0-9]+)/rounds/(?P<obj_uuid>[a-f0-9]+)/close/$",
         views.ProtectedCallViewSet.as_view({"post": "close_round"}),
         name="proposal-call-close_round",
-    )
+    ),
+    re_path(
+        r"^api/proposal-proposals/(?P<uuid>[a-f0-9]+)/resources/(?P<obj_uuid>[a-f0-9]+)/purchase_order/$",
+        views.ProposalViewSet.as_view(
+            {
+                "post": "resource_purchase_order",
+                "delete": "resource_purchase_order",
+            }
+        ),
+        name="proposal-proposal-resource-purchase-order",
+    ),
 ]
 
 # Public reviewer invitation endpoints (token-based, no auth required)

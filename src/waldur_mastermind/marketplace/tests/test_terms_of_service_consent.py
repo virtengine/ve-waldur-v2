@@ -12,7 +12,7 @@ from django.test.utils import override_settings
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.test import APITestCase, APITransactionTestCase
+from rest_framework.test import APITestCase
 
 from waldur_core.logging.models import Event
 from waldur_core.permissions.enums import PermissionEnum
@@ -27,6 +27,7 @@ from waldur_core.structure.tests.factories import (
 )
 from waldur_mastermind.analytics import models as analytics_models
 from waldur_mastermind.marketplace import models, tasks
+from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.callbacks import resource_creation_succeeded
 from waldur_mastermind.marketplace.enums import (
     BillingTypes,
@@ -518,6 +519,59 @@ class TermsOfServiceConsentTest(APITestCase):
             terms_of_service="Updated Terms of Service",
             version="2.0",
             requires_reconsent=False,
+        )
+
+        models.UserOfferingConsent.objects.create(
+            user=self.user,
+            offering=self.offering,
+            version="2.0",
+        )
+
+        response = self.client.get(
+            self.consent_list_url, {"requires_reconsent": "false"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertFalse(response.data[0]["requires_reconsent"])
+
+    def test_requires_reconsent_filter_true_excludes_matching_version(self):
+        """Test requires_reconsent=true excludes consents already on active ToS version."""
+        self.client.force_authenticate(user=self.user)
+
+        deactivate_tos_config(self.tos_config)
+
+        models.OfferingTermsOfService.objects.create(
+            offering=self.offering,
+            terms_of_service="Updated Terms of Service",
+            version="2.0",
+            requires_reconsent=True,
+            is_active=True,
+        )
+
+        models.UserOfferingConsent.objects.create(
+            user=self.user,
+            offering=self.offering,
+            version="2.0",
+        )
+
+        response = self.client.get(
+            self.consent_list_url, {"requires_reconsent": "true"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 0)
+
+    def test_requires_reconsent_filter_false_includes_matching_version(self):
+        """Test requires_reconsent=false includes consents on active ToS version."""
+        self.client.force_authenticate(user=self.user)
+
+        deactivate_tos_config(self.tos_config)
+
+        models.OfferingTermsOfService.objects.create(
+            offering=self.offering,
+            terms_of_service="Updated Terms of Service",
+            version="2.0",
+            requires_reconsent=True,
+            is_active=True,
         )
 
         models.UserOfferingConsent.objects.create(
@@ -1300,6 +1354,104 @@ class TermsOfServiceConsentTest(APITestCase):
             self.assertIn(str(user_without_consent.uuid), user_uuids)
             self.assertIn(str(user_no_consent_main.uuid), user_uuids)
             self.assertEqual(len(user_uuids), 5)
+
+    def test_glauth_excludes_users_without_consent(self):
+        """glauth must not emit OfferingUsers lacking active ToS consent."""
+        user_with_consent = self.user
+        user_without_consent = UserFactory()
+        add_user_to_project(user_without_consent, self.project, role=ProjectRole.MEMBER)
+
+        models.UserOfferingConsent.objects.create(
+            user=user_with_consent,
+            offering=self.offering,
+            version="1.0",
+        )
+
+        # Ensure both have OfferingUser rows with usernames (revoke/bypass path).
+        for user in (user_with_consent, user_without_consent):
+            ou, _ = models.OfferingUser.objects.get_or_create(
+                user=user,
+                offering=self.offering,
+                defaults={"username": user.username},
+            )
+            if not ou.username:
+                ou.username = user.username
+                ou.save(update_fields=["username"])
+
+        tree = marketplace_utils.build_glauth_tree(self.offering)
+        tree_usernames = {ou.username for ou in tree["_offering_users"]}
+
+        self.assertIn(user_with_consent.username, tree_usernames)
+        self.assertNotIn(user_without_consent.username, tree_usernames)
+
+    def test_glauth_excludes_users_after_consent_revoked(self):
+        """Revoking consent removes the user from glauth export."""
+        consent = models.UserOfferingConsent.objects.create(
+            user=self.user,
+            offering=self.offering,
+            version="1.0",
+        )
+        ou, _ = models.OfferingUser.objects.get_or_create(
+            user=self.user,
+            offering=self.offering,
+            defaults={"username": self.user.username},
+        )
+        if not ou.username:
+            ou.username = self.user.username
+            ou.save(update_fields=["username"])
+
+        tree = marketplace_utils.build_glauth_tree(self.offering)
+        self.assertIn(self.user.username, {o.username for o in tree["_offering_users"]})
+
+        consent.revoke()
+
+        tree = marketplace_utils.build_glauth_tree(self.offering)
+        self.assertNotIn(
+            self.user.username, {o.username for o in tree["_offering_users"]}
+        )
+
+    def test_glauth_includes_all_users_when_consent_enforcement_disabled(self):
+        """Without ENFORCE_USER_CONSENT_FOR_OFFERINGS, glauth keeps all users."""
+        user_without_consent = UserFactory()
+        add_user_to_project(user_without_consent, self.project, role=ProjectRole.MEMBER)
+
+        for user in (self.user, user_without_consent):
+            ou, _ = models.OfferingUser.objects.get_or_create(
+                user=user,
+                offering=self.offering,
+                defaults={"username": user.username},
+            )
+            if not ou.username:
+                ou.username = user.username
+                ou.save(update_fields=["username"])
+
+        with override_constance_config(ENFORCE_USER_CONSENT_FOR_OFFERINGS=False):
+            tree = marketplace_utils.build_glauth_tree(self.offering)
+            tree_usernames = {ou.username for ou in tree["_offering_users"]}
+            self.assertIn(self.user.username, tree_usernames)
+            self.assertIn(user_without_consent.username, tree_usernames)
+
+    def test_glauth_includes_users_for_offering_without_tos(self):
+        """Offerings without active ToS are unaffected by consent filtering."""
+        offering_no_tos = OfferingFactory(
+            customer=self.customer,
+            type="Marketplace.Basic",
+            category=self.category,
+            plugin_options={
+                "service_provider_can_create_offering_user": True,
+                "username_generation_policy": "waldur_username",
+            },
+        )
+        user_no_consent = UserFactory()
+        models.OfferingUser.objects.create(
+            user=user_no_consent,
+            offering=offering_no_tos,
+            username=user_no_consent.username,
+        )
+
+        tree = marketplace_utils.build_glauth_tree(offering_no_tos)
+        tree_usernames = {ou.username for ou in tree["_offering_users"]}
+        self.assertIn(user_no_consent.username, tree_usernames)
 
     def test_offering_user_serializer_consent_fields_with_consent(self):
         """Test that OfferingUserSerializer includes consent fields when user has consent."""
@@ -2487,6 +2639,7 @@ class ResourceConsentUIFieldsTest(APITestCase):
     def test_update_limits_allowed_with_tos_consent(self):
         """Test that updating resource limits is allowed with ToS consent."""
         ProjectRole.MANAGER.add_permission(PermissionEnum.UPDATE_RESOURCE_LIMITS)
+        ProjectRole.MANAGER.add_permission(PermissionEnum.CREATE_ORDER)
 
         models.OfferingTermsOfService.objects.create(
             offering=self.offering,
@@ -3147,6 +3300,70 @@ class OfferingTermsOfServiceFilterTest(APITestCase):
         )
 
 
+class PublicOfferingDetailsUserHasOfferingUserTest(APITestCase):
+    """Test user_has_offering_user field on PublicOfferingDetailsSerializer."""
+
+    def setUp(self):
+        ProjectRole.MANAGER.add_permission(PermissionEnum.LIST_RESOURCES)
+
+        self.user = UserFactory()
+        self.customer = CustomerFactory()
+        self.project = ProjectFactory(customer=self.customer)
+        self.offering = OfferingFactory(
+            customer=self.customer,
+            type="Marketplace.Basic",
+            shared=True,
+            state=OfferingStates.ACTIVE,
+            plugin_options={
+                "service_provider_can_create_offering_user": True,
+                "username_generation_policy": "waldur_username",
+            },
+        )
+        self.plan = PlanFactory(offering=self.offering)
+        self.resource = ResourceFactory(
+            project=self.project,
+            offering=self.offering,
+            plan=self.plan,
+            state=ResourceStates.OK,
+        )
+        add_user_to_project(self.user, self.project, role=ProjectRole.MANAGER)
+        self.public_offering_url = reverse(
+            "marketplace-public-offering-detail",
+            kwargs={"uuid": self.offering.uuid.hex},
+        )
+        self.resource_offering_url = ResourceFactory.get_url(self.resource, "offering")
+
+    def test_user_has_offering_user_true_on_public_offering_detail(self):
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.get(self.public_offering_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["user_has_offering_user"])
+
+    def test_user_has_offering_user_false_when_no_offering_user(self):
+        models.OfferingUser.objects.filter(
+            user=self.user,
+            offering=self.offering,
+        ).delete()
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.get(self.public_offering_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["user_has_offering_user"])
+
+    def test_user_has_offering_user_on_resource_offering_action(self):
+        models.OfferingUser.objects.filter(
+            user=self.user,
+            offering=self.offering,
+        ).delete()
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.get(self.resource_offering_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("user_has_offering_user", response.data)
+        self.assertFalse(response.data["user_has_offering_user"])
+
+
 @override_constance_config(ENFORCE_USER_CONSENT_FOR_OFFERINGS=True)
 class TermsOfServiceConsentEventLoggingTest(APITestCase):
     """Test event logging for Terms of Service consent operations."""
@@ -3791,7 +4008,7 @@ class ToSConsentStatsTest(APITestCase):
 
 
 @override_constance_config(ENFORCE_USER_CONSENT_FOR_OFFERINGS=True)
-class ToSConsentNotificationTest(APITransactionTestCase):
+class ToSConsentNotificationTest(APITestCase):
     """Test cases for ToS consent notification tasks and handlers."""
 
     def setUp(self):

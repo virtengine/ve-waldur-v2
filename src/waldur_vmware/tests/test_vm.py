@@ -4,6 +4,7 @@ import ddt
 from rest_framework import status, test
 
 from waldur_vmware import models
+from waldur_vmware.backend import VMwareBackend
 from waldur_vmware.tests.utils import override_plugin_settings
 
 from . import factories, fixtures
@@ -410,6 +411,44 @@ class VirtualMachineLimitsValidationTest(VirtualMachineCreateBaseTest):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
+class VirtualMachineRuntimeStateTest(test.APITestCase):
+    """The power state has to reach clients as it is stored.
+
+    The UI decides whether Start, Stop, Reset and the guest actions are
+    available by comparing this field to POWERED_ON, POWERED_OFF and SUSPENDED,
+    so a label -- or the null the serializer used to return -- leaves every one
+    of them disabled.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.VMwareFixture()
+        self.vm = self.fixture.virtual_machine
+        self.url = factories.VirtualMachineFactory.get_url(self.vm)
+
+    def test_runtime_state_is_serialized(self):
+        self.vm.runtime_state = models.VirtualMachine.RuntimeStates.POWERED_OFF
+        self.vm.save()
+        self.client.force_authenticate(self.fixture.owner)
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["runtime_state"],
+            models.VirtualMachine.RuntimeStates.POWERED_OFF,
+        )
+
+    def test_unknown_runtime_state_is_serialized_as_empty(self):
+        self.vm.runtime_state = ""
+        self.vm.save()
+        self.client.force_authenticate(self.fixture.owner)
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["runtime_state"], "")
+
+
 class VirtualMachineDeleteTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.VMwareFixture()
@@ -429,122 +468,6 @@ class VirtualMachineDeleteTest(test.APITestCase):
         self.client.force_authenticate(self.fixture.owner)
         response = self.client.delete(self.url)
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
-
-
-class VirtualMachineBackendTest(test.APITestCase):
-    def setUp(self):
-        self.fixture = fixtures.VMwareFixture()
-        self.client = mock.MagicMock()
-
-    def create_vm(self, vm):
-        backend = self.fixture.virtual_machine.get_backend()
-
-        backend.client = self.client
-        backend.client.deploy_vm_from_template.return_value = "vm-01"
-        backend.client.create_vm.return_value = "vm-01"
-        backend.client.get_vm.return_value = {"power_state": "POWERED_OFF", "disks": []}
-
-        backend.create_virtual_machine(vm)
-
-    def test_folder_is_used_for_vm_provisioning_from_template(self):
-        # Arrange
-        vm = self.fixture.virtual_machine
-        vm.folder = self.fixture.folder
-        vm.save()
-
-        # Act
-        self.create_vm(vm)
-
-        # Assert
-        spec = self.client.deploy_vm_from_template.mock_calls[0][1][1]
-        self.assertEqual(spec["placement"]["folder"], self.fixture.folder.backend_id)
-
-    def test_if_folder_is_not_specified_default_folder_is_found(self):
-        # Arrange
-        vm = self.fixture.virtual_machine
-        vm.folder = None
-        vm.save()
-        self.client.list_folders.return_value = [
-            {"name": "string", "folder": "obj-103"},
-            {"name": "string", "folder": "obj-104"},
-        ]
-
-        # Act
-        self.create_vm(vm)
-
-        # Assert
-        spec = self.client.deploy_vm_from_template.mock_calls[0][1][1]
-        self.assertEqual(spec["placement"]["folder"], "obj-103")
-
-    def test_cluster_is_used_for_vm_provisioning_from_template(self):
-        # Arrange
-        vm = self.fixture.virtual_machine
-
-        # Act
-        self.create_vm(vm)
-
-        # Assert
-        spec = self.client.deploy_vm_from_template.mock_calls[0][1][1]
-        self.assertEqual(spec["placement"]["cluster"], self.fixture.cluster.backend_id)
-
-    def test_if_cluster_is_not_specified_default_resource_pool_is_found(self):
-        # Arrange
-        vm = self.fixture.virtual_machine
-        vm.cluster = None
-        vm.save()
-        self.client.list_resource_pools.return_value = [
-            {"name": "string", "resource_pool": "obj-103"},
-            {"name": "string", "resource_pool": "obj-104"},
-        ]
-
-        # Act
-        self.create_vm(vm)
-
-        # Assert
-        spec = self.client.deploy_vm_from_template.mock_calls[0][1][1]
-        self.assertEqual(spec["placement"]["resource_pool"], "obj-103")
-
-    def test_nic_is_overridden_for_template(self):
-        # Arrange
-        vm = self.fixture.virtual_machine
-        self.client.get_template_library_item.return_value = {
-            "nics": [
-                {
-                    "key": "obj-103",
-                    "value": {
-                        "backing_type": "STANDARD_PORTGROUP",
-                        "mac_type": "MANUAL",
-                        "network": "obj-103",
-                    },
-                }
-            ]
-        }
-        vm.networks.add(self.fixture.network)
-
-        # Act
-        self.create_vm(vm)
-
-        # Assert
-        spec = self.client.deploy_vm_from_template.mock_calls[0][1][1]
-        self.assertEqual(
-            spec["hardware_customization"]["nics"],
-            [{"key": "obj-103", "value": {"network": self.fixture.network.backend_id}}],
-        )
-
-    def test_nic_is_created_from_scratch(self):
-        # Arrange
-        vm = self.fixture.virtual_machine
-        vm.template = None
-        vm.networks.add(self.fixture.network)
-        vm.save()
-
-        # Act
-        self.create_vm(vm)
-
-        # Assert
-        self.client.create_nic.assert_called_once_with(
-            "vm-01", self.fixture.network.backend_id
-        )
 
 
 class NetworkPortCreateTest(test.APITestCase):
@@ -637,4 +560,113 @@ class GuestPowerTest(test.APITestCase):
         # Assert
         self.assertEqual(
             response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
+
+
+class TemplateDeploymentSpecTest(test.APITestCase):
+    """The Content Library deployment spec, which stays on REST.
+
+    ``_get_vm_placement``, ``_get_template_nics`` and
+    ``create_virtual_machine_from_template`` are not part of the pyVmomi
+    migration, so they keep mock-level coverage: vcsim cannot describe a library
+    item's hardware, and ``test_full_order_path_from_template`` deliberately
+    deploys without a cluster, which leaves the cluster-placement branch and the
+    NIC override with no other test.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.VMwareFixture()
+        self.rest_client = mock.MagicMock()
+        self.rest_client.deploy_vm_from_template.return_value = "vm-01"
+        self.rest_client.get_template_library_item.return_value = {"nics": []}
+        # `client` reads through the process-wide session cache, so it is
+        # patched on the class rather than assigned on the instance — which
+        # would also leave a mock in the cache for the tests that follow.
+        patcher = mock.patch.object(
+            VMwareBackend,
+            "client",
+            new_callable=mock.PropertyMock,
+            return_value=self.rest_client,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def deploy(self, vm):
+        """Provision `vm` and return the spec sent to the Content Library.
+
+        The post-deployment read and the default-placement lookups moved to
+        SOAP, so they are stubbed out; what this asserts on is the REST spec.
+        """
+        backend = vm.get_backend()
+        backend._get_vm_properties = mock.Mock(
+            return_value={
+                "runtime.powerState": "poweredOff",
+                "config.hardware.device": [],
+            }
+        )
+        backend.get_default_vm_folder = mock.Mock(return_value="group-v1")
+        backend.get_default_resource_pool = mock.Mock(return_value="resgroup-1")
+
+        backend.create_virtual_machine(vm)
+
+        return self.rest_client.deploy_vm_from_template.mock_calls[0][1][1]
+
+    def test_folder_is_used_for_vm_provisioning_from_template(self):
+        vm = self.fixture.virtual_machine
+        vm.folder = self.fixture.folder
+        vm.save()
+
+        spec = self.deploy(vm)
+
+        self.assertEqual(spec["placement"]["folder"], self.fixture.folder.backend_id)
+
+    def test_if_folder_is_not_specified_default_folder_is_found(self):
+        vm = self.fixture.virtual_machine
+        vm.folder = None
+        vm.save()
+
+        spec = self.deploy(vm)
+
+        self.assertEqual(spec["placement"]["folder"], "group-v1")
+
+    def test_cluster_is_used_for_vm_provisioning_from_template(self):
+        vm = self.fixture.virtual_machine
+
+        spec = self.deploy(vm)
+
+        self.assertEqual(spec["placement"]["cluster"], self.fixture.cluster.backend_id)
+        # A cluster and a resource pool are alternatives: vCenter derives the
+        # cluster's root pool itself, and naming both over-constrains placement.
+        self.assertNotIn("resource_pool", spec["placement"])
+
+    def test_if_cluster_is_not_specified_default_resource_pool_is_found(self):
+        vm = self.fixture.virtual_machine
+        vm.cluster = None
+        vm.save()
+
+        spec = self.deploy(vm)
+
+        self.assertEqual(spec["placement"]["resource_pool"], "resgroup-1")
+
+    def test_nic_is_overridden_for_template(self):
+        vm = self.fixture.virtual_machine
+        vm.networks.add(self.fixture.network)
+        self.rest_client.get_template_library_item.return_value = {
+            "nics": [
+                {
+                    "key": "obj-103",
+                    "value": {
+                        "backing_type": "STANDARD_PORTGROUP",
+                        "mac_type": "MANUAL",
+                        "network": "obj-103",
+                    },
+                }
+            ]
+        }
+
+        spec = self.deploy(vm)
+
+        self.assertEqual(
+            spec["hardware_customization"]["nics"],
+            [{"key": "obj-103", "value": {"network": self.fixture.network.backend_id}}],
         )

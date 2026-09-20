@@ -7,7 +7,7 @@ from django.utils import timezone
 from waldur_core.core import utils as core_utils
 from waldur_core.structure.models import Customer
 from waldur_mastermind.invoices import models as invoice_models
-from waldur_mastermind.marketplace import billing_discount
+from waldur_mastermind.marketplace import billing_discount, billing_mode
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.billing_limit import LimitPeriodProcessor
 from waldur_mastermind.marketplace.billing_utils import (
@@ -107,12 +107,10 @@ class MarketplaceBillingService:
                 )
                 return
 
+        resolved = billing_mode.resolve_for_resource(resource)
+
         # LIMIT components: delegate to LimitPeriodProcessor
-        limit_types = set(
-            resource.offering.components.filter(
-                billing_type=BillingTypes.LIMIT
-            ).values_list("type", flat=True)
-        )
+        limit_types = resolved.limit_types
         for component_type, new_quantity in resource.limits.items():
             if component_type not in limit_types:
                 continue
@@ -122,10 +120,9 @@ class MarketplaceBillingService:
 
         # Prepaid ONE_TIME components: supplementary charge for remaining period
         prepaid_types = {
-            c.type: c
-            for c in resource.offering.components.filter(
-                billing_type=BillingTypes.ONE_TIME, is_prepaid=True
-            )
+            c.type: c.component
+            for c in resolved.components.values()
+            if c.billing_type == BillingTypes.ONE_TIME and c.is_prepaid
         }
         if prepaid_types and resource.end_date:
             cls._handle_prepaid_limits_change(
@@ -185,7 +182,9 @@ class MarketplaceBillingService:
                 start=now,
                 end=core_utils.month_end(now),
                 details=details,
-                measured_unit=offering_component.measured_unit,
+                measured_unit=billing_mode.resolve_component(
+                    offering_component, plan_component.plan
+                ).measured_unit,
             )
 
     @classmethod
@@ -322,9 +321,9 @@ class MarketplaceBillingService:
                 )
                 continue
 
-            is_limit = offering_component.billing_type == BillingTypes.LIMIT
+            effective = billing_mode.resolve_component(offering_component, plan)
 
-            if is_limit:
+            if effective.billing_type == BillingTypes.LIMIT:
                 LimitPeriodProcessor.process_creation(
                     resource, plan_component, invoice, start, end, order_type
                 )
@@ -353,10 +352,13 @@ class MarketplaceBillingService:
         - ON_PLAN_SWITCH: Creates a single item if the order type is UPDATE.
         """
         offering_component = plan_component.component
+        effective = billing_mode.resolve_component(
+            offering_component, plan_component.plan
+        )
 
-        is_fixed = offering_component.billing_type == BillingTypes.FIXED
-        is_one = offering_component.billing_type == BillingTypes.ONE_TIME
-        is_switch = offering_component.billing_type == BillingTypes.ON_PLAN_SWITCH
+        is_fixed = effective.billing_type == BillingTypes.FIXED
+        is_one = effective.billing_type == BillingTypes.ONE_TIME
+        is_switch = effective.billing_type == BillingTypes.ON_PLAN_SWITCH
         if (
             is_fixed
             or (is_one and order_type == OrderTypes.CREATE)
@@ -365,25 +367,49 @@ class MarketplaceBillingService:
             unit_price = plan_component.price
             unit = resource.plan.unit
             quantity = 0
+            discount_volume = None
 
             if is_fixed:
                 unit_price *= plan_component.amount
                 quantity = invoice_models.get_quantity(unit, start, end)
-            elif is_one and offering_component.is_prepaid:
+            elif is_one and effective.is_prepaid:
                 # Prepaid ONE_TIME: charge limit × duration_months upfront
                 unit = invoice_models.Units.QUANTITY
                 component_type = offering_component.type
                 limit = resource.limits.get(component_type, 0)
                 factor = resource.offering.component_factors.get(component_type, 1)
                 quantity = limit / factor if factor != 1 else limit
+                # The volume discount is thresholded on the raw volume; capture
+                # it before the upfront duration multiplication below.
+                discount_volume = quantity
                 if resource.end_date:
                     start_date = start.date() if hasattr(start, "date") else start
                     quantity *= core_utils.calculate_duration_months(
                         start_date, resource.end_date
                     )
+                else:
+                    # A prepaid component with no period is charged for a single
+                    # month. That is occasionally right — an open-ended grant —
+                    # but it is also what a lost end date looks like, and the
+                    # difference is a whole subscription's worth of invoice, so
+                    # say which one happened rather than let it pass in silence.
+                    logger.warning(
+                        "Prepaid component %s of resource %s (UUID: %s) is being "
+                        "charged for a single period: the resource carries no end "
+                        "date, so there is no duration to multiply by.",
+                        component_type,
+                        resource.name,
+                        resource.uuid.hex,
+                    )
             elif is_one or is_switch:
+                # The plan's amount, as every estimate reads it. Charging one
+                # regardless quoted a plan one figure and billed another in
+                # whichever direction the amount fell: a component sold in
+                # quantity (40 GPU hours at 15) was quoted 600 and billed 15,
+                # while one left at the default zero was quoted nothing and
+                # billed in full.
                 unit = invoice_models.Units.QUANTITY
-                quantity = 1
+                quantity = plan_component.amount
 
             create_discounted_resource_on_activation(resource)
 
@@ -406,12 +432,17 @@ class MarketplaceBillingService:
                 details["unit_price"] = float(unit_price)
 
             # Record the volume that feeds the org-aggregated volume discount:
-            # FIXED scales on the configured amount, one-time and plan-switch
-            # charges on their billed quantity. The discount itself is computed
-            # and materialized at invoice finalization (billing_discount).
-            details[billing_discount.DISCOUNT_USAGE_KEY] = float(
-                plan_component.amount if is_fixed else quantity
-            )
+            # FIXED scales on the configured amount, prepaid ONE_TIME on the
+            # raw limit (never the duration-multiplied upfront quantity, so a
+            # long prepaid period cannot push a small volume over a tier
+            # threshold), other one-time and plan-switch charges on their
+            # billed quantity. The discount itself is computed and
+            # materialized at invoice finalization (billing_discount).
+            if is_fixed:
+                discount_volume = plan_component.amount
+            elif discount_volume is None:
+                discount_volume = quantity
+            details[billing_discount.DISCOUNT_USAGE_KEY] = float(discount_volume)
 
             invoice_models.InvoiceItem.objects.create(
                 name=name,
@@ -425,7 +456,9 @@ class MarketplaceBillingService:
                 unit_price=discounted_unit_price,
                 unit=unit,
                 quantity=quantity,
-                measured_unit=offering_component.measured_unit,
+                measured_unit=billing_mode.resolve_component(
+                    offering_component, plan_component.plan
+                ).measured_unit,
                 article_code=offering_component.article_code
                 or resource.plan.article_code,
             )

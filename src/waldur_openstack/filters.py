@@ -1,10 +1,14 @@
+from typing import cast
+
 import django_filters
 from django.db.models import Q
 from django_filters.widgets import BooleanWidget
 
 from waldur_core.core import filters as core_filters
+from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates
 from waldur_core.structure import filters as structure_filters
+from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace.models import Offering
 from waldur_openstack.utils import get_valid_availability_zones
 
@@ -47,18 +51,31 @@ class SharedTenantFilterSet(django_filters.FilterSet):
         return queryset.filter(tenants=tenant)
 
     def filter_offering(self, queryset, name, value):
+        """Narrow service properties to those an offering can use.
+
+        An offering's scope is a generic relation, and OpenStack uses two kinds.
+        The tenant-provisioning offering is scoped to the service settings,
+        while the per-tenant instance and volume offerings that Waldur creates
+        alongside a tenant are scoped to that tenant. Assuming settings meant a
+        tenant-scoped offering reached a Tenant queryset with a Tenant instance,
+        which Django rejects outright — the request failed with a 500 rather
+        than an empty or filtered result.
+        """
         try:
             offering = Offering.objects.get(uuid=value)
         except Offering.DoesNotExist:
             return queryset.none()
-        if not offering.scope:
-            return queryset.none()
 
-        tenants = models.Tenant.objects.filter(service_settings=offering.scope)
-        if tenants.exists():
-            return queryset.filter(tenants__in=tenants).distinct()
-        # Fall back to service settings level when no tenants exist yet
-        return queryset.filter(settings=offering.scope)
+        scope = offering.scope
+        if isinstance(scope, models.Tenant):
+            return queryset.filter(tenants=scope).distinct()
+        if isinstance(scope, structure_models.ServiceSettings):
+            tenants = models.Tenant.objects.filter(service_settings=scope)
+            if tenants.exists():
+                return queryset.filter(tenants__in=tenants).distinct()
+            # Fall back to service settings level when no tenants exist yet
+            return queryset.filter(settings=scope)
+        return queryset.none()
 
 
 class SecurityGroupFilter(TenantFilterSet, structure_filters.BaseResourceFilter):
@@ -621,9 +638,40 @@ class InstanceFilter(TenantFilterSet, structure_filters.BaseResourceFilter):
         method="filter_attach_volume",
         label="Filter for attachment to volume UUID",
     )
+    security_group = core_filters.URLFilter(
+        view_name="openstack-sgp-detail",
+        method="filter_security_group_url",
+        label="Security group URL",
+    )
+    security_group_uuid = core_filters.RelatedUUIDFilter(
+        view_name="openstack-sgp-detail",
+        method="filter_security_group",
+        label="Security group UUID",
+    )
     query = django_filters.CharFilter(
         method="filter_query", label="Search by name, internal IP, or external IP"
     )
+
+    def filter_security_group(self, queryset, name, value):
+        """
+        A security group is attached to an instance directly, as reported by
+        Nova, and to its ports, as applied by Neutron. Both relations are
+        traversed, since the direct one is refreshed by instance pull only.
+        """
+        return queryset.filter(
+            Q(security_groups__uuid=value) | Q(ports__security_groups__uuid=value)
+        ).distinct()
+
+    def filter_security_group_url(self, queryset, name, value):
+        # A filter method replaces Filter.filter, so the URL is resolved to the
+        # UUID here instead of by URLFilter itself.
+        security_group_filter = cast(
+            core_filters.URLFilter, self.filters["security_group"]
+        )
+        uuid = security_group_filter.get_uuid(value)
+        if not uuid or not core_utils.is_uuid_like(uuid):
+            return queryset.none()
+        return self.filter_security_group(queryset, name, uuid)
 
     def filter_attach_volume(self, queryset, name, value):
         """

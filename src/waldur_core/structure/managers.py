@@ -137,16 +137,85 @@ def _get_resource_role_customer_ids_qs(user):
     return get_user_resource_descended_customer_ids(user)
 
 
-def filter_customer_by_ip_address(ip_address):
-    return structure_models.Customer.objects.filter(
-        models.Q(access_subnet_set__inet__isnull=True)
-        | models.Q(access_subnet_set__inet__net_contains_or_equals=ip_address)
+def get_service_provider_manager_customer_ids_qs(user):
+    """Lazy QuerySet of Customer IDs whose ServiceProvider the user has a role on.
+
+    Unlike resource roles, this is deliberately kept out of
+    ``filter_queryset_for_user``: it only makes the organization listable and
+    readable through ``/api/customers/``, never visible to the many other
+    callers (invoices, credits, chat tools) that scope by customer.
+
+    Returns ``None`` when the marketplace module is not installed.
+    """
+    try:
+        from waldur_mastermind.marketplace.managers import (
+            get_user_managed_service_provider_customer_ids,
+        )
+    except ImportError:
+        return None
+    return get_user_managed_service_provider_customer_ids(user)
+
+
+def get_service_provider_manager_only_customer_ids(user, customer_ids) -> set:
+    """Subset of ``customer_ids`` the user reaches solely through a service
+    provider role, i.e. not visible via ``filter_queryset_for_user``.
+
+    This is the single definition of "manager only". Note that an offering
+    role on one of the provider's offerings does not confer customer
+    visibility in ``filter_queryset_for_user``, so such a user is still
+    "manager only" here; clients must not infer otherwise from the
+    ``customer_uuid`` on offering permissions."""
+    if not user.is_authenticated or user.is_staff or user.is_support:
+        return set()
+    managed_qs = get_service_provider_manager_customer_ids_qs(user)
+    if managed_qs is None:
+        return set()
+    managed_ids = set(managed_qs.filter(customer_id__in=customer_ids))
+    if not managed_ids:
+        return set()
+    otherwise_visible = filter_queryset_for_user(
+        structure_models.Customer.objects.filter(id__in=managed_ids), user
     ).values_list("id", flat=True)
+    return managed_ids - set(otherwise_visible)
+
+
+def filter_customer_by_ip_address(ip_address):
+    """Customers the given address may act on behalf of.
+
+    Only subnets the organization marked as applying to portal sign-in count
+    here. An entry added to reach a resource of some offering must never
+    restrict who can sign in, so it is excluded — that separation is the whole
+    reason the scope flag exists.
+
+    A customer with no portal-scoped subnets is unrestricted. ``Exists`` rather
+    than a join: the join form matched "has a row whose inet is null", which
+    cannot express "has no portal-scoped rows at all", and duplicated customer
+    ids once several subnets matched.
+    """
+    portal_subnets = structure_models.AccessSubnet.objects.filter(
+        customer=models.OuterRef("pk"),
+        applies_to_portal=True,
+        inet__isnull=False,
+    )
+    return (
+        structure_models.Customer.objects.annotate(
+            has_portal_subnets=models.Exists(portal_subnets),
+            address_allowed=models.Exists(
+                portal_subnets.filter(inet__net_contains_or_equals=ip_address)
+            ),
+        )
+        .filter(models.Q(has_portal_subnets=False) | models.Q(address_allowed=True))
+        .values_list("id", flat=True)
+    )
 
 
 def filter_queryset_by_user_ip(queryset, request):
     user = request.user
-    user_ip = core_utils.get_ip_address(request)
+    # Normalise the raw, client-controlled X-Forwarded-For: an unparseable
+    # value must resolve to None (which the `not user_ip` guard below treats as
+    # "no restriction") rather than reaching the Postgres inet lookup, where it
+    # would raise and 500 the request.
+    user_ip = core_utils.normalize_ip_address(core_utils.get_ip_address(request))
 
     if queryset is None:
         return queryset
@@ -208,12 +277,22 @@ class PrivateServiceSettingsManager(ServiceSettingsManager):
         return super().get_queryset().filter(shared=False)
 
 
-def get_connected_customers(user, role=None):
+def get_connected_customers(user, role=None) -> QuerySet[int]:
+    """Customer **ids** the user holds a role on, despite the name.
+
+    Use ``filter(customer__in=...)``; a membership test needs
+    ``Customer.objects.filter(pk=..., id__in=...).exists()``.
+    """
     ctype = ContentType.objects.get_for_model(structure_models.Customer)
     return get_scope_ids(user, ctype, role)
 
 
-def get_connected_projects(user, role=None):
+def get_connected_projects(user, role=None) -> QuerySet[int]:
+    """Project **ids** the user holds a role on, despite the name.
+
+    Use ``filter(project__in=...)``; a membership test needs
+    ``Project.objects.filter(pk=..., id__in=...).exists()``.
+    """
     ctype = ContentType.objects.get_for_model(structure_models.Project)
     return get_scope_ids(user, ctype, role)
 
@@ -318,7 +397,11 @@ def get_active_tokens():
     # Get tokens that are either:
     # 1. Within their lifetime (created + token_lifetime > now)
     # 2. Have no lifetime limit (token_lifetime is NULL)
-    return authtoken_models.Token.objects.filter(
-        Q(created__gte=Now() - F("user__token_lifetime") * timedelta(seconds=1))
-        | Q(user__token_lifetime__isnull=True)
-    ).select_related("user")
+    return (
+        authtoken_models.Token.objects.filter(
+            Q(created__gte=Now() - F("user__token_lifetime") * timedelta(seconds=1))
+            | Q(user__token_lifetime__isnull=True)
+        )
+        .select_related("user")
+        .order_by("-created", "key")
+    )

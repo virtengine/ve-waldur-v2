@@ -1,6 +1,7 @@
 import datetime
 import ipaddress
 import logging
+import math
 import re
 from decimal import Decimal
 from typing import Literal, cast
@@ -29,6 +30,7 @@ from rest_framework import exceptions as rf_exceptions
 from rest_framework import serializers
 from rest_framework.exceptions import APIException, PermissionDenied
 from rest_framework.permissions import SAFE_METHODS
+from rest_framework.reverse import reverse
 
 from waldur_core.checklist import enums as checklist_enums
 from waldur_core.checklist import models as checklist_models
@@ -42,7 +44,12 @@ from waldur_core.core.enums import CoreStates, ReviewStates
 from waldur_core.core.exceptions import IncorrectStateException
 from waldur_core.core.fields import NaturalChoiceField
 from waldur_core.core.mixins import GetValueMixin
-from waldur_core.core.models import NAME_LENGTH, User, get_ssh_key_fingerprints
+from waldur_core.core.models import (
+    DESCRIPTION_LENGTH,
+    NAME_LENGTH,
+    User,
+    get_ssh_key_fingerprints,
+)
 from waldur_core.core.validators import BackendURLValidator, validate_ssh_public_key
 from waldur_core.media.validators import ImageValidator
 from waldur_core.permissions import models as permission_models
@@ -63,7 +70,6 @@ from waldur_core.structure.executors import ServiceSettingsCreateExecutor
 from waldur_core.structure.managers import (
     filter_queryset_for_user,
     get_connected_customers,
-    get_connected_projects,
 )
 from waldur_core.structure.serializers import get_options_serializer_class
 from waldur_mastermind.billing.serializers import (
@@ -73,21 +79,32 @@ from waldur_mastermind.billing.serializers import (
 from waldur_mastermind.common import formula as common_formula
 from waldur_mastermind.common import mixins as common_mixins
 from waldur_mastermind.common.exceptions import TransactionRollback
-from waldur_mastermind.common.serializers import validate_options
+from waldur_mastermind.common.serializers import (
+    K8S_TOPOLOGY_MODES,
+    VISIBLE_IF_FIELD_TYPES,
+    get_hidden_options,
+    strip_hidden_options,
+    validate_options,
+)
 from waldur_mastermind.common.utils import prices_are_equal
-from waldur_mastermind.invoices.models import InvoiceItem
+from waldur_mastermind.invoices.models import Invoice, InvoiceItem
 from waldur_mastermind.invoices.serializers import PaymentProfileSerializer
 from waldur_mastermind.invoices.utils import get_billing_price_estimate_for_resources
 from waldur_mastermind.marketplace.billing_utils import convert_slurm_usage
 from waldur_mastermind.marketplace.enums import (
+    MAX_LIMIT_DECIMAL_PLACES,
     OPENSTACK_TENANT_OFFERING,
     SITE_AGENT_OFFERING,
     SWAPPABLE_OFFERING_TYPES,
+    AccountScopes,
+    AccountSettingSources,
+    BillingModes,
     BillingTypes,
     CourseAccountState,
     DiscountAggregations,
     LimitPeriods,
     MaintenanceTimingBucket,
+    MissingUsagePolicies,
     OfferingStates,
     OfferingUserRuntimeStates,
     OfferingUserStates,
@@ -101,6 +118,7 @@ from waldur_mastermind.marketplace.enums import (
     RobotAccountStates,
     ServiceAccountState,
     ServiceAccountStatesType,
+    SwitchBillingModes,
     UsageLimitAction,
 )
 from waldur_mastermind.marketplace.fields import PublicPlanField
@@ -123,9 +141,12 @@ from waldur_mastermind.marketplace_rancher.const import (
 from waldur_mastermind.proposal import models as proposal_models
 from waldur_pid import models as pid_models
 
-from . import log, models, permissions, plugins, posix_ids, utils
+from . import billing_mode, log, models, permissions, plugins, posix_ids, utils
 
 logger = logging.getLogger(__name__)
+
+MAX_ORDER_NOTIFICATION_EMAILS = 10
+MAX_ORDER_NOTIFICATION_ROLES = 10
 
 
 def validate_auto_approve_for_roles_is_staff_only(user, instance, plugin_options):
@@ -160,27 +181,48 @@ def validate_disable_grace_period_is_staff_only(user, instance, plugin_options):
         )
 
 
-def validate_project_or_customer_role_names(value):
-    """Reject any name that is not an active project- or organization-scoped
-    role. Shared by the restricted_to_roles / auto_approve_for_roles options."""
+def validate_role_names(value, scope_models, scopes_label):
+    """Reject any name that is not an active role scoped to one of scope_models.
+
+    A role name is only meaningful where the option resolves it, so each option
+    passes the models it resolves names on and a label naming them in the error.
+    """
     if not value:
         return value
-    project_ct = ContentType.objects.get_for_model(structure_models.Project)
-    customer_ct = ContentType.objects.get_for_model(structure_models.Customer)
+    content_types = [ContentType.objects.get_for_model(model) for model in scope_models]
     existing = set(
         permission_models.Role.objects.filter(
             name__in=value,
             is_active=True,
-            content_type__in=[project_ct, customer_ct],
+            content_type__in=content_types,
         ).values_list("name", flat=True)
     )
     invalid = [name for name in value if name not in existing]
     if invalid:
         raise rf_exceptions.ValidationError(
-            _("The following are not valid project or organization roles: %s")
-            % ", ".join(invalid)
+            _("The following are not valid %(scopes)s roles: %(names)s")
+            % {"scopes": scopes_label, "names": ", ".join(invalid)}
         )
     return value
+
+
+def validate_project_or_customer_role_names(value):
+    """Shared by the restricted_to_roles / auto_approve_for_roles options."""
+    return validate_role_names(
+        value,
+        [structure_models.Project, structure_models.Customer],
+        _("project or organization"),
+    )
+
+
+def validate_provider_role_names(value):
+    """Used by the order_notification_roles option, whose names are resolved on
+    the provider organization and on the offering itself."""
+    return validate_role_names(
+        value,
+        [structure_models.Customer, models.Offering],
+        _("organization or offering"),
+    )
 
 
 class LifecyclePluginOptionsSerializer(serializers.Serializer):
@@ -231,7 +273,7 @@ class LifecyclePluginOptionsSerializer(serializers.Serializer):
     )
     disable_autoapprove = serializers.BooleanField(
         required=False,
-        help_text="If set to True, orders for this offering will always require manual approval, overriding auto_approve_in_service_provider_projects",
+        help_text="If set to True, orders for this offering will always require manual consumer approval, overriding every other consumer-side auto-approve mechanism (auto_approve_in_service_provider_projects, auto_approve_for_roles, project auto-approval rules, and the ORDER.APPROVE permission). Termination orders, staff users and provider approval are not affected",
     )
     supports_downscaling = serializers.BooleanField(
         required=False,
@@ -314,9 +356,42 @@ class LifecyclePluginOptionsSerializer(serializers.Serializer):
         required=False,
         help_text="If set to True, create orders when options of related resources are changed.",
     )
+    enable_resource_end_date_change_requests = serializers.BooleanField(
+        required=False,
+        help_text="If set to True, users without RESOURCE.SET_END_DATE can "
+        "request an end date change, and holders of that permission approve or "
+        "reject. Approval writes the date directly; no order is created. "
+        "Requests are published as events so an external approval system can "
+        "decide instead. Not applicable to prepaid offerings, which extend "
+        "through renewal instead.",
+    )
+    enable_resource_limit_change_requests = serializers.BooleanField(
+        required=False,
+        help_text="If set to True, users who cannot change resource limits "
+        "directly (RESOURCE.SET_LIMITS together with ORDER.CREATE) can request "
+        "a limit change, and holders of RESOURCE.SET_LIMITS approve or reject. "
+        "Approval submits an update order for the requested limits.",
+    )
     enable_resource_projects = serializers.BooleanField(
         required=False,
         help_text="Enable sub-project management within resources.",
+    )
+    enable_membership_sync_status = serializers.BooleanField(
+        required=False,
+        help_text=(
+            "Enable per-member sync status reporting by the site agent: "
+            "team views show whether each role grant has propagated to "
+            "the provider backend, and providers can trigger a resync."
+        ),
+    )
+    enable_scim_entitlements = serializers.BooleanField(
+        required=False,
+        help_text=(
+            "Include this offering in outbound SCIM user entitlement sync. "
+            "When unset or false, SSH access endpoints on this offering "
+            "are not pushed to the remote SCIM service even if "
+            "SCIM_MEMBERSHIP_SYNC_ENABLED is on."
+        ),
     )
     enable_resource_access_subnets = serializers.BooleanField(
         required=False,
@@ -479,6 +554,39 @@ class LifecyclePluginOptionsSerializer(serializers.Serializer):
             )
         return value
 
+    def validate(self, attrs):
+        """Refuse end date change requests on a prepaid offering up front.
+
+        utils.offering_allows_end_date_change_requests ignores the option for
+        prepaid offerings, so without this the switch saves and then does
+        nothing, which reads as a bug. Prepaid resources extend through renewal,
+        whose duration bounds and upfront charge an arbitrary date would bypass.
+
+        Only the offering being edited can be inspected here — components arrive
+        through their own endpoints — so a prepaid component added later still
+        leaves the option set but inert. Approval re-checks the same gate, so
+        nothing slips through on that route.
+        """
+        attrs = super().validate(attrs)
+        if not attrs.get("enable_resource_end_date_change_requests"):
+            return attrs
+
+        offering = getattr(self.root, "instance", None)
+        if (
+            offering is not None
+            and getattr(offering, "pk", None)
+            and offering.components.filter(is_prepaid=True).exists()
+        ):
+            raise rf_exceptions.ValidationError(
+                {
+                    "enable_resource_end_date_change_requests": _(
+                        "Prepaid offerings extend through renewal, so they "
+                        "cannot accept end date change requests."
+                    )
+                }
+            )
+        return attrs
+
 
 class SupportPluginOptionsSerializer(serializers.Serializer):
     enable_issues_for_membership_changes = serializers.BooleanField(
@@ -555,29 +663,67 @@ def validate_posix_path(value, field):
     return value
 
 
+def merge_account_options(current: dict | None, changes: dict) -> dict:
+    """Apply account-setting changes key by key.
+
+    As an offering's plugin options are updated: an omitted key is kept, and a
+    blank value removes the setting so that it is inherited again.
+    """
+    options = dict(current or {})
+    for key, value in changes.items():
+        if value == "":
+            options.pop(key, None)
+        else:
+            options[key] = value
+    return options
+
+
 class HeappePluginOptionsSerializer(serializers.Serializer):
     heappe_cluster_id = serializers.CharField(
-        required=False, help_text="HEAppE cluster id"
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        help_text="HEAppE cluster id",
     )
     heappe_local_base_path = serializers.CharField(
-        required=False, help_text="HEAppE local base path"
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        help_text="HEAppE local base path",
     )
-    heappe_url = serializers.CharField(required=False, help_text="HEAppE url")
-    heappe_username = serializers.CharField(required=False, help_text="HEAppE username")
-    homedir_prefix = serializers.CharField(
-        required=False, help_text="GLAuth homedir prefix", default="/home/"
+    heappe_url = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        help_text="HEAppE url",
+    )
+    heappe_username = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        help_text="HEAppE username",
+    )
+    heappe_identifier = serializers.CharField(
+        required=False,
+        # Homeport submits an empty string when the field is cleared.
+        allow_blank=True,
+        allow_null=True,
+        help_text="Identifier of the HEAppE instance this offering targets, "
+        "e.g. 'it4i-heappe-prod'. Lets providers with multiple HEAppE "
+        "deployments disambiguate which one a given offering uses.",
     )
     scratch_project_directory = serializers.CharField(
-        required=False, help_text="HEAppE scratch project directory"
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        help_text="HEAppE scratch project directory",
     )
     project_permanent_directory = serializers.CharField(
-        required=False, help_text="HEAppE project permanent directory"
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        help_text="HEAppE project permanent directory",
     )
-
-    def validate_homedir_prefix(self, value):
-        # Concatenated with the username into each account's homeDir and synced
-        # to GLAuth/LDAP, so it must be a safe absolute path (no traversal).
-        return validate_posix_path(value, "Home directory prefix")
 
 
 class GLAuthPluginOptionsSerializer(serializers.Serializer):
@@ -627,22 +773,6 @@ class GLAuthPluginOptionsSerializer(serializers.Serializer):
             "to the variables available for resource-scope templates."
         ),
     )
-    username_anonymized_prefix = serializers.CharField(
-        required=False,
-        default="waldur_",
-        help_text="GLAuth prefix for anonymized usernames",
-    )
-    username_generation_policy = serializers.ChoiceField(
-        required=False,
-        choices=[option.value for option in UsernameGenerationPolicy],
-        help_text="GLAuth username generation policy",
-        default=UsernameGenerationPolicy.SERVICE_PROVIDER.value,
-    )
-    login_shell = serializers.CharField(
-        required=False,
-        default="/bin/bash",
-        help_text="Default login shell assigned to GLAuth/LDAP accounts.",
-    )
     uid_source = serializers.ChoiceField(
         required=False,
         default="pool",
@@ -679,11 +809,6 @@ class GLAuthPluginOptionsSerializer(serializers.Serializer):
             "attribute, alongside the generated POSIX login name."
         ),
     )
-
-    def validate_login_shell(self, value):
-        # Assigned as each account's loginShell and synced to GLAuth/LDAP, so it
-        # must be a safe absolute path (same rule as the per-user override).
-        return validate_posix_path(value, "Login shell")
 
 
 class RancherPluginOptionsSerializer(serializers.Serializer):
@@ -782,6 +907,16 @@ class AgentPluginOptionsSerializer(serializers.Serializer):
         "carryover logic, and fairshare decay for site-agent managed SLURM offerings.",
         default=False,
     )
+    enforce_qos = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="When enabled, the site agent enforces the offering's QoS "
+        "selection by granting the chosen QoS on the SLURM association "
+        "(QosLevel/DefaultQOS). When disabled (default), QoS is informational "
+        "only — profiles are shown and the selection is recorded on the "
+        "resource, but the agent does not touch SLURM QoS. The agent config "
+        "may override this per deployment.",
+    )
 
 
 class OfferingResourceDisplayOptionsSerializer(serializers.Serializer):
@@ -814,6 +949,12 @@ class OfferingResourceDisplayOptionsSerializer(serializers.Serializer):
         required=False,
         help_text="List of disabled marketplace resource actions for this offering.",
     )
+    show_ssh_key_loss_warning = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="Show a warning about unrecoverable loss of the SSH "
+        "private key on the OpenStack instance order form.",
+    )
 
     def validate_disabled_resource_actions(self, value):
         valid_actions = [choice[0] for choice in ResourceAction.CHOICES]
@@ -834,7 +975,182 @@ class ScriptPluginOptionsSerializer(serializers.Serializer):
     )
 
 
+class AccountOptionsSerializer(serializers.Serializer):
+    """Account settings, set on an offering or on its service provider.
+
+    Offerings carry them in ``plugin_options`` and service providers in
+    ``account_options``, under the same keys; this one serializer validates
+    both, so a setting is declared once and means the same on either. An
+    offering's value wins, then its provider's, then the built-in default, and
+    ``Offering.account_settings`` reports what each resolves to.
+
+    No field has a default: an absent key means "inherit", and a declared
+    default would be written into every record saved through the API,
+    shadowing the value it is meant to fall back to. A blank value removes the
+    record's own setting.
+    """
+
+    account_scope = serializers.ChoiceField(
+        required=False,
+        allow_blank=True,
+        choices=AccountScopes.CHOICES,
+        help_text=(
+            "Where accounts are held: 'offering' keeps one account per offering "
+            "(the historical behaviour); 'provider' shares one account per user "
+            "across the provider's offerings."
+        ),
+    )
+    username_generation_policy = serializers.ChoiceField(
+        required=False,
+        allow_blank=True,
+        choices=[option.value for option in UsernameGenerationPolicy],
+        help_text="How the usernames of offering users are generated.",
+    )
+    username_anonymized_prefix = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text=(
+            "Prefix for anonymized usernames; the name is the prefix followed by "
+            "the account's POSIX UID."
+        ),
+    )
+    homedir_prefix = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text="Prefix of each account's home directory; the username follows.",
+    )
+    login_shell = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text="Login shell assigned to GLAuth/LDAP accounts.",
+    )
+
+    def validate_homedir_prefix(self, value):
+        # Concatenated with the username into each account's homeDir and synced
+        # to GLAuth/LDAP, so it must be a safe absolute path (no traversal).
+        return validate_posix_path(value, "Home directory prefix")
+
+    def validate_login_shell(self, value):
+        # Assigned as each account's loginShell and synced to GLAuth/LDAP, so it
+        # must be a safe absolute path (same rule as the per-user override).
+        return validate_posix_path(value, "Login shell")
+
+
+class InheritedAccountSettingSerializer(serializers.Serializer):
+    value = serializers.CharField(help_text="The value the setting resolves to.")
+    source = serializers.ChoiceField(
+        choices=AccountSettingSources.CHOICES,
+        help_text=(
+            "Where the value comes from: the offering's own plugin option, the "
+            "service provider's account options, or the built-in default."
+        ),
+    )
+
+
+class AccountSettingSerializer(InheritedAccountSettingSerializer):
+    inherited = InheritedAccountSettingSerializer(
+        help_text=(
+            "What the setting resolves to without the offering's own value: the "
+            "service provider's, else the built-in default. Removing the "
+            "offering's override leads to it."
+        )
+    )
+
+
+class OfferingAccountSettingsSerializer(serializers.Serializer):
+    """Effective account settings of an offering, each with its source."""
+
+    account_scope = AccountSettingSerializer()
+    username_generation_policy = AccountSettingSerializer()
+    username_anonymized_prefix = AccountSettingSerializer()
+    homedir_prefix = AccountSettingSerializer()
+    login_shell = AccountSettingSerializer()
+
+
+class AccountOptionsChangeSerializer(serializers.Serializer):
+    account_options = AccountOptionsSerializer(
+        help_text=(
+            "Changes to the provider's account options, merged into the current "
+            "ones key by key; a blank value removes a setting."
+        )
+    )
+
+
+class AccountSettingChangeSerializer(serializers.Serializer):
+    before = InheritedAccountSettingSerializer()
+    after = InheritedAccountSettingSerializer()
+
+
+class AccountSettingChangesSerializer(serializers.Serializer):
+    account_scope = AccountSettingChangeSerializer()
+    username_generation_policy = AccountSettingChangeSerializer()
+    username_anonymized_prefix = AccountSettingChangeSerializer()
+    homedir_prefix = AccountSettingChangeSerializer()
+    login_shell = AccountSettingChangeSerializer()
+
+
+class AccountExampleSerializer(serializers.Serializer):
+    username = serializers.CharField(
+        allow_blank=True,
+        help_text=(
+            "The username a person new to the offering would get; placeholders "
+            "in angle brackets stand for the person's own values."
+        ),
+    )
+    home_directory = serializers.CharField(allow_blank=True)
+    login_shell = serializers.CharField(allow_blank=True)
+
+
+class AccountRenameSerializer(serializers.Serializer):
+    username = serializers.CharField(allow_blank=True)
+    new_username = serializers.CharField(
+        allow_blank=True,
+        allow_null=True,
+        help_text="Null when the rename would first allocate a POSIX UID.",
+    )
+    home_directory = serializers.CharField(allow_blank=True)
+    new_home_directory = serializers.CharField(allow_blank=True)
+
+
+class OfferingAccountPreviewSerializer(serializers.Serializer):
+    uuid = serializers.CharField()
+    name = serializers.CharField()
+    settings = AccountSettingChangesSerializer()
+    changed = serializers.ListField(child=serializers.CharField())
+    example = AccountExampleSerializer()
+    renames = AccountRenameSerializer(many=True)
+    provider_accounts_kept = serializers.IntegerField(
+        help_text="Provider accounts that keep their username and POSIX values."
+    )
+    accounts_keeping_home_or_shell = serializers.IntegerField(
+        help_text=(
+            "Existing accounts that keep their home directory and login shell; "
+            "the change applies to accounts created afterwards."
+        )
+    )
+
+
+class AccountOptionsVersionsSerializer(serializers.Serializer):
+    current = AccountOptionsSerializer()
+    proposed = AccountOptionsSerializer()
+
+
+class AccountOptionsPreviewSerializer(serializers.Serializer):
+    account_options = AccountOptionsVersionsSerializer()
+    offerings = OfferingAccountPreviewSerializer(many=True)
+    renamed = serializers.IntegerField()
+    provider_accounts_kept = serializers.IntegerField()
+    accounts_keeping_home_or_shell = serializers.IntegerField()
+    username_conflicts = serializers.IntegerField(
+        help_text=(
+            "People whose usernames disagree across offerings. Non-zero blocks "
+            "switching to per service provider accounts."
+        )
+    )
+
+
 class MergedPluginOptionsSerializer(
+    AccountOptionsSerializer,
     LifecyclePluginOptionsSerializer,
     OpenStackPluginOptionsSerializer,
     HeappePluginOptionsSerializer,
@@ -850,9 +1166,17 @@ class MergedPluginOptionsSerializer(
 
 class HeappeSecretOptionsSerializer(serializers.Serializer):
     heappe_cluster_password = serializers.CharField(
-        required=False, help_text="HEAppE cluster password"
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        help_text="HEAppE cluster password",
     )
-    heappe_password = serializers.CharField(required=False, help_text="HEAppE password")
+    heappe_password = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        help_text="HEAppE password",
+    )
 
 
 class IPMappingSerializer(serializers.Serializer):
@@ -1059,11 +1383,50 @@ class RancherSecretOptionsSerializer(serializers.Serializer):
     )
 
 
+class OrderNotificationSecretOptionsSerializer(serializers.Serializer):
+    """Who gets told about a new order.
+
+    Declared as secret options rather than plugin options: plugin_options is
+    rendered to every marketplace consumer (public offering endpoint, order and
+    resource serializers), and provider-internal mailboxes are contact details,
+    not catalogue data. secret_options is gated by can_see_secret_options, so
+    only the provider organization sees these.
+    """
+
+    order_notification_emails = serializers.ListField(
+        child=serializers.EmailField(),
+        required=False,
+        allow_empty=True,
+        max_length=MAX_ORDER_NOTIFICATION_EMAILS,
+        help_text="Email addresses notified about every new order for this "
+        "offering, regardless of whether the order needs approval. Intended for "
+        "provider-side mailboxes which do not belong to a Waldur user, so these "
+        "addresses are notified even if a user with the same address disabled "
+        f"notifications. At most {MAX_ORDER_NOTIFICATION_EMAILS} addresses.",
+    )
+    order_notification_roles = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        allow_empty=True,
+        max_length=MAX_ORDER_NOTIFICATION_ROLES,
+        help_text="List of organization or offering role names (e.g. "
+        "'CUSTOMER.OWNER', 'OFFERING.MANAGER') whose holders are notified about "
+        "every new order for this offering, regardless of whether the order "
+        "needs approval. Names are resolved on the provider organization and on "
+        "the offering itself. Users who disabled notifications in their profile "
+        f"are skipped. At most {MAX_ORDER_NOTIFICATION_ROLES} names.",
+    )
+
+    def validate_order_notification_roles(self, value):
+        return validate_provider_role_names(value)
+
+
 class GenericSecretOptionsSerializer(serializers.Serializer):
     pass
 
 
 class MergedSecretOptionsSerializer(
+    OrderNotificationSecretOptionsSerializer,
     HeappeSecretOptionsSerializer,
     OpenstackSecretOptionsSerializer,
     GLAuthSecretOptionsSerializer,
@@ -1113,6 +1476,55 @@ class ServiceProviderSerializer(
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
 ):
+    def validate_account_options(self, value):
+        """Refuse provider scope while any user's usernames still disagree.
+
+        Turning the scope on is what makes offering accounts read through a single
+        provider account, so it cannot be done while it is ambiguous which username
+        that account should carry. The conflicts are reported by the provider's
+        ``username_conflicts`` action and resolved by ``adopt_provider_accounts``.
+        """
+        if (
+            value.get("account_scope") == AccountScopes.PROVIDER
+            and self.instance is not None
+            and self.instance.account_scope != AccountScopes.PROVIDER
+        ):
+            conflicts = utils.provider_username_conflicts(self.instance)
+            if conflicts:
+                raise serializers.ValidationError(
+                    _(
+                        "%(count)d user(s) hold different usernames on different "
+                        "offerings of this provider. Resolve them with the "
+                        "adopt_provider_accounts action before enabling "
+                        "provider-level accounts."
+                    )
+                    % {"count": len(conflicts)}
+                )
+        return value
+
+    def update(self, instance, validated_data):
+        """Adopt the provider's existing accounts when the scope is turned on.
+
+        Validation only refuses an ambiguous flip; nothing used to act on a
+        clean one, so an operator could enable provider scope and have every
+        existing account stay per-offering while only new ones were backed --
+        the mixed state the setting exists to remove. validate_account_scope
+        has already established there are no unresolved conflicts, so the
+        adoption cannot pick a username arbitrarily.
+        """
+        was_provider_scope = instance.account_scope == AccountScopes.PROVIDER
+        changes = validated_data.pop("account_options", None)
+        instance = super().update(instance, validated_data)
+        if changes is not None:
+            instance.account_options = merge_account_options(
+                instance.account_options, changes
+            )
+            instance.save(update_fields=["account_options"])
+        if not was_provider_scope and instance.account_scope == AccountScopes.PROVIDER:
+            adopted = utils.adopt_provider_accounts(instance)
+            logger.info("Provider scope enabled for %s; adopted %s", instance, adopted)
+        return instance
+
     class Meta:
         model = models.ServiceProvider
         fields = (
@@ -1134,6 +1546,7 @@ class ServiceProviderSerializer(
             "description",
             "offering_count",
             "allowed_domains",
+            "account_options",
         )
         related_paths = {
             "customer": ("uuid", "name", "native_name", "abbreviation", "slug")
@@ -1151,6 +1564,34 @@ class ServiceProviderSerializer(
     customer_country = serializers.CharField(source="customer.country", read_only=True)
     organization_groups = structure_serializers.OrganizationGroupSerializer(
         many=True, read_only=True
+    )
+    account_options = AccountOptionsSerializer(
+        required=False,
+        help_text=(
+            "Account settings for this provider's offerings, under the same keys "
+            "as an offering's plugin options. Each applies to every offering that "
+            "does not set its own. Updated key by key: an omitted key is kept, "
+            "and a blank value removes it."
+        ),
+    )
+
+    def create(self, validated_data):
+        options = validated_data.pop("account_options", None)
+        instance = super().create(validated_data)
+        if options:
+            instance.account_options = merge_account_options({}, options)
+            instance.save(update_fields=["account_options"])
+        return instance
+
+    # Declared explicitly so the schema renders an array; a bare JSONField is
+    # mapped to a free-form object by JSONFieldExtension.
+    allowed_domains = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        help_text=_(
+            "List of allowed domains for offering endpoints. "
+            "Only staff can modify this field. "
+        ),
     )
 
     def get_fields(self):
@@ -1777,10 +2218,69 @@ class PosixIdPoolStatsSerializer(serializers.Serializer):
     utilization_threshold = serializers.IntegerField()
 
 
+class PosixIdPoolRepointChangeSerializer(serializers.Serializer):
+    """One POSIX identifier that a re-point moves (read-only)."""
+
+    offering_user_uuid = serializers.CharField()
+    offering_uuid = serializers.CharField()
+    offering_name = serializers.CharField()
+    user_uuid = serializers.CharField()
+    username = serializers.CharField()
+    namespace = serializers.CharField()
+    old_value = serializers.IntegerField(allow_null=True)
+    new_value = serializers.IntegerField()
+
+
+class PosixIdPoolLeftBehindConsumerSerializer(serializers.Serializer):
+    """A non-user consumer that keeps its value from the previous pool."""
+
+    kind = serializers.CharField()
+    uid = serializers.IntegerField(allow_null=True)
+    gid = serializers.IntegerField(allow_null=True)
+    identity_uuid = serializers.CharField()
+
+
+class PosixIdPoolRepointSerializer(serializers.Serializer):
+    """Impact of re-pointing an offering's existing accounts onto its own pool."""
+
+    changes = PosixIdPoolRepointChangeSerializer(many=True)
+    released = serializers.IntegerField(
+        help_text="Identities freed in the previously resolved pool. Their values "
+        "are withheld from recycling until an operator returns them."
+    )
+    retained = serializers.IntegerField(
+        help_text="Users whose previous identity stays active because this pool "
+        "does not manage every namespace they hold a value in."
+    )
+    other_consumers = PosixIdPoolLeftBehindConsumerSerializer(
+        many=True,
+        help_text="Robot accounts and groups of the offering that keep their "
+        "values from the previously resolved pool; re-pointing moves offering "
+        "accounts only.",
+    )
+
+
+class PosixIdPoolRepointRequestSerializer(serializers.Serializer):
+    confirm = serializers.BooleanField(
+        help_text="Must be true. Re-pointing rewrites identifiers that the "
+        "provider's directory and filesystem already carry, so it is never "
+        "applied implicitly - preview it first with repoint_preview."
+    )
+
+
 class PosixIdentitySerializer(serializers.HyperlinkedModelSerializer):
+    """Audit view of one allocated identity.
+
+    ``offering`` names the offering that first triggered the allocation; a user
+    identity is shared by every offering of the provider that resolves to the
+    same pool, so it must not be read as the identity's owner.
+    """
+
     pool_uuid = serializers.ReadOnlyField(source="pool.uuid")
-    offering_uuid = serializers.ReadOnlyField(source="offering.uuid")
-    offering_name = serializers.ReadOnlyField(source="offering.name")
+    offering_uuid = serializers.ReadOnlyField(source="offering.uuid", allow_null=True)
+    offering_name = serializers.ReadOnlyField(source="offering.name", allow_null=True)
+    user_uuid = serializers.ReadOnlyField(source="user.uuid", allow_null=True)
+    user_username = serializers.ReadOnlyField(source="user.username", allow_null=True)
     consumer_type = serializers.SerializerMethodField()
     consumer_name = serializers.SerializerMethodField()
 
@@ -1793,9 +2293,12 @@ class PosixIdentitySerializer(serializers.HyperlinkedModelSerializer):
             "uid",
             "gid",
             "released_at",
+            "recyclable",
             "pool_uuid",
             "offering_uuid",
             "offering_name",
+            "user_uuid",
+            "user_username",
             "consumer_type",
             "consumer_name",
         )
@@ -1808,12 +2311,16 @@ class PosixIdentitySerializer(serializers.HyperlinkedModelSerializer):
 
     @extend_schema_field(serializers.CharField(allow_null=True))
     def get_consumer_type(self, identity):
-        return identity.content_type.model
+        if identity.user_id:
+            return "user"
+        return identity.content_type.model if identity.content_type_id else None
 
     @extend_schema_field(serializers.CharField(allow_null=True))
     def get_consumer_name(self, identity):
         # Consumer may be deleted (released rows) and some consumer models
         # have no uuid field — fall back to str() rendering only.
+        if identity.user_id:
+            return str(identity.user)
         consumer = identity.consumer
         return str(consumer) if consumer is not None else None
 
@@ -1848,7 +2355,6 @@ class TagSerializer(
         Staff sees all offerings.
         Service providers see their own + active/paused/archived public offerings.
         """
-        from waldur_core.structure.managers import get_connected_customers
 
         request = self.context.get("request")
         if not request:
@@ -1977,7 +2483,6 @@ class MarketplaceCategorySerializer(
             "icon",
             "default_vm_category",
             "default_volume_category",
-            "default_tenant_category",
             "offering_count",
             "available_offerings_count",
             "sections",
@@ -2000,7 +2505,6 @@ class MarketplaceCategorySerializer(
         for flag in [
             "default_volume_category",
             "default_vm_category",
-            "default_tenant_category",
         ]:
             if data.get(flag):
                 category_exists = (
@@ -2059,7 +2563,11 @@ class PricesUpdateSerializer(serializers.Serializer):
             price_field = "price"
         for key, old_component in component_map.items():
             new_price = future_prices.get(key, 0)
-            old_price = getattr(old_component, price_field) or 0
+            old_price = getattr(old_component, price_field)
+            if old_price is None:
+                # A missing future price means the current price carries over,
+                # so that is the value the new one has to be compared against.
+                old_price = old_component.price
             if not prices_are_equal(old_price, new_price):
                 setattr(old_component, price_field, new_price)
                 old_component.save(update_fields=[price_field])
@@ -2076,14 +2584,35 @@ class QuotasUpdateSerializer(serializers.Serializer):
         new_keys = set(new_quotas.keys())
         plan: models.Plan = self.instance
 
+        # Every billing type whose charge is the plan's amount times its price:
+        # a fixed component billed per period, a setup fee, a plan-switch fee.
+        # A prepaid one-time component is excluded because its quantity comes
+        # from the limit the customer requests and the length of the
+        # subscription, so an amount here would be settable and then ignored.
+        #
+        # Restricted to FIXED alone, this endpoint rejected the whole request
+        # whenever the form offered a one-time component beside a fixed one —
+        # which is every offering that charges a setup fee — so no amount could
+        # be saved at all and every one of them sat at the field's default.
+        resolved = billing_mode.resolve_plan(plan)
         valid_types = {
-            component.type
-            for component in plan.offering.components.all()
-            if component.billing_type == BillingTypes.FIXED
+            effective.type
+            for effective in resolved.components.values()
+            if effective.billing_type
+            in (
+                BillingTypes.FIXED,
+                BillingTypes.ONE_TIME,
+                BillingTypes.ON_PLAN_SWITCH,
+            )
+            and not effective.is_prepaid
         }
         component_map = validate_components(new_keys, valid_types, plan)
         for key, old_component in component_map.items():
-            new_amount = new_quotas.get(key, 0)
+            if key not in new_quotas:
+                # Only what the caller named. Defaulting the rest to zero would
+                # wipe the amount of any component the form did not show.
+                continue
+            new_amount = new_quotas[key]
             if old_component.amount != new_amount:
                 old_component.amount = new_amount
                 old_component.save(update_fields=["amount"])
@@ -2195,9 +2724,19 @@ class DiscountsUpdateSerializer(serializers.Serializer):
 
 
 class NestedPlanComponentSerializer(serializers.ModelSerializer):
+    """Plan component with the billing fields resolved for its plan.
+
+    ``billing_type``, ``measured_unit``, ``is_prepaid`` and ``limit_period``
+    come from the plan's billing mode for builtin components and from the
+    offering component otherwise.
+    """
+
     type = serializers.ReadOnlyField(source="component.type")
     name = serializers.ReadOnlyField(source="component.name")
-    measured_unit = serializers.ReadOnlyField(source="component.measured_unit")
+    measured_unit = serializers.SerializerMethodField()
+    billing_type = serializers.SerializerMethodField()
+    is_prepaid = serializers.SerializerMethodField()
+    limit_period = serializers.SerializerMethodField()
     discount_description = serializers.SerializerMethodField()
 
     class Meta:
@@ -2206,6 +2745,9 @@ class NestedPlanComponentSerializer(serializers.ModelSerializer):
             "type",
             "name",
             "measured_unit",
+            "billing_type",
+            "is_prepaid",
+            "limit_period",
             "amount",
             "price",
             "future_price",
@@ -2213,6 +2755,34 @@ class NestedPlanComponentSerializer(serializers.ModelSerializer):
             "discount_aggregation",
             "discount_description",
         )
+
+    @staticmethod
+    def _effective(plan_component):
+        if plan_component.component is None:
+            return None
+        return billing_mode.resolve_component(
+            plan_component.component, plan_component.plan
+        )
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_measured_unit(self, plan_component):
+        effective = self._effective(plan_component)
+        return effective.measured_unit if effective else None
+
+    @extend_schema_field(serializers.ChoiceField(choices=BillingTypes.CHOICES))
+    def get_billing_type(self, plan_component):
+        effective = self._effective(plan_component)
+        return effective.billing_type if effective else None
+
+    @extend_schema_field(serializers.BooleanField())
+    def get_is_prepaid(self, plan_component):
+        effective = self._effective(plan_component)
+        return effective.is_prepaid if effective else False
+
+    @extend_schema_field(serializers.ChoiceField(choices=LimitPeriods.CHOICES))
+    def get_limit_period(self, plan_component):
+        effective = self._effective(plan_component)
+        return effective.limit_period if effective else None
 
     @extend_schema_field(serializers.CharField(allow_null=True))
     def get_discount_description(self, component):
@@ -2229,8 +2799,19 @@ class BasePlanSerializer(
         many=True, read_only=True
     )
     is_active = serializers.SerializerMethodField()
-    description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
+    description = core_serializers.HTMLCleanField(
+        required=False, allow_blank=True, max_length=DESCRIPTION_LENGTH
+    )
     components = NestedPlanComponentSerializer(many=True, read_only=True)
+    billing_mode = serializers.ChoiceField(
+        choices=BillingModes.CHOICES,
+        required=False,
+        default=BillingModes.INHERIT,
+        help_text=_(
+            "How the offering's builtin components are billed under this plan. "
+            "Custom components keep their own accounting type."
+        ),
+    )
 
     class Meta:
         model = models.Plan
@@ -2242,6 +2823,7 @@ class BasePlanSerializer(
             "article_code",
             "max_amount",
             "archived",
+            "billing_mode",
             "is_active",
             "unit_price",
             "unit",
@@ -2283,6 +2865,11 @@ class BasePlanSerializer(
         return {item.component.type: item.amount for item in plan.components.all()}
 
     def get_resources_count(self, plan: models.Plan) -> int:
+        # Annotated by utils.get_plans_available_for_user. This serializer is
+        # also used on querysets that carry no annotation, hence the fallback.
+        annotated = getattr(plan, "resources_count", None)
+        if annotated is not None:
+            return annotated
         return models.Resource.objects.filter(plan=plan).count()
 
     def get_plan_type(self, plan: models.Plan) -> str:
@@ -2291,9 +2878,15 @@ class BasePlanSerializer(
 
         for plan_component in plan.components.all():
             offering_component = plan_component.component
+            if offering_component is None:
+                continue
 
             if plan_component.price:
-                components_types.add(offering_component.billing_type)
+                components_types.add(
+                    billing_mode.resolve_component(
+                        offering_component, plan
+                    ).billing_type
+                )
 
         if len(components_types) == 1:
             if BillingTypes.USAGE in components_types:
@@ -2318,14 +2911,21 @@ class BasePlanSerializer(
 
         for plan_component in components:
             offering_component = plan_component.component
+            if offering_component is None:
+                continue
 
             if plan_component.price:
-                if offering_component.billing_type == BillingTypes.LIMIT:
+                effective = billing_mode.resolve_component(offering_component, plan)
+                if effective.billing_type == BillingTypes.LIMIT:
                     price += plan_component.price
-                elif offering_component.billing_type == BillingTypes.FIXED:
+                elif effective.billing_type in (
+                    BillingTypes.FIXED,
+                    BillingTypes.ONE_TIME,
+                ):
+                    # Both are the plan's amount times its price. One-time used
+                    # the bare price, which read as the fee for a single unit
+                    # however many the plan sold.
                     price += plan_component.price * (plan_component.amount or 1)
-                elif offering_component.billing_type == BillingTypes.ONE_TIME:
-                    price += plan_component.price
 
         return price
 
@@ -2366,12 +2966,24 @@ class ProviderPlanDetailsSerializer(BaseProviderPlanSerializer):
 
     def validate(self, attrs):
         if not self.instance:
+            offering = attrs["offering"]
             if not has_permission(
                 self.context["request"],
                 PermissionEnum.CREATE_OFFERING_PLAN,
-                attrs["offering"].customer,
+                offering.customer,
             ):
                 raise PermissionDenied()
+            # Creation is guarded here rather than by an action validator:
+            # ActionsViewSet runs those for detail actions and update alone.
+            if not utils.offering_owns_pricing(offering):
+                raise ValidationError(
+                    {
+                        "offering": _(
+                            "This offering is a child offering, so its plans "
+                            "belong to the parent."
+                        )
+                    }
+                )
         return attrs
 
     def create(self, validated_data):
@@ -2522,6 +3134,13 @@ STORAGE_FOLDER_PERMISSIONS = (
     ("770", "770 - Group write, no setgid"),
     ("775", "775 - Group write, world read, no setgid"),
     ("777", "777 - Full access, no setgid"),
+)
+
+
+K8S_LOAD_BALANCER_MODES = (
+    ("required", "Always included"),
+    ("optional", "Customer chooses"),
+    ("disabled", "Not offered"),
 )
 
 
@@ -2717,6 +3336,22 @@ class K8sDefaultConfigurationSerializer(serializers.Serializer):
     default_lb_logs_disk_gb = serializers.IntegerField(
         min_value=1, max_value=2000, required=False
     )
+    load_balancer_mode = serializers.ChoiceField(
+        choices=K8S_LOAD_BALANCER_MODES,
+        required=False,
+        help_text="Whether clusters get a load balancer: always (required), "
+        "at the customer's choice (optional) or never (disabled). "
+        "Treated as required when omitted.",
+    )
+    topology_mode = serializers.ChoiceField(
+        choices=K8S_TOPOLOGY_MODES,
+        required=False,
+        help_text="Cluster topology: one site with three controllers "
+        "(1-datacenter), three sites with one controller each (3-datacenter) "
+        "or the customer's pick (customer_choice). When omitted, the option "
+        "type decides: 1-datacenter for single_datacenter_k8s_config, "
+        "3-datacenter for multi_datacenter_k8s_config.",
+    )
 
     # Worker node requirements
     minimal_worker_vcpus = serializers.IntegerField(
@@ -2841,6 +3476,33 @@ class OptionValidatorSerializer(serializers.Serializer):
     target_field = serializers.CharField()
 
 
+@extend_schema_field({"oneOf": [{"type": "boolean"}, {"type": "string"}]})
+class OptionVisibleIfValueField(serializers.Field):
+    """A value an option must have for a dependent option to be shown."""
+
+    def to_internal_value(self, data):
+        if not isinstance(data, bool | str):
+            raise serializers.ValidationError(_("Must be a boolean or a string."))
+        return data
+
+    def to_representation(self, value):
+        return value
+
+
+class OptionVisibleIfSerializer(serializers.Serializer):
+    field = serializers.CharField(
+        help_text=_("Key of an earlier option whose value controls visibility.")
+    )
+    values = serializers.ListField(
+        child=OptionVisibleIfValueField(),
+        allow_empty=False,
+        help_text=_(
+            "The option is shown when the referenced option has one of these values. "
+            "For a multi-select option, when any of its selected values is listed."
+        ),
+    )
+
+
 class OptionFieldSerializer(serializers.Serializer):
     type = serializers.ChoiceField(choices=FIELD_TYPES)
     label = serializers.CharField()
@@ -2856,6 +3518,10 @@ class OptionFieldSerializer(serializers.Serializer):
     default_configs = K8sDefaultConfigurationSerializer(required=False)
     validators = serializers.ListField(
         child=OptionValidatorSerializer(), required=False
+    )
+    visible_if = OptionVisibleIfSerializer(
+        required=False,
+        help_text=_("Show this option only when another option has a given value."),
     )
 
     def validate(self, attrs):
@@ -2896,6 +3562,7 @@ class OfferingOptionsSerializer(serializers.Serializer):
 
     def validate(self, attrs):
         options = attrs.get("options", {})
+        self._validate_visible_if(options, attrs.get("order") or [])
         for name, option in options.items():
             validators = option.get("validators")
             if not validators:
@@ -2926,6 +3593,112 @@ class OfferingOptionsSerializer(serializers.Serializer):
                         )
         return attrs
 
+    def _validate_visible_if(self, options, order):
+        positions = {key: index for index, key in enumerate(order)}
+        for name, option in options.items():
+            rule = option.get("visible_if")
+            if not rule:
+                continue
+            field = rule["field"]
+            params = {"field": field, "name": name}
+            if field not in options:
+                raise self._visible_if_error(
+                    _("Option %(field)s referenced by option %(name)s is not found."),
+                    params,
+                )
+            if (
+                field not in positions
+                or name not in positions
+                or positions[field] >= positions[name]
+            ):
+                raise self._visible_if_error(
+                    _(
+                        "Option %(field)s referenced by option %(name)s "
+                        "must appear earlier in order."
+                    ),
+                    params,
+                )
+            parent = options[field]
+            parent_type = parent.get("type")
+            if parent_type not in VISIBLE_IF_FIELD_TYPES:
+                raise self._visible_if_error(
+                    _(
+                        "Option %(field)s referenced by option %(name)s must be "
+                        "a boolean, select_string or select_string_multi option."
+                    ),
+                    params,
+                )
+            values = rule["values"]
+            if parent_type == "boolean":
+                valid = all(isinstance(value, bool) for value in values)
+            else:
+                choices = parent.get("choices") or []
+                valid = all(
+                    isinstance(value, str) and value in choices for value in values
+                )
+            if not valid:
+                raise self._visible_if_error(
+                    _(
+                        "Values of the visibility rule of option %(name)s "
+                        "are not valid for option %(field)s."
+                    ),
+                    params,
+                )
+
+    @staticmethod
+    def _visible_if_error(message, params):
+        return serializers.ValidationError({"options": message % params})
+
+
+class LimitValueField(serializers.FloatField):
+    """A component limit, which may be fractional.
+
+    Order.limits and Resource.limits are JSONFields written with the stdlib
+    encoder, so the value has to stay JSON-native — a Decimal raises at save
+    time. Whole numbers are returned as int so that a limit of 5 keeps
+    serialising as 5 rather than 5.0 and existing payloads are unchanged.
+    """
+
+    @staticmethod
+    def _narrow(value):
+        # FloatField, unlike DecimalField, accepts nan and inf, and
+        # MinValueValidator waves nan through because every comparison against
+        # it is False. Persisting one into a jsonb column is a DataError.
+        if not math.isfinite(float(value)):
+            raise serializers.ValidationError(_("A valid number is required."))
+        return utils.narrow_limit_value(value)
+
+    def to_internal_value(self, data):
+        return self._narrow(super().to_internal_value(data))
+
+    def to_representation(self, value):
+        # FloatField.to_representation would render a stored 2 as 2.0. These
+        # fields are read as well as written — orders and proposal resources
+        # both return their limits — so narrowing here too is what keeps an
+        # integer-only deployment's payloads byte-identical.
+        return self._narrow(value)
+
+
+class LimitBoundField(serializers.DecimalField):
+    """A component's limit bound: min, max, default, cap or quota threshold.
+
+    Stored as Decimal so a component that accepts a fractional limit can also
+    describe one, but rendered as a JSON number rather than DRF's default
+    decimal string. A string here would be a silent break: homeport tests these
+    bounds for truthiness, and "0.00" is truthy where 0 is not.
+    """
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("max_digits", 20)
+        kwargs.setdefault("decimal_places", MAX_LIMIT_DECIMAL_PLACES)
+        kwargs.setdefault("coerce_to_string", False)
+        super().__init__(**kwargs)
+
+    def to_representation(self, value):
+        # Whole bounds keep rendering as 10 rather than 10.0, so payloads for
+        # integer-only components are unchanged.
+        return LimitValueField._narrow(super().to_representation(value))
+
 
 class OfferingComponentSerializer(serializers.ModelSerializer):
     offering_uuid = serializers.ReadOnlyField(source="offering.uuid")
@@ -2950,6 +3723,7 @@ class OfferingComponentSerializer(serializers.ModelSerializer):
             "unit_factor",
             "limit_period",
             "limit_amount",
+            "limit_decimal_places",
             "article_code",
             "max_value",
             "min_value",
@@ -2972,6 +3746,14 @@ class OfferingComponentSerializer(serializers.ModelSerializer):
             "limit_period": {"allow_null": True},
         }
 
+    # Declared rather than inferred, so the bounds stay JSON numbers instead of
+    # the decimal strings a ModelSerializer would produce for these columns.
+    limit_amount = LimitBoundField(required=False, allow_null=True)
+    max_value = LimitBoundField(required=False, allow_null=True)
+    min_value = LimitBoundField(required=False, allow_null=True)
+    max_available_limit = LimitBoundField(required=False, allow_null=True)
+    default_limit = LimitBoundField(required=False, allow_null=True)
+
     def validate(self, attrs):
         if "limit_period" not in attrs or not attrs["limit_period"]:
             # On update, preserve the existing value when limit_period is
@@ -2985,6 +3767,8 @@ class OfferingComponentSerializer(serializers.ModelSerializer):
             attrs["max_value"] = 1
             attrs["limit_period"] = LimitPeriods.MONTH
             attrs["limit_amount"] = None
+            # A checkbox is on or off; a precision here would be meaningless.
+            attrs["limit_decimal_places"] = 0
         if (
             self.instance
             and self.instance.offering.type == OPENSTACK_TENANT_OFFERING
@@ -2999,6 +3783,13 @@ class OfferingComponentSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     "Built-in OpenStack offering component type, name and unit are not editable."
                 )
+        if self.instance:
+            # On create the offering is only known to the caller, which checks
+            # there; see create_offering_component and create_offering_components.
+            utils.validate_component_precision_is_supported(
+                self.instance.offering.type,
+                attrs.get("limit_decimal_places", self.instance.limit_decimal_places),
+            )
         self._validate_prepaid(attrs)
 
         return attrs
@@ -3143,6 +3934,26 @@ class UpdateOfferingComponent(OfferingComponentSerializer):
             # Only check uniqueness if type is actually changing
             if new_type != current_type:
                 offering = self.instance.offering
+                builtin_types = plugins.manager.get_component_types(offering.type)
+
+                # Renaming a builtin away drops it from under the plugin, the same
+                # as removing it; renaming onto one sidesteps the create check.
+                if self.instance.is_builtin or current_type in builtin_types:
+                    raise serializers.ValidationError(
+                        {
+                            "type": _(
+                                "The type of a built-in component cannot be changed."
+                            )
+                        }
+                    )
+                if new_type in builtin_types:
+                    raise serializers.ValidationError(
+                        {
+                            "type": _("Cannot use a built-in component type: %s")
+                            % new_type
+                        }
+                    )
+
                 existing_component = (
                     offering.components.filter(type=new_type)
                     .exclude(uuid=self.instance.uuid)
@@ -3239,6 +4050,7 @@ class ExportImportPlanSerializer(serializers.ModelSerializer):
             "article_code",
             "max_amount",
             "archived",
+            "billing_mode",
             "is_active",
             "unit_price",
             "unit",
@@ -3389,8 +4201,24 @@ class PlanComponentSerializer(serializers.ModelSerializer):
     plan_name = serializers.ReadOnlyField(source="plan.name")
     plan_unit = serializers.ReadOnlyField(source="plan.unit")
     component_name = serializers.ReadOnlyField(source="component.name")
-    measured_unit = serializers.ReadOnlyField(source="component.measured_unit")
-    billing_type = serializers.ReadOnlyField(source="component.billing_type")
+    measured_unit = serializers.SerializerMethodField()
+    billing_type = serializers.SerializerMethodField()
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_measured_unit(self, plan_component):
+        if plan_component.component is None:
+            return None
+        return billing_mode.resolve_component(
+            plan_component.component, plan_component.plan
+        ).measured_unit
+
+    @extend_schema_field(serializers.ChoiceField(choices=BillingTypes.CHOICES))
+    def get_billing_type(self, plan_component):
+        if plan_component.component is None:
+            return None
+        return billing_mode.resolve_component(
+            plan_component.component, plan_component.plan
+        ).billing_type
 
     class Meta:
         model = models.PlanComponent
@@ -3465,6 +4293,18 @@ class NestedSoftwareCatalogSerializer(serializers.ModelSerializer):
     catalog = CatalogSummarySerializer(read_only=True)
     partition = PartitionSummarySerializer(read_only=True, allow_null=True)
     package_count = serializers.SerializerMethodField()
+    # Declared explicitly so the schema renders an array; a bare JSONField is
+    # mapped to a free-form object by JSONFieldExtension.
+    enabled_cpu_family = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        help_text=_("List of enabled CPU families: ['x86_64', 'aarch64']"),
+    )
+    enabled_cpu_microarchitectures = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        help_text=_("List of enabled CPU microarchitectures: ['generic', 'zen3']"),
+    )
 
     class Meta:
         model = models.OfferingSoftwareCatalog
@@ -3483,8 +4323,111 @@ class NestedSoftwareCatalogSerializer(serializers.ModelSerializer):
         return obj.catalog.packages.count()
 
 
+QOS_LIMIT_FIELDS = (
+    "name",
+    "description",
+    "max_nodes",
+    "min_nodes",
+    "default_time",
+    "max_time",
+    "grace_time",
+    "priority",
+    "grp_tres",
+    "max_tres_per_job",
+    "max_tres_per_node",
+    "max_tres_per_user",
+    "min_tres_per_job",
+    "flags",
+)
+
+
+class OfferingQoSSerializer(serializers.ModelSerializer):
+    """Serializer for OfferingQoS model."""
+
+    offering_name = serializers.CharField(source="offering.name", read_only=True)
+    offering = serializers.SlugRelatedField(
+        slug_field="uuid", queryset=models.Offering.objects.all()
+    )
+
+    class Meta:
+        model = models.SlurmOfferingQoS
+        fields = (
+            "uuid",
+            "created",
+            "modified",
+            "offering",
+            "offering_name",
+            *QOS_LIMIT_FIELDS,
+        )
+        read_only_fields = ("uuid", "created", "modified")
+
+
+class OfferingQoSUpdateSerializer(serializers.ModelSerializer):
+    """Serializer for updating OfferingQoS model."""
+
+    qos_uuid = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=models.SlurmOfferingQoS.objects.all(),
+        write_only=True,
+    )
+
+    class Meta:
+        model = models.SlurmOfferingQoS
+        fields = ("qos_uuid", *QOS_LIMIT_FIELDS)
+
+
+class RemoveQoSSerializer(serializers.Serializer):
+    qos_uuid = serializers.UUIDField()
+
+
+class NestedQoSSerializer(serializers.ModelSerializer):
+    """Nested read serializer exposing the QoS catalog on the offering payload."""
+
+    class Meta:
+        model = models.SlurmOfferingQoS
+        fields = ("uuid", *QOS_LIMIT_FIELDS)
+
+
+class NestedPartitionQoSSerializer(serializers.ModelSerializer):
+    """Nested read serializer for a partition's QoS allow-list entries."""
+
+    qos = serializers.SlugRelatedField(slug_field="uuid", read_only=True)
+    qos_name = serializers.CharField(source="qos.name", read_only=True)
+
+    class Meta:
+        model = models.SlurmPartitionQoS
+        fields = ("uuid", "qos", "qos_name", "is_default")
+
+
+class PartitionQoSItemSerializer(serializers.Serializer):
+    qos_uuid = serializers.SlugRelatedField(
+        slug_field="uuid", queryset=models.SlurmOfferingQoS.objects.all()
+    )
+    is_default = serializers.BooleanField(default=False)
+
+
+class SetPartitionQoSSerializer(serializers.Serializer):
+    """Replace a partition's QoS allow-list (SLURM AllowQos gate)."""
+
+    partition_uuid = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=models.OfferingPartition.objects.all(),
+        write_only=True,
+    )
+    qos_options = PartitionQoSItemSerializer(many=True)
+
+    def validate_qos_options(self, value):
+        if sum(1 for item in value if item["is_default"]) > 1:
+            raise serializers.ValidationError(
+                _("At most one QoS option can be the default.")
+            )
+        return value
+
+
 class NestedPartitionSerializer(serializers.ModelSerializer):
     """Nested serializer for OfferingPartition model."""
+
+    qos_options = NestedPartitionQoSSerializer(many=True, read_only=True)
 
     class Meta:
         model = models.OfferingPartition
@@ -3511,6 +4454,7 @@ class NestedPartitionSerializer(serializers.ModelSerializer):
             "exclusive_user",
             "priority_tier",
             "qos",
+            "qos_options",
             "req_resv",
         )
 
@@ -3526,6 +4470,16 @@ class OfferingOptionsField(serializers.JSONField):
     pass
 
 
+class BillingModeComponentSerializer(serializers.Serializer):
+    """An offering component as a plan in one billing mode would bill it."""
+
+    type = serializers.CharField()
+    billing_type = serializers.ChoiceField(choices=BillingTypes.CHOICES)
+    measured_unit = serializers.CharField(allow_blank=True)
+    is_prepaid = serializers.BooleanField()
+    limit_period = serializers.ChoiceField(choices=LimitPeriods.CHOICES)
+
+
 class ProviderOfferingDetailsSerializer(
     core_serializers.SlugSerializerMixin,
     core_serializers.RestrictedSerializerMixin,
@@ -3537,10 +4491,19 @@ class ProviderOfferingDetailsSerializer(
     options = OfferingOptionsField(read_only=True)
     resource_options = OfferingOptionsField(read_only=True)
     plugin_options = MergedPluginOptionsField(read_only=True)
+    account_settings = serializers.SerializerMethodField()
     secret_options = MergedSecretOptionsField(read_only=True)
     service_attributes = serializers.SerializerMethodField()
+    # What the caller may change on the offering-update page. The provider-only
+    # fields above are dropped for anyone who fails the first of these, so a
+    # client cannot tell "no permission" from "nothing configured" without them.
+    can_update_integration = serializers.SerializerMethodField()
+    can_update_options = serializers.SerializerMethodField()
     components = OfferingComponentSerializer(required=False, many=True)
+    limit_precision_advisory = serializers.SerializerMethodField()
     order_count = serializers.SerializerMethodField()
+    billing_period_applies = serializers.SerializerMethodField()
+    billing_mode_components = serializers.SerializerMethodField()
     plans = BaseProviderPlanSerializer(many=True, required=False)
     screenshots = NestedScreenshotSerializer(many=True, read_only=True)
     state = serializers.SerializerMethodField()
@@ -3553,6 +4516,9 @@ class ProviderOfferingDetailsSerializer(
     )
     scope_state = serializers.SerializerMethodField()
     scope_error_message = serializers.SerializerMethodField()
+    scope_resource = serializers.SerializerMethodField()
+    scope_resource_uuid = serializers.SerializerMethodField()
+    scope_resource_name = serializers.SerializerMethodField()
     files = NestedOfferingFileSerializer(many=True, read_only=True)
     quotas = serializers.SerializerMethodField()
     organization_groups = structure_serializers.OrganizationGroupSerializer(
@@ -3568,6 +4534,7 @@ class ProviderOfferingDetailsSerializer(
     )
     software_catalogs = NestedSoftwareCatalogSerializer(many=True, read_only=True)
     partitions = NestedPartitionSerializer(many=True, read_only=True)
+    qos_profiles = NestedQoSSerializer(many=True, read_only=True)
     has_compliance_requirements = serializers.SerializerMethodField()
     billing_type_classification = serializers.SerializerMethodField()
     effective_available_limits = serializers.SerializerMethodField()
@@ -3604,6 +4571,8 @@ class ProviderOfferingDetailsSerializer(
             "url",
             "uuid",
             "created",
+            "billing_period_applies",
+            "billing_mode_components",
             "name",
             "slug",
             "description",
@@ -3616,6 +4585,7 @@ class ProviderOfferingDetailsSerializer(
             "default_access_subnets",
             "software_catalogs",
             "partitions",
+            "qos_profiles",
             "customer",
             "customer_uuid",
             "customer_name",
@@ -3629,9 +4599,13 @@ class ProviderOfferingDetailsSerializer(
             "options",
             "resource_options",
             "components",
+            "limit_precision_advisory",
             "plugin_options",
+            "account_settings",
             "secret_options",
             "service_attributes",
+            "can_update_integration",
+            "can_update_options",
             "state",
             "vendor_details",
             "getting_started",
@@ -3648,6 +4622,9 @@ class ProviderOfferingDetailsSerializer(
             "scope_name",
             "scope_state",
             "scope_error_message",
+            "scope_resource",
+            "scope_resource_uuid",
+            "scope_resource_name",
             "files",
             "quotas",
             "paused_reason",
@@ -3728,9 +4705,6 @@ class ProviderOfferingDetailsSerializer(
 
     def get_fields(self):
         fields = super().get_fields()
-        if self.instance and not self.can_see_secret_options():
-            fields.pop("secret_options", None)
-            fields.pop("service_attributes", None)
         method = self.context["view"].request.method
         if method == "GET":
             if "components" in fields:
@@ -3756,9 +4730,57 @@ class ProviderOfferingDetailsSerializer(
 
         return fields
 
-    def can_see_secret_options(self) -> bool:
+    @extend_schema_field(OfferingAccountSettingsSerializer)
+    def get_account_settings(self, offering: models.Offering):
+        return offering.account_settings
+
+    #: Rendered only for a caller entitled to this particular offering.
+    PROVIDER_ONLY_FIELDS = ("secret_options", "service_attributes")
+
+    def _check_offering_access(self, gate, offering=None) -> bool:
+        """Whether the caller passes one provider-side gate for one offering.
+
+        Decided per offering rather than per serializer: a page is rendered by a
+        single child serializer, so a decision taken once would apply whichever
+        offering sorted first to every other row.
+        """
         request = self.context.get("request")
-        return request and permissions.can_see_secret_options(request, self.instance)
+        if not request:
+            return False
+        offering = offering if offering is not None else self.instance
+        if not offering:
+            return False
+        # Each gate costs a query per source path, and a serializer may render
+        # the same offering more than once, so remember the verdict. The context
+        # is shared by every child of a list serializer, and keyed by gate as
+        # well as offering since the two gates answer independently.
+        memo = self.context.setdefault("_provider_field_access", {})
+        key = (gate.__name__, getattr(offering, "pk", None))
+        if key[1] is None:
+            return bool(gate(request, offering))
+        if key not in memo:
+            memo[key] = bool(gate(request, offering))
+        return memo[key]
+
+    def can_see_secret_options(self, offering=None) -> bool:
+        """Whether the caller may see the provider-only fields of one offering."""
+        return self._check_offering_access(permissions.can_see_secret_options, offering)
+
+    def get_can_update_integration(self, offering: models.Offering) -> bool:
+        return self.can_see_secret_options(offering)
+
+    def get_can_update_options(self, offering: models.Offering) -> bool:
+        return self._check_offering_access(
+            permissions.can_update_offering_options, offering
+        )
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if any(field in data for field in self.PROVIDER_ONLY_FIELDS):
+            if not self.can_see_secret_options(instance):
+                for field in self.PROVIDER_ONLY_FIELDS:
+                    data.pop(field, None)
+        return data
 
     def get_total_customers(self, offering: models.Offering) -> int | None:
         # Added via annotate in ProviderOfferingViewSet.get_queryset
@@ -3801,6 +4823,32 @@ class ProviderOfferingDetailsSerializer(
         except AttributeError:
             return None
 
+    @extend_schema_field(serializers.URLField(allow_null=True))
+    def get_scope_resource(self, offering: models.Offering):
+        # The URL is built from the annotated UUID, so that resolving it does
+        # not cost an extra query. See get_scope_resource_uuid.
+        uuid = getattr(offering, "scope_resource_uuid", None)
+        request = self.context.get("request")
+        if not uuid or request is None:
+            return None
+        return reverse(
+            "marketplace-resource-detail",
+            kwargs={"uuid": uuid.hex},
+            request=request,
+        )
+
+    def get_scope_resource_uuid(self, offering: models.Offering) -> str | None:
+        # Added via annotate in offering viewsets, in detail view only,
+        # because the lookup is not worth an extra join in the list view.
+        try:
+            return offering.scope_resource_uuid.hex
+        except AttributeError:
+            return None
+
+    def get_scope_resource_name(self, offering: models.Offering) -> str | None:
+        # See get_scope_resource_uuid.
+        return getattr(offering, "scope_resource_name", None)
+
     @extend_schema_field(QuotaSerializer(many=True))
     def get_quotas(self, offering: models.Offering):
         try:
@@ -3808,11 +4856,98 @@ class ProviderOfferingDetailsSerializer(
         except AttributeError:
             return []
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_limit_precision_advisory(self, offering: models.Offering) -> str | None:
+        """What to tell the provider before they raise a component's precision.
+
+        Plugins that know their backend cannot hold a fraction refuse it
+        outright through ``max_limit_decimal_places``. This is for the one that
+        cannot know: the site agent fronts many backends, so the answer belongs
+        to the individual offering rather than to the type, and it advises
+        rather than refuses. Null when there is nothing to say.
+
+        Answered only for a single offering, or when a list request names the
+        field -- the same rule ProviderOfferingViewSet applies to its expensive
+        annotations, and for the same reason: the plugin answers it with a
+        query, so on a list it would cost one per row. A list of offerings
+        carries no precision field to advise about, and the component editor
+        reads the offering one at a time.
+        """
+        view = self.context.get("view")
+        if view is not None and not getattr(view, "detail", False):
+            request = getattr(view, "request", None)
+            asked_for = request is not None and "limit_precision_advisory" in (
+                request.query_params.getlist("field")
+            )
+            if not asked_for:
+                return None
+        advisory = plugins.manager.get_limit_precision_advisory(offering)
+        return str(advisory) if advisory else None
+
     def get_order_count(self, offering: models.Offering) -> int:
         try:
             return offering.get_quota_usage("order_count")
         except ObjectDoesNotExist:
             return 0
+
+    @extend_schema_field(
+        {
+            "type": "object",
+            "additionalProperties": {"type": "boolean"},
+            "description": (
+                "Per plan billing mode, whether a plan's billing period changes "
+                "what is invoiced. False means every component of this offering "
+                "would price a quantity of its own under that mode, so the "
+                "period is inert on the invoice."
+            ),
+        }
+    )
+    def get_billing_period_applies(self, offering: models.Offering) -> dict:
+        """Whether the plan's billing period matters, per billing mode.
+
+        The plan form needs this before a plan exists, so it cannot be derived
+        from a plan's resolved components; answering it here keeps the rule in
+        the resolver rather than duplicated in the client.
+        """
+        return {
+            mode: billing_mode.billing_period_applies(offering, mode)
+            for mode, _label in BillingModes.CHOICES
+        }
+
+    @extend_schema_field(
+        serializers.DictField(
+            child=serializers.ListField(child=BillingModeComponentSerializer()),
+            help_text=(
+                "Per plan billing mode, every component of this offering as a "
+                "plan in that mode would bill it: billing type, measured unit, "
+                "prepaid flag and limit period."
+            ),
+        )
+    )
+    def get_billing_mode_components(self, offering: models.Offering) -> dict:
+        """How each component would bill under each plan mode.
+
+        A plan exposes its own resolved components, but the plan form has to
+        price a mode before any plan carries it -- the first usage plan on an
+        offering bills core-hours, not the cores the offering stores. Only the
+        resolver knows those units, so it answers here rather than in a copy
+        of the rule in the client.
+        """
+        return {
+            mode: [
+                {
+                    "type": effective.type,
+                    "billing_type": effective.billing_type,
+                    "measured_unit": effective.measured_unit,
+                    "is_prepaid": effective.is_prepaid,
+                    "limit_period": effective.limit_period,
+                }
+                for effective in billing_mode.ResolvedPlan(
+                    offering, billing_mode.PlanModeStub(mode)
+                ).components.values()
+            ]
+            for mode, _label in BillingModes.CHOICES
+        }
 
     @extend_schema_field(OfferingComponentSerializer(many=True))
     def get_components(self, offering: models.Offering):
@@ -3842,6 +4977,10 @@ class ProviderOfferingDetailsSerializer(
 
     @extend_schema_field(dict)
     def get_service_attributes(self, offering: models.Offering) -> dict[str, any]:
+        # Resolving offering.scope costs a query per row, and to_representation
+        # drops the key for a caller who may not see it — so do not pay for it.
+        if not self.can_see_secret_options(offering):
+            return {}
         try:
             service = offering.scope
         except AttributeError:
@@ -3876,6 +5015,13 @@ class ProviderOfferingDetailsSerializer(
             return "mixed"
 
         billing_types = set(component.billing_type for component in components)
+        # Plans may override the builtin components; count those modes too.
+        if billing_mode.offering_has_builtin_components(offering):
+            plan_modes = set(offering.plans.values_list("billing_mode", flat=True))
+            if BillingModes.USAGE in plan_modes:
+                billing_types.add(BillingTypes.USAGE)
+            if BillingModes.LIMIT in plan_modes:
+                billing_types.add(BillingTypes.LIMIT)
 
         if billing_types == {BillingTypes.LIMIT}:
             return "limit_only"
@@ -3910,18 +5056,37 @@ set_override(
 class PublicOfferingDetailsSerializer(ProviderOfferingDetailsSerializer):
     class Meta(ProviderOfferingDetailsSerializer.Meta):
         view_name = "marketplace-public-offering-detail"
+        # limit_precision_advisory names the provider's own backend and exists
+        # for the component editor. A consumer browsing the marketplace has
+        # nothing to configure with it and no business knowing the provider
+        # runs SLURM.
         fields = tuple(
             f
             for f in ProviderOfferingDetailsSerializer.Meta.fields
-            if f != "backend_id_rules"
+            if f not in ("backend_id_rules", "limit_precision_advisory")
         ) + (
             "user_has_consent",
+            "user_has_offering_user",
             "is_accessible",
+            "open_for_proposals",
         )
 
     plugin_options = MergedPluginOptionsField(read_only=True)
     user_has_consent = serializers.SerializerMethodField()
+    user_has_offering_user = serializers.SerializerMethodField()
     is_accessible = serializers.SerializerMethodField()
+    open_for_proposals = serializers.SerializerMethodField()
+
+    @extend_schema_field(QuotaSerializer(many=True))
+    def get_quotas(self, offering: models.Offering):
+        """Quotas of a child offering describe the customer's own tenant.
+
+        A top-level offering is scoped to the provider's service settings, so its
+        totals are the provider's capacity and stay out of the public payload.
+        """
+        if offering.parent_id is None:
+            return []
+        return super().get_quotas(offering)
 
     @extend_schema_field(BasePublicPlanSerializer(many=True))
     def get_filtered_plans(self, offering: models.Offering):
@@ -3941,6 +5106,17 @@ class PublicOfferingDetailsSerializer(ProviderOfferingDetailsSerializer):
 
         return models.UserOfferingConsent.objects.filter(
             user=request.user, offering=offering, revocation_date__isnull=True
+        ).exists()
+
+    @extend_schema_field(serializers.BooleanField())
+    def get_user_has_offering_user(self, offering: models.Offering) -> bool:
+        """Check if the current user has an OfferingUser record for this offering."""
+        request = self.context.get("request")
+        if not request or not request.user or request.user.is_anonymous:
+            return False
+
+        return models.OfferingUser.objects.filter(
+            user=request.user, offering=offering
         ).exists()
 
     @extend_schema_field(serializers.BooleanField())
@@ -3964,6 +5140,23 @@ class PublicOfferingDetailsSerializer(ProviderOfferingDetailsSerializer):
         plans = utils.get_plans_available_for_user(request.user, offering)
         return plans.filter(archived=False).exists()
 
+    @extend_schema_field(serializers.BooleanField())
+    def get_open_for_proposals(self, offering: models.Offering) -> bool:
+        """Offering can be requested via a proposal in an active call with an open or upcoming round.
+
+        Says nothing about *this* user's eligibility for those calls — the call's
+        own restrictions are checked by the public call eligibility endpoint.
+        The fallback below covers serialization outside an annotated queryset.
+        """
+        annotated = getattr(offering, "open_for_proposals", None)
+        if annotated is not None:
+            return annotated
+        return (
+            proposal_models.RequestedOffering.objects.open_for_proposals()
+            .filter(offering=offering)
+            .exists()
+        )
+
     def get_fields(self):
         fields = super().get_fields()
         fields.pop("secret_options", None)
@@ -3979,7 +5172,16 @@ class OfferingComponentLimitSerializer(serializers.Serializer):
     )
 
 
+def validate_plan_billing_mode(offering, mode, plan=None):
+    """A plan mode other than inherit needs builtin components to act on,
+    and it is frozen while resources use the plan."""
+    error = billing_mode.check_plan_billing_mode(offering, mode, plan)
+    if error:
+        raise serializers.ValidationError({"billing_mode": _(error)})
+
+
 def create_plan(offering, plan_data):
+    validate_plan_billing_mode(offering, plan_data.get("billing_mode"))
     components = {component.type: component for component in offering.components.all()}
 
     plan = models.Plan.objects.create(offering=offering, **plan_data)
@@ -4003,7 +5205,10 @@ class OfferingCreateSerializer(ProviderOfferingDetailsSerializer):
     options = OfferingOptionsSerializer(required=False)
     resource_options = OfferingOptionsSerializer(required=False)
     plugin_options = MergedPluginOptionsSerializer(required=False)
-    description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
+    # full_description and vendor_details are TextField-backed, hence unbounded.
+    description = core_serializers.HTMLCleanField(
+        required=False, allow_blank=True, max_length=DESCRIPTION_LENGTH
+    )
     full_description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
     vendor_details = core_serializers.HTMLCleanField(required=False, allow_blank=True)
     offering_group = serializers.SlugRelatedField(
@@ -4123,10 +5328,19 @@ class OfferingCreateSerializer(ProviderOfferingDetailsSerializer):
             max_value = values.get("max_value") or values.get("max")
             max_available_limit = values.get("max_available_limit")
 
+            limit_decimal_places = values.get("limit_decimal_places", 0)
+            # A component whose type matches a plugin fixed component is routed
+            # here rather than through create_offering_component, so without
+            # this the precision a provider asked for was dropped in silence.
+            utils.validate_component_precision_is_supported(
+                offering.type, limit_decimal_places
+            )
+
             models.OfferingComponent.objects.filter(offering=offering, type=key).update(
                 min_value=min_value,
                 max_value=max_value,
                 max_available_limit=max_available_limit,
+                limit_decimal_places=limit_decimal_places,
                 article_code=values.get("article_code", ""),
             )
 
@@ -4190,7 +5404,11 @@ def update_plan_details(plan, data):
         "unit",
         "max_amount",
         "article_code",
+        "billing_mode",
     }.difference(set(plan_fields_that_cannot_be_edited))
+
+    if "billing_mode" in data:
+        validate_plan_billing_mode(plan.offering, data["billing_mode"], plan=plan)
 
     for key in PLAN_FIELDS:
         if key in data:
@@ -4235,7 +5453,10 @@ class OfferingOverviewUpdateSerializer(
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
 ):
-    description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
+    # full_description is TextField-backed, hence unbounded.
+    description = core_serializers.HTMLCleanField(
+        required=False, allow_blank=True, max_length=DESCRIPTION_LENGTH
+    )
     full_description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
 
     class Meta:
@@ -4404,7 +5625,61 @@ class OfferingIntegrationUpdateSerializer(serializers.ModelSerializer):
         validate_disable_grace_period_is_staff_only(
             user, self.instance, attrs.get("plugin_options", {})
         )
+        self._joining_offerings = self._validate_account_scope_switch(
+            attrs.get("plugin_options", {})
+        )
         return attrs
+
+    def _validate_account_scope_switch(self, plugin_options) -> list | None:
+        """Refuse moving this offering into provider scope while usernames disagree.
+
+        Joining the provider's shared accounts backs each account of this
+        offering with the person's provider account, so it is refused -- as the
+        provider-level switch is -- while anyone holds a different username here
+        than on the offerings already sharing accounts. Returns the offerings
+        sharing accounts once this one joins, or None when it does not join.
+        """
+        offering = self.instance
+        if "account_scope" not in plugin_options or offering.uses_provider_accounts:
+            return None
+        provider = offering.service_provider
+        if provider is None:
+            return None
+        new_options = dict(offering.plugin_options or {})
+        if plugin_options["account_scope"] == "":
+            new_options.pop("account_scope", None)
+        else:
+            new_options["account_scope"] = plugin_options["account_scope"]
+        scope = offering.resolve_account_setting_with_source(
+            "account_scope", plugin_options=new_options
+        )[0]
+        if scope != AccountScopes.PROVIDER:
+            return None
+        offerings = [
+            other
+            for other in models.Offering.objects.filter(
+                customer_id=offering.customer_id
+            ).select_related("customer__serviceprovider")
+            if other.pk != offering.pk and other.uses_provider_accounts
+        ] + [offering]
+        conflicts = utils.provider_username_conflicts(provider, offerings=offerings)
+        if conflicts:
+            raise rf_exceptions.ValidationError(
+                {
+                    "plugin_options": {
+                        "account_scope": [
+                            _(
+                                "%(count)d user(s) hold a different username on "
+                                "this offering than on the offerings of this "
+                                "provider that share accounts. Resolve them with "
+                                "the adopt_provider_accounts action first."
+                            )
+                            % {"count": len(conflicts)}
+                        ]
+                    }
+                }
+            )
+        return offerings
 
     def get_fields(self):
         fields = super().get_fields()
@@ -4438,6 +5713,12 @@ class OfferingIntegrationUpdateSerializer(serializers.ModelSerializer):
     def _update_plugin_options(self, instance, validated_data):
         plugin_options = validated_data.pop("plugin_options", {})
         for key, value in plugin_options.items():
+            if value == "" and key in models.Offering.ACCOUNT_SETTING_DEFAULTS:
+                # Options are merged key by key, so leaving a key out keeps it;
+                # a blank account setting is how its override is removed and
+                # the provider value inherited again.
+                instance.plugin_options.pop(key, None)
+                continue
             if isinstance(value, datetime.date | datetime.datetime):
                 value = value.isoformat()
             instance.plugin_options[key] = value
@@ -4449,6 +5730,19 @@ class OfferingIntegrationUpdateSerializer(serializers.ModelSerializer):
         self._update_secret_options(instance, validated_data)
         self._update_plugin_options(instance, validated_data)
         offering = super().update(instance, validated_data)
+        joining = getattr(self, "_joining_offerings", None)
+        if joining:
+            # Validation refused an ambiguous switch; a clean one still has to
+            # back the offering's existing accounts, or they would stay
+            # per-offering while only new ones share the provider account.
+            adopted = utils.adopt_provider_accounts(
+                offering.service_provider, offerings=joining
+            )
+            logger.info(
+                "Offering %s joined its provider's accounts; adopted %s",
+                offering,
+                adopted,
+            )
         return offering
 
 
@@ -4815,9 +6109,11 @@ class BaseItemSerializer(
             validate_plan(plan)
 
         if offering.options:
-            validate_options(
+            attributes = validate_options(
                 offering.options.get("options", {}), attrs.get("attributes")
             )
+            if "attributes" in attrs:
+                attrs["attributes"] = attributes
 
         limits = attrs.get("limits")
         if limits:
@@ -4830,7 +6126,9 @@ class BaseItemSerializer(
                 }
                 attrs["limits"] = limits
             if limits:
-                utils.validate_limits(limits, offering, is_creation=True)
+                utils.validate_limits(
+                    limits, offering, is_creation=True, plan=attrs.get("plan")
+                )
         return attrs
 
     def get_fields(self):
@@ -4845,7 +6143,7 @@ class BaseItemSerializer(
         return fields
 
 
-def _validate_prepaid_duration_against_component(
+def validate_prepaid_duration_against_component(
     duration_in_months: int, component, field_name: str
 ):
     """
@@ -4903,6 +6201,7 @@ class BaseOrderSerializer(BaseItemSerializer):
             "resource_uuid",
             "resource_type",
             "resource_name",
+            "resource_end_date",
             "cost",
             "state",
             "output",
@@ -4950,6 +6249,9 @@ class BaseOrderSerializer(BaseItemSerializer):
         read_only=True, source="resource.uuid"
     )
     resource_name = serializers.CharField(read_only=True, source="resource.name")
+    resource_end_date = serializers.DateField(
+        read_only=True, source="resource.end_date", allow_null=True
+    )
     resource_uuid = serializers.UUIDField(
         read_only=True, source="resource.backend_uuid", allow_null=True
     )
@@ -4957,7 +6259,7 @@ class BaseOrderSerializer(BaseItemSerializer):
         read_only=True, source="resource.backend_type", allow_null=True
     )
     state = serializers.SerializerMethodField()
-    limits = serializers.DictField(child=serializers.IntegerField(), required=False)
+    limits = serializers.DictField(child=LimitValueField(), required=False)
     accepting_terms_of_service = serializers.BooleanField(
         required=False, write_only=True
     )
@@ -4995,7 +6297,15 @@ class OrderUpdateSerializer(BaseOrderSerializer):
     def validate(self, attrs):
         limits = attrs.get("limits")
         if limits:
-            validate_limits(limits, self.instance.offering, self.instance.resource)
+            validate_limits(
+                limits,
+                self.instance.offering,
+                self.instance.resource,
+                plan=self.instance.plan,
+            )
+        options = (self.instance.offering.options or {}).get("options")
+        if options and "attributes" in attrs:
+            attrs["attributes"] = strip_hidden_options(options, attrs["attributes"])
         return attrs
 
 
@@ -5013,7 +6323,12 @@ class OrderApproveByProviderSerializer(serializers.Serializer):
                 raise serializers.ValidationError(
                     _("Metadata for resource options is not defined.")
                 )
-            validate_options(resource_options["options"], new_options, optional=True)
+            options = resource_options["options"]
+            current_options = (order.resource.options if order.resource else None) or {}
+            hidden = get_hidden_options(options, {**current_options, **new_options})
+            attributes["new_options"] = validate_options(
+                options, new_options, optional=True, hidden=hidden
+            )
         return attributes
 
 
@@ -5030,6 +6345,31 @@ class OrderConsumerInfoSerializer(serializers.Serializer):
 
 class OrderInfoResponseSerializer(serializers.Serializer):
     detail = serializers.CharField(read_only=True)
+
+
+class DashboardMyOrderSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField(read_only=True)
+    offering_uuid = serializers.UUIDField(read_only=True)
+    offering_name = serializers.CharField(read_only=True)
+    resource_uuid = serializers.UUIDField(read_only=True)
+    resource_name = serializers.CharField(read_only=True)
+    project_uuid = serializers.UUIDField(read_only=True)
+    project_name = serializers.CharField(read_only=True)
+    customer_uuid = serializers.UUIDField(read_only=True)
+    customer_name = serializers.CharField(read_only=True)
+    # Both fields are machine-readable values the frontend maps to translated
+    # labels, rather than the mixed conventions the underlying enums carry
+    # (OrderStates labels are lowercase-hyphen, OrderTypes labels are title
+    # case). `type` is therefore lowercased here and gets its own schema enum
+    # instead of reusing RequestTypes; `state` already matches OrderState.
+    state = serializers.ChoiceField(
+        choices=[(value, value) for value in OrderStates.VALUES], read_only=True
+    )
+    type = serializers.ChoiceField(
+        choices=[(value.lower(), value.lower()) for value in OrderTypes.VALUES],
+        read_only=True,
+    )
+    created = serializers.DateTimeField(read_only=True)
 
 
 class OrderDetailsSerializer(BaseOrderSerializer):
@@ -5064,6 +6404,8 @@ class OrderDetailsSerializer(BaseOrderSerializer):
             "new_plan_name",
             "old_plan_uuid",
             "new_plan_uuid",
+            "old_plan_billing_mode",
+            "new_plan_billing_mode",
             "old_cost_estimate",
             "new_cost_estimate",
             "can_terminate",
@@ -5075,8 +6417,10 @@ class OrderDetailsSerializer(BaseOrderSerializer):
             "provider_message",
             "provider_message_url",
             "provider_message_attachment",
+            "provider_message_updated_at",
             "consumer_message",
             "consumer_message_attachment",
+            "consumer_message_updated_at",
             "consumer_rejection_comment",
             "provider_rejection_comment",
             "auto_approved",
@@ -5190,6 +6534,18 @@ class OrderDetailsSerializer(BaseOrderSerializer):
         source="plan.uuid",
         allow_null=True,
     )
+    old_plan_billing_mode = serializers.SerializerMethodField()
+    new_plan_billing_mode = serializers.SerializerMethodField()
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_old_plan_billing_mode(self, order):
+        """How the previous plan bills (limit, usage, mixed, fixed)."""
+        return billing_mode.describe_plan_billing(order.old_plan)
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_new_plan_billing_mode(self, order):
+        """How the requested plan bills (limit, usage, mixed, fixed)."""
+        return billing_mode.describe_plan_billing(order.plan)
 
     new_cost_estimate = serializers.ReadOnlyField(
         source="cost",
@@ -5376,6 +6732,11 @@ class OrderCreateSerializer(
     project_name = serializers.ReadOnlyField(source="project.name")
     project_description = serializers.ReadOnlyField(source="project.description")
     customer_name = serializers.ReadOnlyField(source="project.customer.name")
+    # This endpoint always provisions a new resource, so the order it produces
+    # is always a CREATE. Accepting a caller-supplied type here would attach an
+    # Update/Terminate/Restore order to a freshly built resource, a combination
+    # nothing downstream expects.
+    type = NaturalChoiceField(choices=OrderTypes.CHOICES, read_only=True)
 
     class Meta:
         model = models.Order
@@ -5472,11 +6833,16 @@ class OrderCreateSerializer(
             attributes=attributes,
             name=attributes.get("name") or "",
         )
-        # Set end_date BEFORE init_cost so prepaid duration is included
+        # Set end_date BEFORE init_cost so prepaid duration is included.
+        # Use order start_date as offset base when it is in the future so
+        # max/default termination offsets measure resource lifetime from
+        # provisioning, not from order submission (aligned with Homeport).
         end_date = validate_end_date(
             resource.offering,
             resource.created.date(),
             parse_date(attributes.get("end_date")),
+            start_date=validated_data.get("start_date"),
+            project_end_date=project.end_date,
         )
         if end_date:
             resource.end_date = end_date
@@ -5486,12 +6852,17 @@ class OrderCreateSerializer(
         resource.init_cost()
 
         # Set resource options from offering's resource_options
-        resource.options = {}
-        for resource_option in (
-            validated_data["offering"].resource_options.get("options", {}).keys()
-        ):
-            if resource_option in attributes:
-                resource.options[resource_option] = attributes[resource_option]
+        resource_options = validated_data["offering"].resource_options.get(
+            "options", {}
+        )
+        resource.options = strip_hidden_options(
+            resource_options,
+            {
+                key: attributes[key]
+                for key in resource_options.keys()
+                if key in attributes
+            },
+        )
 
         resource.save()
 
@@ -5503,7 +6874,7 @@ class OrderCreateSerializer(
             plan=validated_data.get("plan"),
             attributes=attributes,
             limits=validated_data.get("limits", {}),
-            type=validated_data.get("type"),
+            type=OrderTypes.CREATE,
             start_date=validated_data.get("start_date"),
         )
         validate_order(order, request)
@@ -5788,18 +7159,41 @@ class OrderCreateSerializer(
                 {"attributes.end_date": _("End date must be in the future.")}
             )
 
-        # Rule 2: Validate duration against component constraints.
-        start_date = order_start_date or timezone.now().date()
-        # Calculate duration in full months. A partial month at the end counts as a full month.
-        delta = relativedelta(end_date, start_date)
-        duration_in_months = delta.years * 12 + delta.months
-        if delta.days > 0:
-            duration_in_months += 1
+        # Rule 2: Validate duration against component constraints. The length
+        # the client chose is the contract where it is stated: the browser
+        # computes end_date from its *local* today, so east of UTC an evening
+        # order arrives as N months + 1 day, which the date-derived count would
+        # round up to N + 1 and reject against a max of N. Pricing already
+        # prefers the stated length (CostEstimateMixin._prepaid_duration_months).
+        if "prepaid_duration_months" in attributes:
+            duration_in_months = attributes["prepaid_duration_months"]
+            if (
+                isinstance(duration_in_months, bool)
+                or not isinstance(duration_in_months, int)
+                or duration_in_months < 1
+            ):
+                raise ValidationError(
+                    {
+                        "attributes.prepaid_duration_months": _(
+                            "A whole number of months, at least 1."
+                        )
+                    }
+                )
+            duration_field = "attributes.prepaid_duration_months"
+        else:
+            # Older clients send the date only: count full months from the
+            # order's start, a partial month at the end counting as a full one.
+            start_date = order_start_date or timezone.now().date()
+            delta = relativedelta(end_date, start_date)
+            duration_in_months = delta.years * 12 + delta.months
+            if delta.days > 0:
+                duration_in_months += 1
+            duration_field = "attributes.end_date"
 
         # Check against every prepaid component's duration limits
         for component in prepaid_components:
-            _validate_prepaid_duration_against_component(
-                duration_in_months, component, "attributes.end_date"
+            validate_prepaid_duration_against_component(
+                duration_in_months, component, duration_field
             )
 
     def _validate_plan_for_create(self, attrs, offering):
@@ -5951,6 +7345,12 @@ class OfferingAccessSubnetSerializer(
             network = ipaddress.ip_network(value, strict=True)
         except ValueError as e:
             raise rf_exceptions.ValidationError(str(e))
+        # A /0 default would match every address and silently neutralise the
+        # concealment filter for every resource of the offering.
+        if network.prefixlen == 0:
+            raise rf_exceptions.ValidationError(
+                _("A /0 mask is not allowed: it matches every address.")
+            )
         return str(network)
 
     def validate(self, validated_data):
@@ -5983,81 +7383,16 @@ class OfferingAccessSubnetSerializer(
         return validated_data
 
 
-class ResourceAccessSubnetSerializer(
-    core_serializers.AugmentedSerializerMixin,
-    serializers.HyperlinkedModelSerializer,
-):
-    class Meta:
-        model = models.ResourceAccessSubnet
-        fields = (
-            "uuid",
-            "inet",
-            "description",
-            "resource",
-            "resource_name",
-            "resource_backend_id",
-        )
-        extra_kwargs = {
-            "resource": {
-                "lookup_field": "uuid",
-                "view_name": "marketplace-resource-detail",
-            },
-        }
-        protected_fields = ["resource"]
-
-    inet = serializers.CharField()
-    resource_name = serializers.ReadOnlyField(source="resource.name")
-    resource_backend_id = serializers.ReadOnlyField(source="resource.backend_id")
-
-    def validate_inet(self, value):
-        # A bare IP address is treated as a single-host /32 network. The stored
-        # value is advisory data for an external firewall; only single IPs are
-        # allowed, consistent with the organization-level access subnets.
-        if "/" not in value:
-            value = f"{value}/32"
-        if not value.endswith("/32"):
-            raise rf_exceptions.ValidationError(
-                _("Only a single IP address (/32) is allowed.")
-            )
-        return value
-
-    def validate(self, validated_data):
-        if not self.instance:
-            resource = validated_data["resource"]
-            if not (resource.offering.plugin_options or {}).get(
-                "enable_resource_access_subnets"
-            ):
-                raise rf_exceptions.ValidationError(
-                    {"resource": _("Access subnets are not enabled for this offering.")}
-                )
-            # The permission is granted on the consumer project/customer, so
-            # check both scopes (staff bypass is handled inside has_permission).
-            consumer_scopes = [resource.project, resource.project.customer]
-            if not any(
-                has_permission(
-                    self.context["request"],
-                    PermissionEnum.CREATE_RESOURCE_ACCESS_SUBNET,
-                    scope,
-                )
-                for scope in consumer_scopes
-            ):
-                raise PermissionDenied()
-
-        return validated_data
-
-
 class OfferingAccessSubnetExpandedSerializer(serializers.Serializer):
-    """A single resource access subnet with its resource/project/customer context."""
+    """A consumer access subnet with its customer/offering context."""
 
     inet = serializers.CharField()
     description = serializers.CharField(allow_blank=True)
-    resource_uuid = serializers.CharField()
-    resource_name = serializers.CharField()
-    resource_backend_id = serializers.CharField(allow_blank=True)
-    project_uuid = serializers.CharField()
-    project_name = serializers.CharField()
+    is_staff_managed = serializers.BooleanField()
     customer_uuid = serializers.CharField()
     customer_name = serializers.CharField()
+    offering_uuid = serializers.CharField()
+    offering_name = serializers.CharField()
 
 
 class OfferingAccessSubnetsSerializer(serializers.Serializer):
@@ -6066,6 +7401,50 @@ class OfferingAccessSubnetsSerializer(serializers.Serializer):
     expanded = OfferingAccessSubnetExpandedSerializer(many=True)
     packed = serializers.ListField(child=serializers.CharField())
     defaults = serializers.ListField(child=serializers.CharField())
+
+
+class AggregatedAccessSubnetsRequestSerializer(serializers.Serializer):
+    """Query parameters of the multi-offering access-subnet aggregation."""
+
+    offering_uuid = serializers.ListField(
+        child=serializers.UUIDField(),
+        min_length=1,
+        help_text=_("Repeated query parameter selecting the offerings to aggregate."),
+    )
+    include_organization_subnets = serializers.BooleanField(
+        default=False,
+        help_text=_(
+            "Also merge in the organization-level access subnets of customers "
+            "owning non-terminated resources of the selected offerings."
+        ),
+    )
+
+
+class OfferingDefaultAccessSubnetRowSerializer(serializers.Serializer):
+    """A provider-default offering subnet with its offering context."""
+
+    inet = serializers.CharField()
+    description = serializers.CharField(allow_blank=True)
+    offering_uuid = serializers.CharField()
+    offering_name = serializers.CharField()
+
+
+class OrganizationAccessSubnetRowSerializer(serializers.Serializer):
+    """An organization-level access subnet with its customer context."""
+
+    inet = serializers.CharField()
+    description = serializers.CharField(allow_blank=True)
+    customer_uuid = serializers.CharField()
+    customer_name = serializers.CharField()
+
+
+class AggregatedAccessSubnetsSerializer(serializers.Serializer):
+    """Access subnets aggregated across several offerings."""
+
+    expanded = OfferingAccessSubnetExpandedSerializer(many=True)
+    packed = serializers.ListField(child=serializers.CharField())
+    defaults = OfferingDefaultAccessSubnetRowSerializer(many=True)
+    organization_subnets = OrganizationAccessSubnetRowSerializer(many=True)
 
 
 class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerializer):
@@ -6078,6 +7457,7 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
         help_text="Whether the resource owns any API keys, so the portal can offer "
         "key management without knowing which backend serves the resource."
     )
+    offering_account_settings = serializers.SerializerMethodField()
     # Declared explicitly (rather than auto-derived from the model CharField) so
     # the blank state — "" when no restriction is active — is surfaced in the
     # OpenAPI schema as a BlankEnum member. Without allow_blank the generated
@@ -6111,6 +7491,7 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
             "project_uuid",
             "project_name",
             "project_description",
+            "project_start_date",
             "project_end_date",
             "project_effective_end_date",
             "resource_effective_end_date",
@@ -6160,6 +7541,7 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
             "offering_state",
             "offering_components",
             "has_api_keys",
+            "offering_account_settings",
         )
         read_only_fields = (
             "backend_metadata",
@@ -6205,6 +7587,7 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
     )
     project_uuid = serializers.UUIDField(read_only=True, source="project.uuid")
     project_name = serializers.ReadOnlyField(source="project.name")
+    project_start_date = serializers.ReadOnlyField(source="project.start_date")
     project_end_date = serializers.ReadOnlyField(source="project.end_date")
     project_effective_end_date = serializers.DateField(
         read_only=True,
@@ -6251,12 +7634,10 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
     parent_offering_slug = serializers.ReadOnlyField(source="parent.slug")
     # If resource is usage-based, frontend would render button to show and report usage
     is_usage_based = serializers.ReadOnlyField(
-        source="offering.is_usage_based",
-        help_text="Returns True if the resource has usage-based components that track variable consumption.",
+        help_text="Returns True if the resource bills any component by usage under its plan.",
     )
     is_limit_based = serializers.ReadOnlyField(
-        source="offering.is_limit_based",
-        help_text="Returns True if the resource has limit-based components with user-adjustable quotas.",
+        help_text="Returns True if the resource bills any component on user-adjustable limits under its plan.",
     )
     can_terminate = serializers.SerializerMethodField()
     report = ResourceReportField(read_only=True)
@@ -6327,7 +7708,7 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
         instantaneous `current_usages` value (which may be lower after usage
         drops mid-period).
         """
-        if not resource.offering.is_limit_based or not resource.plan:
+        if not resource.is_limit_based or not resource.plan:
             return {}
 
         return utils.get_current_period_usage(resource)
@@ -6335,7 +7716,9 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
     def get_available_actions(self, resource: models.Resource) -> list[str]:
         return plugins.manager.get_available_resource_actions(resource)
 
-    def get_limits(self, resource: models.Resource) -> dict[str, int]:
+    def get_limits(self, resource: models.Resource) -> dict[str, float]:
+        # float, not int: a component may allow fractional limits, and the
+        # annotation is what the generated clients are typed from.
         return resource.limits
 
     def get_attributes(self, resource: models.Resource) -> dict:
@@ -6353,6 +7736,10 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
     @extend_schema_field(BackendMetadataSerializer)
     def get_backend_metadata(self, resource: models.Resource):
         return resource.backend_metadata
+
+    @extend_schema_field(OfferingAccountSettingsSerializer)
+    def get_offering_account_settings(self, resource: models.Resource):
+        return resource.offering.account_settings
 
     def get_has_api_keys(self, resource: models.Resource) -> bool:
         # ConsumerResourceViewSet annotates this, so listing resources costs one
@@ -6422,22 +7809,10 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
             ).data
 
     def _user_can_see_order_workflow(self, resource: models.Resource) -> bool:
-        """A user with only a direct Resource or ResourceProject UserRole has
-        intentional minimal visibility — order workflow timeline is a
-        project/customer-level concern and should be hidden from them."""
         request = self.context.get("request")
         if not request or getattr(request, "user", None) is None:
             return True
-        user = request.user
-        if user.is_anonymous:
-            return False
-        if user.is_staff or user.is_support:
-            return True
-        if resource.project_id in get_connected_projects(
-            user
-        ) or resource.project.customer_id in get_connected_customers(user):
-            return True
-        return False
+        return utils.user_can_see_resource_order_workflow(request.user, resource)
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -6531,13 +7906,15 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
         if not resource.offering_id:
             return None
 
-        # Use values_list to get only the data we need in a single query
-        # This avoids N+1 queries by fetching type and limit_period in bulk
-        limit_components_data = models.OfferingComponent.objects.filter(
-            offering_id=resource.offering_id,
-            billing_type=BillingTypes.LIMIT,
-            limit_period__isnull=False,
-        ).values_list("type", "limit_period")
+        # Resolve through the resource's plan: a usage plan has no renewal dates
+        # for the builtin components even though they are stored as LIMIT.
+        limit_components_data = [
+            (effective.type, effective.limit_period)
+            for effective in billing_mode.resolve_for_resource(
+                resource
+            ).components.values()
+            if effective.billing_type == BillingTypes.LIMIT and effective.limit_period
+        ]
 
         if not limit_components_data:
             return None
@@ -6636,7 +8013,38 @@ class ResourceSwitchPlanSerializer(serializers.HyperlinkedModelSerializer):
                 {"plan": _("Billing period of new plan must match the old one.")}
             )
 
+        self._validate_limits_for_target_plan(resource, plan)
+
         return attrs
+
+    @staticmethod
+    def _validate_limits_for_target_plan(resource, plan):
+        """A limit plan bills the resource's current limits from the switch.
+
+        A resource created under a usage plan may carry no limits at all,
+        so the switch is refused until the provider has set quotas.
+        """
+        target = billing_mode.resolve_plan(plan)
+        current = billing_mode.resolve_for_resource(resource)
+        newly_limited = target.limit_types - current.limit_types
+        if not newly_limited:
+            return
+        limits_validator = plugins.manager.get_limits_validator(plan.offering.type)
+        if limits_validator is None:
+            return
+        try:
+            limits_validator(resource.limits or {})
+        except rf_exceptions.ValidationError as e:
+            raise rf_exceptions.ValidationError(
+                {
+                    "plan": _(
+                        "The selected plan bills the resource limits, but the "
+                        "current limits are incomplete (%s). Ask the service "
+                        "provider to set quotas before switching."
+                    )
+                    % "; ".join(str(m) for m in e.detail)
+                }
+            )
 
 
 class ResourceUpdateSerializer(serializers.ModelSerializer):
@@ -6686,10 +8094,15 @@ class ResourceUpdateSerializer(serializers.ModelSerializer):
                 )
 
         # The utility function handles all other cases (max offset, required date, etc.)
+        # Termination offsets are measured from the creation order's start_date
+        # when provisioning was delayed, same as at order creation time.
+        creation_order = resource.creation_order
         end_date = validate_end_date(
             offering=resource.offering,
             created_date=resource.created.date(),
             end_date=end_date,
+            start_date=creation_order.start_date if creation_order else None,
+            project_end_date=resource.project.end_date if resource.project else None,
         )
         return end_date
 
@@ -6798,7 +8211,7 @@ class ResourceRenewSerializer(serializers.Serializer):
         help_text=_("Number of months to extend the subscription by."),
     )
     limits = serializers.DictField(
-        child=serializers.IntegerField(min_value=0),
+        child=LimitValueField(min_value=0),
         required=False,
         help_text=_("Optional new limits for the resource. Supports upgrades only."),
     )
@@ -6837,9 +8250,7 @@ class RenewalEstimateRequestSerializer(serializers.Serializer):
     extension_months = serializers.IntegerField(
         min_value=1, max_value=MAX_RENEWAL_MONTHS
     )
-    limits = serializers.DictField(
-        child=serializers.IntegerField(min_value=0), required=False
-    )
+    limits = serializers.DictField(child=LimitValueField(min_value=0), required=False)
 
     def validate(self, attrs):
         resource = self.context.get("resource")
@@ -6933,14 +8344,18 @@ class ResourceApiKeyStatusSerializer(serializers.ModelSerializer):
     """Non-secret view of a resource API key — safe for listing/polling."""
 
     resource_uuid = serializers.ReadOnlyField(source="resource.uuid")
+    # The agent's reconciliation pass finds keys by listing, so unlike a command
+    # it has nothing carrying the resource's backend id — and it needs one to talk
+    # to the backend.
+    resource_backend_id = serializers.ReadOnlyField(source="resource.backend_id")
 
     class Meta:
         model = models.ResourceApiKey
         fields = (
             "uuid",
             "resource_uuid",
+            "resource_backend_id",
             "client_id",
-            "fingerprint",
             "state",
             "modified",
             "error_message",
@@ -7003,9 +8418,7 @@ class ResourceUpdateLimitsSerializer(serializers.ModelSerializer):
         model = models.Order
         fields = ("limits", "request_comment", "attachment")
 
-    limits = serializers.DictField(
-        child=serializers.IntegerField(min_value=0), required=True
-    )
+    limits = serializers.DictField(child=LimitValueField(min_value=0), required=True)
     attachment = serializers.FileField(
         required=False,
         help_text=_("Optional PDF attachment for the limit update request."),
@@ -7019,6 +8432,12 @@ class ResourceLimitChangeRequestCreateSerializer(serializers.ModelSerializer):
     )
     state = serializers.CharField(source="get_state_display", read_only=True)
     uuid = serializers.UUIDField(read_only=True)
+    # The model field is a bare JSONField, so without this any JSON value at all
+    # reached approve() and on into validate_limits. Typed like every other
+    # limit payload; precision is settled per component in validate_limits.
+    requested_limits = serializers.DictField(
+        child=LimitValueField(min_value=0), required=True
+    )
 
     class Meta:
         model = models.ResourceLimitChangeRequest
@@ -7033,11 +8452,38 @@ class ResourceLimitChangeRequestCreateSerializer(serializers.ModelSerializer):
                     "instead of creating a request."
                 )
             )
-        if has_permission(
-            user, PermissionEnum.UPDATE_RESOURCE_LIMITS, resource.project
-        ) or has_permission(
-            user, PermissionEnum.UPDATE_RESOURCE_LIMITS, resource.project.customer
-        ):
+        # Checked first, so nothing below reveals anything about a resource the
+        # user cannot see.
+        accessible = filter_queryset_for_user(
+            models.Resource.objects.filter(pk=resource.pk),
+            user,
+        )
+        if not accessible.exists():
+            raise serializers.ValidationError(
+                _("You don't have access to this resource.")
+            )
+        if not utils.offering_allows_limit_change_requests(resource.offering):
+            raise serializers.ValidationError(
+                _("This offering does not accept limit change requests.")
+            )
+        # Changing limits directly also submits an order, so a user is only
+        # redirected to that route when they can do both. Holding the limits
+        # permission alone leaves the request flow as their way forward,
+        # otherwise they would have no route at all.
+        can_update_directly = (
+            has_permission(
+                user, PermissionEnum.UPDATE_RESOURCE_LIMITS, resource.project
+            )
+            or has_permission(
+                user, PermissionEnum.UPDATE_RESOURCE_LIMITS, resource.project.customer
+            )
+        ) and (
+            has_permission(user, PermissionEnum.CREATE_ORDER, resource.project)
+            or has_permission(
+                user, PermissionEnum.CREATE_ORDER, resource.project.customer
+            )
+        )
+        if can_update_directly:
             raise serializers.ValidationError(
                 _(
                     "You have permission to change resource limits directly. "
@@ -7080,6 +8526,182 @@ class ResourceLimitChangeRequestCreateSerializer(serializers.ModelSerializer):
         validated_data["created_by"] = request.user
         validated_data["state"] = ReviewStates.PENDING
         return super().create(validated_data)
+
+
+class ResourceEndDateChangeRequestCreateSerializer(serializers.ModelSerializer):
+    resource = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=models.Resource.objects.all(),
+    )
+    state = serializers.CharField(source="get_state_display", read_only=True)
+    uuid = serializers.UUIDField(read_only=True)
+
+    class Meta:
+        model = models.ResourceEndDateChangeRequest
+        fields = ("resource", "requested_end_date", "comment", "uuid", "state")
+
+    def validate_resource(self, resource):
+        user = self.context["request"].user
+        if user.is_staff or user.is_support:
+            raise serializers.ValidationError(
+                _(
+                    "Staff and support users should use resource edit "
+                    "instead of creating a request."
+                )
+            )
+        # Checked first, so nothing below reveals anything about a resource the
+        # user cannot see.
+        accessible = filter_queryset_for_user(
+            models.Resource.objects.filter(pk=resource.pk),
+            user,
+        )
+        if not accessible.exists():
+            raise serializers.ValidationError(
+                _("You don't have access to this resource.")
+            )
+        if not utils.offering_allows_end_date_change_requests(resource.offering):
+            raise serializers.ValidationError(
+                _("This offering does not accept end date change requests.")
+            )
+        # Mirrors permissions.user_can_set_end_date_as_consumer: this permission
+        # writes the date directly, so a request would be an approval the user
+        # could grant themselves. Everyone else asks.
+        if any(
+            has_permission(user, PermissionEnum.SET_RESOURCE_END_DATE, scope)
+            for scope in (resource.project, resource.project.customer)
+        ):
+            raise serializers.ValidationError(
+                _(
+                    "You have permission to change the resource end date directly. "
+                    "Use set end date instead of creating a request."
+                )
+            )
+        return resource
+
+    def validate(self, attrs):
+        resource = attrs.get("resource")
+        requested_end_date = attrs.get("requested_end_date")
+        user = self.context["request"].user
+
+        if resource and requested_end_date:
+            if resource.end_date == requested_end_date:
+                raise serializers.ValidationError(
+                    _("Requested end date is identical to the current end date.")
+                )
+            utils.validate_end_date_for_resource(resource, requested_end_date)
+
+        if (
+            resource
+            and models.ResourceEndDateChangeRequest.objects.filter(
+                resource=resource,
+                created_by=user,
+                state=ReviewStates.PENDING,
+            ).exists()
+        ):
+            raise serializers.ValidationError(
+                _(
+                    "You already have a pending end date change request "
+                    "for this resource."
+                )
+            )
+        return attrs
+
+    def create(self, validated_data):
+        request = self.context["request"]
+        validated_data["created_by"] = request.user
+        validated_data["state"] = ReviewStates.PENDING
+        return super().create(validated_data)
+
+
+class ResourceEndDateChangeRequestSerializer(serializers.HyperlinkedModelSerializer):
+    @staticmethod
+    def eager_load(queryset, request=None):
+        return queryset.select_related(
+            "resource__project__customer",
+            "resource__offering",
+            "created_by",
+            "reviewed_by",
+        )
+
+    state = serializers.CharField(source="get_state_display", read_only=True)
+    resource_uuid = serializers.UUIDField(read_only=True, source="resource.uuid")
+    resource_name = serializers.CharField(read_only=True, source="resource.name")
+    project_uuid = serializers.UUIDField(read_only=True, source="resource.project.uuid")
+    project_name = serializers.CharField(read_only=True, source="resource.project.name")
+    customer_uuid = serializers.UUIDField(
+        read_only=True, source="resource.project.customer.uuid"
+    )
+    customer_name = serializers.CharField(
+        read_only=True, source="resource.project.customer.name"
+    )
+    offering_uuid = serializers.UUIDField(
+        read_only=True, source="resource.offering.uuid"
+    )
+    offering_name = serializers.CharField(
+        read_only=True, source="resource.offering.name"
+    )
+    created_by_full_name = serializers.CharField(
+        read_only=True, source="created_by.full_name", allow_null=True
+    )
+    created_by_uuid = serializers.UUIDField(
+        read_only=True, source="created_by.uuid", allow_null=True
+    )
+    reviewed_by_full_name = serializers.CharField(
+        read_only=True, source="reviewed_by.full_name", allow_null=True
+    )
+    reviewed_by_uuid = serializers.UUIDField(
+        read_only=True, source="reviewed_by.uuid", allow_null=True
+    )
+    current_end_date = serializers.DateField(
+        read_only=True, source="resource.end_date", allow_null=True
+    )
+
+    class Meta:
+        model = models.ResourceEndDateChangeRequest
+        fields = (
+            "url",
+            "uuid",
+            "state",
+            "resource",
+            "resource_uuid",
+            "resource_name",
+            "project_uuid",
+            "project_name",
+            "customer_uuid",
+            "customer_name",
+            "offering_uuid",
+            "offering_name",
+            "requested_end_date",
+            "current_end_date",
+            "comment",
+            "created",
+            "created_by_uuid",
+            "created_by_full_name",
+            "reviewed_at",
+            "reviewed_by_uuid",
+            "reviewed_by_full_name",
+            "review_comment",
+            "backend_id",
+        )
+        read_only_fields = ("backend_id",)
+        extra_kwargs = {
+            "url": {
+                "lookup_field": "uuid",
+                "view_name": "marketplace-resource-end-date-change-request-detail",
+            },
+            "resource": {
+                "lookup_field": "uuid",
+                "view_name": "marketplace-resource-detail",
+            },
+        }
+
+
+class ResourceEndDateChangeRequestBackendIDSerializer(serializers.ModelSerializer):
+    """Lets an external approval system record its own identifier on a request."""
+
+    class Meta:
+        model = models.ResourceEndDateChangeRequest
+        fields = ("backend_id",)
 
 
 class ResourceLimitChangeRequestSerializer(serializers.HyperlinkedModelSerializer):
@@ -7163,14 +8785,14 @@ class ResourceLimitChangeRequestSerializer(serializers.HyperlinkedModelSerialize
 class ResourceReallocateTargetSerializer(serializers.Serializer):
     resource_uuid = serializers.UUIDField(required=True)
     allocated_limits = serializers.DictField(
-        child=serializers.IntegerField(min_value=1),
+        child=LimitValueField(min_value=0),
         required=True,
     )
 
 
 class ResourceReallocateLimitsSerializer(serializers.Serializer):
     limits = serializers.DictField(
-        child=serializers.IntegerField(min_value=1),
+        child=LimitValueField(min_value=0),
         required=True,
     )
 
@@ -7352,11 +8974,11 @@ class ResourceOptionsSerializer(serializers.ModelSerializer):
                 _("There's a pending order for changing resource options.")
             )
 
-        validate_options(resource_options["options"], attrs, optional=True)
-        if self.instance.options:
-            return {**self.instance.options, **attrs}
-        else:
-            return attrs
+        options = resource_options["options"]
+        merged = {**(self.instance.options or {}), **attrs}
+        hidden = get_hidden_options(options, merged)
+        validate_options(options, attrs, optional=True, hidden=hidden)
+        return strip_hidden_options(options, merged, hidden)
 
 
 class ResourceOfferingSerializer(serializers.ModelSerializer):
@@ -7403,6 +9025,13 @@ class CategoryComponentUsageSerializer(
 class BaseComponentUsageSerializer(
     BaseComponentSerializer, serializers.ModelSerializer
 ):
+    # Deprecated alias for missing_usage_policy == REUSE, kept so that existing
+    # API consumers (including older remote Waldur deployments) keep working.
+    recurring = serializers.SerializerMethodField(
+        help_text="Deprecated, use missing_usage_policy instead. "
+        "True when the reported value is reused every month until changed."
+    )
+
     class Meta:
         model = models.ComponentUsage
         fields = (
@@ -7414,8 +9043,12 @@ class BaseComponentUsageSerializer(
             "measured_unit",
             "usage",
             "date",
+            "missing_usage_policy",
             "recurring",
         )
+
+    def get_recurring(self, instance) -> bool:
+        return instance.missing_usage_policy == MissingUsagePolicies.REUSE
 
 
 class ComponentUsageSerializer(BaseComponentUsageSerializer):
@@ -7446,7 +9079,6 @@ class ComponentUsageSerializer(BaseComponentUsageSerializer):
             "project_uuid",
             "customer_name",
             "customer_uuid",
-            "recurring",
             "billing_period",
             "modified_by",
         )
@@ -7633,10 +9265,13 @@ class ComponentUserUsageCreateSerializer(serializers.ModelSerializer):
             # If date is in a past billing period (historical backfilling),
             # only allow for display-only components (limit-based and prepaid)
             if date_billing_period < current_billing_period:
-                if (
-                    component_usage.component.billing_type
-                    not in DISPLAY_ONLY_BILLING_TYPES
-                ):
+                effective_billing_type = billing_mode.resolve_component(
+                    component_usage.component,
+                    component_usage.plan_period.plan
+                    if component_usage.plan_period
+                    else resource.plan,
+                ).billing_type
+                if effective_billing_type not in DISPLAY_ONLY_BILLING_TYPES:
                     raise serializers.ValidationError(
                         _(
                             "Service providers can only specify date for limit-based or prepaid billing components when backfilling past billing periods."
@@ -7840,9 +9475,41 @@ class ComponentUsageItemSerializer(serializers.Serializer):
     description = serializers.CharField(
         required=False, allow_blank=True, help_text="Optional description of usage"
     )
-    recurring = serializers.BooleanField(
-        default=False, help_text="Whether this usage is recurring"
+    missing_usage_policy = serializers.ChoiceField(
+        choices=MissingUsagePolicies.CHOICES,
+        required=False,
+        help_text="What to record for this component when the following billing "
+        "period passes with no usage report.",
     )
+    recurring = serializers.BooleanField(
+        required=False,
+        allow_null=True,
+        default=None,
+        help_text="Deprecated, use missing_usage_policy instead. "
+        "True is equivalent to missing_usage_policy='reuse'.",
+    )
+
+    def validate(self, attrs):
+        policy = attrs.get("missing_usage_policy")
+        recurring = attrs.pop("recurring", None)
+
+        if policy is None:
+            attrs["missing_usage_policy"] = (
+                MissingUsagePolicies.REUSE if recurring else MissingUsagePolicies.NONE
+            )
+        elif recurring is not None and recurring != (
+            policy == MissingUsagePolicies.REUSE
+        ):
+            raise rf_exceptions.ValidationError(
+                {
+                    "recurring": _(
+                        "Conflicting values of recurring and missing_usage_policy. "
+                        "Use missing_usage_policy alone."
+                    )
+                }
+            )
+
+        return attrs
 
 
 class ComponentUsageCreateSerializer(serializers.Serializer):
@@ -7866,23 +9533,62 @@ class ComponentUsageCreateSerializer(serializers.Serializer):
         help_text="Date for usage reporting (staff and service providers for limit-based components). If not provided, current date is used.",
     )
 
+    @staticmethod
+    def _has_mutable_invoice_for_period(resource, date_value):
+        """Whether the resource's customer already has an invoice for the
+        backfilled date's billing period that still accepts modifications.
+
+        Mirrors the gate applied when usage is actually written into an
+        invoice item, see
+        billing_usage.BillingUsageProcessor._create_or_update_usage_invoice_item.
+        """
+        if not date_value:
+            return False
+
+        billing_period = core_utils.month_start(date_value)
+        invoice = Invoice.objects.filter(
+            customer=resource.project.customer,
+            year=billing_period.year,
+            month=billing_period.month,
+        ).first()
+        return bool(invoice) and invoice.state in Invoice.States.MUTABLE_STATES
+
     def _is_backfillable_component_usage(self, attrs):
         """Check that every reported component is safe to backfill.
 
         Backfilling a past period is only forbidden for USAGE components,
         because those directly create retroactive invoice items. Limit-based
         and prepaid (one-time) usage is display-only, so it is safe to backfill.
+
+        USAGE components are allowed too when the resource's customer already
+        has a mutable (not yet frozen) invoice for the backfilled billing
+        period.
         """
         plan_period = attrs.get("plan_period")
         resource = plan_period and plan_period.resource or attrs.get("resource")
         if not resource:
             return False
 
+        usage_backfill_has_mutable_invoice = self._has_mutable_invoice_for_period(
+            resource, attrs.get("date")
+        )
+
         components_map = self.get_components_map(resource.plan.offering)
         for usage in attrs.get("usages", []):
             component = components_map.get(usage.get("type"))
-            if component and component.billing_type not in DISPLAY_ONLY_BILLING_TYPES:
-                return False
+            if not component:
+                continue
+            effective_billing_type = billing_mode.resolve_component(
+                component, resource.plan
+            ).billing_type
+            if effective_billing_type in DISPLAY_ONLY_BILLING_TYPES:
+                continue
+            if (
+                effective_billing_type == BillingTypes.USAGE
+                and usage_backfill_has_mutable_invoice
+            ):
+                continue
+            return False
         return True
 
     def validate_date(self, value):
@@ -7941,7 +9647,12 @@ class ComponentUsageCreateSerializer(serializers.Serializer):
                 {"resource": _("Resource is not in valid state.")}
             )
 
-        valid_components = set(self.get_components_map(offering))
+        # save() records usage against the plan's offering, and a child
+        # offering's resources take their plan from the parent: a type has to
+        # exist on both, or save() would fail on it.
+        valid_components = set(self.get_components_map(offering)) & set(
+            self.get_components_map(resource.plan.offering)
+        )
         actual_components = {usage["type"] for usage in attrs["usages"]}
 
         invalid_components = ", ".join(sorted(actual_components - valid_components))
@@ -8018,36 +9729,44 @@ class ComponentUsageCreateSerializer(serializers.Serializer):
             amount = usage["amount"]
             description = usage.get("description", "")
             component = components_map[usage["type"]]
-            recurring = usage["recurring"]
-            if component.billing_type == BillingTypes.USAGE:
-                component.validate_amount(resource, amount, now)
-            models.ComponentUsage.objects.filter(
-                resource=resource,
-                component=component,
-                billing_period=billing_period,
-            ).update(recurring=False)
-
+            missing_usage_policy = usage["missing_usage_policy"]
             if not plan_period:
                 plan_period = utils.get_plan_period_for_billing(resource, now)
-
-            # Look up by (resource, component, billing_period) only —
-            # plan_period is a mutable attribute, not part of the identity.
-            # This prevents duplicates when plan_period changes from None
-            # to a real value (e.g. after historical backfill).
-            existing_qs = models.ComponentUsage.objects.filter(
+            effective = billing_mode.resolve_component(
+                component, plan_period.plan if plan_period else resource.plan
+            )
+            if effective.billing_type == BillingTypes.USAGE:
+                component.validate_amount(resource, amount, now)
+            month_rows = models.ComponentUsage.objects.filter(
                 resource=resource,
                 component=component,
                 billing_period=billing_period,
             )
-            existing = existing_qs.first()
+            month_rows.update(missing_usage_policy=MissingUsagePolicies.NONE)
+
+            # One row per plan; a legacy row without a period is adopted,
+            # rows of other plans are never touched.
+            existing = utils._get_current_usage_row(
+                resource, component, billing_period, plan_period
+            )
+            row_amount = amount
+            if effective.billing_type == BillingTypes.USAGE:
+                # The report is the month's total. Rows of other plans stay
+                # frozen at their value (they are invoiced at that plan's
+                # prices), so this plan's row holds the remainder.
+                others = month_rows.exclude(plan_period__isnull=True)
+                if existing is not None:
+                    others = others.exclude(pk=existing.pk)
+                if plan_period is not None:
+                    others = others.exclude(plan_period__plan=plan_period.plan)
+                total = others.aggregate(total=Sum("usage"))["total"] or 0
+                row_amount = max(Decimal(0), Decimal(amount) - total)
             if existing:
-                # Clean up legacy duplicates (same billing period, different plan_periods)
-                existing_qs.exclude(pk=existing.pk).delete()
                 existing.plan_period = plan_period
-                existing.usage = amount
+                existing.usage = row_amount
                 existing.date = now
                 existing.description = description
-                existing.recurring = recurring
+                existing.missing_usage_policy = missing_usage_policy
                 existing.modified_by = user
                 existing.save()
                 usage = existing
@@ -8058,10 +9777,10 @@ class ComponentUsageCreateSerializer(serializers.Serializer):
                     component=component,
                     plan_period=plan_period,
                     billing_period=billing_period,
-                    usage=amount,
+                    usage=row_amount,
                     date=now,
                     description=description,
-                    recurring=recurring,
+                    missing_usage_policy=missing_usage_policy,
                     modified_by=user,
                 )
                 created = True
@@ -8159,13 +9878,23 @@ class OfferingUserPosixGroupSerializer(serializers.Serializer):
     customer_uuid = serializers.CharField(allow_null=True)
     project_accessible = serializers.BooleanField()
     pool_uuid = serializers.CharField(allow_null=True)
+    pool_scope = serializers.CharField(allow_null=True)
+
+
+class PosixSharingOfferingSerializer(serializers.Serializer):
+    """An offering that uses a shared POSIX identity (read-only)."""
+
+    uuid = serializers.CharField()
+    name = serializers.CharField()
 
 
 class OfferingUserPosixAllocationSerializer(serializers.Serializer):
     """An offering user's POSIX identifier and the pool it came from (read-only).
 
     ``namespace`` is ``uid`` or ``gid``; ``pool_*`` / ``scope_*`` are null when
-    the value is not tracked by a POSIX ID pool.
+    the value is not tracked by a POSIX ID pool. ``shared_with_offerings`` lists
+    the user's other offerings that resolve to the same pool and therefore carry
+    the very same value.
     """
 
     namespace = serializers.CharField()
@@ -8173,21 +9902,38 @@ class OfferingUserPosixAllocationSerializer(serializers.Serializer):
     pool_uuid = serializers.CharField(allow_null=True)
     scope = serializers.CharField(allow_null=True)
     scope_name = serializers.CharField(allow_null=True)
+    shared_with_offerings = PosixSharingOfferingSerializer(many=True)
 
 
 class UserPosixIdentitySerializer(serializers.Serializer):
-    """One of a user's POSIX identifiers across all their offering accounts.
+    """One of a user's POSIX identifiers, consolidated across their accounts.
 
+    One row per ``(pool, namespace, value)``: a UID allocated once for the user
+    is reported once, with ``offerings`` naming every account that uses it.
+    ``offering_name`` / ``offering_uuid`` repeat the first of those for clients
+    written against the previous one-row-per-offering shape; they are deprecated
+    and go away once those clients read ``offerings``.
     ``namespace`` is ``uid`` or ``gid``; ``context`` holds the project name for
-    group GIDs. ``pool_uuid`` is null when the value is not tracked by a pool.
+    group GIDs. ``pool_uuid`` / ``pool_scope`` are null when the value is not
+    tracked by a pool.
     """
 
-    offering_name = serializers.CharField()
-    offering_uuid = serializers.CharField()
     namespace = serializers.CharField()
     value = serializers.IntegerField()
     context = serializers.CharField(allow_null=True)
     pool_uuid = serializers.CharField(allow_null=True)
+    pool_scope = serializers.CharField(allow_null=True)
+    offerings = PosixSharingOfferingSerializer(many=True)
+    offering_name = serializers.CharField(
+        allow_null=True,
+        help_text="Deprecated: the first entry of 'offerings'. The endpoint "
+        "used to return one row per offering; read 'offerings' instead.",
+    )
+    offering_uuid = serializers.CharField(
+        allow_null=True,
+        help_text="Deprecated: the first entry of 'offerings'. Read "
+        "'offerings' instead.",
+    )
 
 
 class OfferingUserPosixAttributesSerializer(serializers.Serializer):
@@ -8211,7 +9957,8 @@ class OfferingUserPosixAttributesSerializer(serializers.Serializer):
         max_value=models.PosixIdPool.MAX_ID,
         help_text=(
             "Override the account's UID. The value must fall within the "
-            "offering's POSIX ID pool and is rejected if already allocated."
+            "offering's resolved POSIX ID pool and is rejected with 400 if it "
+            "is out of range or already held by another active identity."
         ),
     )
     primarygroup = serializers.IntegerField(
@@ -8219,7 +9966,10 @@ class OfferingUserPosixAttributesSerializer(serializers.Serializer):
         allow_null=True,
         min_value=models.PosixIdPool.MIN_ID,
         max_value=models.PosixIdPool.MAX_ID,
-        help_text="Override the account's primary GID (see uidnumber).",
+        help_text=(
+            "Override the account's primary GID, under the same pool-range "
+            "and uniqueness rules as uidnumber."
+        ),
     )
 
     # login_shell and home_directory sync to LDAP and are consumed by downstream
@@ -8241,13 +9991,30 @@ class OfferingUserPosixAttributesSerializer(serializers.Serializer):
 
 
 class OfferingUserPosixUpdateResponseSerializer(serializers.Serializer):
-    """Response of the set_posix_attributes action: the updated POSIX
-    attributes plus any non-fatal warnings (e.g. a UID outside every active
-    range)."""
+    """Response of the set_posix_attributes action: the POSIX ids now stored
+    for the account plus any non-fatal advisories about the accepted values (a
+    reserved id - 65534 or 65535 - or a value of 2^31 or above). Out-of-range
+    and already-allocated values are rejected with 400, not warned about."""
 
-    uidnumber = serializers.IntegerField(allow_null=True, required=False)
-    primarygroup = serializers.IntegerField(allow_null=True, required=False)
-    warnings = serializers.ListField(child=serializers.CharField(), default=list)
+    uidnumber = serializers.IntegerField(
+        allow_null=True,
+        required=False,
+        help_text="The UID now stored for the account.",
+    )
+    primarygroup = serializers.IntegerField(
+        allow_null=True,
+        required=False,
+        help_text="The primary GID now stored for the account.",
+    )
+    warnings = serializers.ListField(
+        child=serializers.CharField(),
+        default=list,
+        help_text=(
+            "Non-fatal advisories about the accepted values: a reserved POSIX "
+            "id (65534 or 65535) or a value of 2^31 or above. Out-of-range "
+            "and already-allocated values are rejected with 400 instead."
+        ),
+    )
 
 
 class OfferingUserSerializer(
@@ -8504,6 +10271,31 @@ class OfferingUserSerializer(
     def get_home_directory(self, offering_user: models.OfferingUser):
         return (offering_user.backend_metadata or {}).get("homeDir")
 
+    def validate(self, attrs):
+        """Refuse writes to fields a provider account owns.
+
+        On a backed account the columns here are a cache of the provider account,
+        kept so filtering and ordering keep working. Writing to them directly
+        would be silently undone the next time the parent propagates, so say so
+        rather than accepting an edit that will not stick.
+        """
+        instance = self.instance
+        if instance is not None and instance.is_provider_backed:
+            delegated = {"username"} & set(attrs)
+            if delegated:
+                raise serializers.ValidationError(
+                    {
+                        field: _(
+                            "This account is owned by the service provider account "
+                            "%(uuid)s. Change it there instead; every offering "
+                            "account of this user at the provider follows it."
+                        )
+                        % {"uuid": instance.service_provider_account.uuid.hex}
+                        for field in delegated
+                    }
+                )
+        return super().validate(attrs)
+
     def to_internal_value(self, data):
         # Pre-process data to convert UUID fields to URL fields before field validation
         if self.instance is None:  # Only for creation
@@ -8637,8 +10429,6 @@ class OfferingUserSerializer(
             return offering_user._compliance_completion_exists
 
         # Fall back to individual query if not pre-loaded
-        from django.contrib.contenttypes.models import ContentType
-
         offering_user_ct = ContentType.objects.get_for_model(offering_user)
         return checklist_models.ChecklistCompletion.objects.filter(
             scope_content_type=offering_user_ct,
@@ -8842,7 +10632,19 @@ class OfferingUserSerializer(
                 _("It is not allowed to create users for current offering.")
             )
 
-        instance = super().create(validated_data)
+        # Through the shared creator, so an offering in provider scope gets a
+        # backed account here too. Creating the row directly would insert an
+        # unbacked one, which is the divergence provider scope exists to
+        # remove -- and this is the one public route into it.
+        instance, created = utils.create_offering_user(
+            validated_data["user"],
+            offering,
+            username=validated_data.get("username"),
+        )
+        if not created:
+            raise rf_exceptions.ValidationError(
+                _("An account for this user on this offering already exists.")
+            )
 
         # Set state to OK for backward compatibility when username is provided during creation
         if (
@@ -8868,6 +10670,225 @@ class OfferingUserSerializer(
         instance = super().update(instance, validated_data)
 
         return instance
+
+
+class ProviderUsernameCandidateSerializer(serializers.Serializer):
+    """One username competing to survive adoption, with the evidence for choosing it."""
+
+    username = serializers.CharField()
+    offering_count = serializers.IntegerField()
+    offering_uuids = serializers.ListField(child=serializers.CharField())
+    has_active_resources = serializers.BooleanField()
+    home_directories = serializers.ListField(child=serializers.CharField())
+
+
+class ProviderUsernameConflictSerializer(serializers.Serializer):
+    """A user whose offering accounts disagree about their username."""
+
+    user_uuid = serializers.CharField()
+    user_username = serializers.CharField()
+    user_full_name = serializers.CharField()
+    candidates = ProviderUsernameCandidateSerializer(many=True)
+
+
+class AdoptProviderAccountsSerializer(serializers.Serializer):
+    """Surviving usernames for the users whose accounts disagree."""
+
+    resolutions = serializers.DictField(
+        child=serializers.CharField(),
+        required=False,
+        help_text=(
+            "User UUID (hex) to the username that survives adoption. Only needed "
+            "for users reported by the 'username_conflicts' action."
+        ),
+    )
+
+
+class AdoptProviderAccountsResponseSerializer(serializers.Serializer):
+    adopted = serializers.IntegerField(help_text="Provider accounts created.")
+    backed = serializers.IntegerField(
+        help_text="Offering accounts now reading through a provider account."
+    )
+
+
+class ServiceProviderAccountSerializer(
+    core_serializers.RestrictedSerializerMixin, serializers.HyperlinkedModelSerializer
+):
+    """A user's account at a service provider, shared by that provider's offerings."""
+
+    # Read-only rather than writable: the endpoint has no create action, so the
+    # only thing a writable identity field could do is re-parent an existing
+    # account onto another provider or another person -- silently handing over
+    # its username and POSIX identity.
+    service_provider = serializers.HyperlinkedRelatedField(
+        read_only=True,
+        view_name="marketplace-service-provider-detail",
+        lookup_field="uuid",
+    )
+    service_provider_uuid = serializers.ReadOnlyField(source="service_provider.uuid")
+    service_provider_name = serializers.ReadOnlyField(
+        source="service_provider.customer.name"
+    )
+    user = serializers.HyperlinkedRelatedField(
+        read_only=True,
+        view_name="user-detail",
+        lookup_field="uuid",
+    )
+    user_uuid = serializers.ReadOnlyField(source="user.uuid")
+    # Null unless every offering the account backs exposes the attribute to
+    # the provider; see to_representation.
+    user_username = serializers.CharField(
+        source="user.username", read_only=True, allow_null=True
+    )
+    user_full_name = serializers.CharField(
+        source="user.full_name", read_only=True, allow_null=True
+    )
+    user_email = serializers.CharField(
+        source="user.email", read_only=True, allow_null=True
+    )
+    state = serializers.SerializerMethodField()
+    uidnumber = serializers.SerializerMethodField()
+    primarygroup = serializers.SerializerMethodField()
+    login_shell = serializers.SerializerMethodField()
+    home_directory = serializers.SerializerMethodField()
+    offering_count = serializers.SerializerMethodField()
+    # Restriction is enforced per offering -- the GLAuth rendering and the site
+    # agent both read OfferingUser.is_restricted, and nothing consults the
+    # provider account's copy. Exposing it as writable here would look like a
+    # provider-wide switch that silently does nothing, so it is read-only until
+    # something actually enforces it.
+    is_restricted = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = models.ServiceProviderAccount
+        fields = (
+            "url",
+            "uuid",
+            "created",
+            "modified",
+            "service_provider",
+            "service_provider_uuid",
+            "service_provider_name",
+            "user",
+            "user_uuid",
+            "user_username",
+            "user_full_name",
+            "user_email",
+            "username",
+            "state",
+            "runtime_state",
+            "is_restricted",
+            "service_provider_comment",
+            "service_provider_comment_url",
+            "uidnumber",
+            "primarygroup",
+            "login_shell",
+            "home_directory",
+            "offering_count",
+        )
+        extra_kwargs = dict(
+            url={
+                "lookup_field": "uuid",
+                "view_name": "marketplace-service-provider-account-detail",
+            },
+        )
+
+    #: Attributes of the person behind the account, keyed by the exposure
+    #: setting that governs each.
+    USER_ATTRIBUTE_FIELDS = {
+        "username": "user_username",
+        "full_name": "user_full_name",
+        "email": "user_email",
+    }
+
+    def _exposed_attributes(self, account) -> set:
+        """What every offering the account backs exposes to the provider.
+
+        The account is shared, so an attribute one of its offerings keeps from
+        the provider is kept here too. An account backing no offering exposes
+        nothing. Resolved once per offering per request.
+        """
+        cache = self.context.setdefault("_offering_exposure", {})
+        exposed = None
+        for offering_user in account.offering_users.all():
+            offering = offering_user.offering
+            if offering.pk not in cache:
+                cache[offering.pk] = set(
+                    models.OfferingUserAttributeConfig.get_exposed_fields_for_scope(
+                        offering
+                    )
+                )
+            exposed = (
+                cache[offering.pk] if exposed is None else exposed & cache[offering.pk]
+            )
+        return exposed or set()
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        exposed = self._exposed_attributes(instance)
+        for attribute, field in self.USER_ATTRIBUTE_FIELDS.items():
+            if field in data and attribute not in exposed:
+                data[field] = None
+        return data
+
+    def validate_username(self, username):
+        """One name per provider directory.
+
+        The model carries a partial unique constraint on (service_provider,
+        username), but DRF only derives a validator from it when every field of
+        the constraint is writable here -- and service_provider is deliberately
+        read-only. Without this check a duplicate name would reach the database
+        and surface as a 500 instead of a 400. Case-insensitive because the
+        directories these names land in (LDAP, POSIX) treat them so.
+        """
+        if not username or self.instance is None:
+            return username
+        taken = (
+            models.ServiceProviderAccount.objects.filter(
+                service_provider=self.instance.service_provider,
+                username__iexact=username,
+            )
+            .exclude(pk=self.instance.pk)
+            .exists()
+        )
+        if taken:
+            raise serializers.ValidationError(
+                _("Another account at this service provider already has this username.")
+            )
+        return username
+
+    @extend_schema_field(serializers.ChoiceField(choices=OfferingUserStates.VALUES))
+    def get_state(self, account) -> str:
+        return account.get_state_display()
+
+    @extend_schema_field(serializers.IntegerField(allow_null=True))
+    def get_uidnumber(self, account):
+        return (account.backend_metadata or {}).get("uidnumber")
+
+    @extend_schema_field(serializers.IntegerField(allow_null=True))
+    def get_primarygroup(self, account):
+        return (account.backend_metadata or {}).get("primarygroup")
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_login_shell(self, account):
+        return (account.backend_metadata or {}).get("loginShell")
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_home_directory(self, account):
+        return (account.backend_metadata or {}).get("homeDir")
+
+    @extend_schema_field(serializers.IntegerField())
+    def get_offering_count(self, account) -> int:
+        """How many of the provider's offerings currently read through this account.
+
+        ServiceProviderAccountViewSet annotates this, so a list page costs one
+        query instead of a COUNT per row. The fallback keeps the field correct
+        for an instance that did not come from that queryset.
+        """
+        annotated = getattr(account, "offering_count", None)
+        if annotated is not None:
+            return annotated
+        return account.offering_users.count()
 
 
 class OfferingUserUpdateRestrictionSerializer(serializers.Serializer):
@@ -9188,6 +11209,9 @@ class ResourceProjectSerializer(serializers.ModelSerializer):
     removed_by_username = serializers.CharField(
         source="removed_by.username", read_only=True, allow_null=True, default=None
     )
+    created_by_username = serializers.CharField(
+        source="created_by.username", read_only=True, allow_null=True, default=None
+    )
     # The model field is nullable; without allow_null the OpenAPI schema
     # declares it non-nullable and generated SDK clients call from_dict(None).
     termination_metadata = serializers.JSONField(read_only=True, allow_null=True)
@@ -9212,6 +11236,7 @@ class ResourceProjectSerializer(serializers.ModelSerializer):
             "removed_date",
             "removed_by",
             "removed_by_username",
+            "created_by_username",
             "termination_metadata",
         )
         read_only_fields = (
@@ -9226,6 +11251,7 @@ class ResourceProjectSerializer(serializers.ModelSerializer):
             "removed_date",
             "removed_by",
             "removed_by_username",
+            "created_by_username",
             "termination_metadata",
         )
         # Disable DRF auto-validators. The model has a partial UniqueConstraint
@@ -9283,17 +11309,7 @@ class ResourceProjectSerializer(serializers.ModelSerializer):
             # sub-allocatable to a project is also required when this
             # flag is on. That's LIMIT-billed plus prepaid ONE_TIME
             # (e.g. helpdesk-style up-front allocations).
-            required_types = list(
-                offering.components.filter(
-                    Q(billing_type=BillingTypes.LIMIT)
-                    | Q(
-                        billing_type=BillingTypes.ONE_TIME,
-                        is_prepaid=True,
-                    )
-                )
-                .values_list("type", flat=True)
-                .order_by("type")
-            )
+            required_types = sorted(offering.get_limit_components(resource.plan))
             provided = attrs.get("limits") or {}
             missing = [t for t in required_types if not provided.get(t)]
             if missing:
@@ -9314,7 +11330,9 @@ class ResourceProjectSerializer(serializers.ModelSerializer):
 
         # Per-component bounds (offering component min/max) apply regardless
         # of the policy: an operator's component caps are always honoured.
-        for component, value in utils.get_components_map(limits, offering):
+        for component, value in utils.get_components_map(
+            limits, offering, resource.plan
+        ):
             utils.validate_min_max_limit(value, component)
 
         policy = plugin_options.get("resource_projects_limit_policy", "none")
@@ -9436,7 +11454,62 @@ class ResourceProjectErrorMessageSerializer(serializers.Serializer):
     )
 
 
-class NestedResourceProjectPermissionSerializer(serializers.ModelSerializer):
+class MemberSyncFieldsMixin(serializers.Serializer):
+    """Adds agent-reported sync fields to a UserRole-shaped serializer.
+
+    The fields are emitted only when the view put a ``member_sync_index``
+    into the context (i.e. the offering opted in via
+    ``enable_membership_sync_status`` and the view prefetched the rows).
+    Otherwise they are dropped from the payload entirely, so opted-out
+    offerings keep today's exact response shape. An index hit of None
+    serializes as null — "the agent has not reported on this grant",
+    which is distinct from any real state.
+    """
+
+    sync_state = serializers.SerializerMethodField()
+    sync_message = serializers.SerializerMethodField()
+    sync_reported_at = serializers.SerializerMethodField()
+
+    def _sync_row(self, user_role):
+        index = self.context.get("member_sync_index")
+        if index is None:
+            return None
+        scope = user_role.scope
+        if isinstance(scope, models.ResourceProject):
+            key = (user_role.user_id, "resource_project", scope.id, user_role.role.name)
+        else:
+            key = (user_role.user_id, "resource", None, user_role.role.name)
+        return index.get(key)
+
+    def get_sync_state(self, user_role) -> str | None:
+        row = self._sync_row(user_role)
+        return row and row.state
+
+    def get_sync_message(self, user_role) -> str | None:
+        row = self._sync_row(user_role)
+        return row and row.message
+
+    @extend_schema_field(serializers.DateTimeField(allow_null=True))
+    def get_sync_reported_at(self, user_role):
+        row = self._sync_row(user_role)
+        if row is None:
+            return None
+        # A report leaves unchanged rows untouched, so when the agent last
+        # reported lives on the resource. Rows stored before that record
+        # existed fall back to their own timestamp.
+        return self.context.get("member_sync_reported_at") or row.modified
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if self.context.get("member_sync_index") is None:
+            for field in ("sync_state", "sync_message", "sync_reported_at"):
+                data.pop(field, None)
+        return data
+
+
+class NestedResourceProjectPermissionSerializer(
+    MemberSyncFieldsMixin, serializers.ModelSerializer
+):
     """Mirrors NestedProjectPermissionSerializer from waldur_core.structure
     but for ResourceProject scope. Used inside ResourceTeamMemberSerializer
     to expose a user's per-resource_project role grants under one Resource."""
@@ -9461,21 +11534,101 @@ class NestedResourceProjectPermissionSerializer(serializers.ModelSerializer):
             "role_name",
             "role_uuid",
             "expiration_time",
+            "sync_state",
+            "sync_message",
+            "sync_reported_at",
         ]
+
+
+class NestedResourceRolePermissionSerializer(
+    MemberSyncFieldsMixin, serializers.ModelSerializer
+):
+    """A single resource-scope role grant. Used inside
+    ResourceTeamMemberSerializer.roles so users holding several
+    resource-scope roles expose all of them, not just one."""
+
+    role_name = serializers.CharField(read_only=True, source="role.name")
+    role_uuid = serializers.UUIDField(read_only=True, source="role.uuid")
+
+    class Meta:
+        model = permission_models.UserRole
+        fields = [
+            "role_name",
+            "role_uuid",
+            "expiration_time",
+            "sync_state",
+            "sync_message",
+            "sync_reported_at",
+        ]
+
+
+class MemberSyncStatusEntrySerializer(serializers.Serializer):
+    """One reported grant in a set_membership_sync_statuses payload."""
+
+    username = serializers.CharField(required=False, allow_blank=True)
+    user_uuid = serializers.UUIDField(required=False)
+    scope_type = serializers.ChoiceField(
+        choices=models.ResourceMemberSyncStatus.ScopeTypes.CHOICES
+    )
+    resource_project_uuid = serializers.UUIDField(required=False)
+    # Bounded by the column: a longer name used to reach the INSERT and fail
+    # there with a DataError (HTTP 500) instead of a 400.
+    role_name = serializers.CharField(
+        max_length=models.ResourceMemberSyncStatus._meta.get_field(
+            "role_name"
+        ).max_length
+    )
+    state = serializers.ChoiceField(
+        choices=models.ResourceMemberSyncStatus.States.CHOICES
+    )
+    message = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate(self, attrs):
+        if not attrs.get("username") and not attrs.get("user_uuid"):
+            raise rf_exceptions.ValidationError(
+                "Either username or user_uuid is required."
+            )
+        if (
+            attrs["scope_type"]
+            == models.ResourceMemberSyncStatus.ScopeTypes.RESOURCE_PROJECT
+            and not attrs.get("resource_project_uuid")
+        ):
+            raise rf_exceptions.ValidationError(
+                "resource_project_uuid is required for resource_project scope."
+            )
+        return attrs
+
+
+class MemberSyncStatusReportSerializer(serializers.Serializer):
+    """Full-replace report of a resource's member sync statuses."""
+
+    statuses = MemberSyncStatusEntrySerializer(many=True)
+
+
+class MemberSyncStatusReportResultSerializer(serializers.Serializer):
+    """Result of a sync-status report: how many rows landed, what was skipped."""
+
+    stored = serializers.IntegerField()
+    skipped = serializers.ListField(child=serializers.CharField())
 
 
 class ResourceTeamMemberSerializer(
     core_serializers.RestrictedSerializerMixin, serializers.ModelSerializer
 ):
-    """One row per user with their direct Resource role plus a nested
+    """One row per user with their direct Resource roles plus a nested
     list of their per-ResourceProject grants under THIS resource. Mirrors
     structure.serializers.CustomerUserSerializer.
+
+    ``roles`` carries every resource-scope grant; the scalar
+    ``role_name``/``role_uuid``/``expiration_time`` reflect the first
+    grant only and are kept for backward compatibility.
     """
 
     expiration_time = serializers.SerializerMethodField()
     resource_projects = serializers.SerializerMethodField()
     role_name = serializers.SerializerMethodField()
     role_uuid = serializers.SerializerMethodField()
+    roles = serializers.SerializerMethodField()
 
     class Meta:
         model = core_models.User
@@ -9488,6 +11641,7 @@ class ResourceTeamMemberSerializer(
             "image",
             "role_name",
             "role_uuid",
+            "roles",
             "expiration_time",
             "resource_projects",
         ]
@@ -9495,14 +11649,27 @@ class ResourceTeamMemberSerializer(
             "url": {"lookup_field": "uuid"},
         }
 
-    def _get_resource_permission(self, user):
+    def _get_resource_permissions(self, user):
+        # Prefer the per-user grants the view bulk-loaded into context; fall
+        # back to a per-user query for callers that did not prefetch.
+        by_user = self.context.get("resource_roles_by_user")
+        if by_user is not None:
+            return by_user.get(user.id, [])
         resource = self.context["resource"]
-        return permission_models.UserRole.objects.filter(
-            content_type=ContentType.objects.get_for_model(models.Resource),
-            object_id=resource.id,
-            user=user,
-            is_active=True,
-        ).first()
+        return list(
+            permission_models.UserRole.objects.filter(
+                content_type=ContentType.objects.get_for_model(models.Resource),
+                object_id=resource.id,
+                user=user,
+                is_active=True,
+            )
+            .select_related("role")
+            .order_by("role__name")
+        )
+
+    def _get_resource_permission(self, user):
+        permissions = self._get_resource_permissions(user)
+        return permissions[0] if permissions else None
 
     def get_role_name(self, user) -> str | None:
         permission = self._get_resource_permission(user)
@@ -9512,6 +11679,12 @@ class ResourceTeamMemberSerializer(
         permission = self._get_resource_permission(user)
         return permission and permission.role.uuid.hex
 
+    @extend_schema_field(NestedResourceRolePermissionSerializer(many=True))
+    def get_roles(self, user):
+        return NestedResourceRolePermissionSerializer(
+            self._get_resource_permissions(user), many=True, context=self.context
+        ).data
+
     @extend_schema_field(serializers.DateTimeField(allow_null=True))
     def get_expiration_time(self, user):
         permission = self._get_resource_permission(user)
@@ -9519,16 +11692,22 @@ class ResourceTeamMemberSerializer(
 
     @extend_schema_field(NestedResourceProjectPermissionSerializer(many=True))
     def get_resource_projects(self, user):
-        resource = self.context["resource"]
-        rp_ids = models.ResourceProject.available_objects.filter(
-            resource=resource
-        ).values_list("id", flat=True)
-        grants = permission_models.UserRole.objects.filter(
-            content_type=ContentType.objects.get_for_model(models.ResourceProject),
-            object_id__in=rp_ids,
-            user=user,
-            is_active=True,
-        ).select_related("role")
+        # Prefer the per-user grants the view bulk-loaded (with their
+        # generic-FK scope primed); fall back to a per-user query otherwise.
+        by_user = self.context.get("rp_roles_by_user")
+        if by_user is not None:
+            grants = by_user.get(user.id, [])
+        else:
+            resource = self.context["resource"]
+            rp_ids = models.ResourceProject.available_objects.filter(
+                resource=resource
+            ).values_list("id", flat=True)
+            grants = permission_models.UserRole.objects.filter(
+                content_type=ContentType.objects.get_for_model(models.ResourceProject),
+                object_id__in=rp_ids,
+                user=user,
+                is_active=True,
+            ).select_related("role")
         return NestedResourceProjectPermissionSerializer(
             grants, many=True, context=self.context
         ).data
@@ -10590,7 +12769,13 @@ class MarketplaceProviderCustomerSerializer(ProviderOfferingCustomerSerializer):
         return get_payment_profiles(self, customer)
 
     def get_projects_count(self, customer) -> int:
-        return self.get_resources(customer).values_list("project_id").distinct().count()
+        return (
+            self.get_resources(customer)
+            .order_by()
+            .values_list("project_id")
+            .distinct()
+            .count()
+        )
 
     def get_users_count(self, customer) -> int:
         return self.get_users_qs(customer).count()
@@ -11000,6 +13185,17 @@ class StateTransitionErrorSerializer(serializers.Serializer):
     )
 
 
+class DetailResponseSerializer(serializers.Serializer):
+    """A plain ``{"detail": "..."}`` body.
+
+    Declared on non-2xx responses (e.g. 409/429) so the generated SDK
+    clients treat them as known outcomes instead of raising
+    ``UnexpectedStatus``.
+    """
+
+    detail = serializers.CharField(read_only=True)
+
+
 class RobotAccountErrorSerializer(serializers.Serializer):
     error_message = serializers.CharField(
         required=False, help_text=_("Error message to be saved to the robot account")
@@ -11291,8 +13487,8 @@ class ComponentUserUsageLimitSerializer(
 
 @extend_schema_field(IntegrationStatusSerializer(many=True, allow_null=True))
 def get_integration_status(serializer, offering):
-    if not has_permission(
-        serializer.context["request"], PermissionEnum.UPDATE_OFFERING, offering.customer
+    if not utils.can_update_offering_in_any_scope(
+        serializer.context["request"], offering
     ):
         return None
 
@@ -11376,11 +13572,7 @@ class RemoveOfferingComponentSerializer(serializers.Serializer):
 
 class SwitchBillingModeSerializer(serializers.Serializer):
     billing_mode = serializers.ChoiceField(
-        choices=[
-            ("monthly", "Monthly (Limit-based)"),
-            ("prepaid", "Prepaid (One-time)"),
-            ("usage", "Usage-based"),
-        ],
+        choices=SwitchBillingModes.CHOICES,
         help_text="Switch all builtin components to monthly (LIMIT), prepaid (ONE_TIME + is_prepaid), or usage-based billing.",
     )
 
@@ -11389,6 +13581,41 @@ class RemoveSoftwareCatalogSerializer(serializers.Serializer):
     offering_catalog_uuid = serializers.UUIDField(
         help_text="UUID of the offering catalog to remove"
     )
+
+
+class RuntimeStatesFilterSerializer(serializers.Serializer):
+    project_uuid = serializers.UUIDField(
+        required=False,
+        help_text="Filter runtime states by resources within a specific project.",
+    )
+    category_uuid = serializers.UUIDField(
+        required=False,
+        help_text="Filter runtime states by resources belonging to a specific category.",
+    )
+    offering_uuid = serializers.UUIDField(
+        required=False,
+        help_text="Filter runtime states by resources of a specific offering.",
+    )
+    customer_uuid = serializers.UUIDField(
+        required=False,
+        help_text="Filter runtime states by resources within a specific customer.",
+    )
+
+    def validate(self, attrs):
+        if not any(
+            attrs.get(field)
+            for field in (
+                "project_uuid",
+                "category_uuid",
+                "offering_uuid",
+                "customer_uuid",
+            )
+        ):
+            raise serializers.ValidationError(
+                "Provide at least one of project_uuid, category_uuid, "
+                "offering_uuid or customer_uuid."
+            )
+        return attrs
 
 
 class RuntimeStatesSerializer(serializers.Serializer):
@@ -11923,9 +14150,23 @@ class UserOfferingConsentSerializer(
         if obj.revocation_date is not None:
             return False
 
-        active_tos = obj.offering.terms_of_service_configs.filter(
-            is_active=True
-        ).first()
+        offering = obj.offering
+        if (
+            hasattr(offering, "_prefetched_objects_cache")
+            and "terms_of_service_configs" in offering._prefetched_objects_cache
+        ):
+            active_tos = next(
+                (
+                    tos
+                    for tos in offering.terms_of_service_configs.all()
+                    if tos.is_active
+                ),
+                None,
+            )
+        else:
+            active_tos = offering.terms_of_service_configs.filter(
+                is_active=True
+            ).first()
         if not active_tos or not active_tos.requires_reconsent:
             return False
         return active_tos.version != obj.version
@@ -12291,8 +14532,16 @@ class CourseAccountSerializer(serializers.HyperlinkedModelSerializer):
         read_only=True, allow_null=True, source="project.end_date"
     )
 
-    user_uuid = serializers.UUIDField(read_only=True, source="user.uuid")
-    username = serializers.CharField(read_only=True, source="user.username")
+    # user is SET_NULL on delete: a course account left over from a failed or
+    # partial close can have user=None, so these must tolerate (and emit) null
+    # rather than being silently dropped from the response (see get_attribute's
+    # SkipField path for a read-only field with no default).
+    user_uuid = serializers.UUIDField(
+        read_only=True, source="user.uuid", allow_null=True, default=None
+    )
+    username = serializers.CharField(
+        read_only=True, source="user.username", allow_null=True, default=None
+    )
 
     customer_uuid = serializers.UUIDField(
         read_only=True, source="project.customer.uuid"
@@ -12526,6 +14775,17 @@ class SoftwareCatalogDiscoverSerializer(serializers.Serializer):
 
 class NestedSoftwareTargetSerializer(serializers.ModelSerializer):
     """Nested serializer for unified SoftwareTarget model."""
+
+    # Declared explicitly so the schema renders an array; a bare JSONField is
+    # mapped to a free-form object by JSONFieldExtension.
+    gpu_architectures = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        help_text=_(
+            "List of GPU architectures this target supports "
+            "(e.g., ['nvidia/cc70', 'nvidia/cc90'])"
+        ),
+    )
 
     class Meta:
         model = models.SoftwareTarget
@@ -12778,6 +15038,19 @@ class SoftwareVersionSerializer(serializers.HyperlinkedModelSerializer):
 class SoftwareTargetSerializer(serializers.HyperlinkedModelSerializer):
     """Serializer for unified SoftwareTarget model."""
 
+    # Declared explicitly so the schema renders an array; a bare JSONField is
+    # mapped to a free-form object by JSONFieldExtension. `read_only` is set
+    # here rather than inherited from Meta.read_only_fields, which DRF applies
+    # via extra_kwargs and therefore never reaches a declared field.
+    gpu_architectures = serializers.ListField(
+        child=serializers.CharField(),
+        read_only=True,
+        help_text=_(
+            "List of GPU architectures this target supports "
+            "(e.g., ['nvidia/cc70', 'nvidia/cc90'])"
+        ),
+    )
+
     class Meta:
         model = models.SoftwareTarget
         fields = (
@@ -12822,6 +15095,18 @@ class OfferingSoftwareCatalogSerializer(serializers.ModelSerializer):
     partition_name = serializers.CharField(
         source="partition.partition_name", read_only=True
     )
+    # Declared explicitly so the schema renders an array; a bare JSONField is
+    # mapped to a free-form object by JSONFieldExtension.
+    enabled_cpu_family = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        help_text=_("List of enabled CPU families: ['x86_64', 'aarch64']"),
+    )
+    enabled_cpu_microarchitectures = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        help_text=_("List of enabled CPU microarchitectures: ['generic', 'zen3']"),
+    )
 
     class Meta:
         model = models.OfferingSoftwareCatalog
@@ -12857,6 +15142,18 @@ class OfferingSoftwareCatalogUpdateSerializer(serializers.ModelSerializer):
         queryset=models.OfferingPartition.objects.all(),
         required=False,
         allow_null=True,
+    )
+    # Declared explicitly so the schema renders an array; a bare JSONField is
+    # mapped to a free-form object by JSONFieldExtension.
+    enabled_cpu_family = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        help_text=_("List of enabled CPU families: ['x86_64', 'aarch64']"),
+    )
+    enabled_cpu_microarchitectures = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        help_text=_("List of enabled CPU microarchitectures: ['generic', 'zen3']"),
     )
 
     class Meta:
@@ -12915,6 +15212,7 @@ class OfferingPartitionSerializer(serializers.ModelSerializer):
     offering = serializers.SlugRelatedField(
         slug_field="uuid", queryset=models.Offering.objects.all()
     )
+    qos_options = NestedPartitionQoSSerializer(many=True, read_only=True)
 
     class Meta:
         model = models.OfferingPartition
@@ -12945,6 +15243,7 @@ class OfferingPartitionSerializer(serializers.ModelSerializer):
             "exclusive_user",
             "priority_tier",
             "qos",
+            "qos_options",
             "req_resv",
         )
         read_only_fields = ("uuid", "created", "modified")
@@ -13064,6 +15363,9 @@ class ExportPlanDataSerializer(serializers.Serializer):
     max_amount = serializers.IntegerField(allow_null=True)
     article_code = serializers.CharField(allow_blank=True)
     backend_id = serializers.CharField(allow_blank=True)
+    billing_mode = serializers.ChoiceField(
+        choices=BillingModes.CHOICES, default=BillingModes.INHERIT
+    )
     components = ExportPlanComponentDataSerializer(many=True)
 
 
@@ -13812,7 +16114,7 @@ class ResourceUsageByCustomerSerializer(serializers.Serializer):
         help_text="Component usages keyed by component type",
     )
     limits = serializers.DictField(
-        child=serializers.IntegerField(),
+        child=LimitValueField(),
         help_text="Resource limits keyed by limit name",
     )
 
@@ -14208,3 +16510,16 @@ class GlauthTreeSerializer(serializers.Serializer):
     groups = GlauthTreeGroupSerializer(many=True)
     users = GlauthTreeUserSerializer(many=True)
     robot_accounts = GlauthTreeRobotAccountSerializer(many=True)
+
+
+class ProviderGlauthTreeSerializer(serializers.Serializer):
+    """One GLAuth directory across the offerings of a provider that share accounts."""
+
+    offerings = GlauthTreeOfferingSerializer(many=True)
+    groups = GlauthTreeGroupSerializer(many=True)
+    users = GlauthTreeUserSerializer(many=True)
+    robot_accounts = GlauthTreeRobotAccountSerializer(many=True)
+    warnings = serializers.ListField(
+        child=serializers.CharField(),
+        help_text="Disagreements between the offerings that could not be merged.",
+    )

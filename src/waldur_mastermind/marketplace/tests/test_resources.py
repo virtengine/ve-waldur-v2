@@ -267,6 +267,20 @@ class ResourceGetTest(test.APITestCase):
         response = self.get_resource()
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
+    def test_service_provider_sees_project_start_date(self):
+        self.project.start_date = datetime.date(2024, 1, 15)
+        self.project.save()
+        owner = UserFactory()
+        self.offering.customer.add_user(owner, CustomerRole.OWNER)
+
+        self.client.force_authenticate(owner)
+        url = factories.ResourceFactory.get_provider_resource_url(self.resource)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["project_start_date"], datetime.date(2024, 1, 15)
+        )
+
     def test_other_user_can_not_get_resource_data(self):
         response = self.get_resource(UserFactory())
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
@@ -398,7 +412,7 @@ class ResourceGetTest(test.APITestCase):
         self.assertEqual(response.data["offering_backend_id"], "")
 
 
-class ResourceSwitchPlanTest(test.APITransactionTestCase):
+class ResourceSwitchPlanTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ServiceFixture()
         self.project = self.fixture.project
@@ -420,6 +434,9 @@ class ResourceSwitchPlanTest(test.APITransactionTestCase):
         CustomerRole.OWNER.add_permission(PermissionEnum.APPROVE_ORDER)
         ProjectRole.ADMIN.add_permission(PermissionEnum.SWITCH_RESOURCE_PLAN)
         ProjectRole.MANAGER.add_permission(PermissionEnum.SWITCH_RESOURCE_PLAN)
+        # Switching a plan submits an order, so it needs order creation rights.
+        for role in (CustomerRole.OWNER, ProjectRole.ADMIN, ProjectRole.MANAGER):
+            role.add_permission(PermissionEnum.CREATE_ORDER)
 
     def switch_plan(self, user, resource, plan):
         self.client.force_authenticate(user)
@@ -611,6 +628,9 @@ class ResourceRenewTest(test.APITestCase):
         # Set permissions
         CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_RESOURCE_LIMITS)
         ProjectRole.ADMIN.add_permission(PermissionEnum.UPDATE_RESOURCE_LIMITS)
+        # Renewal submits an order, so it needs order creation rights too.
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_ORDER)
+        ProjectRole.ADMIN.add_permission(PermissionEnum.CREATE_ORDER)
 
     def renew_resource(self, user, resource, payload):
         self.client.force_authenticate(user)
@@ -992,6 +1012,21 @@ class ResourceTerminateTest(test.APITestCase):
         self.assertEqual(order.state, OrderStates.EXECUTING)
         self.assertEqual(order.created_by, self.fixture.staff)
 
+    def test_order_is_approved_implicitly_when_purchase_order_is_required(self):
+        # Regression: require_purchase_order_upload used to hold every terminate
+        # order in PENDING_CONSUMER, and the terminate endpoint accepts no
+        # attachment, so the order could only be unblocked by uploading a file
+        # to it out of band. Termination is exempt from the requirement.
+        self.offering.plugin_options = {"require_purchase_order_upload": True}
+        self.offering.save()
+
+        # Act
+        response = self.terminate(self.fixture.staff)
+
+        # Assert
+        order = models.Order.objects.get(uuid=response.data["order_uuid"])
+        self.assertEqual(order.state, OrderStates.EXECUTING)
+
     def test_plan_switch_is_not_allowed_if_pending_order_for_resource_already_exists(
         self,
     ):
@@ -1031,6 +1066,31 @@ class ResourceTerminateTest(test.APITestCase):
         self.assertEqual(order.state, OrderStates.EXECUTING)
         self.assertEqual(order.consumer_reviewed_by, self.fixture.owner)
         self.assertEqual(models.Order.objects.filter(resource=self.resource).count(), 1)
+
+    @mock.patch("waldur_mastermind.marketplace.tasks.process_order.delay")
+    def test_owner_confirms_pending_terminate_order_when_purchase_order_is_required(
+        self, mocked_process_order
+    ):
+        CustomerRole.OWNER.add_permission(PermissionEnum.APPROVE_ORDER)
+        self.offering.plugin_options = {"require_purchase_order_upload": True}
+        self.offering.save()
+
+        order = factories.OrderFactory(
+            resource=self.resource,
+            project=self.project,
+            offering=self.offering,
+            plan=self.plan,
+            type=OrderTypes.TERMINATE,
+            state=OrderStates.PENDING_CONSUMER,
+            created_by=self.fixture.admin,
+        )
+
+        owner_response = self.terminate(self.fixture.owner)
+        self.assertEqual(owner_response.status_code, status.HTTP_200_OK)
+
+        order.refresh_from_db()
+        self.assertEqual(order.state, OrderStates.EXECUTING)
+        self.assertEqual(order.consumer_reviewed_by, self.fixture.owner)
 
     @mock.patch(
         "waldur_mastermind.marketplace.tasks.notify_provider_about_pending_order.delay"
@@ -1350,7 +1410,7 @@ class ResourceCostEstimateTest(test.APITestCase):
         self.assertEqual(order.cost, 50)
 
 
-class ResourceUpdateLimitsTest(test.APITransactionTestCase):
+class ResourceUpdateLimitsTest(test.APITestCase):
     def setUp(self):
         plugins.manager.register(
             offering_type="TEST_TYPE",
@@ -1375,6 +1435,8 @@ class ResourceUpdateLimitsTest(test.APITransactionTestCase):
         )
 
         CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_RESOURCE_LIMITS)
+        # A limit update submits an order, so it needs order creation rights too.
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_ORDER)
 
     def update_limits(self, user, resource, limits=None):
         limits = limits or {"vcpu": 10}
@@ -1382,6 +1444,24 @@ class ResourceUpdateLimitsTest(test.APITransactionTestCase):
         url = factories.ResourceFactory.get_url(resource, "update_limits")
         payload = {"limits": limits}
         return self.client.post(url, payload)
+
+    def test_a_fraction_is_refused_on_an_integer_only_component(self):
+        """update_limits is the UI's change-limits route and had no fractional
+        test, though it is one of the eight validate_limits call sites."""
+        response = self.update_limits(self.fixture.owner, self.resource, {"vcpu": 1.5})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_a_fraction_is_accepted_where_the_component_allows_it(self):
+        models.OfferingComponent.objects.filter(
+            offering=self.resource.offering, type="vcpu"
+        ).update(limit_decimal_places=1)
+
+        response = self.update_limits(self.fixture.owner, self.resource, {"vcpu": 1.5})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        order = models.Order.objects.filter(resource=self.resource).latest("created")
+        self.assertEqual(order.limits["vcpu"], 1.5)
 
     def test_create_update_limits_order(self):
         response = self.update_limits(self.fixture.owner, self.resource)
@@ -1568,6 +1648,9 @@ class ResourceReallocateLimitsTest(test.APITestCase):
 
         CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_RESOURCE_LIMITS)
         ProjectRole.MANAGER.add_permission(PermissionEnum.UPDATE_RESOURCE_LIMITS)
+        # Reallocation submits one order per affected resource.
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_ORDER)
+        ProjectRole.MANAGER.add_permission(PermissionEnum.CREATE_ORDER)
 
     def reallocate_limits(self, user, source_resource, limits, targets):
         self.client.force_authenticate(user)
@@ -1922,23 +2005,96 @@ class ResourceReallocateLimitsTest(test.APITestCase):
             "Limits to reallocate and targets cannot be empty.", str(response.data)
         )
 
-    def test_reallocate_limits_validates_positive_values(self):
+    def reallocate_allocated(self, allocated):
         targets = [
             {
                 "resource_uuid": self.target_resource_1.uuid.hex,
-                "allocated_limits": {"vcpu": -1, "ram": 6},
+                "allocated_limits": allocated,
             }
         ]
-        response = self.reallocate_limits(
+        return self.reallocate_limits(
             self.fixture.owner,
             self.source_resource,
             {"vcpu": 3, "ram": 6},
             targets,
         )
+
+    def allow_fractions(self, places=1):
+        """Let every component of the offering take a fractional limit."""
+        models.OfferingComponent.objects.filter(
+            offering=self.source_resource.offering
+        ).update(limit_decimal_places=places)
+
+    def test_a_fraction_is_refused_on_integer_only_components(self):
+        """The reallocate paths call validate_limits three times and none of
+        them had a fractional test, though this is where add_limit_values --
+        the only exact-arithmetic helper -- is actually used in production."""
+        response = self.reallocate_allocated({"vcpu": 0.5, "ram": 6})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_a_fractional_split_that_balances_exactly_is_accepted(self):
+        """0.1 + 0.2 as floats is 0.30000000000000004, which overshoots the
+        amount being reallocated and fails a split that balances exactly."""
+        self.allow_fractions()
+        targets = [
+            {
+                "resource_uuid": self.target_resource_1.uuid.hex,
+                "allocated_limits": {"vcpu": 0.1, "ram": 6},
+            },
+            {
+                "resource_uuid": self.target_resource_2.uuid.hex,
+                "allocated_limits": {"vcpu": 0.2, "ram": 4},
+            },
+        ]
+
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"vcpu": 0.3, "ram": 10},
+            targets,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    def test_the_source_limit_after_a_fractional_reallocation_is_exact(self):
+        """The subtraction must not leave 9.699999999999999 behind."""
+        self.allow_fractions()
+        targets = [
+            {
+                "resource_uuid": self.target_resource_1.uuid.hex,
+                "allocated_limits": {"vcpu": 0.3, "ram": 6},
+            }
+        ]
+
+        response = self.reallocate_limits(
+            self.fixture.owner,
+            self.source_resource,
+            {"vcpu": 0.3, "ram": 6},
+            targets,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        source_order = models.Order.objects.filter(
+            resource=self.source_resource, type=OrderTypes.UPDATE
+        ).latest("created")
+        self.assertEqual(source_order.limits["vcpu"], 9.7)
+
+    def test_reallocate_limits_rejects_negative_values(self):
+        response = self.reallocate_allocated({"vcpu": -1, "ram": 6})
+
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn(
-            "Ensure this value is greater than or equal to 1.", str(response.data)
+            "Ensure this value is greater than or equal to 0.", str(response.data)
         )
+
+    def test_reallocate_limits_rejects_zero_values(self):
+        # The serializer floor is 0 so that a fractional component can be
+        # reallocated below 1; positivity is enforced downstream instead.
+        response = self.reallocate_allocated({"vcpu": 0, "ram": 6})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("must be positive", str(response.data))
 
     def test_reallocate_limits_requires_permission_for_target_resource(self):
         other_project = ProjectFactory()
@@ -2342,6 +2498,53 @@ class ResourceDetailsTest(test.APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
 
+class ResourceTeamMembersMultiRoleTest(test.APITestCase):
+    """team_members deduplicates by user, so a user holding several
+    resource-scope roles must expose all of them via roles[]; the scalar
+    role_name reflects only the first grant and is kept for
+    backward compatibility."""
+
+    def setUp(self) -> None:
+        from django.contrib.contenttypes.models import ContentType
+
+        from waldur_core.permissions.models import Role
+
+        self.fixture = fixtures.ProjectFixture()
+        self.offering = factories.OfferingFactory(customer=self.fixture.customer)
+        self.resource = factories.ResourceFactory(
+            project=self.fixture.project, offering=self.offering
+        )
+        self.user = UserFactory()
+        resource_ct = ContentType.objects.get_for_model(models.Resource)
+        self.role_a = Role.objects.create(
+            name="custom_role_a", content_type=resource_ct, is_system_role=False
+        )
+        self.role_b = Role.objects.create(
+            name="custom_role_b", content_type=resource_ct, is_system_role=False
+        )
+        self.resource.add_user(self.user, self.role_a)
+        self.resource.add_user(self.user, self.role_b)
+        self.url = factories.ResourceFactory.get_url(
+            self.resource, action="team_members"
+        )
+
+    def test_all_resource_scope_roles_are_returned(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(
+            self.url, {"field": ["full_name", "role_name", "roles"]}
+        )
+        self.assertEqual(status.HTTP_200_OK, response.status_code)
+        rows = [row for row in response.data if row["full_name"] == self.user.full_name]
+        self.assertEqual(1, len(rows))
+        row = rows[0]
+        self.assertEqual(
+            {"custom_role_a", "custom_role_b"},
+            {grant["role_name"] for grant in row["roles"]},
+        )
+        # The legacy scalar still carries one of the grants.
+        self.assertIn(row["role_name"], {"custom_role_a", "custom_role_b"})
+
+
 class ResourceGetTeamTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = fixtures.ProjectFixture()
@@ -2597,10 +2800,10 @@ class ResourceForceTerminateTest(test.APITestCase):
         mock.patch.stopall()
 
     @data("staff")
-    def test_user_can_force_terminate_resource(self, user):
+    def test_staff_also_gets_erred_resource_on_processor_failure(self, user):
         order_state, resource_state = self._terminate_order(user)
         self.assertEqual(order_state, OrderStates.ERRED)
-        self.assertEqual(resource_state, ResourceStates.TERMINATED)
+        self.assertEqual(resource_state, ResourceStates.ERRED)
 
     @data(
         "owner",
@@ -2620,9 +2823,7 @@ class ResourceForceTerminateTest(test.APITestCase):
     def _terminate_order(self, user):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
-        response = self.client.post(
-            self.url, {"attributes": {"action": "force_destroy"}}
-        )
+        response = self.client.post(self.url, {"attributes": {}})
         if response.status_code == 404:
             return None, self.resource.state
         order_uuid = response.data["order_uuid"]
@@ -2650,6 +2851,53 @@ class ProviderResourcesTest(test.APITestCase):
     @data("admin", "owner")
     def test_non_provider_users_can_not_get_provider_resources(self, user):
         self.client.force_authenticate(getattr(self.fixture, user))
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class ProviderResourceOrderWorkflowTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.url = factories.ResourceFactory.get_provider_resource_url(self.resource)
+        self.creation_order = self.fixture.order
+
+    def test_provider_owner_sees_creation_order(self):
+        self.client.force_authenticate(self.fixture.provider_owner)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNotNone(response.data["creation_order"])
+        self.assertEqual(
+            response.data["creation_order"]["uuid"], self.creation_order.uuid.hex
+        )
+
+    def test_provider_manager_sees_order_in_progress(self):
+        in_progress = models.Order.objects.create(
+            project=self.resource.project,
+            resource=self.resource,
+            state=OrderStates.EXECUTING,
+            created_by=self.fixture.owner,
+            offering=self.resource.offering,
+            type=OrderTypes.UPDATE,
+        )
+        self.client.force_authenticate(self.fixture.provider_manager)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsNotNone(response.data["order_in_progress"])
+        self.assertEqual(
+            response.data["order_in_progress"]["uuid"], in_progress.uuid.hex
+        )
+
+    def test_provider_project_member_cannot_see_order_workflow(self):
+        # offering_admin holds only a project role on the provider's internal
+        self.assertFalse(
+            marketplace_utils.user_can_see_resource_order_workflow(
+                self.fixture.offering_admin, self.resource
+            )
+        )
+
+    def test_provider_project_member_cannot_access_provider_resource(self):
+        self.client.force_authenticate(self.fixture.offering_admin)
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
@@ -3019,3 +3267,129 @@ class ResourceSlugTemplateValidatorTest(test.APITestCase):
         serializer = self._validate_max_length(0)
         self.assertFalse(serializer.is_valid())
         self.assertIn("resource_slug_max_length", serializer.errors)
+
+
+@ddt
+class ProviderResourceOfferingScopeTest(test.APITestCase):
+    """Provider write-back actions must accept an offering-level role.
+
+    A user holding only OFFERING.MANAGER can act on resources of that
+    offering, without needing a customer-wide role. This is what a site
+    agent authenticates as. See waldur/waldur-mastermind#317.
+    """
+
+    def setUp(self):
+        self.fixture = MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.resource.offering.resource_options = {
+            "options": {"ram": {"type": "integer", "label": "RAM"}}
+        }
+        self.resource.offering.save()
+        for permission in (
+            PermissionEnum.SET_RESOURCE_BACKEND_METADATA,
+            PermissionEnum.SET_RESOURCE_STATE,
+            PermissionEnum.SUBMIT_RESOURCE_REPORT,
+            PermissionEnum.UPDATE_RESOURCE_OPTIONS,
+        ):
+            OfferingRole.MANAGER.add_permission(permission)
+
+    def make_request(self, resource, action, payload):
+        url = factories.ResourceFactory.get_provider_resource_url(
+            resource, action=action
+        )
+        self.client.force_authenticate(self.fixture.offering_manager)
+        return self.client.post(url, payload, format="json")
+
+    @data(
+        ("set_backend_metadata", {"backend_metadata": {"key": "value"}}),
+        (
+            "set_endpoints",
+            {"endpoints": [{"name": "API", "url": "http://example.com/v1"}]},
+        ),
+        ("set_as_ok", None),
+        ("refresh_last_sync", None),
+        (
+            "submit_report",
+            {"report": [{"header": "Section header", "body": "Section body"}]},
+        ),
+        ("update_options_direct", {"options": {"ram": 4}}),
+        ("set_limits", {"limits": {"cpu": 2}}),
+    )
+    @unpack
+    def test_offering_manager_can_write_back(self, action, payload):
+        response = self.make_request(self.resource, action, payload)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, action)
+
+    @data(
+        "set_backend_metadata",
+        "set_endpoints",
+        "set_as_ok",
+        "refresh_last_sync",
+        "submit_report",
+        "update_options_direct",
+        "set_limits",
+    )
+    def test_offering_manager_can_not_reach_another_offering(self, action):
+        other = factories.ResourceFactory()
+        response = self.make_request(other, action, None)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND, action)
+
+
+@ddt
+class ProviderSetEndDateOfferingScopeTest(test.APITestCase):
+    """OFFERING.MANAGER carries RESOURCE.SET_END_DATE, so a site agent can
+    write an end date back without a customer-wide role.
+
+    #317 made the provider check reach the offering scope; the role still did
+    not hold the permission, so the call kept returning 403. permissions.yaml
+    now grants it alongside the other provider write-back permissions. See
+    waldur/waldur-mastermind#318.
+    """
+
+    def setUp(self):
+        self.fixture = MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.resource.state = ResourceStates.OK
+        self.resource.save()
+        OfferingRole.MANAGER.add_permission(PermissionEnum.SET_RESOURCE_END_DATE)
+        # The deprecated action refuses a resource invoiced in the last 90 days.
+        # That rule is not what is under test here, and the fixture always
+        # bills the resource on creation.
+        invoices_models.InvoiceItem.objects.filter(resource=self.resource).delete()
+        self.end_date = timezone.datetime.today().date() + datetime.timedelta(days=90)
+
+    def set_end_date(self, resource, action="set_end_date"):
+        url = factories.ResourceFactory.get_provider_resource_url(
+            resource, action=action
+        )
+        self.client.force_authenticate(self.fixture.offering_manager)
+        return self.client.post(
+            url, {"end_date": self.end_date.isoformat()}, format="json"
+        )
+
+    @data("set_end_date", "set_end_date_by_provider")
+    def test_offering_manager_sets_the_end_date(self, action):
+        """Both the current action and the deprecated one, which checked
+        offering.customer only and so contradicted its own replacement."""
+        response = self.set_end_date(self.resource, action)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.end_date, self.end_date)
+
+    @data("set_end_date", "set_end_date_by_provider")
+    def test_offering_manager_can_not_reach_another_offering(self, action):
+        other = factories.ResourceFactory(state=ResourceStates.OK)
+
+        response = self.set_end_date(other, action)
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND, action)
+
+    @data("set_end_date", "set_end_date_by_provider")
+    def test_role_without_the_permission_is_still_refused(self, action):
+        """The grant is what unlocks this — not membership of the offering."""
+        OfferingRole.MANAGER.delete_permission(PermissionEnum.SET_RESOURCE_END_DATE)
+
+        response = self.set_end_date(self.resource, action)
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, action)

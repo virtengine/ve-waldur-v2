@@ -7,15 +7,18 @@ to optimize test execution time. It determines which tests are relevant to the
 changes in a given merge request, preventing the need to run the entire test suite.
 
 How it works:
-1.  It reads the `dependency_graph.yaml` file, which maps each Django application
-    to a list of other applications it depends on.
+1.  It builds the app dependency graph (see build_dependency_graph.py) from the
+    current source tree, so it can never be stale.
 2.  It builds a reverse dependency map in memory. This allows it to quickly answer
     the question: "If App B changes, which apps depend on it?"
 3.  It uses GitLab's predefined CI variable `CI_MERGE_REQUEST_DIFF_BASE_SHA` to get a
     list of all files changed in the current merge request.
-4.  It maps each changed file to its corresponding Django application.
-5.  Build the reverse map and find all DIRECTLY affected apps.
-    Transitive dependency traversal is disabled for simplicity and speed.
+4.  It drops files that cannot change the outcome of the unit suite (migrations,
+    locale, docs) and maps the rest to their Django application.
+5.  Each changed app is selected. Apps that directly depend on a changed app are
+    added too — but only when the change is to shared code, not when it is
+    confined to the app's own tests/templates/static files. Transitive
+    traversal is disabled for simplicity and speed.
 6.  Finally, it prints a space-separated string of the paths to the selected
     application directories. This string can be directly consumed by pytest.
 
@@ -28,6 +31,7 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 # --- Third-party Library Imports and Checks ---
@@ -61,6 +65,8 @@ def _ignore_unknown_tag(loader, tag_suffix, node):
 
 GitLabSafeLoader.add_multi_constructor("!", _ignore_unknown_tag)
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from build_dependency_graph import build_dependency_map  # noqa: E402
 
 # --- Configuration Constants ---
 
@@ -70,20 +76,50 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # The path to the source code directory.
 SRC_ROOT = PROJECT_ROOT / "src"
 
-# The path to the pre-computed dependency graph file.
-DEPENDENCY_GRAPH_FILE = PROJECT_ROOT / "tests" / "dependency_graph.yaml"
-
 # A list of files and directories that, if changed, are considered "core"
 # changes. Any change to these will trigger a full test run as a safety measure.
+#
+# Deliberately NOT here (each was measured over the last 200 pipelines, #293):
+#   - `src/waldur_core/permissions` — 14 of 41 MR full runs, mostly for
+#     migrations and a management command. It is an ordinary app now; the
+#     graph fans it out to its 25 direct dependents like any other.
+#   - `pyproject.toml` — 7 full runs for version bumps and tool config. Only a
+#     change to what gets installed matters; see pyproject_affects_tests().
+#   - this script — its own tests are run instead, see SELECTOR_SOURCES.
 FULL_RUN_TRIGGERS = [
-    "pyproject.toml",
     "uv.lock",
-    "tests/dependency_graph.yaml",  # If the graph itself changes, run all tests.
     "src/waldur_core/server",
-    "src/waldur_core/permissions",  # Nearly all apps depend on permissions.
     "conftest.py",  # Root conftest affects all tests.
-    str(Path(__file__).relative_to(PROJECT_ROOT)),  # If this script changes.
 ]
+
+# Changing the selector should exercise the selector's tests, not the suite.
+SELECTOR_SOURCES = ("tests/select_tests.py", "tests/build_dependency_graph.py")
+SELECTOR_TESTS = "tests/test_select_tests.py"
+
+# Sections of pyproject.toml whose change cannot alter what the unit suite
+# does. Anything outside this list (dependencies, dependency-groups,
+# entry-points, tool.uv, tool.pytest, ...) forces a full run.
+PYPROJECT_IRRELEVANT_KEYS = (
+    ("project", "version"),
+    ("project", "description"),
+    ("project", "readme"),
+    ("tool", "ruff"),
+    ("tool", "pyright"),
+    ("tool", "mypy"),
+)
+
+# Directory names / suffixes of files that cannot change the unit suite's
+# outcome. The suite runs with --no-migrations, so migrations are covered by
+# `Run migration tests`, not here. A migration plus its test cost a 279-minute
+# 51-app run before this filter existed.
+IRRELEVANT_DIRS = {"migrations", "locale"}
+IRRELEVANT_SUFFIXES = {".md", ".po", ".mo"}
+
+# A change confined to these directories affects only the owning app's tests:
+# nothing in another app imports them. Such a change selects the app itself
+# but does not fan out to its dependents. (`management` is *not* here — 33
+# test files call other apps' commands via call_command.)
+LOCAL_ONLY_DIRS = {"tests", "templates", "static"}
 
 # .gitlab-ci.yml is treated specially — see ci_diff_affects_tests().
 # Only changes that touch test/build stages or test-related sections trigger
@@ -116,19 +152,88 @@ TEST_INFRASTRUCTURE_KEYS = {
     "Run tests dynamically",
 }
 
+# Jobs that build or publish container images. They live in the `test` and
+# `build` stages, but they do not run the Python suite and nothing about their
+# definition can change its outcome — so a change confined to them must not
+# force a full run. Without this, editing the `rules:` of a buildah job cost a
+# 15-shard pytest run (~277 runner-minutes); see #293.
+IMAGE_JOB_KEYS = {
+    "Build docker image for tests",
+    "Build MR image for integration tests",
+    "Publish the YOLO multiarch docker image",
+    "Publish the latest multiarch docker image",
+    "Publish multiarch docker image with specific version",
+    "Test Multi-arch docker image build",
+    "Try building docker image",
+    "Lint docker image",
+    "Lint dockerfile",
+}
+
+
+def resolve_stage(
+    name: str, config: dict, _seen: frozenset[str] = frozenset()
+) -> str | None:
+    """Return a job's stage, following `extends:` when it is not set inline.
+
+    `body.get("stage")` alone silently returns None for every job that inherits
+    its stage — in this repo that is everything extending `.Unit test runner`
+    (`Run migration tests`, `Run demo presets tests`, `Run type checkings`,
+    `Check startup memory budget`). They were then reported as "limited to
+    deploy/postdeploy/release jobs", which is the opposite of the truth.
+    """
+    body = config.get(name)
+    if not isinstance(body, dict) or name in _seen:
+        return None
+    if body.get("stage") is not None:
+        return body["stage"]
+    extends = body.get("extends")
+    if isinstance(extends, str):
+        extends = [extends]
+    for parent in extends or []:
+        stage = resolve_stage(parent, config, _seen | {name})
+        if stage is not None:
+            return stage
+    return None
+
 
 def log(message: str):
     """Helper function to print messages to stderr."""
     print(f"[select-tests] {message}", file=sys.stderr)
 
 
+def _first_parent(sha: str) -> str | None:
+    """Return ``sha^1`` if ``sha`` is a merge commit, else None."""
+    try:
+        parents = subprocess.check_output(
+            ["git", "rev-list", "--parents", "-n", "1", sha], text=True
+        ).split()[1:]
+    except subprocess.CalledProcessError:
+        return None
+    return parents[0] if len(parents) >= 2 else None
+
+
 def get_diff_endpoints() -> tuple[str, str] | None:
-    """Return (merge_base_sha, source_sha) for the current MR, or None if not
-    running in an MR pipeline / unable to determine.
+    """Return (base_sha, head_sha) describing the change under test.
+
+    - Merge request pipeline: merge-base of the source branch and the target,
+      so only the MR's own commits count.
+    - Push of a merge commit (an MR landing on develop): the merge commit's
+      first parent, i.e. the same files the MR changed — but selected and run
+      against the *actual* post-merge tree. That is what catches two MRs that
+      each passed alone but conflict together, without replaying the whole
+      suite on every merge (which cost ~178 runner-hours per 5 days, #293).
+    - Anything else (direct push of plain commits, no git context): None,
+      which the caller treats as a full run.
     """
     target_branch_ref = os.environ.get("CI_MERGE_REQUEST_TARGET_BRANCH_NAME")
     source_sha = os.environ.get("CI_COMMIT_SHA")
-    if not (target_branch_ref and source_sha):
+    if not source_sha:
+        return None
+    if not target_branch_ref:
+        parent = _first_parent(source_sha)
+        if parent:
+            log(f"Merge commit pushed; diffing against first parent {parent[:8]}.")
+            return parent, source_sha
         return None
     target_ref = f"origin/{target_branch_ref}"
     try:
@@ -157,9 +262,9 @@ def get_changed_files() -> list[str]:
     endpoints = get_diff_endpoints()
     if endpoints is None:
         log(
-            "WARNING: Not in a Merge Request pipeline context. Defaulting to full test run."
+            "WARNING: Neither a merge request nor a merge commit. Defaulting to full test run."
         )
-        return ["pyproject.toml"]
+        return ["uv.lock"]
 
     merge_base_sha, source_sha = endpoints
     log(
@@ -179,25 +284,7 @@ def get_changed_files() -> list[str]:
     except subprocess.CalledProcessError as e:
         log(f"ERROR: Could not determine changed files: {e}")
         log("Defaulting to full test run as a safety precaution.")
-        return ["pyproject.toml"]
-
-
-def load_dependency_graph(path: Path) -> dict[str, list[str]]:
-    """
-    Loads the dependency graph from the YAML file.
-
-    Args:
-        path: The path to the 'dependency_graph.yaml' file.
-
-    Returns:
-        A dictionary representing the dependency graph.
-    """
-    if not path.exists():
-        log(f"ERROR: Dependency graph not found at {path}")
-        return {}  # Return empty dict, which will trigger a full run later.
-
-    with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        return ["uv.lock"]
 
 
 def build_reverse_dependency_map(
@@ -250,6 +337,59 @@ def map_file_to_app(file_path: str, all_apps: set[str]) -> str | None:
     return best_match
 
 
+def is_test_irrelevant(file_path: str) -> bool:
+    """True for files that cannot change what the unit suite does."""
+    path = Path(file_path)
+    return bool(IRRELEVANT_DIRS & set(path.parts)) or path.suffix in IRRELEVANT_SUFFIXES
+
+
+def is_local_only(file_path: str) -> bool:
+    """True when a change to this file can only affect its own app's tests."""
+    return bool(LOCAL_ONLY_DIRS & set(Path(file_path).parts))
+
+
+def _drop_keys(data: dict, keys: tuple[tuple[str, ...], ...]) -> dict:
+    for path in keys:
+        node = data
+        for part in path[:-1]:
+            node = node.get(part) if isinstance(node, dict) else None
+            if node is None:
+                break
+        if isinstance(node, dict):
+            node.pop(path[-1], None)
+    return data
+
+
+def pyproject_affects_tests(base_text: str | None, head_text: str | None) -> bool:
+    """True unless the pyproject.toml change is confined to PYPROJECT_IRRELEVANT_KEYS.
+
+    Unparsable or missing content is treated as affecting tests.
+    """
+    if base_text is None or head_text is None:
+        return True
+    try:
+        base = _drop_keys(tomllib.loads(base_text), PYPROJECT_IRRELEVANT_KEYS)
+        head = _drop_keys(tomllib.loads(head_text), PYPROJECT_IRRELEVANT_KEYS)
+    except tomllib.TOMLDecodeError as exc:
+        log(f"WARNING: pyproject.toml unparsable ({exc}); assuming full run.")
+        return True
+    return base != head
+
+
+def _git_show(sha: str, path: str) -> str | None:
+    try:
+        return subprocess.check_output(["git", "show", f"{sha}:{path}"], text=True)
+    except subprocess.CalledProcessError:
+        return None
+
+
+def pyproject_diff_affects_tests(merge_base_sha: str, head_sha: str) -> bool:
+    return pyproject_affects_tests(
+        _git_show(merge_base_sha, "pyproject.toml"),
+        _git_show(head_sha, "pyproject.toml"),
+    )
+
+
 def build_line_to_top_level_key_map(yaml_text: str) -> dict[int, str | None]:
     """Map every 1-indexed line number in a YAML document to its enclosing
     top-level key.
@@ -283,6 +423,40 @@ def build_line_to_top_level_key_map(yaml_text: str) -> dict[int, str | None]:
                 current_key = key_part
         result[line_no] = current_key
     return result
+
+
+def changed_job_keys(
+    name: str, base_config: dict, head_config: dict
+) -> set[str] | None:
+    """Return the set of keys whose value differs between the base and head
+    definition of `name`, or None if the key is absent from both.
+
+    This is a *semantic* comparison of the parsed job, not of diff lines, which
+    matters for two reasons the earlier line-based attribution got wrong:
+
+      - PyYAML resolves `<<:` merge keys, so swapping which rules anchor a job
+        merges shows up here as a plain change to `rules`, even though the diff
+        touches a line reading `<<: *some_anchor`.
+      - A comment added above a job — or anywhere inside it — changes no key at
+        all, so the job is correctly reported as unchanged. Line attribution
+        blamed such comments on whichever key preceded them.
+
+    See #293.
+    """
+    base = base_config.get(name)
+    head = head_config.get(name)
+    if base is None and head is None:
+        return None
+    if not isinstance(base, dict) or not isinstance(head, dict):
+        # Added, removed, or changed shape — treat every key as changed. The
+        # fallback keeps the result non-empty so an addition is never mistaken
+        # for "semantically unchanged" and pruned.
+        keys: set[str] = set()
+        for side in (base, head):
+            if isinstance(side, dict):
+                keys |= set(side)
+        return keys or {"__whole_key__"}
+    return {k for k in set(base) | set(head) if base.get(k) != head.get(k)}
 
 
 def parse_diff_hunks(diff_text: str) -> list[tuple[int, int, int, int]]:
@@ -377,6 +551,30 @@ def ci_diff_affects_tests(merge_base_sha: str, head_sha: str) -> bool:
         )
         return True
 
+    # Parse both sides so the line-attributed key set can be checked against what
+    # actually changed. Line attribution is deliberately generous — it blames a
+    # comment on the key it follows — so it reports keys the diff never altered.
+    try:
+        head_config = yaml.load(head_yaml, Loader=GitLabSafeLoader) or {}
+        base_config = yaml.load(base_yaml, Loader=GitLabSafeLoader) or {}
+    except yaml.YAMLError as exc:
+        log(f"WARNING: .gitlab-ci.yml unparsable ({exc}); assuming full run.")
+        return True
+
+    # Drop keys whose parsed definition is identical on both sides. Without this,
+    # adding a documented anchor after `.unit_test_rules` blamed the new comment
+    # block on `.unit_test_rules` and forced a full run, even though that key was
+    # untouched.
+    unchanged = {
+        n for n in touched if changed_job_keys(n, base_config, head_config) == set()
+    }
+    if unchanged:
+        log(f"Keys attributed by line but semantically unchanged: {sorted(unchanged)}")
+        touched = touched - unchanged
+        if not touched:
+            log("Nothing actually changed in the CI file; skipping full run.")
+            return False
+
     if touched & TEST_INFRASTRUCTURE_KEYS:
         log(
             "CI diff touches test infrastructure "
@@ -384,119 +582,140 @@ def ci_diff_affects_tests(merge_base_sha: str, head_sha: str) -> bool:
         )
         return True
 
-    # Walk each touched job and check its stage in the head config.
-    try:
-        head_config = yaml.load(head_yaml, Loader=GitLabSafeLoader) or {}
-    except yaml.YAMLError as exc:
-        log(f"WARNING: head .gitlab-ci.yml unparsable ({exc}); assuming full run.")
-        return True
-
     for name in touched:
-        body = head_config.get(name)
-        if isinstance(body, dict) and body.get("stage") in TEST_RELATED_STAGES:
+        if name in IMAGE_JOB_KEYS:
+            log(f"Job '{name}' only builds/publishes an image; not a full-run trigger.")
+            continue
+        # `rules:` only controls *when* a job is scheduled — it cannot change what
+        # the Python suite does. Compared semantically, so swapping which rules
+        # anchor a job merges (`<<: *other_anchor`) counts as a rules change even
+        # though the diff line reads `<<`. Reached only for ordinary jobs: the
+        # global-key and test-infrastructure checks above have already returned,
+        # so `.unit_test_rules` — which is nothing but a rules block — still
+        # forces a full run.
+        if changed_job_keys(name, base_config, head_config) == {"rules"}:
+            log(f"Job '{name}': only its `rules:` changed; not a full-run trigger.")
+            continue
+        if resolve_stage(name, head_config) in TEST_RELATED_STAGES:
             log(f"Job '{name}' is in test-related stage; full run required.")
             return True
 
-    log("CI diff is limited to deploy/postdeploy/release jobs; skipping full run.")
+    log("CI diff does not touch any job that runs the test suite; skipping full run.")
     return False
 
 
-def main():
-    """Main execution logic."""
-    # 1. Load the dependency graph from the YAML file.
-    dependency_map = load_dependency_graph(DEPENDENCY_GRAPH_FILE)
-    if not dependency_map:
-        log("Dependency graph is empty or missing. Triggering a full test run.")
-        print("src")
-        return
+def select_paths(
+    changed_files: list[str],
+    dependency_map: dict[str, set[str]],
+    endpoints: tuple[str, str] | None,
+) -> list[str]:
+    """Decide which pytest paths to run. Pure: all git access goes through
+    the callbacks used by the *_diff_affects_tests helpers, which take SHAs.
 
-    # 2. Get the list of files that have changed in this MR.
-    changed_files = get_changed_files()
-    if not changed_files or (len(changed_files) == 1 and not changed_files[0]):
+    Returns ``["src"]`` for a full run and ``[]`` for nothing to run.
+    """
+    changed_files = [f for f in changed_files if f]
+    if not changed_files:
         log("No changed files detected. No tests to run.")
-        print("")  # Print empty string for the CI variable
-        return
+        return []
 
-    # 3. Check for any "full run" triggers.
-    full_run = False
     for f in changed_files:
         if any(f.startswith(trigger) for trigger in FULL_RUN_TRIGGERS):
             log(f"Core file changed: {f}, triggering a full test run.")
-            full_run = True
-            break
+            return ["src"]
 
-    # 3a. .gitlab-ci.yml is a conditional trigger. Only changes that affect
-    # test infrastructure require a full run.
-    if not full_run and ".gitlab-ci.yml" in changed_files:
-        endpoints = get_diff_endpoints()
+    # Conditional triggers: only the parts that can reach the suite count.
+    conditional = {
+        ".gitlab-ci.yml": ci_diff_affects_tests,
+        "pyproject.toml": pyproject_diff_affects_tests,
+    }
+    for name, check in conditional.items():
+        if name not in changed_files:
+            continue
         if endpoints is None:
             log(
-                ".gitlab-ci.yml changed but can't determine diff endpoints; "
+                f"{name} changed but can't determine diff endpoints; "
                 "triggering full run as a safety precaution."
             )
-            full_run = True
-        else:
-            merge_base_sha, source_sha = endpoints
-            full_run = ci_diff_affects_tests(merge_base_sha, source_sha)
+            return ["src"]
+        if check(*endpoints):
+            return ["src"]
 
-    if full_run:
-        print("src")
-        return
+    extra_paths = []
+    if any(f in SELECTOR_SOURCES for f in changed_files):
+        log("Test selector changed; adding its own tests.")
+        extra_paths.append(SELECTOR_TESTS)
 
-    # 4. Map the changed files to their respective applications.
-    all_apps = set(dependency_map.keys()) | {
-        dep for deps in dependency_map.values() for dep in deps
-    }
-    directly_changed_apps = {
-        app for f in changed_files if (app := map_file_to_app(f, all_apps))
-    }
+    all_apps = set(dependency_map)
+    relevant = [f for f in changed_files if not is_test_irrelevant(f)]
+    ignored = sorted(set(changed_files) - set(relevant))
+    if ignored:
+        log(f"Ignoring {len(ignored)} file(s) that cannot affect unit tests: {ignored}")
+
+    directly_changed_apps: set[str] = set()
+    shared_change_apps: set[str] = set()
+    for f in relevant:
+        app = map_file_to_app(f, all_apps)
+        if not app:
+            continue
+        directly_changed_apps.add(app)
+        if not is_local_only(f):
+            shared_change_apps.add(app)
 
     if not directly_changed_apps:
         log(
-            "Changes detected outside of any known Django app source. No tests selected."
+            "Changes detected outside of any known Django app source. No app tests selected."
         )
-        print("")
-        return
+        return extra_paths
 
-    # 5. Build the reverse map and find all affected apps via traversal.
     reverse_map = build_reverse_dependency_map(dependency_map)
 
     apps_to_test = set(directly_changed_apps)
-    log(f"Directly changed apps: {', '.join(sorted(list(apps_to_test)))}")
+    log(f"Directly changed apps: {', '.join(sorted(apps_to_test))}")
+    local_only = directly_changed_apps - shared_change_apps
+    if local_only:
+        log(
+            "Only tests/templates/static changed in "
+            f"{', '.join(sorted(local_only))}; not fanning out to dependents."
+        )
 
-    for current_app in directly_changed_apps:
-        dependents = reverse_map.get(current_app, [])
-
-        for dependent_app in dependents:
+    for current_app in sorted(shared_change_apps):
+        for dependent_app in reverse_map.get(current_app, []):
             apps_to_test.add(dependent_app)
             log(
                 f"  -> Adding '{dependent_app}' because it directly depends on changed app '{current_app}'"
             )
 
-    # 6. Convert app names back to file paths for pytest.
     test_paths = []
-    for app_name in sorted(list(apps_to_test)):
-        # e.g., 'waldur_mastermind.marketplace' -> 'src/waldur_mastermind/marketplace'
+    for app_name in sorted(apps_to_test):
         app_path = SRC_ROOT / Path(*app_name.split("."))
         if app_path.exists():
-            # Use relative path for the final output
             test_paths.append(str(app_path.relative_to(PROJECT_ROOT)))
         else:
             log(
                 f"WARNING: Could not find directory for app '{app_name}' at expected path '{app_path}'"
             )
 
-    if not test_paths:
-        log("No testable application paths were found after analysis.")
-        print("")
+    log("---")
+    log(f"Final set of apps to test: {', '.join(sorted(apps_to_test))}")
+    return extra_paths + test_paths
+
+
+def main():
+    """Main execution logic."""
+    if os.environ.get("FULL_TEST_RUN", "").lower() in ("true", "yes"):
+        log("FULL_TEST_RUN is set (scheduled sweep); running the whole suite.")
+        print("src")
         return
 
-    log("---")
-    log(f"Final set of apps to test: {', '.join(sorted(list(apps_to_test)))}")
+    dependency_map = build_dependency_map()
+    if not dependency_map:
+        log("Dependency graph is empty. Triggering a full test run.")
+        print("src")
+        return
 
-    # 7. Print the final space-separated string to stdout.
-    final_output = " ".join(test_paths)
-    print(final_output)
+    changed_files = get_changed_files()
+    print(" ".join(select_paths(changed_files, dependency_map, get_diff_endpoints())))
 
 
 if __name__ == "__main__":

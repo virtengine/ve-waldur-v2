@@ -86,6 +86,32 @@ If the permission is for managing team members (creating/updating/deleting roles
 
 This file is loaded by the `import_roles` management command, which runs on deployment. The command creates roles and syncs their permissions from the YAML definition.
 
+**Operator-defined custom roles** (a deployment's own role, not one shipped with Waldur) go
+through a separate file, `docker/rootfs/etc/waldur/custom-roles.yaml`, mounted at
+`/etc/waldur/custom-roles.yaml` — same schema, also loaded by `import_roles` on every
+deployment, but empty (`[]`) by default. The `waldur-helm` chart exposes it as
+`waldur.customRoles`. Don't add operator-specific roles to `permissions.yaml` — that file ships
+with the image and is the same for every deployment.
+
+**Reusing a built-in role's name here is also valid**, and is how an operator fully replaces
+that role's permission set rather than adding/dropping individual permissions.
+`import_roles` matches by name, so an entry for e.g. `CUSTOMER.OWNER` in `custom-roles.yaml`
+overwrites its permissions with exactly the list given — the built-in `permissions.yaml` loads
+first (in `initdb`), so this always wins. This is a deliberate, one-way handover: from then on
+the operator owns that role's full permission set, and any permission mastermind adds to it in
+a later release is loaded and then immediately overwritten again on every deployment until the
+operator adds it to their own list too. Use `permissions-override.yaml`
+(`add_permissions`/`drop_permissions`, below) instead when the goal is to adjust a role while
+still tracking future upstream changes to it.
+
+Two more caveats, regardless of which name is used. A role loaded from this file is created as
+a **system role**, so it can no longer be renamed or deleted through the API; if a role of that
+name was created by hand in the UI, it is converted to a system role and its permission set is
+replaced by the file's. And there is no counterpart to `drop_stale_permissions` for roles —
+removing a role from the file does **not** remove it from the database, it only stops being
+managed. Deactivate roles you no longer want via `permissions-override.yaml`
+(`is_active: false`) rather than by deleting the entry.
+
 ### 3. Use in ViewSets
 
 ```python
@@ -93,6 +119,51 @@ my_action_permissions = [
     permission_factory(PermissionEnum.MY_NEW_PERMISSION, ["project.customer"])
 ]
 ```
+
+## Team visibility
+
+Listing the members of a scope (`GET .../list_users/`) is gated on a
+permission, not on role membership. Staff and support always pass. Otherwise
+the caller needs an active role that is one of the following:
+
+- on the organization, and grants `CUSTOMER.VIEW_TEAM`
+  (`PermissionEnum.VIEW_CUSTOMER_TEAM`);
+- on any project of the organization, and grants `PROJECT.VIEW_TEAM`
+  (`PermissionEnum.VIEW_PROJECT_TEAM`);
+- on the scope itself, when that scope is not an organization or a project
+  (resource, offering, call, proposal). No permission is needed here.
+
+Provider-side access to a resource's team (`OFFERING.UPDATE` on the offering or
+its organization) is unchanged.
+
+`permissions.yaml` grants `CUSTOMER.VIEW_TEAM` to `CUSTOMER.OWNER`,
+`CUSTOMER.SUPPORT` and `CUSTOMER.READER`. It grants `PROJECT.VIEW_TEAM` to
+`PROJECT.ADMIN`, `PROJECT.MANAGER` and `PROJECT.MEMBER`. A role without it,
+such as a zero-permission placeholder, can no longer see who else is in the
+organization. A role cloned into an organization copies its template's
+permissions when it is created, and later additions to the template do not
+reach it. Migration `permissions.0029_view_team_permissions` therefore adds the
+view-team permission to the six system roles above **and to their existing
+clones**, so organization owners on a cloned role keep the team listing after
+the upgrade. It also covers stacks that never run `import_roles`.
+
+Migration `permissions.0030_view_team_for_existing_roles` does the same for
+**every other organization or project role that exists at upgrade time**, such
+as roles staff created by hand, because until then any role let its holder list
+the team. SRAM placeholder roles are left out: they are meant to be private.
+Roles created after the upgrade get the permission only when someone grants it.
+
+Roles defined in `custom-roles.yaml` are different: `import_roles` replaces
+their whole permission set on every deployment, so the migration's addition is
+dropped again. Add `CUSTOMER.VIEW_TEAM` / `PROJECT.VIEW_TEAM` to those roles'
+`permissions` lists, or to `add_permissions` in `permissions-override.yaml`,
+which is applied afterwards. `import_roles` warns about every organization or
+project role it loads without the matching permission.
+
+The test suite mirrors the YAML grant: an autouse fixture in the root
+`conftest.py` adds the matching permission to every customer- and
+project-scoped system role that `get_system_role` creates. A test that needs
+the permission absent calls `role.delete_permission(...)`.
 
 ## Permission System Behavior
 
@@ -216,3 +287,44 @@ PAT auth should `select_related("customer", "project__customer",
 "offering")` (or whichever ancestors apply) — scoped PATs walk the
 ancestor chain on every permission check, so each missed `select_related`
 multiplies into one query per ancestor per check.
+
+## Role hygiene report
+
+`waldur_core/permissions/hygiene.py` checks the role catalogue for names that
+are not machine codes, system roles this release does not define, clones whose
+name or organization binding drifted, custom roles that are silently offered in
+every organization, and permissions that can never apply to a role's scope.
+Offering catalog roles (`resource` / `resource_project`) are exempt — their
+names are the provider's to choose.
+
+Two entry points, both read-only:
+
+```bash
+waldur check_role_names                       # text, exits 1 on errors
+waldur check_role_names --severity warning    # errors and warnings only
+waldur check_role_names --format json
+```
+
+```http
+GET /api/roles/hygiene_report/                # staff only
+```
+
+Only the findings that cannot be legitimately deployment-specific carry the
+error severity that fails the command: a name that is not a machine code, a
+system role bound to the wrong scope, a clone whose name drifted from its
+organization, a clone that lost its organization binding, and a role bound to
+more than one organization. A role name this release does not define is a
+warning — `import_roles` marks every role in a deployment's own
+`permissions.yaml` as a system role, and a deployment cannot add its roles to
+`SYSTEM_ROLE_SCOPES`.
+
+Two tables drive the scope checks and are the place to extend when a scope type
+or permission category is added, both in `permissions/enums.py`:
+`SCOPE_ANCESTORS` (which scopes a role governs from where it is granted) and
+`PERMISSION_TARGET_SCOPES` (the scope each permission category acts on). A
+permission is meaningful on its target scope and on every ancestor of it; a
+category missing from the table is skipped rather than guessed at.
+
+## Quiet grant sources
+
+`UserRole.source` records who issued a machine-made grant (`rule:<uuid>`, `sram:<uuid>`, ...). Role events carry it as `role_source`. An app can register a source prefix with `waldur_core.permissions.utils.register_quiet_grant_source(prefix)` in `AppConfig.ready`: grants and revocations with that prefix are still logged, but their events carry `suppress_email: true` and email hooks skip them. The SRAM integration registers `sram:` and `sram-rule:`, since its membership sync would otherwise email on every change.

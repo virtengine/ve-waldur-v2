@@ -8,6 +8,7 @@ from django.db import transaction
 from django.db.models import (
     Avg,
     Count,
+    DateTimeField,
     DurationField,
     Exists,
     ExpressionWrapper,
@@ -41,6 +42,7 @@ from waldur_core.core.views import (
     ActionMethodMixin,
     ActionsViewSet,
     ReadOnlyActionsViewSet,
+    no_count_action,
 )
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
@@ -60,12 +62,14 @@ from waldur_core.structure.managers import (
 )
 from waldur_core.structure.models import Customer
 from waldur_core.structure.permissions import _get_customer
+from waldur_core.user_actions.providers import DASHBOARD_LIST_LIMIT
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.views import BaseMarketplaceView, PublicViewsetMixin
 from waldur_mastermind.proposal import (
     affinity_scoring,
     filters,
     models,
+    notification_rules,
     orcid_service,
     serializers,
     tasks,
@@ -86,19 +90,122 @@ from waldur_mastermind.proposal.enums import (
     COISeverityLevels,
     COIStatuses,
     COITypes,
+    ProposalFieldStates,
     ProposalStates,
     RequestedOfferingStates,
     ReviewerPoolInvitationStatuses,
     ReviewerSuggestionStatuses,
+    RoundStatuses,
     TransitionModes,
     WorkflowStepInstanceStatuses,
 )
+from waldur_mastermind.proposal.permissions import CALL_PERMISSION_SOURCES
 
 from .managers import get_connected_call_organizers, get_connected_calls
 from .models import Proposal
 from .serializers import ReviewSubmitSerializer, _is_reviewer_only_view
 
 logger = logging.getLogger(__name__)
+
+
+def validate_round_is_open(proposal):
+    """A proposal may only be submitted while its round is open.
+
+    Same rule as creation (``ProposalSerializer.validate``), so a proposal can
+    never be created into a state it could not then be sent from.
+
+    Nothing checked the round here before, so a draft could be submitted after
+    the cutoff: that notified the call managers, created the workflow step
+    instances and moved the proposal into review, only for
+    ``proposals_for_ended_rounds_should_be_cancelled`` to cancel it within the
+    hour. The deadline is now enforced at the door rather than swept up after.
+    """
+    round_status = proposal.round.status
+    if round_status == RoundStatuses.SCHEDULED:
+        raise exceptions.ValidationError(
+            _("Round has not opened yet, so the proposal cannot be submitted.")
+        )
+    if round_status == RoundStatuses.ENDED:
+        raise exceptions.ValidationError(
+            _("Round has closed, so the proposal can no longer be submitted.")
+        )
+
+
+def validate_project_details_complete(proposal):
+    """Every field the call marked required carries a value.
+
+    Until now requiredness lived only in the frontend, which disabled the submit
+    button while a step reported itself incomplete — an API client could submit
+    a proposal with an empty summary. A per-call configuration that only the
+    form respected would be no stronger, so the rule is enforced here.
+
+    Hidden and optional fields are never checked: the applicant was either not
+    asked, or asked without obligation.
+    """
+    states = models.CallProposalFieldConfig.get_states_for_call(proposal.round.call)
+    missing = []
+    for field_name, state in states.items():
+        if state != ProposalFieldStates.REQUIRED:
+            continue
+        if field_name == "supporting_documentation":
+            if not proposal.proposaldocumentation_set.exists():
+                missing.append(field_name)
+            continue
+        if not getattr(proposal, field_name, None):
+            missing.append(field_name)
+    if missing:
+        raise exceptions.ValidationError(
+            _("The following required fields are empty: %(fields)s.")
+            % {"fields": ", ".join(sorted(missing))}
+        )
+
+
+def validate_purchase_orders_present(proposal):
+    """Every requested resource whose call entry demands a purchase order has one.
+
+    Enforced at submission rather than at creation so an applicant can assemble
+    the request first and attach the authorisation last, which is the order the
+    two usually arrive in.
+
+    The requirement is a property of the call entry
+    (``RequestedOffering.require_purchase_order``), seeded from the offering's
+    ``require_purchase_order_upload`` but owned by the call manager afterwards —
+    the offering flag alone gates *order approval*, which happens well after a
+    proposal is reviewed.
+
+    The rule itself lives on the model so ``Proposal.can_submit`` reports
+    exactly what this enforces, and the form can say what is missing rather
+    than letting the applicant discover it from a rejected request.
+    """
+    missing = proposal.offerings_missing_purchase_orders()
+    if missing:
+        raise exceptions.ValidationError(
+            _(
+                "A purchase order is required for the following offerings: %(offerings)s."
+            )
+            % {"offerings": ", ".join(missing)}
+        )
+
+
+def validate_requested_amounts_present(proposal):
+    """No requested resource may ask for an offering without naming an amount.
+
+    Attaching an offering creates a resource request with empty limits, which
+    the proposal form counted as a completed step. Submitted like that,
+    ``allocate_proposal`` provisions a resource with no quota at all — the
+    applicant is awarded nothing and finds out after the review.
+
+    Offerings with nothing to ask for (no limit or prepaid component) are
+    exempt: there is no amount to name in the first place.
+    """
+    missing = proposal.offerings_missing_requested_amounts()
+    if missing:
+        raise exceptions.ValidationError(
+            _(
+                "Requested amounts are missing for the following offerings: %(offerings)s."
+            )
+            % {"offerings": ", ".join(missing)}
+        )
 
 
 def validate_call_not_archived(nested_obj):
@@ -427,9 +534,16 @@ class CallManagingOrganisationViewSet(
 
 class PublicCallViewSet(viewsets.ReadOnlyModelViewSet):
     lookup_field = "uuid"
-    queryset = models.Call.objects.filter(
-        state__in=[CallStates.ACTIVE, CallStates.ARCHIVED]
-    ).order_by("created")
+    queryset = (
+        models.Call.objects.filter(state__in=[CallStates.ACTIVE, CallStates.ARCHIVED])
+        # Each template serializes its offering's components so the applicant
+        # can be shown a price; without this that is a query per template.
+        .prefetch_related(
+            "resource_templates__requested_offering__offering__components",
+            "resource_templates__requested_offering__plan__components",
+        )
+        .order_by("created")
+    )
     serializer_class = serializers.PublicCallSerializer
     filterset_class = filters.CallFilter
     permission_classes = (rf_permissions.AllowAny,)
@@ -486,6 +600,26 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     update_validators = partial_update_validators = [
         core_validators.StateValidator(CallStates.DRAFT, CallStates.ACTIVE)
     ]
+    # Every write to a call -- core fields, state transitions, rounds, offerings,
+    # documents, workflow steps -- requires UPDATE_CALL. "*" covers the call
+    # manager's role on the call itself; "manager" reaches the
+    # CallManagingOrganisation where an organizer's CUSTOMER.CALL_ORGANIZER role
+    # is bound. Actions declaring their own <action>_permissions override this.
+    unsafe_methods_permissions = [
+        permission_factory(PermissionEnum.UPDATE_CALL, CALL_PERMISSION_SOURCES)
+    ]
+    # POST to the list route has no object to check against; creation is gated
+    # by CREATE_CALL on the managing organisation in the serializer.
+    create_permissions = []
+    # Team management carries its own permission set -- CALL.CREATE_PERMISSION /
+    # UPDATE_PERMISSION / DELETE_PERMISSION, enforced against the call or its
+    # customer in UserRoleMutateSerializer.validate. It is deliberately separate
+    # from UPDATE_CALL: the shipped CUSTOMER.OWNER role holds the former and not
+    # the latter, so letting the blanket gate cover these inherited UserRoleMixin
+    # actions would take call-team management away from owners.
+    add_user_permissions = []
+    update_user_permissions = []
+    delete_user_permissions = []
 
     queryset = models.Call.objects.all()
 
@@ -614,11 +748,25 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         # resource templates applicants can request, and it matches the call
         # serializer's `offerings` field (accepted-only) so the frontend gate
         # agrees exactly with this check.
-        if not call.requestedoffering_set.filter(
+        accepted = call.requestedoffering_set.filter(
             state=RequestedOfferingStates.ACCEPTED
-        ).exists():
+        )
+        if not accepted.exists():
             raise exceptions.ValidationError(
                 _("Call must have at least one accepted offering to be activated.")
+            )
+        # An accepted offering with no plan passes every other check and then
+        # cannot be asked for: the applicant's resource-request form lists only
+        # offerings that carry one, so the call activates and applicants meet an
+        # empty picker. A plan can only be set while the offering is still
+        # requested, so catching it here is the last point it is still fixable.
+        planless = list(
+            accepted.filter(plan__isnull=True).values_list("offering__name", flat=True)
+        )
+        if planless:
+            raise exceptions.ValidationError(
+                _("These offerings have no plan and could not be requested: %s.")
+                % ", ".join(planless)
             )
         call.state = CallStates.ACTIVE
         call.save()
@@ -804,7 +952,9 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             status=status.HTTP_201_CREATED,
         )
 
-    rounds_bulk_set_permissions = [permission_factory(PermissionEnum.UPDATE_CALL)]
+    rounds_bulk_set_permissions = [
+        permission_factory(PermissionEnum.UPDATE_CALL, CALL_PERMISSION_SOURCES)
+    ]
     rounds_bulk_set_serializer_class = serializers.BulkRoundCreateRequestSerializer
 
     @extend_schema(responses={status.HTTP_200_OK: serializers.ProtectedRoundSerializer})
@@ -839,10 +989,6 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         except models.Round.DoesNotExist:
             return response.Response(status=status.HTTP_404_NOT_FOUND)
 
-        permissions_utils.permission_factory(PermissionEnum.CLOSE_ROUNDS, ["*"])(
-            request, self, call
-        )
-
         if call_round.call.state != CallStates.ACTIVE:
             raise exceptions.ValidationError(_("Call is not active."))
 
@@ -859,6 +1005,12 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             status=status.HTTP_200_OK,
         )
 
+    # CLOSE_ROUNDS, not UPDATE_CALL. Declared so the blanket unsafe-method gate
+    # does not also demand UPDATE_CALL here.
+    close_round_permissions = [
+        permission_factory(PermissionEnum.CLOSE_ROUNDS, CALL_PERMISSION_SOURCES)
+    ]
+
     @extend_schema(
         request=serializers.CallAttachDocumentsSerializer,
         responses=None,
@@ -871,11 +1023,14 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         if instance.state == CallStates.ARCHIVED:
             raise IncorrectStateException()
 
-        if hasattr(request.data, "getlist"):
-            documents = request.data.getlist("documents", [])
-        else:
-            documents = request.data.get("documents", [])
-        description = request.data.get("description", "")
+        # Validate through the serializer the schema already advertises.
+        # Reading request.data directly let any string be written straight into
+        # CallDocument.file, so a caller could store an arbitrary storage path
+        # instead of an upload.
+        serializer = serializers.CallAttachDocumentsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        documents = serializer.validated_data["documents"]
+        description = serializer.validated_data.get("description", "")
 
         for file_data in documents:
             obj, created = models.CallDocument.objects.get_or_create(
@@ -908,15 +1063,20 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         instance: models.Call = self.get_object()
         if instance.state == CallStates.ARCHIVED:
             raise IncorrectStateException()
-        if hasattr(request.data, "getlist"):
-            documents = request.data.getlist("documents", [])
-        else:
-            documents = request.data.get("documents", [])
-        for file_data in documents:
-            models.CallDocument.objects.get(
-                call=instance,
-                uuid=file_data,
-            ).delete()
+        serializer = serializers.CallDetachDocumentsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        documents = serializer.validated_data["documents"]
+        for document_uuid in documents:
+            try:
+                document = models.CallDocument.objects.get(
+                    call=instance,
+                    uuid=document_uuid,
+                )
+            except models.CallDocument.DoesNotExist:
+                raise exceptions.NotFound(
+                    f"Document {document_uuid} is not attached to this call."
+                )
+            document.delete()
             event_logger.emit(
                 f"Attachment for call {instance.name} has been removed.",
                 event_type=EventType.CALL_DOCUMENT_REMOVED,
@@ -1058,7 +1218,9 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     step_checklists_permissions = []
 
     # Call Manager Compliance Endpoints
-    compliance_overview_permissions = [permission_factory(PermissionEnum.UPDATE_CALL)]
+    compliance_overview_permissions = [
+        permission_factory(PermissionEnum.UPDATE_CALL, CALL_PERMISSION_SOURCES)
+    ]
 
     @extend_schema(
         description="Get compliance overview for call manager showing all proposals and their compliance status.",
@@ -1086,7 +1248,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         return response.Response(overview_data)
 
     review_proposal_compliance_permissions = [
-        permission_factory(PermissionEnum.UPDATE_CALL)
+        permission_factory(PermissionEnum.UPDATE_CALL, CALL_PERMISSION_SOURCES)
     ]
 
     @extend_schema(
@@ -1139,7 +1301,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             )
 
     proposal_compliance_answers_permissions = [
-        permission_factory(PermissionEnum.UPDATE_CALL)
+        permission_factory(PermissionEnum.UPDATE_CALL, CALL_PERMISSION_SOURCES)
     ]
 
     @extend_schema(
@@ -1681,23 +1843,32 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         """Get or update COI configuration for a call."""
         call = self.get_object()
 
-        config, created = models.CallCOIConfiguration.objects.get_or_create(call=call)
-
         if request.method == "GET":
+            config, _ = models.CallCOIConfiguration.objects.get_or_create(call=call)
             serializer = serializers.CallCOIConfigurationSerializer(
                 config, context=self.get_serializer_context()
             )
             return response.Response(serializer.data)
 
-        # PATCH - update configuration
-        serializer = serializers.CallCOIConfigurationSerializer(
-            config,
-            data=request.data,
-            partial=True,
-            context=self.get_serializer_context(),
-        )
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
+        # PATCH - update configuration.
+        # The mutual-exclusion rule is validated against the persisted row, so
+        # the read and the write have to be one atomic, locked unit. Two
+        # concurrent PATCHes each writing one half of an overlapping pair would
+        # otherwise both validate against a disjoint snapshot and both commit,
+        # producing the exact state this rule makes unreachable.
+        with transaction.atomic():
+            config, _ = models.CallCOIConfiguration.objects.get_or_create(call=call)
+            config = models.CallCOIConfiguration.objects.select_for_update().get(
+                pk=config.pk
+            )
+            serializer = serializers.CallCOIConfigurationSerializer(
+                config,
+                data=request.data,
+                partial=True,
+                context=self.get_serializer_context(),
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
         return response.Response(serializer.data)
 
     coi_configuration_serializer_class = serializers.CallCOIConfigurationSerializer
@@ -2427,6 +2598,56 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         )
     ]
 
+    @extend_schema(
+        summary="Get call manager dashboard stats",
+        description=(
+            "Returns counts for the call manager dashboard: pending "
+            "assessments, active calls managed by the user, and overdue "
+            "reviews on calls they manage."
+        ),
+        responses={200: serializers.DashboardCallManagerStatsSerializer},
+    )
+    @no_count_action
+    @decorators.action(detail=False, methods=["get"], url_path="dashboard-stats")
+    def dashboard_stats(self, request):
+        user = request.user
+        managed_call_ids = get_connected_calls(user, CallRole.MANAGER)
+
+        active_calls = models.Call.objects.filter(
+            id__in=managed_call_ids, state=CallStates.ACTIVE
+        ).count()
+        pending_assessments = models.Proposal.objects.filter(
+            round__call_id__in=managed_call_ids,
+            state__in=[ProposalStates.SUBMITTED, ProposalStates.IN_REVIEW],
+        ).count()
+        # review_end_date is created + review_duration_in_days, which Postgres
+        # can evaluate directly — no need to pull every pending review into
+        # Python to compare dates.
+        overdue_reviews = (
+            models.Review.objects.filter(
+                state=models.Review.States.IN_REVIEW,
+                proposal__round__call_id__in=managed_call_ids,
+                proposal__round__review_duration_in_days__isnull=False,
+            )
+            .annotate(
+                deadline=ExpressionWrapper(
+                    F("created")
+                    + timedelta(days=1) * F("proposal__round__review_duration_in_days"),
+                    output_field=DateTimeField(),
+                )
+            )
+            .filter(deadline__lt=timezone.now())
+            .count()
+        )
+        return response.Response(
+            {
+                "pending_assessments": pending_assessments,
+                "active_calls": active_calls,
+                "overdue_reviews": overdue_reviews,
+            },
+            status=status.HTTP_200_OK,
+        )
+
 
 def _terminal_workflow_detail(proposal_state):
     """Human-readable detail for a workflow that reached its terminal step."""
@@ -2473,6 +2694,14 @@ class ProposalViewSet(
                     )
                 ),
                 _latest_step_status=Subquery(latest_step_status),
+            )
+            # ProposalSerializer.can_submit reads every requested resource, its
+            # call entry and the offering's components. Prefetched here for the
+            # same reason as the annotations above: without it a list pays three
+            # queries per proposal. Proposal.offerings_missing_* filter these in
+            # Python so the prefetch is actually used.
+            .prefetch_related(
+                "requestedresource_set__requested_offering__offering__components",
             )
             .order_by("created")
         )
@@ -2689,6 +2918,9 @@ class ProposalViewSet(
                         days=call_step.duration_in_days
                     )
                 first_step.save(update_fields=["status", "started_at", "deadline"])
+                notification_rules.dispatch_step_event(
+                    first_step, proposal_enums.NotificationRuleTriggers.STEP_STARTED
+                )
                 proposal.state = ProposalStates.IN_REVIEW
                 proposal.workflow_step = first_step_id
             else:
@@ -2705,7 +2937,13 @@ class ProposalViewSet(
             status=status.HTTP_200_OK,
         )
 
-    submit_validators = [core_validators.StateValidator(ProposalStates.DRAFT)]
+    submit_validators = [
+        core_validators.StateValidator(ProposalStates.DRAFT),
+        validate_round_is_open,
+        validate_project_details_complete,
+        validate_requested_amounts_present,
+        validate_purchase_orders_present,
+    ]
 
     submit_permissions = [is_creator]
 
@@ -2761,6 +2999,56 @@ class ProposalViewSet(
         )(self, request, uuid, obj_uuid)
 
     resource_detail_serializer_class = serializers.RequestedResourceSerializer
+
+    @extend_schema(
+        methods=["post"],
+        operation_id="proposal_proposals_resource_purchase_order_set",
+        request=serializers.RequestedResourcePurchaseOrderSerializer,
+        responses={
+            status.HTTP_200_OK: serializers.RequestedResourcePurchaseOrderSerializer
+        },
+        description="Upload or replace the purchase order of a requested resource.",
+    )
+    @extend_schema(
+        methods=["delete"],
+        operation_id="proposal_proposals_resource_purchase_order_delete",
+        request=None,
+        responses={status.HTTP_204_NO_CONTENT: None},
+        description="Remove the purchase order of a requested resource.",
+    )
+    def resource_purchase_order(self, request, uuid=None, obj_uuid=None):
+        # get_object() applies filter_queryset_for_user, so visibility of the
+        # proposal is what gates this, exactly as for resource_detail.
+        proposal = cast(models.Proposal, self.get_object())
+        if proposal.state != ProposalStates.DRAFT:
+            raise IncorrectStateException(
+                "Only proposals with a draft status are available for editing."
+            )
+        try:
+            requested_resource = proposal.requestedresource_set.get(uuid=obj_uuid)
+        except models.RequestedResource.DoesNotExist:
+            return response.Response(status=status.HTTP_404_NOT_FOUND)
+
+        if request.method == "DELETE":
+            if requested_resource.attachment:
+                requested_resource.attachment.delete(save=False)
+            requested_resource.purchase_order_reference = ""
+            requested_resource.save(
+                update_fields=["attachment", "purchase_order_reference"]
+            )
+            return response.Response(status=status.HTTP_204_NO_CONTENT)
+
+        serializer = self.get_serializer(requested_resource, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        # Replace rather than accumulate, as the order attachment endpoint does.
+        if "attachment" in serializer.validated_data and requested_resource.attachment:
+            requested_resource.attachment.delete(save=False)
+        serializer.save()
+        return response.Response(serializer.data, status=status.HTTP_200_OK)
+
+    resource_purchase_order_serializer_class = (
+        serializers.RequestedResourcePurchaseOrderSerializer
+    )
 
     @extend_schema(
         description="Attach document to proposal.",
@@ -3324,9 +3612,13 @@ class ProposalViewSet(
         query_params = getattr(request, "query_params", request.GET)
         include_all = query_params.get("include_all", "false").lower() == "true"
         if include_all:
-            questions = checklist.questions.all().order_by("order")
+            questions = checklist.get_questions()
         else:
-            questions = checklist.get_visible_questions(completion)
+            # Visibility follows the requesting user's own answers, as
+            # existing_answer does below.
+            questions = checklist.get_visible_questions(
+                completion, answers=completion.get_latest_answers(user=request.user)
+            )
         response_serializer = checklist_serializers.ChecklistResponseSerializer(
             {"checklist": checklist, "completion": completion, "questions": questions},
             context={
@@ -3470,6 +3762,29 @@ class ProposalViewSet(
     step_checklist_responses_permissions = [
         proposal_permissions.can_view_step_checklist_responses
     ]
+
+    @extend_schema(
+        summary="Get submitter dashboard stats",
+        description=(
+            "Returns counts of the current user's own proposals grouped by "
+            "state, covering both in-progress and decided proposals."
+        ),
+        responses={200: serializers.DashboardSubmitterStatsSerializer},
+    )
+    @no_count_action
+    @decorators.action(detail=False, methods=["get"], url_path="dashboard-stats")
+    def dashboard_stats(self, request):
+        payload = models.Proposal.objects.filter(created_by=request.user).aggregate(
+            total=Count("id"),
+            draft=Count("id", filter=Q(state=ProposalStates.DRAFT)),
+            submitted=Count("id", filter=Q(state=ProposalStates.SUBMITTED)),
+            in_review=Count("id", filter=Q(state=ProposalStates.IN_REVIEW)),
+            accepted=Count("id", filter=Q(state=ProposalStates.ACCEPTED)),
+            rejected=Count("id", filter=Q(state=ProposalStates.REJECTED)),
+            canceled=Count("id", filter=Q(state=ProposalStates.CANCELED)),
+        )
+        serializer = serializers.DashboardSubmitterStatsSerializer(payload)
+        return response.Response(serializer.data, status=status.HTTP_200_OK)
 
 
 class ReviewViewSet(ActionsViewSet):
@@ -3631,6 +3946,70 @@ class ReviewViewSet(ActionsViewSet):
         update_permissions
     ) = partial_update_permissions = [action_permission_check]
 
+    @extend_schema(
+        summary="Get reviewer dashboard stats and deadlines",
+        description=(
+            "Returns counts (assigned, pending, completed) for every review "
+            "assigned to the current user, plus their nearest review "
+            "deadlines ordered by due date. Overdue reviews sort first and "
+            "are included; the counts cover all reviews, the deadline list is "
+            "capped and deadlines_total gives its true length."
+        ),
+        responses={200: serializers.DashboardReviewerStatsSerializer},
+    )
+    @no_count_action
+    @decorators.action(detail=False, methods=["get"], url_path="dashboard-stats")
+    def dashboard_stats(self, request):
+        user = request.user
+        own_reviews = models.Review.objects.filter(reviewer=user)
+        counts = own_reviews.aggregate(
+            assigned=Count("id"),
+            pending=Count("id", filter=Q(state=models.Review.States.IN_REVIEW)),
+            completed=Count("id", filter=Q(state=models.Review.States.SUBMITTED)),
+        )
+
+        # A deadline only exists when the round sets review_duration_in_days;
+        # annotating it lets Postgres do the filtering and the ordering.
+        reviews_with_deadline = (
+            own_reviews.filter(
+                state=models.Review.States.IN_REVIEW,
+                proposal__round__review_duration_in_days__isnull=False,
+            )
+            .annotate(
+                deadline=ExpressionWrapper(
+                    F("created")
+                    + timedelta(days=1) * F("proposal__round__review_duration_in_days"),
+                    output_field=DateTimeField(),
+                )
+            )
+            .select_related("proposal", "proposal__round", "proposal__round__call")
+            .order_by("deadline")
+        )
+        # This list is embedded in an object, so it cannot be paginated the way
+        # the standalone dashboard lists are. It carries its own total instead —
+        # `pending` is not it, since a review whose round sets no review
+        # duration has no deadline and never appears here.
+        deadlines_total = reviews_with_deadline.count()
+        deadlines = [
+            {
+                "uuid": review.uuid,
+                "proposal_uuid": review.proposal.uuid,
+                "proposal_name": review.proposal.name,
+                "call_uuid": review.proposal.round.call.uuid,
+                "call_name": review.proposal.round.call.name,
+                "due_date": review.deadline,
+            }
+            for review in reviews_with_deadline[:DASHBOARD_LIST_LIMIT]
+        ]
+
+        payload = {
+            **counts,
+            "deadlines": deadlines,
+            "deadlines_total": deadlines_total,
+        }
+        serializer = serializers.DashboardReviewerStatsSerializer(payload)
+        return response.Response(serializer.data, status=status.HTTP_200_OK)
+
 
 class ProviderRequestedOfferingViewSet(ReadOnlyActionsViewSet):
     lookup_field = "uuid"
@@ -3686,6 +4065,63 @@ class ProviderRequestedOfferingViewSet(ReadOnlyActionsViewSet):
     accept_permissions = cancel_permissions = [
         proposal_permissions.user_can_accept_requested_offering
     ]
+
+
+@extend_schema_view(
+    list=extend_schema(
+        parameters=[
+            OpenApiParameter(
+                "include_closed",
+                OpenApiTypes.BOOL,
+                description=(
+                    "Include requests belonging to rejected or canceled "
+                    "proposals. They are omitted by default."
+                ),
+            )
+        ]
+    )
+)
+class UserRequestedResourceViewSet(ReadOnlyActionsViewSet):
+    """Resources the current user has requested through a proposal.
+
+    Counterpart of ``ProviderRequestedResourceViewSet``, which scopes to
+    offerings the user *manages* — the service provider's view of who applied.
+    This one scopes to proposals the user can read, reusing the very rule
+    ``ProposalViewSet`` applies, so this list and "My proposals" can never
+    disagree about what the user is party to.
+
+    Note it does not scope through ``RequestedResource.Permissions.project_path``
+    (``proposal__project``): that project does not exist until the proposal is
+    approved, so it would hide exactly the pending rows this page is about.
+
+    Requests on rejected or canceled proposals are left out unless asked for:
+    they are settled questions, and listing them by default buries the requests
+    the user can still act on. ``?include_closed=true`` brings them back.
+    """
+
+    lookup_field = "uuid"
+    serializer_class = serializers.UserRequestedResourceSerializer
+    filterset_class = filters.RequestedResourceFilter
+    filter_backends = (DjangoFilterBackend,)
+
+    def get_queryset(self):
+        proposals = filter_queryset_for_user(
+            models.Proposal.objects.all(), self.request.user
+        )
+        if self.request.query_params.get("include_closed") not in ("true", "True"):
+            proposals = proposals.exclude(
+                state__in=[ProposalStates.CANCELED, ProposalStates.REJECTED]
+            )
+        return (
+            models.RequestedResource.objects.filter(proposal__in=proposals)
+            .select_related(
+                "proposal",
+                "proposal__round__call",
+                "requested_offering__offering",
+                "resource",
+            )
+            .order_by("-created")
+        )
 
 
 class ProviderRequestedResourceViewSet(ReadOnlyActionsViewSet):
@@ -3767,6 +4203,49 @@ class RoundViewSet(ReadOnlyActionsViewSet):
         )
         return self.get_paginated_response(serializer.data)
 
+    @extend_schema(
+        summary="Get upcoming round deadlines for the call manager dashboard",
+        description=(
+            "Returns the rounds in calls managed by the current user that are "
+            "still open (cutoff time in the future), nearest first. Paginated: "
+            "the exact total is in the X-Result-Count header."
+        ),
+        responses={200: serializers.DashboardUpcomingDeadlineSerializer(many=True)},
+    )
+    @decorators.action(detail=False, methods=["get"], url_path="dashboard-deadlines")
+    def dashboard_deadlines(self, request):
+        user = request.user
+        managed_call_ids = get_connected_calls(user, CallRole.MANAGER)
+        rounds = (
+            models.Round.objects.filter(
+                call_id__in=managed_call_ids,
+                cutoff_time__gte=timezone.now(),
+            )
+            .select_related("call")
+            .order_by("cutoff_time")
+        )
+        # Paginated rather than sliced to DASHBOARD_LIST_LIMIT: PAGE_SIZE is
+        # also 10, so the page the dashboard renders is unchanged, but a manager
+        # running more than ten open rounds no longer sees the first ten
+        # presented as all of them.
+        page = self.paginate_queryset(rounds)
+        if request.method == "HEAD":
+            # Count-only request (the `_count` companion): the X-Result-Count
+            # header is set from the paginator, so skip serialising the page.
+            return self.get_paginated_response([])
+        payload = [
+            {
+                "uuid": round_obj.uuid,
+                "call_uuid": round_obj.call.uuid,
+                "call_name": round_obj.call.name,
+                "round_name": round_obj.name,
+                "due_date": round_obj.cutoff_time,
+            }
+            for round_obj in page
+        ]
+        serializer = serializers.DashboardUpcomingDeadlineSerializer(payload, many=True)
+        return self.get_paginated_response(serializer.data)
+
 
 class ProposalProjectRoleMappingViewSet(ActionsViewSet):
     lookup_field = "uuid"
@@ -3781,6 +4260,61 @@ class ProposalProjectRoleMappingViewSet(ActionsViewSet):
     update_validators = partial_update_validators = destroy_validators = [
         validate_call_not_archived
     ]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        user = self.request.user
+        if user.is_staff or user.is_support:
+            return queryset
+        # A mapping is visible exactly when its call is. Writes stay gated on
+        # UPDATE_CALL.
+        return queryset.filter(
+            call__in=filter_queryset_for_user(models.Call.objects.all(), user)
+        )
+
+    def get_permissions(self):
+        # CanUpdateCallPermission implements only has_object_permission, which
+        # DRF never calls for a list route -- without this the collection was
+        # readable anonymously. Reads are scoped by get_queryset instead.
+        if self.action in ("list", "retrieve"):
+            return [rf_permissions.IsAuthenticated()]
+        return super().get_permissions()
+
+
+class CallWorkflowStepNotificationRuleViewSet(ActionsViewSet):
+    """Call-level notification rules attached to workflow steps.
+
+    Readable by anyone connected to the call (managers, reviewers, panel), so
+    the review UI can show who is notified; writable by call managers only
+    (``CanUpdateCallPermission`` on update/delete, the serializer on create).
+    Archived calls are read-only.
+    """
+
+    lookup_field = "uuid"
+    serializer_class = serializers.CallWorkflowStepNotificationRuleSerializer
+    queryset = models.CallWorkflowStepNotificationRule.objects.all().select_related(
+        "workflow_step", "workflow_step__call"
+    )
+    filterset_class = filters.CallWorkflowStepNotificationRuleFilter
+    filter_backends = (DjangoFilterBackend,)
+    permission_classes = [proposal_permissions.CanUpdateCallPermission]
+    update_validators = partial_update_validators = destroy_validators = [
+        validate_call_not_archived
+    ]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        user = self.request.user
+        if user.is_staff or user.is_support:
+            return queryset
+        return queryset.filter(workflow_step__call__in=get_connected_calls(user))
+
+    def get_permissions(self):
+        # Object-level UPDATE_CALL is only meaningful for writes; reads are
+        # scoped by get_queryset.
+        if self.action in ("list", "retrieve"):
+            return [rf_permissions.IsAuthenticated()]
+        return super().get_permissions()
 
 
 # =============================================================================
@@ -4389,7 +4923,11 @@ class ConflictOfInterestViewSet(ActionsViewSet):
                 item.save(update_fields=["status", "has_coi"])
                 item.coi_records.remove(coi)
 
-    dismiss_permissions = waive_permissions = recuse_permissions = [
+    # The update route is included: it was ungated, so the reviewer a conflict
+    # is about could PATCH their own record.
+    dismiss_permissions = waive_permissions = recuse_permissions = (
+        update_permissions
+    ) = partial_update_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
             ["call", "call.manager"],
@@ -5664,6 +6202,19 @@ class AssignmentBatchViewSet(ActionsViewSet):
             ["call", "call.manager"],
         )
     ]
+    # Batches come from the call's generate_assignments / create_manual_assignment;
+    # POSTing here only ever raised an IntegrityError. create_permissions is
+    # emptied because the gate below needs an object and a list route has none.
+    disabled_actions = ["create"]
+    create_permissions = []
+    # Editing or deleting a batch is call-management work. Deleting was ungated,
+    # so a reviewer could erase an assignment instead of declining it.
+    unsafe_methods_permissions = [
+        permission_factory(
+            PermissionEnum.MANAGE_PROPOSAL_REVIEW,
+            ["call", "call.manager"],
+        )
+    ]
 
     def get_serializer_class(self):
         if self.action == "list":
@@ -5827,6 +6378,22 @@ class AssignmentItemViewSet(ActionsViewSet):
 
     # Permissions for manager-only actions
     suggest_alternatives_permissions = reassign_permissions = [
+        permission_factory(
+            PermissionEnum.MANAGE_PROPOSAL_REVIEW,
+            ["batch.call", "batch.call.manager"],
+        )
+    ]
+    # Responding is the reviewer's own consent; managers intervene through
+    # reassign / force_accept.
+    accept_permissions = decline_permissions = [
+        proposal_permissions.user_is_assignment_reviewer
+    ]
+    # Items come from the call's assignment generation, same as their batch.
+    disabled_actions = ["create"]
+    create_permissions = []
+    # Every other write is call-management work; accept/decline above override
+    # this for the reviewer's own response.
+    unsafe_methods_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_PROPOSAL_REVIEW,
             ["batch.call", "batch.call.manager"],

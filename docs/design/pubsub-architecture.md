@@ -78,11 +78,15 @@ imports.
 |----------|---------|
 | one offering | the classic site-agent case |
 | projects, a customer, or a mix | a slice the owner has access to |
+| your own user (`{"type": "user", "uuid": <own>}`) | your own identity events — profile, SSH keys, lifecycle, role changes. Authorized by identity, not by role; binding *another* user is staff/support only. |
 | **empty** | **global: everything platform-wide — user-centric events (all-user PII) AND marketplace events. Staff/support only.** |
 
 Bindings use the same vocabulary as Personal Access Tokens (`TYPE_MAP`,
 `AllowedScopeInputSerializer`), so `{"type": "project", "uuid": "..."}` means the
-same thing in both features.
+same thing in both features. The one exception is `user`: it exists **only** for
+event-consumer bindings (`EVENT_CONSUMER_TYPE_MAP`), deliberately kept out of
+`TYPE_MAP` so PAT scopes, invitation targets, role content types, and the
+`RoleType` schema enum are unaffected.
 
 > **An empty binding set means global.** A consumer left without bindings by a
 > partial write would therefore fail *open* as an all-user PII firehose. Both
@@ -145,7 +149,13 @@ legacy path dropped. Treated as a bug fix; see `_resolve_event_project`.
 
 The user-centric events originate in `waldur_core` (User, SSH keys, roles), so
 they are dispatched from `waldur_core.logging.event_dispatch` and delivered to
-**global consumers**. A global (empty-scope) consumer means "everything": it
+**global consumers** and to the affected user's **self-bound consumers**
+(`dispatch_user_event` passes the affected user's `(content_type, id)` as the
+scope-key; delivery to a self-bound consumer is authorized by identity —
+`consumer.user == affected user` — rather than by role). A user-scoped
+`user_role` event on the core path cannot double-deliver with the marketplace
+path below: the marketplace path matches only offering/project/customer keys,
+never a user key. A global (empty-scope) consumer means "everything": it
 also receives the marketplace events (orders, resources, offering users, …)
 through the marketplace dispatcher, which opts globals in via
 `build_messages(include_global=True)`. The single care point is `user_role`,
@@ -182,6 +192,13 @@ a **Personal Access Token**, that PAT is the password, so the queue survives a
 browser logout or session-token rotation (the raw secret is read from the
 request header — only its hash is stored). A caller still using a plain session
 token keeps the DRF token as the password.
+
+Which of the two it was is recorded on the consumer (`auth_kind`, plus the PAT's
+prefix and name) together with the permission branch that authorised the
+registration (`authorized_via`), and refreshed on every re-registration. Without
+it a site agent on a staff session is indistinguishable from one on a scoped
+PAT, and a revoked PAT cannot be traced to the queues it backed. A non-PAT or
+staff-authorised registration is audited, on change only.
 
 Queues are provisioned with the hardened arguments the legacy path uses —
 `x-message-ttl` (1h), `x-max-length` (10 000), `reject-publish-dlx` overflow and

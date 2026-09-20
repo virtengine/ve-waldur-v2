@@ -8,19 +8,18 @@ from django.core.exceptions import MultipleObjectsReturned, ObjectDoesNotExist
 from django.db import transaction
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
-from rest_framework import exceptions, serializers
+from rest_framework import exceptions
 
 from waldur_core.core import validators as core_validators
 from waldur_core.core.enums import CoreStates
 from waldur_core.core.exceptions import IncorrectStateException
 from waldur_core.structure.backend import ServiceBackend
+from waldur_mastermind.marketplace import billing_mode, plugins
 from waldur_mastermind.marketplace import models as marketplace_models
-from waldur_mastermind.marketplace import plugins
 from waldur_mastermind.marketplace.enums import (
     OPENSTACK_INSTANCE_OFFERING,
     OPENSTACK_TENANT_OFFERING,
     OPENSTACK_VOLUME_OFFERING,
-    BillingTypes,
     OfferingStates,
     OrderTypes,
 )
@@ -99,7 +98,7 @@ def create_offering_components(offering):
 
     for component_data in fixed_components:
         marketplace_models.OfferingComponent.objects.create(
-            offering=offering, **component_data._asdict()
+            offering=offering, billed_per_plan=True, **component_data._asdict()
         )
 
 
@@ -217,11 +216,9 @@ def import_usage(resource: marketplace_models.Resource):
         return
 
     usages = get_usage_values(resource, tenant)
-    has_usage_billing = resource.offering.components.filter(
-        billing_type=BillingTypes.USAGE,
-    ).exists()
+    has_usage_billing = billing_mode.resolve_for_resource(resource).is_usage_based
     # Update ComponentUsage for billing (monthly peak for LIMIT components,
-    # hourly accumulator for USAGE components).
+    # hourly accumulator for USAGE components, both resolved per plan).
     import_current_usages(resource, usages, hourly_accumulation=has_usage_billing)
     # current_usages drives the UI's "right-now consumption" widget. Write
     # the fresh values directly — the ComponentUsage mirror would otherwise
@@ -1209,43 +1206,54 @@ def create_marketplace_resource_for_imported_resources(
         create_offerings_for_volume_and_instance(instance)
 
 
-def _map_ip_via_cidr(floating_ip_address, floating_cidr, public_cidr):
-    """Map a floating IP to a public IP using CIDR-based translation."""
-    return (
-        ".".join(public_cidr.split(".")[:-1]) + "." + floating_ip_address.split(".")[-1]
-    )
+def _map_ipv4_via_cidr(ip_addr: ipaddress.IPv4Address, public_cidr: str):
+    """Translate an IPv4 address into the public range, keeping its last octet."""
+    public_ip = ipaddress.ip_interface(public_cidr).ip
+    if public_ip.version != 4:
+        return None
+    return str(ipaddress.IPv4Address(public_ip.packed[:3] + ip_addr.packed[3:]))
 
 
 def get_external_ip(offering, floating_ip_address):
     ip_addr = ipaddress.ip_address(floating_ip_address)
-
-    # Try ExternalSubnet.public_ip_range first
-    if offering.scope:
-        external_subnets = openstack_models.ExternalSubnet.objects.filter(
-            network__settings=offering.scope,
-        ).exclude(public_ip_range="")
-        for subnet in external_subnets:
-            if subnet.cidr and ip_addr in ipaddress.ip_network(subnet.cidr):
-                return _map_ip_via_cidr(
-                    floating_ip_address, subnet.cidr, subnet.public_ip_range
-                )
-
-    # Fall back to secret_options-based mapping
-    ipv4_external_ip_mapping = offering.secret_options.get(
-        "ipv4_external_ip_mapping", []
+    external_subnets = (
+        list(
+            openstack_models.ExternalSubnet.objects.filter(
+                network__settings=offering.scope,
+            ).exclude(cidr="")
+        )
+        if offering.scope
+        else []
     )
-    if not ipv4_external_ip_mapping:
-        return
+    # (private CIDR, public CIDR) pairs, ExternalSubnet.public_ip_range first.
+    mappings = [
+        (subnet.cidr, subnet.public_ip_range)
+        for subnet in external_subnets
+        if subnet.public_ip_range
+    ]
+    mappings.extend(
+        (entry["floating_ip"], entry["external_ip"])
+        for entry in offering.secret_options.get("ipv4_external_ip_mapping", [])
+    )
+    if not mappings:
+        return None
 
-    for offering_external_ip in ipv4_external_ip_mapping:
-        ip_network = ipaddress.ip_network(offering_external_ip["floating_ip"])
+    if ip_addr.version != 4:
+        # Only IPv4 is NATed into a public range. IPv6 is routed as it is: an
+        # address on the provider's external network is its own external
+        # address, while one on a tenant subnet (e.g. a router's internal
+        # interface) is not external at all.
+        if any(
+            ip_addr in ipaddress.ip_network(subnet.cidr, strict=False)
+            for subnet in external_subnets
+        ):
+            return str(ip_addr)
+        return None
 
-        if ip_addr in ip_network:
-            return _map_ip_via_cidr(
-                floating_ip_address,
-                offering_external_ip["floating_ip"],
-                offering_external_ip["external_ip"],
-            )
+    for private_cidr, public_cidr in mappings:
+        if ip_addr in ipaddress.ip_network(private_cidr):
+            return _map_ipv4_via_cidr(ip_addr, public_cidr)
+    return None
 
 
 def update_external_addresses_of_resource(resource: marketplace_models.Resource):
@@ -1330,15 +1338,12 @@ def delete_instance(instance, attributes=None, is_async=True):
     delete_volumes = attributes.get("delete_volumes", True)
     release_floating_ips = attributes.get("release_floating_ips", True)
 
-    if (
-        delete_volumes
-        and openstack_models.Snapshot.objects.filter(
-            source_volume__instance=instance
-        ).exists()
-    ):
-        raise serializers.ValidationError(
-            _("Cannot delete instance. One of its volumes has attached snapshot.")
-        )
+    logger.info(
+        "Scheduling deletion of instance %s (delete_volumes=%s, release_floating_ips=%s)",
+        instance.uuid,
+        delete_volumes,
+        release_floating_ips,
+    )
 
     force = instance.state == CoreStates.ERRED
     transaction.on_commit(

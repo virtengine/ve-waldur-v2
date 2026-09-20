@@ -10,6 +10,7 @@ from waldur_mastermind.chat.tools.enums import ToolCategory, ToolName
 from waldur_mastermind.chat.tools.proposal_helpers import call_detail_url
 from waldur_mastermind.chat.tools.registry import tool_registry
 from waldur_mastermind.proposal.models import Proposal, RequestedResource, Review
+from waldur_mastermind.proposal.utils import get_proposal_duration_months
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +154,13 @@ class ProposalOverviewTool(BaseTool):
             ).first()
             if completion:
                 total_questions = completion.checklist.questions.count()
-                answered = Answer.objects.filter(completion=completion).count()
+                # Answered questions, not per-user answer rows
+                answered = (
+                    Answer.objects.filter(completion=completion)
+                    .values("question_id")
+                    .distinct()
+                    .count()
+                )
                 compliance_status = {
                     "total_questions": total_questions,
                     "answered": answered,
@@ -180,8 +187,8 @@ class ProposalOverviewTool(BaseTool):
             "project_summary": proposal.project_summary[:500]
             if proposal.project_summary
             else "",
-            "duration_days": proposal.duration_in_days,
-            "is_confidential": proposal.project_is_confidential,
+            "requested_duration_months": get_proposal_duration_months(proposal),
+            "fixed_duration_days": call.fixed_duration_in_days if call else None,
             "resource_requests": resources,
             "reviews": {
                 "total": review_stats["total"],

@@ -24,6 +24,7 @@ from waldur_core.quotas.fields import QuotaField
 from waldur_core.quotas.models import QuotaModelMixin
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.managers import filter_queryset_for_user
+from waldur_openstack import enums
 
 if TYPE_CHECKING:
     from django.db.models.manager import RelatedManager
@@ -55,6 +56,7 @@ class Tenant(
     core_models.RuntimeStateMixin,
     structure_models.BaseResource,
     core_models.AvailableMixin,
+    core_models.BackendMissingMixin,
 ):
     flavors: models.Manager["Flavor"]
     images: models.Manager["Image"]
@@ -149,7 +151,7 @@ class Tenant(
 
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
-    class Meta:
+    class Meta(structure_models.BaseResource.Meta):
         unique_together = ("service_settings", "backend_id")
 
     @classmethod
@@ -181,7 +183,15 @@ class Tenant(
 
         if settings.backend_url:
             parsed = urlparse(settings.backend_url)
-            return f"{parsed.scheme}://{parsed.hostname}/dashboard"
+            # Horizon runs on the host's default port, not on Keystone's own
+            # (a classic deployment has Keystone on :5000), so the port is
+            # left out. hostname also drops the brackets an IPv6 literal needs
+            # in a URL, so they are put back. hostname never includes
+            # credentials, so none can end up in this user-facing link.
+            host = parsed.hostname
+            if host and ":" in host:
+                host = f"[{host}]"
+            return f"{parsed.scheme}://{host}/dashboard"
 
     def format_quota(self, name, limit):
         if name == self.Quotas.vcpu.name:
@@ -473,7 +483,7 @@ class HypervisorInventory(core_models.UuidMixin, models.Model):
 
     class Meta:
         unique_together = ("hypervisor", "resource_class")
-        ordering = ("hypervisor", "resource_class")
+        ordering = ["hypervisor", "resource_class", "id"]
 
     @classmethod
     def get_url_name(cls):
@@ -503,7 +513,8 @@ class ExternalSubnet(
         related_name="subnets",
     )
     backend_id = models.CharField(max_length=255, db_index=True)
-    cidr = models.CharField(max_length=32, blank=True)
+    # 43 fits a fully written-out IPv6 prefix: 8 groups of 4, 7 colons, "/128".
+    cidr = models.CharField(max_length=43, blank=True)
     gateway_ip = models.GenericIPAddressField(null=True, blank=True)
     ip_version = models.SmallIntegerField(default=4)
     enable_dhcp = models.BooleanField(default=True)
@@ -785,7 +796,7 @@ class FloatingIP(core_models.RuntimeStateMixin, structure_models.BaseResource):
 
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
-    class Meta:
+    class Meta(structure_models.BaseResource.Meta):
         unique_together = ("tenant", "address")
         verbose_name = _("Floating IP")
         verbose_name_plural = _("Floating IPs")
@@ -904,8 +915,7 @@ class LoadBalancer(structure_models.BaseResource):
     vip_address = models.GenericIPAddressField(
         null=True,
         blank=True,
-        protocol="IPv4",
-        help_text=_("Virtual IP address of the load balancer"),
+        help_text=_("Virtual IP address of the load balancer, IPv4 or IPv6"),
     )
     vip_subnet = models.ForeignKey(
         on_delete=models.SET_NULL,
@@ -1181,6 +1191,9 @@ class HealthMonitor(structure_models.BaseResource):
 
 
 class Network(core_models.RuntimeStateMixin, structure_models.BaseResource):
+    class Meta(structure_models.BaseResource.Meta):
+        pass
+
     subnets: models.Manager["SubNet"]
     ports: models.Manager["Port"]
     rbac_policies: models.Manager["NetworkRBACPolicy"]
@@ -1255,6 +1268,8 @@ class Network(core_models.RuntimeStateMixin, structure_models.BaseResource):
 class SubNet(structure_models.BaseResource):
     ports: models.Manager["Port"]
 
+    Ipv6Modes = enums.Ipv6Modes
+
     tenant = models.ForeignKey(
         on_delete=models.CASCADE,
         to=Tenant,
@@ -1275,24 +1290,53 @@ class SubNet(structure_models.BaseResource):
         help_text=_("List of additional routes for the subnet."),
     )
     cidr = models.CharField(
-        max_length=32,
+        # 43 fits a fully written-out IPv6 prefix: 8 groups of 4, 7 colons, "/128".
+        max_length=43,
         blank=True,
-        help_text=_("IPv4 network address in CIDR format (e.g. 192.168.0.0/24)"),
+        help_text=_(
+            "Network address in CIDR format (e.g. 192.168.0.0/24 or 2001:db8::/64)"
+        ),
     )
     gateway_ip = models.GenericIPAddressField(
-        protocol="IPv4",
         null=True,
         help_text=_("IP address of the gateway for this subnet"),
     )
     allocation_pools = cast(
         list[dict[str, str]],
         JSONField(
-            default=dict,
+            # A list, as the name, the type cast, the serializer field and every
+            # generated client say (#390). The default used to be `dict`, so a
+            # subnet whose pool nobody supplied carried `{}` -- not an empty
+            # list, but a value of the wrong shape -- until the next pull.
+            default=list,
+            blank=True,
             help_text=_("List of IP ranges available for allocation in this subnet"),
         ),
     )
     ip_version = models.SmallIntegerField(
         default=4, help_text=_("IP protocol version (4 or 6)")
+    )
+    ipv6_ra_mode = models.CharField(
+        max_length=20,
+        choices=Ipv6Modes.CHOICES,
+        null=True,
+        blank=True,
+        default=None,
+        help_text=_(
+            "How the router advertises an IPv6 subnet. Null for an IPv4 subnet, "
+            "or when router advertisements come from outside OpenStack."
+        ),
+    )
+    ipv6_address_mode = models.CharField(
+        max_length=20,
+        choices=Ipv6Modes.CHOICES,
+        null=True,
+        blank=True,
+        default=None,
+        help_text=_(
+            "How instances on an IPv6 subnet get their address. Null for an IPv4 "
+            "subnet, or when OpenStack assigns no address itself."
+        ),
     )
     enable_dhcp = models.BooleanField(
         default=True,
@@ -1305,8 +1349,21 @@ class SubNet(structure_models.BaseResource):
     is_connected = models.BooleanField(
         default=True, help_text=_("Is subnet connected to the default tenant router.")
     )
+    router = models.ForeignKey(
+        on_delete=models.SET_NULL,
+        to=Router,
+        null=True,
+        blank=True,
+        related_name="subnets",
+        help_text=_(
+            "Router this subnet is attached to. Set explicitly at creation time, "
+            "otherwise recorded from the backend once the attachment is made. "
+            "While the subnet is disconnected it keeps the router it was last "
+            "attached to, which is the one a reconnect returns it to."
+        ),
+    )
 
-    class Meta:
+    class Meta(structure_models.BaseResource.Meta):
         verbose_name = _("Subnet")
         verbose_name_plural = _("Subnets")
 
@@ -1331,6 +1388,8 @@ class SubNet(structure_models.BaseResource):
             "allocation_pools",
             "cidr",
             "ip_version",
+            "ipv6_ra_mode",
+            "ipv6_address_mode",
             "enable_dhcp",
             "gateway_ip",
             "dns_nameservers",
@@ -1544,6 +1603,7 @@ class Volume(
     TenantQuotaMixin,
     structure_models.Storage,
     core_models.AvailableMixin,
+    core_models.BackendMissingMixin,
 ):
     snapshots: models.Manager["Snapshot"]
     restoration: models.Manager["SnapshotRestoration"]
@@ -1633,7 +1693,7 @@ class Volume(
 
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
-    class Meta:
+    class Meta(structure_models.BaseResource.Meta):
         unique_together = ("service_settings", "backend_id")
 
     def get_quota_deltas(self):
@@ -1681,7 +1741,12 @@ class Volume(
             return False
 
 
-class Snapshot(core_models.ActionMixin, TenantQuotaMixin, structure_models.Storage):
+class Snapshot(
+    core_models.ActionMixin,
+    TenantQuotaMixin,
+    structure_models.Storage,
+    core_models.BackendMissingMixin,
+):
     volumes: models.Manager["Volume"]
     restorations: models.Manager["SnapshotRestoration"]
     backups: models.Manager["Backup"]
@@ -1723,7 +1788,7 @@ class Snapshot(core_models.ActionMixin, TenantQuotaMixin, structure_models.Stora
         help_text=_("Guaranteed time of snapshot retention. If null - keep forever."),
     )
 
-    class Meta:
+    class Meta(structure_models.BaseResource.Meta):
         unique_together = ("service_settings", "backend_id")
 
     @classmethod
@@ -1806,6 +1871,7 @@ class Instance(
     TenantQuotaMixin,
     structure_models.VirtualMachine,
     core_models.AvailableMixin,
+    core_models.BackendMissingMixin,
 ):
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
@@ -1917,15 +1983,24 @@ class Instance(
             "If null, the tenant-wide default from service settings is used."
         ),
     )
+    metadata = JSONField(
+        default=dict,
+        blank=True,
+        help_text=_(
+            "Arbitrary key/value pairs forwarded to Nova as instance metadata."
+        ),
+    )
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
-    class Meta:
+    class Meta(structure_models.BaseResource.Meta):
         unique_together = ("service_settings", "backend_id")
-        ordering = ["name", "created"]
+        ordering = ["name", "created", "id"]
 
     @property
     def external_ips(self) -> list[str]:
-        floating_ips = set(self.floating_ips.values_list("address", flat=True))
+        floating_ips = {
+            floating_ip.address for floating_ip in self.attached_floating_ips
+        }
         if self.directly_connected_ips:
             floating_ips = floating_ips.union(
                 set(self.directly_connected_ips.split(","))
@@ -1938,16 +2013,20 @@ class Instance(
 
     @property
     def external_address(self) -> set[str]:
-        return set(
-            self.floating_ips.exclude(external_address__isnull=True).values_list(
-                "external_address", flat=True
-            )
-        )
+        return {
+            floating_ip.external_address
+            for floating_ip in self.attached_floating_ips
+            if floating_ip.external_address is not None
+        }
 
     @property
     def internal_ips(self):
         internal_ips = set()
-        for ip_list in self.ports.values_list("fixed_ips", flat=True):
+        if self._ports_are_prefetched:
+            fixed_ips_per_port = [port.fixed_ips for port in self.ports.all()]
+        else:
+            fixed_ips_per_port = self.ports.values_list("fixed_ips", flat=True)
+        for ip_list in fixed_ips_per_port:
             if ip_list:
                 internal_ips.update({val["ip_address"] for val in ip_list})
         return list(internal_ips)
@@ -1982,6 +2061,32 @@ class Instance(
     def floating_ips(self) -> models.QuerySet[FloatingIP]:
         return FloatingIP.objects.filter(port__instance=self)
 
+    @property
+    def _ports_are_prefetched(self) -> bool:
+        return "ports" in getattr(self, "_prefetched_objects_cache", {})
+
+    @property
+    def attached_floating_ips(self) -> list[FloatingIP]:
+        """
+        The same floating IPs as the floating_ips property returns. When the
+        instance was loaded with prefetch_related("ports__floating_ips"), as
+        the instance viewset does, the prefetched objects are reused instead
+        of issuing a query; otherwise a single query is made, since the
+        property is also read per instance by metadata handlers.
+        """
+        if not self._ports_are_prefetched:
+            return list(self.floating_ips)
+        floating_ips = [
+            floating_ip
+            for port in self.ports.all()
+            for floating_ip in port.floating_ips.all()
+        ]
+        # Ports group the floating IPs, so the model ordering ("-created", "id")
+        # is restored here; the two passes rely on sort stability.
+        floating_ips.sort(key=lambda floating_ip: floating_ip.id)
+        floating_ips.sort(key=lambda floating_ip: floating_ip.created, reverse=True)
+        return floating_ips
+
     @classmethod
     def get_backend_fields(cls):
         return super().get_backend_fields() + (
@@ -1995,6 +2100,7 @@ class Instance(
             "hypervisor_hostname",
             "directly_connected_ips",
             "image_name",
+            "metadata",
         )
 
     @classmethod
@@ -2117,7 +2223,7 @@ class NetworkRBACPolicy(
         verbose_name = "Network RBAC Policy"
         verbose_name_plural = "Network RBAC Policies"
         unique_together = ("network", "target_tenant", "policy_type")
-        ordering = ["-created"]
+        ordering = ["-created", "id"]
 
     def __str__(self):
         return f"RBAC policy for {self.network} to {self.target_tenant}"

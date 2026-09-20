@@ -58,8 +58,8 @@ whenever they sit on a startup import path — that is exactly where the wins in
 - **Function-local import** — put `from heavy_pkg import X` inside the method that
   uses it. This is the default; prefer it.
 - **`except` clauses across many methods** — add one lazy helper returning the
-  exception tuple: `def _azure_exceptions(): from azure.core.exceptions import
-  AzureError, HttpResponseError; return AzureError, HttpResponseError`.
+  exception tuple: `def _sdk_exceptions(): from heavy_sdk.exceptions import
+  SdkError, HttpResponseError; return SdkError, HttpResponseError`.
 - **Annotation-only symbols** — add `from __future__ import annotations` and import
   them under `if TYPE_CHECKING:` (also silences ruff `F821` for the runtime names).
 - **A symbol used pervasively across one module** (dozens of names) — a single
@@ -99,8 +99,7 @@ whenever they sit on a startup import path — that is exactly where the wins in
 the dep still loads. The `Check startup memory budget` CI job runs this and can
 gate on `MEMORY_BUDGET_MB`.
 
-Reference implementations: `src/waldur_azure/client.py` + `backend.py` (original);
-and the startup sweep — `marketplace_remote` (`waldur_api_client`),
+Reference implementations (the startup sweep): `marketplace_remote` (`waldur_api_client`),
 `waldur_auth_saml2` (`pysaml2`/`xmlschema`), `support` (`atlassian-python-api`),
 `matrix_chat` (`matrix-nio`), `chat/llm_streamer.py` (`openai`).
 
@@ -117,6 +116,23 @@ list_permissions = [permission_factory(PermissionEnum.VIEW_RESOURCE)]
 3. The `import_roles` management command loads permissions.yaml on deployment
 
 See `docs/guides/waldur-permissions.md` for details.
+
+### Media access
+
+Every `FileField`/`ImageField` is served by one endpoint, `/api/media/<uuid>/`,
+which is **deny by default**. Adding a file field therefore means also declaring
+who may download it, in your app's `media_access.py`:
+
+```python
+access.register(
+    access.upload_prefix(Payment, "proof"),
+    access.queryset_rule(Payment, ["proof"], filter_queryset_for_user),
+)
+```
+
+Derive the prefix with `upload_prefix()` / `image_prefix()` -- never hardcode the
+`upload_to` string. `CoverageTest` fails until every file field has a rule.
+See `docs/guides/media-access.md`.
 
 ### Serializers
 
@@ -317,6 +333,7 @@ Detailed guides are in `docs/guides/`:
 - **Testing Guide**: `waldur-testing-guide.md` - Test writing best practices
 - **Code Style**: `waldur-code-style.md` - Formatting and conventions
 - **Permissions**: `waldur-permissions.md` - Permission system details
+- **Media Access**: `media-access.md` - Who may download an uploaded file
 - **Resource Projects**: `resource-projects.md` - ResourceProject model, offering roles, invitations, and RoleAvailability
 - **Build Commands**: `build-commands.md` - Test/lint/build commands
 - **OpenAPI Schema**: `openapi.md` - drf-spectacular customization patterns
@@ -385,15 +402,19 @@ mcp__playwright__browser_take_screenshot --element "Submit button"
 mcp__playwright__browser_resize --width 375 --height 667
 ```
 
-### Jira Issue Workflow
+### Issue Workflow
 
-When working on tasks from Jira (e.g., `https://opennode.atlassian.net/browse/WAL-9564`):
+Issues live in GitLab, in the tracker of the repo they belong to — this repo's are at
+`waldur/waldur-mastermind`. Jira (`WAL-1234`) was the tracker until August 2026; its unresolved
+backlog was migrated here under the `jira-migrated` label, and no new Jira issues are opened.
 
 #### 1. Analyze the Issue
 
-- Fetch issue details using Atlassian MCP tools
+- Fetch issue details with `glab issue view <n>` (`-c` for comments, `-F json` to parse). Use
+  `glab` for all GitLab access — not the `mcp__gitlab__*` tools
 - Determine issue type: **bug** (fix) or **feature/improvement** (other)
 - Check if the issue is already resolved or needs work
+- Comment the analysis on the issue before starting, and set `workflow::in-progress`
 
 #### 2. Prepare the Branch
 
@@ -402,13 +423,15 @@ When working on tasks from Jira (e.g., `https://opennode.atlassian.net/browse/WA
 git checkout develop
 git pull origin develop
 
-# Create appropriate branch
-# For bugs:
-git checkout -b bug/WAL-XXXX
-
-# For features/improvements:
-git checkout -b feature/WAL-XXXX
+# Create appropriate branch, numbered after the issue in THIS repo:
+git checkout -b fix/46-short-desc        # bugs
+git checkout -b feature/46-short-desc    # features/improvements
 ```
+
+Do not use GitLab's "create branch from issue" default (`46-project-credit-ledger`) — it carries
+no repo context, and copying such a name into homeport or docs points it at a different issue.
+When the driving issue lives in **another** repo, leave the number out of the branch name
+entirely (`feature/short-desc`) and qualify it in the commit subject instead.
 
 #### 3. Implement Changes
 
@@ -422,9 +445,16 @@ git checkout -b feature/WAL-XXXX
 # Only add files created/modified as part of this work
 git add <specific-files>
 
-# Commit with proper descriptive message, ticket reference at end of first line
-git commit -m "Add validation for resource quota limits [WAL-XXXX]"
+# Commit with proper descriptive message, issue reference at end of first line
+git commit -m "Add validation for resource quota limits [#46]"
+
+# ...or, when the issue lives in another repo, qualify it — a bare #46 would
+# autolink to THIS project's issue 46, which is unrelated work
+git commit -m "Expose the country list in settings metadata [waldur/waldur-homeport#50]"
 ```
+
+`Closes #46` belongs in the MR description, and only in the MR of the repo that owns the issue,
+so that a docs or frontend MR merging first cannot close a half-finished issue.
 
 **Important**: Do NOT add unrelated files to the commit.
 

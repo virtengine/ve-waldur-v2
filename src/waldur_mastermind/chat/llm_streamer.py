@@ -6,6 +6,7 @@ import time
 
 import httpx
 from constance import config
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db import connections, transaction
 from django.db.models import Max
 from django.utils.translation import gettext_lazy as _
@@ -192,9 +193,15 @@ class LLMStreamer:
         self.accumulated_warning: str = ""
         self.pending_tool_calls: dict[str, dict] = {}
         self.tool_calls: dict[int, dict] = {}
+        # Tool calls the lazy-load guard refused: nothing ran, and no
+        # block is absorbed or persisted for them, so this list is the
+        # only record that the model reached for the tool at all. The
+        # validation harness scores `forbidden_tools` against it.
+        self.rejected_tool_calls: list[dict] = []
         self.user = user
         self.input_tokens = None
         self.output_tokens = None
+        self.model = ""
         self.error = None
         self.thread = thread
         self.original_input = original_input
@@ -253,17 +260,13 @@ class LLMStreamer:
             self._rehydrate_enabled_tools_from_history()
 
         if preload_all_tools:
-            # Pre-load account tools for validation scenarios
-            account_tools = [
-                ToolName.DISPLAY_USER_RESOURCES,
-                ToolName.LIST_ORGANIZATIONS,
-                ToolName.LIST_PROJECTS,
-                ToolName.GET_PROJECT_RESOURCES,
-                ToolName.GET_PROJECT_QUOTA,
-                ToolName.GET_RESOURCE_USAGE,
-            ]
-            for tool_name in account_tools:
-                self._enabled_tool_names.add(tool_name.value)
+            # Validation harness: every registered tool is callable on
+            # turn 0. search_tools is in too — a model that reaches for
+            # it anyway then gets a cheap no-op round instead of the
+            # "not loaded" rejection, which it retries until the cap.
+            self._enabled_tool_names.update(
+                name.value for name in tool_registry.definitions
+            )
 
     def _rehydrate_enabled_tools_from_history(self) -> None:
         """Pre-populate ``_enabled_tool_names`` from prior tool activity.
@@ -338,6 +341,9 @@ class LLMStreamer:
     def _stream_completion(self, messages, include_tools=True, round_num: int = 0):
         """Open a streaming chat completion and yield SDK chunk objects."""
         model = config.AI_ASSISTANT_MODEL
+        # Captured for persistence: the setting is a mutable global, so the
+        # value has to be recorded now, not looked up when the row is saved.
+        self.model = model
         backend_type = config.AI_ASSISTANT_BACKEND_TYPE
         _completion_kwargs = config.AI_ASSISTANT_COMPLETION_KWARGS
         completion_kwargs = (
@@ -980,7 +986,11 @@ class LLMStreamer:
                 {
                     "role": "tool",
                     "tool_call_id": entry["id"],
-                    "content": json.dumps(result_data) if result_data else summary,
+                    # Tools hand back ORM values; a Decimal or date here
+                    # must not take the whole stream down.
+                    "content": json.dumps(result_data, cls=DjangoJSONEncoder)
+                    if result_data
+                    else summary,
                 }
             )
         return followup
@@ -1063,6 +1073,9 @@ class LLMStreamer:
             if tool_name not in self._enabled_tool_names:
                 self._turn_report.append(
                     f"  ⨯ rejected unloaded tool call: {tool_name}"
+                )
+                self.rejected_tool_calls.append(
+                    {"name": tool_name, "arguments": arguments}
                 )
                 # search_tools takes ``categories``, not ``tool_names`` —
                 # look up the unloaded tool's category so the LLM gets a
@@ -1227,12 +1240,14 @@ class LLMStreamer:
         self.assistant_msg.warning = self.accumulated_warning
         self.assistant_msg.input_tokens = self.input_tokens
         self.assistant_msg.output_tokens = self.output_tokens
+        self.assistant_msg.model = self.model
         self.assistant_msg.save(
             update_fields=[
                 "blocks",
                 "warning",
                 "input_tokens",
                 "output_tokens",
+                "model",
                 "modified",
             ]
         )
@@ -1307,6 +1322,7 @@ class LLMStreamer:
                 sequence_index=user_msg.sequence_index + 1,
                 input_tokens=self.input_tokens,
                 output_tokens=self.output_tokens,
+                model=self.model,
             )
         return user_msg, assistant_msg
 

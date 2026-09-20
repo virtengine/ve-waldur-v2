@@ -28,6 +28,14 @@ from waldur_core.users.utils import generate_safe_username
 logger = logging.getLogger(__name__)
 
 
+def is_invitation_scope_unavailable(invitation: models.Invitation) -> bool:
+    """Return True when invitation scope is missing or project is soft-deleted."""
+    scope = invitation.scope
+    if scope is None:
+        return True
+    return bool(getattr(scope, "is_removed", False))
+
+
 @shared_task(name="waldur_core.users.cancel_expired_invitations")
 def cancel_expired_invitations(invitations=None):
     """
@@ -64,10 +72,11 @@ def cancel_expired_invitations(invitations=None):
     ).update(state=InvitationState.EXPIRED)
 
     for invitation in expired_invitations:
-        # Skip invitations where scope was deleted
-        if invitation.scope is None:
+        # Skip invitations where scope was deleted or soft-deleted
+        if is_invitation_scope_unavailable(invitation):
             logger.warning(
-                "Skipping expired invitation notification for %s: scope was deleted",
+                "Skipping expired invitation notification for %s: "
+                "scope was deleted or terminated",
                 invitation.uuid,
             )
             continue
@@ -117,11 +126,11 @@ def send_invitation_created(invitation_uuid, sender):
         update_fields=["execution_state", "error_message", "error_traceback"]
     )
 
-    # Check if scope still exists (it may have been deleted)
-    if invitation.scope is None:
+    # Check if scope still exists or has been soft-deleted (terminated)
+    if is_invitation_scope_unavailable(invitation):
         error_msg = (
             f"Cannot send invitation {invitation_uuid}: "
-            "the related scope has been deleted"
+            "the related scope has been deleted or terminated"
         )
         logger.error(error_msg)
         invitation.error_message = error_msg
@@ -177,7 +186,12 @@ def send_invitation_created(invitation_uuid, sender):
             )
         )
         try:
-            broadcast_mail("users", "invitation_created", context, [invitation.email])
+            broadcast_mail(
+                "users",
+                utils.get_invitation_event_type(invitation),
+                context,
+                [invitation.email],
+            )
 
             invitation.set_ok()
             invitation.save(update_fields=["execution_state"])
@@ -195,10 +209,11 @@ def send_invitation_requested(invitation_uuid, sender):
     """
     invitation = models.Invitation.objects.get(uuid=invitation_uuid)
 
-    # Check if scope still exists (it may have been deleted)
-    if invitation.scope is None:
+    # Check if scope still exists or has been soft-deleted (terminated)
+    if is_invitation_scope_unavailable(invitation):
         logger.error(
-            "Cannot send invitation request %s: the related scope has been deleted",
+            "Cannot send invitation request %s: "
+            "the related scope has been deleted or terminated",
             invitation_uuid,
         )
         return
@@ -227,10 +242,11 @@ def send_invitation_rejected(invitation_uuid, sender):
     """
     invitation = models.Invitation.objects.get(uuid=invitation_uuid)
 
-    # Check if scope still exists (it may have been deleted)
-    if invitation.scope is None:
+    # Check if scope still exists or has been soft-deleted (terminated)
+    if is_invitation_scope_unavailable(invitation):
         logger.error(
-            "Cannot send invitation rejection %s: the related scope has been deleted",
+            "Cannot send invitation rejection %s: "
+            "the related scope has been deleted or terminated",
             invitation_uuid,
         )
         return
@@ -253,10 +269,11 @@ def send_reminder_for_pending_invitations():
         reminder_date = invitation.get_expiration_time() - timedelta(days=1)
         if reminder_date > now:
             continue
-        # Skip invitations where scope was deleted
-        if invitation.scope is None:
+        # Skip invitations where scope was deleted or soft-deleted
+        if is_invitation_scope_unavailable(invitation):
             logger.warning(
-                "Skipping pending invitation reminder for %s: scope was deleted",
+                "Skipping pending invitation reminder for %s: "
+                "scope was deleted or terminated",
                 invitation.uuid,
             )
             continue
@@ -268,6 +285,9 @@ def send_reminder_for_pending_invitations():
         )
         context = utils.get_invitation_context(invitation, sender)
         context["link"] = utils.get_invitation_link(invitation.uuid)
+        context["scope_link"] = utils.get_scope_link(
+            context["type"], invitation.scope.uuid.hex
+        )
         site_link = format_homeport_link()
         context["site_host"] = urlparse(site_link).hostname
         context["reminder"] = True
@@ -280,7 +300,7 @@ def send_reminder_for_pending_invitations():
 
         broadcast_mail(
             "users",
-            "invitation_created",
+            utils.get_invitation_event_type(invitation),
             context,
             [
                 invitation.email,
@@ -326,10 +346,10 @@ def resend_stuck_invitations():
     )
 
     for invitation in stuck_invitations:
-        # Skip invitations where scope was deleted
-        if invitation.scope is None:
+        # Skip invitations where scope was deleted or soft-deleted
+        if is_invitation_scope_unavailable(invitation):
             logger.warning(
-                "Skipping stuck invitation %s: scope was deleted",
+                "Skipping stuck invitation %s: scope was deleted or terminated",
                 invitation.uuid,
             )
             continue
@@ -353,11 +373,11 @@ def resend_stuck_invitations():
 def get_or_create_user(invitation_uuid, sender):
     invitation = models.Invitation.objects.get(uuid=invitation_uuid)
 
-    # Check if scope still exists (it may have been deleted)
-    if invitation.scope is None:
+    # Check if scope still exists or has been soft-deleted (terminated)
+    if is_invitation_scope_unavailable(invitation):
         error_msg = (
             f"Cannot process invitation {invitation_uuid}: "
-            "the related scope has been deleted"
+            "the related scope has been deleted or terminated"
         )
         logger.error(error_msg)
         invitation.error_message = error_msg

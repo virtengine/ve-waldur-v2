@@ -9,6 +9,7 @@ from django.utils import timezone
 from rest_framework import exceptions
 from rest_framework.exceptions import ValidationError
 
+from waldur_core.core.auth_utils import is_pat_auth
 from waldur_core.core.models import User, UserDetailsMatchMixin
 
 from . import enums, models, signals
@@ -36,14 +37,6 @@ def register_expiration_guard(predicate) -> None:
 def is_expiration_exempt(user_role) -> bool:
     """True if any registered guard opts this role out of auto-expiry."""
     return any(guard(user_role) for guard in _expiration_guards)
-
-
-def _is_pat_auth(auth) -> bool:
-    """Check if auth object is a PersonalAccessToken instance.
-
-    Uses class name check to avoid circular imports.
-    """
-    return auth is not None and type(auth).__name__ == "PersonalAccessToken"
 
 
 def _pat_allowed_pairs(auth) -> frozenset:
@@ -104,7 +97,7 @@ def _pat_scope_check(
     if isinstance(request, User):
         return None
     auth = getattr(request, "auth", None)
-    if not _is_pat_auth(auth):
+    if not is_pat_auth(auth):
         return None
     if permission.value not in auth.scopes:
         return False
@@ -120,7 +113,7 @@ def check_pat_staff_scope(request) -> bool:
     STAFF_ACCESS scope.
     """
     auth = getattr(request, "auth", None)
-    if not _is_pat_auth(auth):
+    if not is_pat_auth(auth):
         return True
     return enums.PermissionEnum.STAFF_ACCESS.value in auth.scopes
 
@@ -132,7 +125,7 @@ def check_pat_support_scope(request) -> bool:
     STAFF_ACCESS or SUPPORT_ACCESS scope.
     """
     auth = getattr(request, "auth", None)
-    if not _is_pat_auth(auth):
+    if not is_pat_auth(auth):
         return True
     return (
         enums.PermissionEnum.STAFF_ACCESS.value in auth.scopes
@@ -144,7 +137,17 @@ def has_permission(
     request: "HttpRequest | User",
     permission: enums.PermissionEnum,
     scope: "Model | None",
+    role_index: "dict | None" = None,
 ) -> bool:
+    """Whether the user may exercise ``permission`` on ``scope``.
+
+    ``role_index`` is an optional lookup table from :func:`build_role_index`,
+    for callers checking many scopes in a row. It replaces **only** the final
+    role query — the PAT ceiling, the inactive-user guard and the staff bypass
+    all still run, so a batched caller cannot accidentally widen the answer.
+    A key the index does not cover falls through to the query, which makes an
+    incomplete index a slow answer rather than a wrong one.
+    """
     if isinstance(request, User):
         user = request
     else:
@@ -166,6 +169,12 @@ def has_permission(
     # Handle None scope
     if scope is None:
         return False
+
+    if role_index is not None:
+        ct_id = ContentType.objects.get_for_model(type(scope)).id
+        cached = role_index.get((permission, ct_id, scope.id))
+        if cached is not None:
+            return cached
 
     # Single query with join instead of two separate queries
     return models.UserRole.objects.filter(
@@ -190,7 +199,7 @@ def has_any_permission(
         # PAT ceiling — narrow the permission set to what the PAT carries
         # and reject if the scope falls outside the PAT's entity bindings.
         auth = getattr(request, "auth", None)
-        if _is_pat_auth(auth):
+        if is_pat_auth(auth):
             permissions = [p for p in permissions if p.value in auth.scopes]
             if not permissions:
                 return False
@@ -223,6 +232,51 @@ def has_all_permissions(
     return all(has_permission(request, p, scope) for p in permissions)
 
 
+def has_permission_on_any_source(
+    request: "HttpRequest | User",
+    permission: enums.PermissionEnum,
+    scope: "Model | None",
+    sources: list[str] | None = None,
+) -> bool:
+    """Whether the user holds permission on scope or on any of its named sources.
+
+    `sources` are attribute paths relative to scope, with `"*"` standing for
+    scope itself — e.g. `["*", "customer"]` accepts the permission held either
+    on the object or on its organization. An empty list means scope only.
+
+    This is the traversal `permission_factory` enforces, exposed as a predicate
+    so that a read gate and the write gate it has to agree with can be built
+    from the same rule instead of restating it.
+    """
+    if not scope:
+        return False
+
+    if not sources:
+        return has_permission(request, permission, scope)
+
+    attribute_errors = 0
+    for path in sources:
+        try:
+            source = scope
+            if path != "*":
+                for part in path.split("."):
+                    source = getattr(source, part)
+            if has_permission(request, permission, source):
+                return True
+        except AttributeError:
+            # Continue to next path if attribute doesn't exist
+            attribute_errors += 1
+            continue
+
+    # If all paths failed due to AttributeError, raise AttributeError
+    if attribute_errors == len(sources):
+        raise AttributeError(
+            f"None of the attribute paths {sources} exist on the scope object"
+        )
+
+    return False
+
+
 def permission_factory(permission, sources=None):
     if not isinstance(permission, enums.PermissionEnum):
         raise ValueError(f"permission must be PermissionEnum, got {type(permission)}")
@@ -233,29 +287,8 @@ def permission_factory(permission, sources=None):
         if not scope:
             return
 
-        if not sources:
-            if has_permission(request, permission, scope):
-                return
-        else:
-            attribute_errors = 0
-            for path in sources:
-                try:
-                    source = scope
-                    if path != "*":
-                        for part in path.split("."):
-                            source = getattr(source, part)
-                    if has_permission(request, permission, source):
-                        return
-                except AttributeError:
-                    # Continue to next path if attribute doesn't exist
-                    attribute_errors += 1
-                    continue
-
-            # If all paths failed due to AttributeError, raise AttributeError
-            if attribute_errors == len(sources):
-                raise AttributeError(
-                    f"None of the attribute paths {sources} exist on the scope object"
-                )
+        if has_permission_on_any_source(request, permission, scope, sources):
+            return
 
         raise exceptions.PermissionDenied()
 
@@ -270,7 +303,9 @@ def permission_factory(permission, sources=None):
 def get_users(scope, role_name=None):
     users = models.UserRole.objects.filter(is_active=True, scope=scope)
     if role_name:
-        users = users.filter(role__name=role_name)
+        users = users.filter(
+            Q(role__name=role_name) | Q(role__template__name=role_name)
+        )
     user_ids = users.values_list("user_id", flat=True)
     return User.objects.filter(id__in=user_ids)
 
@@ -282,7 +317,13 @@ def get_users_with_permission(scope, permission):
     return User.objects.filter(id__in=user_ids)
 
 
-def get_scope_ids(user, content_type, role=None, permission=None):
+def get_scope_ids(user, content_type, role=None, permission=None) -> QuerySet[int]:
+    """Ids — not objects — of the scopes the user holds a role on.
+
+    Callers routinely feed this to ``filter(scope__in=...)``, which works with
+    ids. A membership test does not: ``obj in <queryset of ints>`` is neither a
+    type error nor a runtime error, it is silently False.
+    """
     qs = models.UserRole.objects.filter(
         is_active=True, user=user, content_type=content_type
     )
@@ -298,7 +339,9 @@ def get_scope_ids(user, content_type, role=None, permission=None):
             else:
                 # This is a string (like RoleEnum) - use directly
                 role_names.append(r)
-        qs = qs.filter(role__name__in=role_names)
+        qs = qs.filter(
+            Q(role__name__in=role_names) | Q(role__template__name__in=role_names)
+        )
     if permission:
         qs = qs.filter(role__permissions__permission=permission)
     return qs.order_by().values_list("object_id", flat=True).distinct()
@@ -312,11 +355,11 @@ def get_user_ids(content_type, scope_ids, role=None):
     )
     if role:
         if isinstance(role, models.Role):
-            qs = qs.filter(role=role)
+            qs = qs.filter(Q(role=role) | Q(role__template=role))
         else:
             if not isinstance(role, list | tuple):
                 role = [role]
-            qs = qs.filter(role__name__in=role)
+            qs = qs.filter(Q(role__name__in=role) | Q(role__template__name__in=role))
     return qs.values_list("user_id", flat=True)
 
 
@@ -329,17 +372,24 @@ def count_users(scope):
     )
 
 
-def has_user(scope, user, role=None, expiration_time=False):
+def has_user(scope, user, role=None, expiration_time=False, *, match_clones=True):
     """
     Checks whether user has role in entity.
     `expiration_time` can have the following values:
         - False (default) - check whether user has role in entity regardless of expiration.
         - None - check whether user has permanent role in entity.
         - Datetime object - check whether user will have role in entity at specific timestamp.
+    By default a role cloned from `role` (an organization-scoped clone, linked via
+    `Role.template`) also satisfies the check; the reverse never does. Pass
+    `match_clones=False` where role identity itself is checked, e.g. duplicate-grant
+    guards — otherwise a template holder could never be granted the clone.
     """
     qs = models.UserRole.objects.filter(is_active=True, user=user, scope=scope)
     if role:
-        qs = qs.filter(role=role)
+        if match_clones:
+            qs = qs.filter(Q(role=role) | Q(role__template=role))
+        else:
+            qs = qs.filter(role=role)
     if expiration_time is None:
         qs = qs.filter(expiration_time=None)
     elif expiration_time is not False:
@@ -401,6 +451,11 @@ def get_scope_ancestors(scope):
     Resource → Offering / Project → Customer.
     ResourceProject → Resource → … (chain above).
     """
+    if isinstance(scope, User):
+        # A user has no scope ancestors: identity is the whole chain. The
+        # hasattr probing below must never wander into reverse accessors of
+        # the user model.
+        return [scope]
     ancestors = [scope]
     if hasattr(scope, "resource"):  # ResourceProject -> Resource
         ancestors.append(scope.resource)
@@ -428,9 +483,12 @@ def count_active_project_managers(project):
     return (
         models.UserRole.objects.filter(
             scope=project,
-            role__name=enums.RoleEnum.PROJECT_MANAGER,
             is_active=True,
             user__is_active=True,
+        )
+        .filter(
+            Q(role__name=enums.RoleEnum.PROJECT_MANAGER)
+            | Q(role__template__name=enums.RoleEnum.PROJECT_MANAGER)
         )
         .filter(Q(expiration_time=None) | Q(expiration_time__gte=now))
         .count()
@@ -444,11 +502,28 @@ def validate_only_one_project_manager(scope, role):
     if scope._meta.model_name != "project":
         return
 
-    if role.name != enums.RoleEnum.PROJECT_MANAGER:
+    is_manager_role = role.name == enums.RoleEnum.PROJECT_MANAGER or (
+        role.template_id is not None
+        and role.template.name == enums.RoleEnum.PROJECT_MANAGER
+    )
+    if not is_manager_role:
         return
 
     if count_active_project_managers(scope) >= 1:
         raise ValidationError("Project already has an active project manager.")
+
+
+def validate_single_role_per_scope(scope, user):
+    """Reject a second role in one scope when INVITATION_DISABLE_MULTIPLE_ROLES is on.
+
+    Unlike the duplicate-grant guard in ``validate_role_grant``, this counts any
+    active role the user holds in ``scope``, not only the one being granted.
+    """
+    if not config.INVITATION_DISABLE_MULTIPLE_ROLES:
+        return
+
+    if has_user(scope, user):
+        raise ValidationError("User already has role within this scope.")
 
 
 def check_grant_policy(scope, role):
@@ -493,6 +568,24 @@ def check_grant_policy(scope, role):
         raise ValidationError("Role is concealed for this organization.")
 
 
+def validate_scope_available(scope):
+    """Reject a grant on a scope that does not accept role assignments.
+
+    Currently only marketplace offerings: a private (non-shared) offering is
+    owned by a single organization and its roles are not handed out, which
+    ``UserRoleCreateSerializer.validate`` already enforces on the direct
+    add_user path. Checked here as well so the invitation path
+    (``Invitation.accept``) and ``PermissionRequest.approve`` cannot be used to
+    reach the same grant through the back door.
+
+    Guarded on the attribute rather than the model because this helper is
+    generic across every scope type in TYPE_MAP; only Offering defines
+    ``shared``.
+    """
+    if getattr(scope, "shared", None) is False:
+        raise ValidationError("Offering is not available.")
+
+
 def validate_role_grant(scope, user, role, expiration_time=None):
     """Validate a role can be granted to a user on scope.
 
@@ -501,7 +594,7 @@ def validate_role_grant(scope, user, role, expiration_time=None):
     same invariants. Permission/auth checks stay with the caller — this helper
     only validates the (scope, user, role) triple.
     """
-    if has_user(scope, user, role, expiration_time=expiration_time):
+    if has_user(scope, user, role, expiration_time=expiration_time, match_clones=False):
         raise ValidationError("User has already the same role in this scope.")
 
     if not isinstance(scope, role.content_type.model_class()):
@@ -510,8 +603,11 @@ def validate_role_grant(scope, user, role, expiration_time=None):
     if not role.is_active:
         raise ValidationError("Role is not active.")
 
+    validate_scope_available(scope)
+
     check_grant_policy(scope, role)
 
+    validate_single_role_per_scope(scope, user)
     validate_only_one_project_manager(scope, role)
     validate_user_restrictions(scope, user)
 
@@ -550,13 +646,47 @@ def ensure_unique_role_name(name, exclude_id=None):
     return f"{name}-{index}"
 
 
-def add_user(scope, user, role, created_by=None, expiration_time=None, force=False):
+# Prefixes of ``UserRole.source`` values whose grants and revocations must not
+# email anyone: machine-driven membership syncs that would otherwise notify on
+# every change. The events are still logged. Apps register their prefixes in
+# ``AppConfig.ready``.
+QUIET_GRANT_SOURCE_PREFIXES: set[str] = set()
+
+
+def register_quiet_grant_source(prefix: str) -> None:
+    QUIET_GRANT_SOURCE_PREFIXES.add(prefix)
+
+
+def is_quiet_grant_source(source: str) -> bool:
+    return bool(source) and any(
+        source.startswith(prefix) for prefix in QUIET_GRANT_SOURCE_PREFIXES
+    )
+
+
+def add_user(
+    scope,
+    user,
+    role,
+    created_by=None,
+    expiration_time=None,
+    force=False,
+    source="",
+    reason=None,
+):
     """Grant ``role`` to ``user`` on ``scope`` (low-level write primitive).
 
     Enforces the org-scoping policy (:func:`check_grant_policy`) so direct
     callers that bypass ``validate_role_grant`` still respect availability and
     concealment. Pass ``force=True`` for the few internal grants that must bypass
     the policy (e.g. onboarding's initial owner grant).
+
+    ``source`` records the provenance of a machine-issued grant (e.g.
+    ``rule:<uuid>``) and is what makes automatic revocation safe: reconciliation
+    only ever touches rows it recognises as its own. ``reason`` is carried into
+    the audit event, so an automatic grant can say what caused it instead of the
+    generic "System-initiated role assignment". Both are appended last on
+    purpose — several callers pass ``created_by`` and ``expiration_time``
+    positionally.
     """
     if not force:
         check_grant_policy(scope, role)
@@ -568,16 +698,20 @@ def add_user(scope, user, role, created_by=None, expiration_time=None, force=Fal
         object_id=scope.id,
         expiration_time=expiration_time,
         created_by=created_by,
+        source=source,
     )
     signals.role_granted.send(
         sender=models.UserRole,
         instance=permission,
         current_user=created_by,
+        reason=reason,
     )
     return permission
 
 
-def add_user_or_skip(scope, user, role, created_by=None, expiration_time=None):
+def add_user_or_skip(
+    scope, user, role, created_by=None, expiration_time=None, source="", reason=None
+):
     """Grant ``role`` respecting the org-scoping policy, skipping on rejection.
 
     For non-interactive callers — signal handlers, auto-provisioning, group sync,
@@ -587,7 +721,13 @@ def add_user_or_skip(scope, user, role, created_by=None, expiration_time=None):
     """
     try:
         return add_user(
-            scope, user, role, created_by=created_by, expiration_time=expiration_time
+            scope,
+            user,
+            role,
+            created_by=created_by,
+            expiration_time=expiration_time,
+            source=source,
+            reason=reason,
         )
     except ValidationError as exc:
         logger.warning(
@@ -803,6 +943,11 @@ def holds_any_role_on_scope_or_ancestor(user, scope) -> bool:
         return False
     if user.is_staff or user.is_support:
         return True
+    if isinstance(scope, User):
+        # Self-referential user scope: identity, not a UserRole. A user may
+        # always bind to themselves; binding to anyone else is staff/support
+        # only (handled above).
+        return scope.id == user.id
     keys = scope_keys_for(scope)
     if not keys:
         return False
@@ -811,6 +956,44 @@ def holds_any_role_on_scope_or_ancestor(user, scope) -> bool:
         .filter(scope_keys_q(keys))
         .exists()
     )
+
+
+def build_role_index(user, pairs) -> dict:
+    """Answer many ``has_permission`` checks for one user in a few queries.
+
+    The scope axis of :func:`users_with_role_on_any_scope_key`: that one asks
+    "which of these users hold a role in this scope chain", this one asks
+    "which of these scopes does this user hold each permission on". Takes an
+    iterable of ``(permission, scope)`` pairs and returns a dict keyed
+    ``(permission, content_type_id, object_id)``, suitable for passing to
+    ``has_permission(..., role_index=index)``.
+
+    One query per **distinct permission**, not per pair, so the cost is flat in
+    the number of scopes. Callers may over-collect: a pair that never gets
+    checked only widens an ``object_id IN (...)``, while a pair that is checked
+    but missing from the index falls back to its own query.
+    """
+    scopes_by_permission: dict = {}
+    for permission, scope in pairs:
+        if permission is None or scope is None:
+            continue
+        ct_id = ContentType.objects.get_for_model(type(scope)).id
+        scopes_by_permission.setdefault(permission, set()).add((ct_id, scope.id))
+
+    index: dict = {}
+    for permission, scope_keys in scopes_by_permission.items():
+        for ct_id, object_id in scope_keys:
+            index[(permission, ct_id, object_id)] = False
+        held = (
+            models.UserRole.objects.filter(
+                user=user, is_active=True, role__permissions__permission=permission
+            )
+            .filter(scope_keys_q(scope_keys))
+            .values_list("content_type_id", "object_id")
+        )
+        for ct_id, object_id in held:
+            index[(permission, ct_id, object_id)] = True
+    return index
 
 
 def users_with_role_on_any_scope_key(user_ids, scope_keys) -> set[int]:

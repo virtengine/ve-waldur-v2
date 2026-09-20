@@ -8,7 +8,7 @@ from waldur_core.logging.enums import EventType
 from waldur_core.structure.models import Customer, Project
 from waldur_mastermind.support.models import Issue
 
-from . import models, tasks
+from . import backend, models, tasks
 
 
 def get_issue_scopes(issue: Issue) -> set:
@@ -147,16 +147,17 @@ def send_comment_added_notification(
     if comment.is_forwarded:
         return
 
-    # Skip notifications about comments added to an issue by caller himself
-    if comment.author.user == comment.issue.caller:
-        return
+    # A comment from the caller is not sent back to them: the task routes it to
+    # whoever works the ticket instead. An edit of their own comment still
+    # notifies nobody, which is what it did before.
+    is_caller_comment = comment.author.user == comment.issue.caller
 
     serialized_comment = core_utils.serialize_instance(comment)
     if created:
         transaction.on_commit(
             lambda: tasks.send_comment_added_notification.delay(serialized_comment)
         )
-    else:
+    elif not is_caller_comment:
         old_description = comment.tracker.previous("description")
         if old_description != comment.description:
             transaction.on_commit(
@@ -164,6 +165,38 @@ def send_comment_added_notification(
                     serialized_comment, old_description
                 )
             )
+
+
+def send_issue_created_notification(
+    sender, instance: models.Issue, created=False, **kwargs
+):
+    """Tell helpdesk personnel that a new support request has arrived.
+
+    Only for the built-in service desk. Atlassian, Zammad and SMAX notify their
+    own agents, so announcing the ticket again from Waldur would double up.
+    """
+    if created:
+        # The basic backend creates an issue in two saves — first without a
+        # backend id, then with one — so the ticket does not properly exist yet.
+        # Wait for the key, the same way log_issue_save decides an issue was
+        # really created.
+        return
+
+    if not instance.key or not instance.tracker.has_changed("key"):
+        return
+
+    if config.WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE != backend.SupportBackendType.BASIC:
+        return
+
+    if instance.provider_helpdesk_id:
+        # A ticket routed to a provider is a child issue that also passes
+        # through BasicBackend.create_issue when that helpdesk is of type
+        # basic. It belongs to the provider, who gets notify_provider_new_ticket
+        # instead — the operator's staff should not be told twice.
+        return
+
+    issue_id = instance.id
+    transaction.on_commit(lambda: tasks.notify_staff_new_issue.delay(issue_id))
 
 
 def send_issue_updated_notification(
@@ -177,6 +210,13 @@ def send_issue_updated_notification(
 
     # Skip notification if issue is not created on backend yet.
     if not instance.backend_id:
+        return
+
+    if not instance.tracker.previous("backend_id"):
+        # This is the save that materialised the ticket: the backend creates an
+        # issue in two saves — first without a backend id, then with one, along
+        # with the key and the default status. Nothing has been updated yet, so
+        # the caller must not be told that it has.
         return
 
     # Skip notifications if assignee or modification date changed
@@ -283,16 +323,23 @@ def dispatch_routing_on_issue_create(
         instance.tracker.has_changed("backend_id")
         and not instance.tracker.previous("backend_id")
     ):
-        # Only route if resource is already attached
-        if instance.resource_object_id:
+        # Route if a resource or an offering is already attached; either is
+        # enough to resolve the provider (see resolve_routing_offering).
+        if instance.resource_object_id or instance.offering_id:
             should_route = True
 
-    # Scenario 2: resource first attached to existing issue
-    if (
-        not created
-        and instance.resource_object_id
-        and instance.tracker.has_changed("resource_object_id")
-        and not instance.tracker.previous("resource_object_id")
+    # Scenario 2: a resource or an offering is first attached to an existing issue
+    if not created and (
+        (
+            instance.resource_object_id
+            and instance.tracker.has_changed("resource_object_id")
+            and not instance.tracker.previous("resource_object_id")
+        )
+        or (
+            instance.offering_id
+            and instance.tracker.has_changed("offering_id")
+            and not instance.tracker.previous("offering_id")
+        )
     ):
         should_route = True
 

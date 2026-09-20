@@ -31,13 +31,28 @@ def update_estimate_when_invoice_is_created(
     transaction.on_commit(lambda: update_estimates_for_customer(instance.customer))
 
 
-def update_estimates_for_customer(customer):
-    projects = list(Project.available_objects.filter(customer=customer))
-    scopes = [customer] + projects
+def update_estimates_for_scopes(scopes):
+    """Recompute the stored total for each given customer or project.
+
+    Each scope costs one aggregate over the month's invoice items, so callers
+    that know which projects changed should pass only those.
+    """
     for scope in scopes:
         estimate, _ = models.PriceEstimate.objects.get_or_create(scope=scope)
+        # Prime the generic relation with the object the caller already holds.
+        # update_total() reads both `scope` and `content_type`, and on the get
+        # branch neither is cached, so each estimate would otherwise re-fetch
+        # its own scope row plus a ContentType — two queries per scope for data
+        # already in memory. Assigning the GFK caches content_type too, via
+        # ContentType.objects.get_for_model, which is process-cached.
+        estimate.scope = scope
         estimate.update_total()
         estimate.save(update_fields=["total"])
+
+
+def update_estimates_for_customer(customer):
+    projects = list(Project.available_objects.filter(customer=customer))
+    update_estimates_for_scopes([customer] + projects)
 
 
 def process_invoice_item(sender, instance: InvoiceItem, created=False, **kwargs):

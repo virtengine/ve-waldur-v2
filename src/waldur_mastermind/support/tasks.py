@@ -3,7 +3,6 @@ import logging
 from datetime import timedelta
 from smtplib import SMTPException
 
-import html2text
 from celery import shared_task
 from constance import config
 from django.core import signing
@@ -11,6 +10,7 @@ from django.db.models import Q
 from django.template import Context, Template
 from django.template.loader import get_template
 from django.utils import timezone
+from markdownify import markdownify
 
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
@@ -94,8 +94,23 @@ def send_comment_added_notification(serialized_comment):
     ):
         is_system_comment = True
 
+    issue = comment.issue
+    author = comment.author.user if comment.author_id else None
+
+    if author is None and issue.caller is None:
+        # Neither side is a known user, which happens for comments imported from
+        # a remote service desk. There is nobody to tell, and letting this fall
+        # through would queue a send that can only log a warning and give up.
+        return
+
+    if author == issue.caller:
+        # The customer replied. Before this, their comment reached nobody: the
+        # only comment notification went to the caller, who is the author here.
+        notify_helpdesk_new_comment(comment)
+        return
+
     _send_issue_notification(
-        issue=comment.issue,
+        issue=issue,
         template="comment_added",
         extra_context={
             "comment": comment,
@@ -104,6 +119,51 @@ def send_comment_added_notification(serialized_comment):
         },
         notification_key="support.notification_comment_added",
     )
+
+
+def notify_helpdesk_new_comment(comment):
+    """Tell whoever works the ticket that its caller has commented."""
+    issue = comment.issue
+
+    # `broadcast_mail` consults only the Notification row, where `_send_email`
+    # checks this as well. Without it a deployment with support switched off
+    # would still mail its whole staff roster.
+    if not config.WALDUR_SUPPORT_ENABLED:
+        return
+
+    if config.WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE != backend.SupportBackendType.BASIC:
+        # Atlassian, Zammad and SMAX show the comment to their own agents.
+        return
+
+    if issue.provider_helpdesk_id:
+        # A ticket routed to a provider is announced by
+        # `notify_provider_customer_comment` instead.
+        return
+
+    recipients = get_caller_comment_recipients(comment)
+    if not recipients:
+        logger.info(
+            "Nobody is available to notify about a comment on issue %s.", issue.key
+        )
+        return
+
+    try:
+        broadcast_mail(
+            "support",
+            "notification_comment_added_staff",
+            {
+                "issue": issue,
+                "comment": comment,
+                "issue_url": core_utils.format_homeport_link(
+                    "support/issue/{uuid}/", uuid=issue.uuid
+                ),
+            },
+            recipients,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to notify the helpdesk about a comment on issue %s", issue.key
+        )
 
 
 @shared_task(name="waldur_mastermind.support.send_comment_updated_notification")
@@ -180,9 +240,7 @@ def _send_email(
     for k in list(text_context):
         if k.startswith("format_"):
             if html_format:
-                text_context[k.replace("format_", "")] = html2text.html2text(
-                    text_context[k]
-                )
+                text_context[k.replace("format_", "")] = markdownify(text_context[k])
             else:
                 text_context[k.replace("format_", "")] = text_context[k]
 
@@ -296,6 +354,31 @@ def sync_issues():
     backend.get_active_backend().sync_issues()
 
 
+def resolve_routing_offering(issue):
+    """Offering that determines provider routing for an issue.
+
+    Prefers the offering linked directly on the issue (a ticket opened about an
+    offering, possibly with no resource); otherwise derives it from the attached
+    resource's marketplace offering.
+    """
+    from waldur_mastermind.marketplace import models as marketplace_models
+
+    if issue.offering_id:
+        return issue.offering
+
+    resource = issue.resource
+    if not resource:
+        return None
+
+    if isinstance(resource, marketplace_models.Resource):
+        return resource.offering
+
+    marketplace_resource = marketplace_models.Resource.objects.filter(
+        scope=resource
+    ).first()
+    return marketplace_resource.offering if marketplace_resource else None
+
+
 @shared_task(
     name="waldur_mastermind.support.route_issue_to_provider",
     bind=True,
@@ -315,30 +398,18 @@ def route_issue_to_provider(self, issue_id):
         logger.info("Issue %s already routed, skipping.", issue.key)
         return
 
-    # Resolve: Issue -> resource -> Offering -> ServiceProvider -> ProviderHelpdesk
-    resource = issue.resource
-    if not resource:
-        logger.info("Issue %s has no resource, stays with operator.", issue.key)
-        return
-
+    # Resolve: Issue -> Offering -> ServiceProvider -> ProviderHelpdesk.
+    # The offering is the routing determinant; it comes either from the issue
+    # directly (e.g. a ticket opened from an offering, no resource) or from the
+    # attached resource's offering.
     from waldur_mastermind.marketplace import models as marketplace_models
 
-    # Find the marketplace resource and its offering
-    marketplace_resource = None
-    if isinstance(resource, marketplace_models.Resource):
-        marketplace_resource = resource
-    else:
-        marketplace_resource = marketplace_models.Resource.objects.filter(
-            scope=resource
-        ).first()
-
-    if not marketplace_resource:
-        logger.info("No marketplace resource found for issue %s.", issue.key)
-        return
-
-    offering = marketplace_resource.offering
+    resource = issue.resource
+    offering = resolve_routing_offering(issue)
     if not offering or not offering.customer:
-        logger.info("No offering/customer found for issue %s.", issue.key)
+        logger.info(
+            "No routable offering for issue %s, stays with operator.", issue.key
+        )
         return
 
     try:
@@ -476,6 +547,93 @@ def reroute_issue_to_provider(issue, new_helpdesk):
     return new_child, old_helpdesks
 
 
+def get_helpdesk_personnel():
+    """The people who work the operator's helpdesk, as users.
+
+    `is_staff or is_support` is the predicate the support app uses everywhere
+    for helpdesk personnel; `SupportUser` is not a usable roster on the built-in
+    backend, where rows only appear incidentally when somebody comments or
+    resolves. Honours each user's own notification opt-out.
+    """
+    return (
+        core_models.User.objects.filter(is_active=True, notifications_enabled=True)
+        .filter(Q(is_staff=True) | Q(is_support=True))
+        .exclude(email="")
+    )
+
+
+def get_caller_comment_recipients(comment) -> list[str]:
+    """Who to tell that the person who raised the ticket has replied.
+
+    The assignee owns the ticket once it has one, so they alone are told;
+    otherwise nobody in particular owns it yet and the whole helpdesk hears.
+    The author never gets their own comment back, which matters when a staff
+    member raised the ticket themselves.
+    """
+    issue = comment.issue
+    author = comment.author.user if comment.author_id else None
+
+    assignee = issue.assignee.user if issue.assignee_id else None
+    if (
+        assignee is not None
+        and assignee != author
+        and assignee.is_active
+        and assignee.notifications_enabled
+        and assignee.email
+    ):
+        return [assignee.email]
+
+    # No reachable assignee: an agent who has left, or who switched
+    # notifications off, must not swallow the reply. Fall back to the whole
+    # helpdesk, the way the new-ticket notification does.
+
+    personnel = get_helpdesk_personnel()
+    if author is not None:
+        personnel = personnel.exclude(pk=author.pk)
+    return list(personnel.values_list("email", flat=True).distinct())
+
+
+def get_helpdesk_personnel_emails() -> list[str]:
+    """Addresses of the people who work the operator's helpdesk."""
+    return list(get_helpdesk_personnel().values_list("email", flat=True).distinct())
+
+
+@shared_task(name="waldur_mastermind.support.notify_staff_new_issue")
+def notify_staff_new_issue(issue_id):
+    """Tell helpdesk personnel that a support request has been created.
+
+    Only the built-in service desk uses this: Atlassian, Zammad and SMAX notify
+    their own agents, and a ticket routed to a provider helpdesk is announced by
+    `notify_provider_new_ticket` instead.
+    """
+    try:
+        issue = models.Issue.objects.select_related(
+            "caller", "customer", "project"
+        ).get(id=issue_id)
+    except models.Issue.DoesNotExist:
+        return
+
+    recipients = get_helpdesk_personnel_emails()
+    if not recipients:
+        logger.info(
+            "No staff or support user is available to notify about issue %s.",
+            issue.key,
+        )
+        return
+
+    try:
+        broadcast_mail(
+            "support",
+            "notification_issue_created",
+            {"issue": issue},
+            recipients,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to send new issue notification for issue %s", issue.key
+        )
+
+
 @shared_task(name="waldur_mastermind.support.notify_provider_new_ticket")
 def notify_provider_new_ticket(issue_id):
     """Notify provider about a new ticket routed to their helpdesk."""
@@ -598,13 +756,41 @@ def notify_provider_sla_warning(issue_id):
 
 @shared_task(name="waldur_mastermind.support.notify_ticket_escalated")
 def notify_ticket_escalated(issue_id, reason):
-    """Notify operator staff that a ticket has been escalated."""
+    """Notify operator staff that a ticket has been escalated.
+
+    Only for the built-in service desk, for the same reason as
+    `notify_staff_new_issue`: Atlassian, Zammad and SMAX reach their agents in
+    their own system. `notify_provider_escalation` tells the provider side.
+    """
     try:
         issue = models.Issue.objects.get(id=issue_id)
     except models.Issue.DoesNotExist:
         return
 
     logger.info("Issue %s has been escalated. Reason: %s", issue.key, reason)
+
+    if config.WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE != backend.SupportBackendType.BASIC:
+        return
+
+    recipients = get_helpdesk_personnel_emails()
+    if not recipients:
+        logger.info(
+            "No staff or support user is available to notify about the escalation of issue %s.",
+            issue.key,
+        )
+        return
+
+    try:
+        broadcast_mail(
+            "support",
+            "notification_issue_escalated",
+            {"issue": issue, "reason": reason},
+            recipients,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to send escalation notification for issue %s", issue.key
+        )
 
 
 @shared_task(name="waldur_mastermind.support.notify_provider_escalation")
@@ -653,7 +839,7 @@ def forward_comment_to_child(comment_id):
     child_issues = parent_issue.child_issues.all()
 
     for child_issue in child_issues:
-        models.Comment.objects.create(
+        child_comment = models.Comment.objects.create(
             issue=child_issue,
             author=comment.author,
             description=comment.description,
@@ -665,6 +851,9 @@ def forward_comment_to_child(comment_id):
             parent_issue.key,
             child_issue.key,
         )
+        # The provider reads the forwarded copy in their own ticket, but only
+        # learns it is there if they are told.
+        notify_provider_customer_comment.delay(child_comment.id)
 
 
 @shared_task(name="waldur_mastermind.support.propagate_comment_to_parent")
@@ -744,3 +933,5 @@ def check_sla_warnings():
 
     for issue in approaching:
         logger.warning("Issue %s is approaching SLA deadline.", issue.key or issue.uuid)
+        if issue.provider_helpdesk_id:
+            notify_provider_sla_warning.delay(issue.id)

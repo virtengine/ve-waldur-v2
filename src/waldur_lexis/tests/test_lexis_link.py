@@ -11,7 +11,7 @@ from waldur_mastermind.marketplace.enums import RobotAccountStates
 from waldur_mastermind.marketplace.tests import factories, fixtures
 
 
-class LexisLinkCreateTest(test.APITransactionTestCase):
+class LexisLinkCreateTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = fixtures.MarketplaceFixture()
         self.resource = self.fixture.resource
@@ -28,6 +28,7 @@ class LexisLinkCreateTest(test.APITransactionTestCase):
                 "heappe_username": "heappe_user",
                 "heappe_cluster_id": 1,
                 "heappe_local_base_path": "~/",
+                "heappe_identifier": "example-cluster",
                 "scratch_project_directory": "/scratch/projects",
                 "project_permanent_directory": "/permanent/projects",
             }
@@ -213,3 +214,4 @@ class LexisLinkCreateTest(test.APITransactionTestCase):
         self.assertEqual(config.heappe_username, "heappe_user")
         self.assertEqual(config.heappe_cluster_id, 1)
         self.assertEqual(config.heappe_local_base_path, "~/")
+        self.assertEqual(config.heappe_identifier, "example-cluster")

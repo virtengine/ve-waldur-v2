@@ -19,6 +19,7 @@ from waldur_core.structure import models as structure_models
 from waldur_core.structure.signals import resource_imported
 from waldur_kubernetes.backend import KubernetesBackend
 from waldur_mastermind.common import utils as common_utils
+from waldur_mastermind.marketplace_openstack.utils import delete_instance
 from waldur_openstack import models as openstack_models
 from waldur_openstack.views import MarketplaceInstanceViewSet
 from waldur_rancher.enums import (
@@ -157,8 +158,8 @@ class CreateNodeTask(core_tasks.Task):
 
 class DeleteNodeTask(core_tasks.Task):
     def execute(self, instance: models.Node, user_id: str):
+        # user_id is retained for Celery signature compatibility with callers.
         node = instance
-        user = User.objects.get(pk=user_id)
         vm = node.instance
 
         backend = node.get_backend()
@@ -180,16 +181,12 @@ class DeleteNodeTask(core_tasks.Task):
             time.sleep(5)
 
         if vm:
-            view = MarketplaceInstanceViewSet.as_view({"delete": "force_destroy"})
-            response = common_utils.delete_request(
-                view,
-                user,
-                uuid=vm.uuid.hex,
-                query_params={"delete_volumes": True},
+            logger.info(
+                "Scheduling deletion of OpenStack instance %s for Rancher node %s",
+                vm.uuid,
+                node.uuid,
             )
-
-            if response.status_code != status.HTTP_202_ACCEPTED:
-                raise exceptions.RancherException(response.data)
+            delete_instance(vm, {"delete_volumes": True})
         else:
             backend = node.get_backend()
             backend.delete_node(node)
@@ -560,7 +557,9 @@ def sync_rancher_roles():
             existing_role.save(update_fields=["display_name"])
 
     clusters = models.Cluster.objects.filter(state=CoreStates.OK)
-    rancher_settings_ids = clusters.values_list("settings", flat=True).distinct()
+    rancher_settings_ids = (
+        clusters.order_by().values_list("settings", flat=True).distinct()
+    )
     for rancher_settings_id in rancher_settings_ids:
         settings = structure_models.ServiceSettings.objects.get(id=rancher_settings_id)
         try:
@@ -584,7 +583,9 @@ def delete_leftover_keycloak_groups():
     Delete remote Keycloak groups with no linked groups in Waldur
     """
     clusters = models.Cluster.objects.filter(state=CoreStates.OK)
-    rancher_settings_ids = clusters.values_list("settings", flat=True).distinct()
+    rancher_settings_ids = (
+        clusters.order_by().values_list("settings", flat=True).distinct()
+    )
     for rancher_settings_id in rancher_settings_ids:
         settings = structure_models.ServiceSettings.objects.get(id=rancher_settings_id)
         try:
@@ -627,7 +628,9 @@ def delete_leftover_keycloak_memberships():
     Delete remote Keycloak user memberships in groups with no linked instances in Waldur
     """
     clusters = models.Cluster.objects.filter(state=CoreStates.OK)
-    rancher_settings_ids = clusters.values_list("settings", flat=True).distinct()
+    rancher_settings_ids = (
+        clusters.order_by().values_list("settings", flat=True).distinct()
+    )
     for rancher_settings_id in rancher_settings_ids:
         settings = structure_models.ServiceSettings.objects.get(id=rancher_settings_id)
         try:

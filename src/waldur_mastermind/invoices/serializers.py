@@ -19,6 +19,7 @@ from waldur_core.structure import serializers as structure_serializers
 from waldur_core.structure.managers import filter_queryset_for_user
 from waldur_mastermind.common.mixins import PRICE_DECIMAL_PLACES, PRICE_MAX_DIGITS
 from waldur_mastermind.common.utils import quantize_price
+from waldur_mastermind.marketplace import billing_mode
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.enums import BillingTypes
 
@@ -28,7 +29,9 @@ from . import log, models, utils
 class ResourceLimitPeriod(serializers.Serializer):
     start = serializers.CharField(help_text="Start date of the resource limit period")
     end = serializers.CharField(help_text="End date of the resource limit period")
-    quantity = serializers.IntegerField(
+    # A component may allow fractional limits, and this serializer is what the
+    # generated clients are typed from for details.resource_limit_periods.
+    quantity = serializers.FloatField(
         help_text="Quantity of resources consumed during this period"
     )
     billing_periods = serializers.IntegerField(help_text="Number of billing periods")
@@ -83,8 +86,10 @@ class InvoiceItemSerializer(serializers.HyperlinkedModelSerializer):
 
     def get_billing_type(self, item: models.InvoiceItem) -> str:
         plan_component = item.get_plan_component()
-        if plan_component:
-            return plan_component.component.billing_type
+        if plan_component and plan_component.component:
+            return billing_mode.resolve_component(
+                plan_component.component, plan_component.plan
+            ).billing_type
 
     def get_credit(self, item: models.InvoiceItem) -> bool:
         return item.credit is not None
@@ -229,8 +234,11 @@ class InvoiceItemUpdateSerializer(serializers.HyperlinkedModelSerializer):
 
         if self.instance:
             plan_component = self.instance.get_plan_component()
-            if plan_component:
-                if plan_component.component.billing_type == BillingTypes.FIXED:
+            if plan_component and plan_component.component:
+                effective = billing_mode.resolve_component(
+                    plan_component.component, plan_component.plan
+                )
+                if effective.billing_type == BillingTypes.FIXED:
                     del fields["quantity"]
                 else:
                     del fields["start"]
@@ -243,30 +251,37 @@ class InvoiceItemUpdateSerializer(serializers.HyperlinkedModelSerializer):
         """
         invoice_item = instance
         plan_component = invoice_item.get_plan_component()
-        if plan_component:
+        if plan_component and plan_component.component:
             offering_component = plan_component.component
-            if offering_component.billing_type == BillingTypes.USAGE:
+            effective = billing_mode.resolve_component(
+                offering_component, plan_component.plan
+            )
+            if effective.billing_type == BillingTypes.USAGE:
                 resource = invoice_item.resource
                 if not resource:
                     raise ValidationError(
                         _("Marketplace resource is not defined in invoice item.")
                     )
-                component_usage = (
-                    marketplace_models.ComponentUsage.objects.filter(
-                        resource=resource,
-                        component=offering_component,
-                        billing_period__year=invoice_item.invoice.year,
-                        billing_period__month=invoice_item.invoice.month,
-                    )
-                    .order_by("date")
-                    .last()
+                component_usages = marketplace_models.ComponentUsage.objects.filter(
+                    resource=resource,
+                    component=offering_component,
+                    billing_period__year=invoice_item.invoice.year,
+                    billing_period__month=invoice_item.invoice.month,
                 )
+                # After a plan switch the month holds one usage row per plan
+                # period; edit the row behind this item, not its sibling.
+                plan_period_uuid = (invoice_item.details or {}).get("plan_period_uuid")
+                if plan_period_uuid:
+                    component_usages = component_usages.filter(
+                        plan_period__uuid=plan_period_uuid
+                    )
+                component_usage = component_usages.order_by("date").last()
                 if not component_usage:
                     raise ValidationError(_("Component usage is not found."))
                 quantity = validated_data.get("quantity")
                 component_usage.usage = quantity
                 component_usage.save(update_fields=["usage"])
-            elif offering_component.billing_type == BillingTypes.FIXED:
+            elif effective.billing_type == BillingTypes.FIXED:
                 invoice_item = super().update(invoice_item, validated_data)
                 invoice_item._update_quantity()
                 return invoice_item
@@ -520,6 +535,39 @@ class InvoiceItemReportSerializer(serializers.ModelSerializer):
         return extra_kwargs
 
 
+def has_single_plan(invoice_item) -> bool:
+    return bool(
+        invoice_item.resource and invoice_item.resource.offering.plans.count() == 1
+    )
+
+
+def name_with_plan(invoice_item) -> str:
+    """The item name with the plan appended, unless the name already has it."""
+    plan_name = invoice_item.details.get("plan_name")
+    # Generated item names read "<resource> (<offering> / <plan>)...", see
+    # marketplace.billing_utils.get_invoice_item_name.
+    if not plan_name or f" / {plan_name})" in invoice_item.name:
+        return invoice_item.name
+    return f"{invoice_item.name} / {plan_name}"
+
+
+def single_plan_component_text(invoice_item) -> str:
+    """
+    "<resource> (<offering>) / <component>" for an item of a single-plan
+    offering. Resource and offering names come from the snapshot taken when the
+    item was created, so re-exporting a past month gives the same text after
+    either is renamed; the live names are only used for items without one.
+    """
+    details = invoice_item.details
+    resource = invoice_item.resource
+    resource_name = details.get("resource_name") or resource.name
+    offering_name = details.get("offering_name") or resource.offering.name
+    text = f"{resource_name} ({offering_name}) / {details['offering_component_name']}"
+    if invoice_item.name.endswith(" (Overage)"):
+        text += " (Overage)"
+    return text
+
+
 class SAPReportSerializer(serializers.Serializer):
     registrikood = serializers.ReadOnlyField(
         source="invoice.customer.registration_code"
@@ -664,17 +712,11 @@ class SAPReportSerializer(serializers.Serializer):
 
     def get_tekst_2_field(self, invoice_item):
         # If a single plan for an offering exists, skip it from display
-        if invoice_item.resource and invoice_item.resource.offering.plans.count() == 1:
+        if has_single_plan(invoice_item):
             if "offering_component_name" in invoice_item.details:
-                return (
-                    f"{invoice_item.resource.name} ({invoice_item.resource.offering.name}) / "
-                    f"{invoice_item.details['offering_component_name']}"
-                )
+                return single_plan_component_text(invoice_item)
             return invoice_item.name
-        if "plan_name" in invoice_item.details.keys():
-            return f"{invoice_item.name} / {invoice_item.details['plan_name']}"
-        else:
-            return invoice_item.name
+        return name_with_plan(invoice_item)
 
     def get_vat(self, invoice_item):
         return settings.WALDUR_INVOICES["INVOICE_REPORTING"]["SAP_PARAMS"]["KM_KOOD"]
@@ -802,13 +844,9 @@ class SAFReportSerializer(serializers.Serializer):
         return ""
 
     def get_artnimi_field(self, invoice_item: models.InvoiceItem) -> str:
-        # If a single plan for an offering exists, skip it from display
-        if invoice_item.resource and invoice_item.resource.offering.plans.count() == 1:
+        if has_single_plan(invoice_item):
             return invoice_item.name
-        if "plan_name" in invoice_item.details.keys():
-            return f"{invoice_item.name} / {invoice_item.details['plan_name']}"
-        else:
-            return invoice_item.name
+        return name_with_plan(invoice_item)
 
     def get_covered_period(self, invoice_item: models.InvoiceItem) -> str:
         first_day = self.get_first_day(invoice_item)
@@ -1117,6 +1155,9 @@ class CreateCustomerCreditSerializer(CustomerCreditSerializer):
                 )
         return attrs
 
+    # Declared here rather than left to the model, because the field is
+    # redeclared on this serializer and model-level help_text does not reach the
+    # schema through an explicit field.
     offerings = serializers.HyperlinkedRelatedField(
         view_name="marketplace-provider-offering-detail",
         lookup_field="uuid",
@@ -1124,6 +1165,9 @@ class CreateCustomerCreditSerializer(CustomerCreditSerializer):
         required=False,
         allow_null=True,
         many=True,
+        help_text=(
+            "Offerings the credit may be drawn against. Leave empty to allow all offerings: an empty list means unrestricted, not none. Cost on any other offering is invoiced normally and is never compensated from this credit."
+        ),
     )
 
     def update(self, instance, validated_data):
@@ -1160,11 +1204,59 @@ class ProjectCreditSerializer(serializers.HyperlinkedModelSerializer):
         read_only=True, many=True, source="project.customer.customercredit.offerings"
     )
 
+    # Derived from the organization credit without disclosing it: how much of
+    # this allocation can actually be drawn, and whether the organization
+    # balance is the binding constraint.
+    # DecimalField, not ReadOnlyField: DRF renders Decimals as strings, but a
+    # bare ReadOnlyField gives drf-spectacular nothing to go on, so the schema
+    # advertised `number` and the generated SDK typed it as such while the API
+    # returned "0.00000". Mirrors the precision of the underlying `value`.
+    spendable_value = serializers.DecimalField(
+        max_digits=16, decimal_places=5, read_only=True
+    )
+    # Declared for the same reason as spendable_value: a bare ReadOnlyField
+    # leaves drf-spectacular nothing to infer from, and the generated SDK then
+    # types as a number what the API renders as a string.
+    creditable_cost_this_month = serializers.DecimalField(
+        max_digits=16, decimal_places=5, read_only=True, allow_null=True
+    )
+    is_limited_by_organization_credit = serializers.ReadOnlyField()
+
+    # Organization-wide figures. ProjectCredit is readable by project roles so
+    # the dashboard can explain a paused resource, but these three describe the
+    # whole organization, so they stay with customer-level roles.
+    ORGANIZATION_SCOPED_FIELDS = (
+        "customer_credit",
+        "allocated_customer_credit",
+        "offerings",
+    )
+
     @extend_schema_field(serializers.CharField(allow_null=True))
     def get_allocated_customer_credit(self, project_credit) -> Decimal | None:
         return models.ProjectCredit.objects.filter(
             project__customer=project_credit.project.customer
         ).aggregate(sum=Sum("value"))["sum"]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if user is None or user.is_staff or user.is_support:
+            return data
+
+        customer = instance.project.customer
+        # Memoised per serializer instance: a list response would otherwise
+        # re-run the role lookup for every row.
+        cache = self.context.setdefault("_owner_access_cache", {})
+        if customer.id not in cache:
+            cache[customer.id] = structure_permissions._has_owner_access(user, customer)
+        if cache[customer.id]:
+            return data
+
+        for field in self.ORGANIZATION_SCOPED_FIELDS:
+            data.pop(field, None)
+        return data
 
     def validate_project(self, project):
         user = self.context["request"].user
@@ -1190,6 +1282,9 @@ class ProjectCreditSerializer(serializers.HyperlinkedModelSerializer):
             "customer_credit",
             "allocated_customer_credit",
             "consumption_last_month",
+            "creditable_cost_this_month",
+            "spendable_value",
+            "is_limited_by_organization_credit",
             "offerings",
             "end_date",
             "expected_consumption",
@@ -1272,6 +1367,7 @@ class CreateCustomerAffiliateSerializer(CustomerAffiliateSerializer):
         affiliate = self.get_from_attrs_or_instance(attrs, "affiliate")
         start_date = self.get_from_attrs_or_instance(attrs, "start_date")
         end_date = self.get_from_attrs_or_instance(attrs, "end_date")
+        is_active = self.get_from_attrs_or_instance(attrs, "is_active", True)
 
         if customer == affiliate:
             raise exceptions.ValidationError(
@@ -1283,7 +1379,26 @@ class CreateCustomerAffiliateSerializer(CustomerAffiliateSerializer):
                 {"end_date": _("End date must be after the start date.")}
             )
 
+        if is_active:
+            self.validate_single_active_link(customer)
+
         return attrs
+
+    def validate_single_active_link(self, customer):
+        active_links = models.CustomerAffiliate.objects.filter(
+            customer=customer, is_active=True
+        )
+        if self.instance:
+            active_links = active_links.exclude(pk=self.instance.pk)
+        existing = active_links.select_related("affiliate").first()
+        if existing:
+            raise exceptions.ValidationError(
+                _(
+                    "%(customer)s is already referred by %(affiliate)s. "
+                    "Deactivate that link before activating another one."
+                )
+                % {"customer": customer.name, "affiliate": existing.affiliate.name}
+            )
 
 
 class AffiliateFeeAccrualSerializer(serializers.ModelSerializer):
@@ -1350,8 +1465,15 @@ class CreditTransactionSerializer(serializers.ModelSerializer):
     transaction_type_display = serializers.CharField(
         source="get_transaction_type_display", read_only=True
     )
-    customer_uuid = serializers.UUIDField(source="credit.customer.uuid", read_only=True)
-    customer_name = serializers.ReadOnlyField(source="credit.customer.name")
+    # Resolved through the model, because a row moves either the organization
+    # balance or a project allocation, and null once a deleted allocation has
+    # taken the path back to the organization with it.
+    customer_uuid = serializers.UUIDField(
+        source="customer.uuid", read_only=True, allow_null=True
+    )
+    customer_name = serializers.CharField(
+        source="customer.name", read_only=True, allow_null=True
+    )
 
     class Meta:
         model = models.CreditTransaction
@@ -1364,6 +1486,14 @@ class CreditTransactionSerializer(serializers.ModelSerializer):
             "comment",
             "customer_uuid",
             "customer_name",
+            # Denormalised on the row, so a project keeps its drawdown in the
+            # response after its allocation is gone.
+            "project_uuid",
+            "project_name",
+            # The month the movement belongs to, which is not the month it was
+            # recorded in: a roll-back and a re-run both land in the month they
+            # are about.
+            "billing_period",
         )
 
 
@@ -1529,6 +1659,14 @@ class InvoiceCostItemSerializer(serializers.Serializer):
 
 class InvoiceCostSerializer(serializers.Serializer):
     price = serializers.FloatField(read_only=True)
+    # Credit compensation drawn for the period (always <= 0). Distinct from
+    # `price`, which nets compensation against incurred cost and can read ~0
+    # in a month where credit happens to fully offset usage.
+    compensation = serializers.FloatField(read_only=True, default=0)
+    # Gross charges for the period, before any credit is applied. The costs
+    # action has always returned this alongside `price` and `compensation`;
+    # declaring it keeps generated clients from having to read it untyped.
+    incurred = serializers.FloatField(read_only=True, default=0)
     year = serializers.IntegerField(read_only=True)
     month = serializers.IntegerField(read_only=True)
     items = InvoiceCostItemSerializer(many=True, required=False)

@@ -2,6 +2,7 @@ import fnmatch
 import logging
 
 import rest_framework
+from django.contrib.contenttypes.models import ContentType
 from django.db import connection, transaction
 from django.db.models import Count, Max
 from django_filters.rest_framework import DjangoFilterBackend
@@ -20,14 +21,16 @@ from rest_framework import (
     status,
     viewsets,
 )
+from rest_framework.throttling import ScopedRateThrottle
 
+from waldur_core.core import email_diagnostics
 from waldur_core.core import filters as core_filters
 from waldur_core.core import models as core_models
 from waldur_core.core import permissions as core_permissions
 from waldur_core.core import utils as core_utils
 from waldur_core.core.serializers import StatusSerializer
 from waldur_core.logging import backend, enums, filters, models, serializers, utils
-from waldur_core.logging.event_logger import get_event_groups
+from waldur_core.logging.availability import get_available_event_groups
 from waldur_core.structure.serializers_data_access import (
     GlobalUserDataAccessLogSerializer,
 )
@@ -82,8 +85,11 @@ class EventViewSet(viewsets.ReadOnlyModelViewSet):
         """
         Returns a list of groups with event types.
         Group is used in exclude_features query param.
+
+        Narrowed to the groups this deployment can emit. Groups left out stay
+        deliverable and writable -- see waldur_core.logging.availability.
         """
-        return response.Response(get_event_groups())
+        return response.Response(get_available_event_groups())
 
 
 class BaseHookViewSet(viewsets.ModelViewSet):
@@ -180,6 +186,8 @@ class HookSummary(mixins.ListModelMixin, viewsets.GenericViewSet):
     Use /api/hooks/ to get a list of all the hooks of any type that a user can see.
     """
 
+    # Declared so the model stays introspectable; get_queryset() narrows it.
+    queryset = models.BaseHook.objects.all()
     serializer_class = serializers.SummaryHookSerializer
     filter_backends = (core_filters.StaffOrUserFilter, DjangoFilterBackend)
     filterset_class = filters.BaseHookFilter
@@ -635,9 +643,13 @@ Requires support user permissions.""",
                     "offering_uuid": parsed["offering_uuid"] if parsed else None,
                     "object_type": parsed["object_type"] if parsed else None,
                     "consumer_uuid": consumer_uuid,
-                    "queue_type": "consumer"
+                    # Not queue_type: that key already carries RabbitMQ's own
+                    # x-queue-type (classic/quorum/stream) from **queue.
+                    "queue_kind": enums.QueueKind.CONSUMER
                     if consumer_uuid
-                    else ("legacy" if parsed else "unknown"),
+                    else (
+                        enums.QueueKind.LEGACY if parsed else enums.QueueKind.UNKNOWN
+                    ),
                 }
                 enriched_queues.append(enriched_queue)
 
@@ -1168,6 +1180,29 @@ class UserDataAccessLogViewSet(
         return super().get_permissions()
 
 
+def _resolve_consumer_authorization(request, resolved_scopes) -> str:
+    """Which permission branch let this standalone registration through.
+
+    Mirrors the guards `register` applies, in the same order: privilege first
+    (a staff/support caller may bind to anything, and is the only one who may
+    request the global empty binding set), then identity (a caller binding only
+    to their own user scope needs no role at all), then the per-scope role the
+    serializer validated with `holds_any_role_on_scope_or_ancestor`.
+    """
+    user = request.user
+    if user.is_staff:
+        return enums.ConsumerAuthorization.STAFF
+    if user.is_support:
+        return enums.ConsumerAuthorization.SUPPORT
+    user_ct_id = ContentType.objects.get_for_model(core_models.User).id
+    if resolved_scopes and all(
+        scope["content_type_id"] == user_ct_id and scope["object_id"] == user.id
+        for scope in resolved_scopes
+    ):
+        return enums.ConsumerAuthorization.SELF
+    return enums.ConsumerAuthorization.SCOPE_ROLE
+
+
 class EventConsumerViewSet(
     mixins.ListModelMixin,
     mixins.DestroyModelMixin,
@@ -1185,9 +1220,18 @@ class EventConsumerViewSet(
     """
 
     lookup_field = "uuid"
-    queryset = models.EventConsumer.objects.all().order_by("-created")
+    # scopes are prefetched for the serializer's bindings and for is_global,
+    # which reads the populated cache instead of an exists() query per row.
+    queryset = (
+        models.EventConsumer.objects.all()
+        .select_related("user")
+        .prefetch_related("scopes__content_type", "scopes__scope")
+        .order_by("-created")
+    )
     serializer_class = serializers.EventConsumerSerializer
     permission_classes = [permissions.IsAuthenticated]
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = filters.EventConsumerFilter
 
     def get_queryset(self):
         # Consumers owned by a site agent are excluded platform-wide: they are
@@ -1298,6 +1342,12 @@ class EventConsumerViewSet(
 
         effective_object_types = consumer.object_types or all_object_types
 
+        # Resolved once, recorded on each successful exit below: the attribution
+        # must describe a registration that actually completed, or a 400 from
+        # provisioning would leave the row claiming a credential the queue never
+        # got (and an audit event for a registration that never happened).
+        authorized_via = _resolve_consumer_authorization(request, resolved_scopes)
+
         rmq_backend = backend.RabbitMQManagementBackend()
 
         # Fast path: already provisioned and valid — refresh the password.
@@ -1319,6 +1369,11 @@ class EventConsumerViewSet(
                     utils.resolve_consumer_rmq_password(request),
                 )
             ):
+                # The RMQ password now matches the presented credential, so the
+                # attribution can be recorded: a re-registration on a different
+                # credential must refresh it even when the queue itself is
+                # untouched.
+                utils.record_consumer_attribution(consumer, request, authorized_via)
                 data = {
                     "rmq_username": consumer.rmq_username,
                     "queue_name": consumer.queue_name,
@@ -1337,7 +1392,133 @@ class EventConsumerViewSet(
         result = utils.provision_consumer_queue(
             consumer, utils.resolve_consumer_rmq_password(request)
         )
+        utils.record_consumer_attribution(consumer, request, authorized_via)
         result["observable_object_types"] = effective_object_types
         out = serializers.EventConsumerRegistrationResponseSerializer(data=result)
         out.is_valid(raise_exception=True)
         return response.Response(out.data, status=status.HTTP_201_CREATED)
+
+
+class EmailDebugViewSet(viewsets.ViewSet):
+    """
+    Staff-only sanity check for the outgoing email configuration.
+
+    Waldur ships no relay of its own and every notification type ships
+    disabled, so a fresh installation sends nothing and logs nothing to
+    explain why. This endpoint reports both halves, probes the relay on
+    demand, and sends a test message.
+    """
+
+    permission_classes = [permissions.IsAuthenticated, core_permissions.IsStaff]
+    serializer_class = (
+        serializers.EmailDiagnosticsSerializer
+    )  # Default for OpenAPI schema
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "email_diagnostics"
+
+    def get_throttles(self):
+        # Reading the audit opens no socket and sends nothing, so it is exempt
+        # from the throttle that guards the two actions which do.
+        if self.action == "config":
+            return []
+        return super().get_throttles()
+
+    @extend_schema(
+        summary="Audit the outgoing email configuration",
+        description="""Reports the effective mail settings and the problems found in them.
+
+Reads settings only — no connection is opened and no message is sent.
+Covers the two independent halves of email delivery: a usable SMTP relay,
+and at least one enabled notification type. Requires staff permissions.""",
+        responses={
+            status.HTTP_200_OK: serializers.EmailDiagnosticsSerializer,
+        },
+    )
+    @decorators.action(detail=False, methods=["get"])
+    def config(self, request):
+        diagnostics = email_diagnostics.collect_diagnostics()
+        return response.Response(diagnostics.to_dict(), status=status.HTTP_200_OK)
+
+    @extend_schema(
+        summary="Test the SMTP connection",
+        description="""Opens and closes a connection to the configured relay without sending a message.
+
+The connection is made from the API process, which may reach the network
+differently than the Celery workers that send real notifications.
+Requires staff permissions.""",
+        request=None,
+        responses={
+            status.HTTP_200_OK: serializers.EmailProbeSerializer,
+        },
+    )
+    @decorators.action(detail=False, methods=["post"])
+    def probe(self, request):
+        result = email_diagnostics.probe_smtp()
+        logger.info(
+            "User %s probed the SMTP connection: %s",
+            request.user.uuid,
+            "reachable" if result["success"] else result["error"],
+        )
+        return response.Response(result, status=status.HTTP_200_OK)
+
+    @extend_schema(
+        summary="Send a test email",
+        description="""Sends a test message through the same code path as real notifications.
+
+Defaults to the address of the requesting user. Requires staff permissions.""",
+        request=serializers.EmailTestSendRequestSerializer,
+        responses={
+            status.HTTP_200_OK: serializers.EmailTestSendResultSerializer,
+            status.HTTP_400_BAD_REQUEST: None,
+        },
+    )
+    @decorators.action(detail=False, methods=["post"])
+    def send_test(self, request):
+        input_serializer = serializers.EmailTestSendRequestSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        recipient = input_serializer.validated_data.get("email") or request.user.email
+        if not recipient:
+            raise rest_framework.serializers.ValidationError(
+                {
+                    "email": "Your account has no email address, so a recipient must be given."
+                }
+            )
+
+        # An authenticated staff user can name any recipient here, so leave a
+        # trail that ties the message to the person who asked for it.
+        logger.info(
+            "User %s is sending a test email to %s",
+            request.user.uuid,
+            recipient,
+        )
+        try:
+            core_utils.send_mail(
+                subject="Waldur test message",
+                body=(
+                    "This is a test message sent from the Waldur administration interface "
+                    f"by {request.user.full_name or request.user.username}.\n\n"
+                    "Receiving it confirms that the SMTP relay accepts and delivers mail "
+                    "from this installation."
+                ),
+                to=[recipient],
+                fail_silently=False,
+                # An explicit timeout, for the same reason the probe carries one:
+                # the deployments that reach for this button are the ones whose
+                # relay may accept a connection and then never answer, and this
+                # runs inline in the request.
+                connection=email_diagnostics.open_connection(),
+            )
+        except Exception as e:
+            logger.warning("Test email to %s failed: %s", recipient, e)
+            return response.Response(
+                {
+                    "success": False,
+                    "email": recipient,
+                    "error": f"{type(e).__name__}: {e}",
+                },
+                status=status.HTTP_200_OK,
+            )
+        return response.Response(
+            {"success": True, "email": recipient, "error": ""},
+            status=status.HTTP_200_OK,
+        )

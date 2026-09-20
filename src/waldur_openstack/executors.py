@@ -751,10 +751,24 @@ class SetMtuExecutor(core_executors.ActionExecutor):
 class SubNetCreateExecutor(core_executors.CreateExecutor):
     @classmethod
     def get_task_signature(cls, subnet, serialized_subnet, **kwargs):
+        # Passed on only when asked for (#227). Leaving the default path's task
+        # payload byte-identical keeps a rolling upgrade safe: a worker running
+        # the previous release would reject an unknown keyword argument, and the
+        # only callers that set this are on the new release anyway.
+        backend_kwargs = (
+            {"skip_router_connection": True}
+            if kwargs.get("skip_router_connection")
+            else {}
+        )
+        # The router pull that imports the new interface port lives inside
+        # create_subnet, not in this chain. As a chained task its failure would
+        # run get_failure_signature and mark a subnet ERRED that exists and
+        # works in Neutron; inside the backend method it is guarded (#387).
         return core_tasks.BackendMethodTask().si(
             serialized_subnet,
             "create_subnet",
             state_transition="begin_creating",
+            **backend_kwargs,
         )
 
 
@@ -1428,6 +1442,18 @@ class InstanceUpdateSecurityGroupsExecutor(core_executors.ActionExecutor):
         )
 
 
+class InstanceUpdateMetadataExecutor(core_executors.ActionExecutor):
+    action = "Update metadata"
+
+    @classmethod
+    def get_task_signature(cls, instance, serialized_instance, **kwargs):
+        return core_tasks.BackendMethodTask().si(
+            serialized_instance,
+            backend_method="push_instance_metadata",
+            state_transition="begin_updating",
+        )
+
+
 class PortUpdateSecurityGroupsExecutor(core_executors.ActionExecutor):
     action = "Update security groups"
 
@@ -1442,10 +1468,35 @@ class PortUpdateSecurityGroupsExecutor(core_executors.ActionExecutor):
 
 class InstanceDeleteExecutor(core_executors.DeleteExecutor):
     @classmethod
+    def get_success_signature(cls, instance, serialized_instance, **kwargs):
+        return tasks.InstanceDeleteSuccessTask().si(serialized_instance)
+
+    @classmethod
+    def get_failure_signature(
+        cls, instance, serialized_instance, force=False, **kwargs
+    ):
+        # Preserve DeleteExecutorMixin force semantics: permanently broken backends
+        # can still be removed from the DB when force=True (e.g. ERRED instances).
+        if force:
+            return core_tasks.DeletionTask().si(serialized_instance)
+        return tasks.InstanceDeleteFailureTask().s(serialized_instance)
+
+    @classmethod
+    def _termination_step_marker(cls, serialized_instance, step):
+        return tasks.InstanceTerminationStepMarkerTask().si(
+            serialized_instance, step=step
+        )
+
+    @classmethod
     def get_task_signature(cls, instance, serialized_instance, force=False, **kwargs):
         delete_volumes = kwargs.pop("delete_volumes", True)
         release_floating_ips = kwargs.pop("release_floating_ips", True)
 
+        prep_tasks = (
+            cls.get_stop_instance_tasks(instance)
+            + cls.get_delete_backups_tasks(instance)
+            + cls.get_delete_snapshots_tasks(instance)
+        )
         delete_instance_tasks = cls.get_delete_instance_tasks(serialized_instance)
         release_floating_ips_tasks = cls.get_release_floating_ips_tasks(
             instance, release_floating_ips
@@ -1457,7 +1508,10 @@ class InstanceDeleteExecutor(core_executors.DeleteExecutor):
         # Case 1. Instance does not exist at backend
         if not instance.backend_id:
             return chain(
-                cls.get_delete_incomplete_instance_tasks(instance, serialized_instance)
+                prep_tasks
+                + cls.get_delete_incomplete_instance_tasks(
+                    instance, serialized_instance
+                )
             )
 
         # Case 2. Instance exists at backend.
@@ -1467,7 +1521,8 @@ class InstanceDeleteExecutor(core_executors.DeleteExecutor):
         # System volume is deleted implicitly since delete_on_termination=True
         elif delete_volumes:
             return chain(
-                detach_volumes_tasks
+                prep_tasks
+                + detach_volumes_tasks
                 + delete_volumes_tasks
                 + delete_instance_tasks
                 + release_floating_ips_tasks
@@ -1478,11 +1533,85 @@ class InstanceDeleteExecutor(core_executors.DeleteExecutor):
         # Data volumes are detached and not deleted.
         else:
             return chain(
-                detach_volumes_tasks
+                prep_tasks
+                + detach_volumes_tasks
                 + delete_instance_tasks
                 + release_floating_ips_tasks
                 + delete_ports_tasks
             )
+
+    @classmethod
+    def get_stop_instance_tasks(cls, instance):
+        """Stop an active VM before deletion.
+
+        DeleteExecutor.pre_apply already transitions the instance to
+        DELETION_SCHEDULED, so we must not use begin_updating (illegal from
+        that state). Gate only on runtime_state + backend_id.
+        """
+        if not instance.backend_id:
+            return []
+        if instance.runtime_state != models.Instance.RuntimeStates.ACTIVE:
+            return []
+
+        serialized_instance = core_utils.serialize_instance(instance)
+        return [
+            cls._termination_step_marker(
+                serialized_instance, tasks.TERMINATION_STEP_STOP
+            ),
+            core_tasks.BackendMethodTask().si(
+                serialized_instance,
+                "stop_instance",
+            ),
+            core_tasks.PollRuntimeStateTask().si(
+                serialized_instance,
+                backend_pull_method="pull_instance_runtime_state",
+                success_state="SHUTOFF",
+                erred_state="ERRED",
+            ),
+        ]
+
+    @classmethod
+    def get_delete_backups_tasks(cls, instance):
+        backups = list(instance.backups.all())
+        if not backups:
+            return []
+
+        serialized_instance = core_utils.serialize_instance(instance)
+        _tasks = [
+            cls._termination_step_marker(
+                serialized_instance, tasks.TERMINATION_STEP_DELETE_BACKUP
+            )
+        ]
+        for backup in backups:
+            _tasks.append(BackupDeleteExecutor.as_signature(backup))
+        return _tasks
+
+    @classmethod
+    def get_delete_snapshots_tasks(cls, instance):
+        # Backup deletion removes its snapshots; excluding them here
+        backup_snapshot_ids = set(
+            models.Snapshot.objects.filter(backups__instance=instance).values_list(
+                "id", flat=True
+            )
+        )
+        snapshots = [
+            snapshot
+            for volume in instance.volumes.all()
+            for snapshot in volume.snapshots.all()
+            if snapshot.id not in backup_snapshot_ids
+        ]
+        if not snapshots:
+            return []
+
+        serialized_instance = core_utils.serialize_instance(instance)
+        _tasks = [
+            cls._termination_step_marker(
+                serialized_instance, tasks.TERMINATION_STEP_DELETE_SNAPSHOT
+            )
+        ]
+        for snapshot in snapshots:
+            _tasks.append(SnapshotDeleteExecutor.as_signature(snapshot))
+        return _tasks
 
     @classmethod
     def get_delete_incomplete_instance_tasks(cls, instance, serialized_instance):
@@ -1522,6 +1651,9 @@ class InstanceDeleteExecutor(core_executors.DeleteExecutor):
     @classmethod
     def get_delete_instance_tasks(cls, serialized_instance):
         return [
+            cls._termination_step_marker(
+                serialized_instance, tasks.TERMINATION_STEP_DELETE_INSTANCE
+            ),
             core_tasks.BackendMethodTask().si(
                 serialized_instance,
                 backend_method="delete_instance",
@@ -1573,8 +1705,16 @@ class InstanceDeleteExecutor(core_executors.DeleteExecutor):
 
     @classmethod
     def get_detach_data_volumes_tasks(cls, instance):
-        data_volumes = instance.volumes.all().filter(bootable=False)
+        data_volumes = list(instance.volumes.all().filter(bootable=False))
+        if not data_volumes:
+            return []
+
+        serialized_instance = core_utils.serialize_instance(instance)
         detach_volumes = [
+            cls._termination_step_marker(
+                serialized_instance, tasks.TERMINATION_STEP_DETACH_VOLUMES
+            )
+        ] + [
             core_tasks.BackendMethodTask().si(
                 core_utils.serialize_instance(volume),
                 backend_method="detach_volume",

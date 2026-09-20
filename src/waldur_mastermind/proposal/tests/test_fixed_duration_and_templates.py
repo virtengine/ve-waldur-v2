@@ -3,6 +3,9 @@ Tests for fixed duration and resource templates functionality.
 Uses Factory pattern for cleaner test setup.
 """
 
+import datetime
+
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -141,7 +144,9 @@ class FixedDurationTestCase(APITestCase):
         self.customer.add_user(self.customer_owner, CustomerRole.OWNER)
 
         self.call = proposal_factories.CallFactory(state=CallStates.ACTIVE)
-        self.round = proposal_factories.RoundFactory(call=self.call)
+        self.round = proposal_factories.RoundFactory(
+            call=self.call, start_time=timezone.now() - datetime.timedelta(days=1)
+        )
 
     def test_set_fixed_duration_on_call(self):
         """Test setting fixed duration on a call."""
@@ -155,29 +160,8 @@ class FixedDurationTestCase(APITestCase):
         self.call.refresh_from_db()
         self.assertEqual(self.call.fixed_duration_in_days, 30)
 
-    def test_proposal_inherits_fixed_duration(self):
-        """Test that proposals automatically inherit call's fixed duration."""
-        self.call.fixed_duration_in_days = 45
-        self.call.save()
-
-        self.client.force_authenticate(self.customer_owner)
-        url = proposal_factories.ProposalFactory.get_list_url()
-
-        payload = {
-            "name": "Test Proposal",
-            "round_uuid": self.round.uuid.hex,
-            "description": "Test description",
-        }
-
-        response = self.client.post(url, payload, format="json")
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-
-        proposal = models.Proposal.objects.get(uuid=response.data["uuid"])
-        self.assertEqual(proposal.duration_in_days, 45)
-
-    def test_fixed_duration_overrides_provided_value(self):
-        """Test that fixed duration overrides any provided duration value."""
-        # Set fixed duration on call
+    def test_duration_in_days_is_ignored_on_create(self):
+        """The applicant's number decides nothing; old clients still get 201."""
         self.call.fixed_duration_in_days = 60
         self.call.save()
 
@@ -188,15 +172,50 @@ class FixedDurationTestCase(APITestCase):
             "name": "Test Proposal",
             "round_uuid": self.round.uuid.hex,
             "description": "Test description",
-            "duration_in_days": 30,  # This should be ignored
+            "duration_in_days": 30,
         }
 
         response = self.client.post(url, payload, format="json")
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
-        proposal = models.Proposal.objects.get(uuid=response.data["uuid"])
-        # Should use call's fixed duration, not the provided value
-        self.assertEqual(proposal.duration_in_days, 60)
+        self.assertNotIn("duration_in_days", response.data)
+        self.assertTrue(
+            models.Proposal.objects.filter(uuid=response.data["uuid"]).exists()
+        )
+
+    def test_fixed_duration_change_needs_no_confirmation(self):
+        """Pending proposals are untouched; the call's value applies at allocation."""
+        self.call.fixed_duration_in_days = 30
+        self.call.save()
+        pending = [
+            proposal_factories.ProposalFactory(round=self.round, state=state)
+            for state in (
+                ProposalStates.DRAFT,
+                ProposalStates.SUBMITTED,
+                ProposalStates.IN_REVIEW,
+            )
+        ]
+        self.client.force_authenticate(self.staff_user)
+        url = proposal_factories.CallFactory.get_protected_url(self.call)
+
+        response = self.client.patch(url, {"fixed_duration_in_days": 45}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.call.refresh_from_db()
+        self.assertEqual(self.call.fixed_duration_in_days, 45)
+        for proposal in pending:
+            modified = proposal.modified
+            proposal.refresh_from_db()
+            self.assertEqual(proposal.modified, modified)
+
+    def test_non_positive_duration_is_rejected(self):
+        self.client.force_authenticate(self.staff_user)
+        url = proposal_factories.CallFactory.get_protected_url(self.call)
+
+        response = self.client.patch(url, {"fixed_duration_in_days": 0}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("fixed_duration_in_days", response.data)
 
 
 class ResourceTemplateValidationTestCase(APITestCase):
@@ -209,7 +228,9 @@ class ResourceTemplateValidationTestCase(APITestCase):
         self.customer.add_user(self.customer_owner, CustomerRole.OWNER)
 
         self.call = proposal_factories.CallFactory(state=CallStates.ACTIVE)
-        self.round = proposal_factories.RoundFactory(call=self.call)
+        self.round = proposal_factories.RoundFactory(
+            call=self.call, start_time=timezone.now() - datetime.timedelta(days=1)
+        )
         self.requested_offering = proposal_factories.RequestedOfferingFactory(
             call=self.call, state=RequestedOfferingStates.ACCEPTED
         )
@@ -275,7 +296,8 @@ class ResourceTemplateValidationTestCase(APITestCase):
         # Create a call without templates using factories
         call_without_templates = proposal_factories.CallFactory()
         round_without_templates = proposal_factories.RoundFactory(
-            call=call_without_templates
+            call=call_without_templates,
+            start_time=timezone.now() - datetime.timedelta(days=1),
         )
         offering_without_templates = proposal_factories.RequestedOfferingFactory(
             call=call_without_templates, state=RequestedOfferingStates.ACCEPTED
@@ -319,7 +341,9 @@ class IntegrationTestCase(APITestCase):
         call = proposal_factories.CallFactory(
             fixed_duration_in_days=30, state=CallStates.ACTIVE
         )
-        round_obj = proposal_factories.RoundFactory(call=call)
+        round_obj = proposal_factories.RoundFactory(
+            call=call, start_time=timezone.now() - datetime.timedelta(days=1)
+        )
 
         # Add offering and create template using factories
         offering = proposal_factories.RequestedOfferingFactory(
@@ -354,8 +378,6 @@ class IntegrationTestCase(APITestCase):
         )
 
         proposal = models.Proposal.objects.get(uuid=proposal_response.data["uuid"])
-        # Verify fixed duration was applied
-        self.assertEqual(proposal.duration_in_days, 30)
 
         # Add resource from template
         resource_url = proposal_factories.RequestedResourceFactory.get_list_url(
@@ -391,7 +413,9 @@ class IntegrationTestCase(APITestCase):
         template = proposal_factories.CallResourceTemplateFactory(
             call=call, requested_offering=offering
         )
-        round_obj = proposal_factories.RoundFactory(call=call)
+        round_obj = proposal_factories.RoundFactory(
+            call=call, start_time=timezone.now() - datetime.timedelta(days=1)
+        )
         proposal = proposal_factories.ProposalFactory(round=round_obj)
 
         # Verify all relationships are consistent

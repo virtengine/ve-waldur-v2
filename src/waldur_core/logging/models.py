@@ -15,11 +15,13 @@ from django.utils.translation import gettext_lazy as _
 from model_utils.fields import AutoCreatedField
 from model_utils.models import TimeStampedModel
 
+from waldur_core.core import auth_utils
 from waldur_core.core import models as core_models
 from waldur_core.core.fields import JSONField, UUIDField
 from waldur_core.core.managers import GenericKeyMixin
 from waldur_core.core.utils import send_mail, validate_outbound_url
-from waldur_core.logging.enums import ObservableObjectType
+from waldur_core.logging.enums import ConsumerAuthorization, ObservableObjectType
+from waldur_core.logging.log import scrub_sensitive
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +55,7 @@ class EventTypesMixin(models.Model):
 
 class BaseHook(EventTypesMixin, UuidMixin, TimeStampedModel):
     class Meta:
-        ordering = ["-created"]
+        ordering = ["-created", "id"]
 
     user = models.ForeignKey[core_models.User](
         on_delete=models.CASCADE, to=settings.AUTH_USER_MODEL
@@ -133,10 +135,12 @@ class WebHook(BaseHook):
             )
             return
 
+        # Scrub credential-named keys from the context before it leaves for an
+        # external URL — defence in depth against a secret ever reaching a context.
         payload = dict(
             created=event.created.isoformat(),
             message=event.message,
-            context=event.context,
+            context=scrub_sensitive(event.context),
             event_type=event.event_type,
         )
 
@@ -161,6 +165,13 @@ class EmailHook(BaseHook):
     email = models.EmailField(max_length=320)
 
     def process(self, event):
+        if (event.context or {}).get("suppress_email"):
+            logger.info(
+                "Skipping email hook (PK=%s) for event %s: its source asked for no email",
+                self.pk,
+                event.uuid.hex,
+            )
+            return
         if not self.email:
             logger.info(
                 "Skipping processing of email hook (PK=%s) because email is not defined"
@@ -215,7 +226,7 @@ class Event(UuidMixin):
     context = models.JSONField(blank=True)
 
     class Meta:
-        ordering = ("-created",)
+        ordering = ["-created", "id"]
         indexes = [
             models.Index(fields=["-created", "event_type"]),
         ]
@@ -288,7 +299,7 @@ class EventSubscriptionQueue(UuidMixin, TimeStampedModel):
     class Meta:
         unique_together = ("event_subscription", "offering_uuid", "object_type")
         verbose_name = _("Subscription queue")
-        ordering = ["-created"]
+        ordering = ["-created", "id"]
 
     @property
     def queue_name(self) -> str:
@@ -350,6 +361,46 @@ class EventConsumer(UuidMixin, TimeStampedModel):
             "Empty list means all types."
         ),
         validators=[validate_observable_object_types],
+    )
+    # How and by what right the consumer was registered. Refreshed on EVERY
+    # (re-)registration: these describe the credential the queue currently runs
+    # on, not the one it was first created with. Blank on rows that predate the
+    # attribution, and on any path that does not record it.
+    auth_kind = models.CharField(
+        max_length=16,
+        blank=True,
+        default="",
+        choices=auth_utils.auth_method_choices(),
+        help_text=_(
+            "How the registering request authenticated: pat, token (DRF), "
+            "session, oidc or unknown."
+        ),
+    )
+    auth_token_prefix = models.CharField(
+        # The Personal Access Token is referenced by its denormalized prefix and
+        # name rather than by FK on purpose: tracing a consumer back to a
+        # credential matters most once that credential has been revoked or
+        # deleted, which is exactly when a FK would be gone.
+        max_length=10,
+        blank=True,
+        default="",
+        help_text=_("Prefix of the Personal Access Token used, when auth_kind is pat."),
+    )
+    auth_token_name = models.CharField(
+        max_length=150,
+        blank=True,
+        default="",
+        help_text=_("Name of the Personal Access Token used, when auth_kind is pat."),
+    )
+    authorized_via = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        choices=ConsumerAuthorization.choices(),
+        help_text=_(
+            "Which permission branch authorised the registration "
+            "(see ConsumerAuthorization)."
+        ),
     )
 
     @property
@@ -415,7 +466,12 @@ class EmailLog(UuidMixin):
         return f"Email to {self.emails} at {self.sent_at}"
 
     class Meta:
-        ordering = ["-sent_at"]
+        ordering = ["-sent_at", "id"]
+        # The table is append-only and grows with every notification ever sent,
+        # so both the log listing and the email diagnostics — which read the
+        # most recent row and count the last week — would otherwise sort or
+        # scan the whole of it.
+        indexes = [models.Index(fields=["-sent_at"])]
 
 
 class SystemLog(TimeStampedModel):
@@ -427,7 +483,7 @@ class SystemLog(TimeStampedModel):
         BEAT = "beat", "Beat"
 
     class Meta:
-        ordering = ["-created"]
+        ordering = ["-created", "id"]
         indexes = [
             models.Index(
                 fields=["-created", "source"], name="logging_syslog_created_idx"
@@ -514,7 +570,7 @@ class UserDataAccessLog(UuidMixin):
     )
 
     class Meta:
-        ordering = ["-timestamp"]
+        ordering = ["-timestamp", "id"]
         indexes = [
             models.Index(fields=["target_user", "-timestamp"]),
         ]

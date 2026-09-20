@@ -1,16 +1,20 @@
 import copy
 import json
 from collections import defaultdict
+from urllib.parse import quote
 
+import reversion
 from django import forms
 from django.conf import settings
 from django.contrib import admin, messages
 from django.contrib.admin import forms as admin_forms
+from django.contrib.auth import REDIRECT_FIELD_NAME
 from django.contrib.auth import admin as auth_admin
 from django.contrib.auth import forms as auth_forms
 from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
 from django.forms.utils import flatatt
+from django.http import HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.template.response import TemplateResponse
 from django.urls import re_path, reverse
@@ -31,6 +35,9 @@ from waldur_auth_social.utils import pull_remote_eduteams_user
 from waldur_core.core import constance_admin as waldur_constance_admin  # noqa: F401
 from waldur_core.core import models
 from waldur_core.core.authentication import can_access_admin_site
+from waldur_core.core.utils import chunked_queryset
+from waldur_core.passkeys import admin_auth
+from waldur_core.passkeys import policy as passkey_policy
 
 
 def get_admin_url(obj):
@@ -313,11 +320,28 @@ class UserAdmin(auth_admin.UserAdmin, VersionAdmin):
 
     def administratively_deactivate(self, request, queryset):
         reason = f"Administratively deactivated via admin by {request.user.username}"
-        count = queryset.filter(is_active=True).update(
-            is_active=False,
-            is_admin_deactivated=True,
-            deactivation_reason=reason,
-        )
+        # Saved row by row rather than via queryset.update(), which issues raw
+        # SQL and fires no signals: that skipped personal access token
+        # revocation, the audit event and the revision snapshot alike.
+        count = 0
+        # Client-side chunks: the save() below commits between fetches, which
+        # a server-side cursor would not survive behind a pooler.
+        for user in chunked_queryset(queryset.filter(is_active=True)):
+            user.is_active = False
+            user.is_admin_deactivated = True
+            user.deactivation_reason = reason
+            user.save(
+                update_fields=[
+                    "is_active",
+                    "is_admin_deactivated",
+                    "deactivation_reason",
+                ]
+            )
+            count += 1
+        # VersionAdmin already wraps the changelist view in a revision, so the
+        # snapshots above are recorded - but nameless. Label them.
+        if count and reversion.is_active():
+            reversion.set_comment(reason)
         messages.success(
             request,
             _("%(count)d user(s) have been administratively deactivated.")
@@ -329,11 +353,23 @@ class UserAdmin(auth_admin.UserAdmin, VersionAdmin):
     )
 
     def reactivate(self, request, queryset):
-        count = queryset.filter(is_active=False).update(
-            is_active=True,
-            is_admin_deactivated=False,
-            deactivation_reason="",
-        )
+        # See administratively_deactivate for why this is not a queryset update.
+        count = 0
+        # See administratively_deactivate: same pooler-safe walk.
+        for user in chunked_queryset(queryset.filter(is_active=False)):
+            user.is_active = True
+            user.is_admin_deactivated = False
+            user.deactivation_reason = ""
+            user.save(
+                update_fields=[
+                    "is_active",
+                    "is_admin_deactivated",
+                    "deactivation_reason",
+                ]
+            )
+            count += 1
+        if count and reversion.is_active():
+            reversion.set_comment(f"Reactivated via admin by {request.user.username}")
         messages.success(
             request,
             _("%(count)d user(s) have been reactivated.") % {"count": count},
@@ -403,9 +439,24 @@ class CustomAdminAuthenticationForm(admin_forms.AdminAuthenticationForm):
             "for a staff or a support account. Note that both fields may be "
             "case-sensitive."
         ),
+        "passkey_required": _(
+            "This deployment requires a passkey for staff and support "
+            "accounts, and this account has none registered. Sign in to the "
+            "portal with your password and add a passkey from your profile."
+        ),
     }
 
     def confirm_login_allowed(self, user):
+        # A correct password is not enough here, but it is only worth refusing
+        # outright when the user *cannot* comply — with no credential there is
+        # nothing to assert, and the admin has no enrolment flow. Everyone
+        # else proceeds to the passkey step.
+        if passkey_policy.is_enforced_for(
+            user
+        ) and not admin_auth.user_can_satisfy_passkey(user):
+            raise forms.ValidationError(
+                self.error_messages["passkey_required"], code="passkey_required"
+            )
         if not can_access_admin_site(user):
             return super().confirm_login_allowed(user)
 
@@ -418,9 +469,57 @@ class CustomAdminSite(admin.AdminSite):
 
     def has_permission(self, request):
         is_safe = request.method in rf_permissions.SAFE_METHODS
-        return can_access_admin_site(request.user) and (
+        if not can_access_admin_site(request.user) or not (
             is_safe or request.user.is_staff
-        )
+        ):
+            return False
+        # Under enforcement the password half of the login is not the whole
+        # login. Returning False here makes admin_view redirect to the admin
+        # login URL, and login() forwards an authenticated-but-unverified user
+        # to the passkey step rather than showing the form again.
+        if passkey_policy.is_enforced_for(request.user):
+            return admin_auth.is_admin_session_verified(request)
+        return True
+
+    def login(self, request, extra_context=None):
+        if (
+            request.user.is_authenticated
+            and passkey_policy.is_enforced_for(request.user)
+            and not admin_auth.is_admin_session_verified(request)
+        ):
+            target = reverse("admin:passkey_challenge")
+            next_url = request.GET.get(REDIRECT_FIELD_NAME)
+            if next_url:
+                target = f"{target}?{REDIRECT_FIELD_NAME}={quote(next_url)}"
+            return HttpResponseRedirect(target)
+        return super().login(request, extra_context)
+
+    def get_urls(self):
+        from django.urls import path
+
+        urls = [
+            # Deliberately NOT wrapped in self.admin_view: that checks
+            # has_permission, which is false precisely because the session is
+            # unverified, so it would redirect to the login, which forwards
+            # back here — an infinite loop that makes the step unreachable.
+            # The view does its own authentication check instead.
+            path(
+                "passkey/",
+                admin_auth.challenge_view,
+                name="passkey_challenge",
+            ),
+            path(
+                "passkey/options/",
+                admin_auth.options_view,
+                name="passkey_options",
+            ),
+            path(
+                "passkey/verify/",
+                admin_auth.verify_view,
+                name="passkey_verify",
+            ),
+        ]
+        return urls + super().get_urls()
 
     @classmethod
     def clone_default(cls):

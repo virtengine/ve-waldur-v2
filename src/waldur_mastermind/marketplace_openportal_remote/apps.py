@@ -10,7 +10,6 @@ class MarketplaceOpenPortalRemoteConfig(AppConfig):
 
     def ready(self):
         # These need to be imported here to avoid circular imports
-        # This is the same as in waldur_slurm.apps.py
         from waldur_mastermind.marketplace import handlers as marketplace_handlers
         from waldur_mastermind.marketplace import models as marketplace_models
         from waldur_mastermind.marketplace.enums import BillingTypes, LimitPeriods
@@ -45,6 +44,8 @@ class MarketplaceOpenPortalRemoteConfig(AppConfig):
             update_resource_processor=processor.UpdateRemoteAllocationLimitsProcessor,
             delete_resource_processor=processor.DeleteRemoteAllocationProcessor,
             can_update_limits=True,
+            # Allocation.node_limit is a BigIntegerField.
+            max_limit_decimal_places=0,
             components=(
                 Component(
                     type="node",

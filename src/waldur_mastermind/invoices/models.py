@@ -29,6 +29,7 @@ from waldur_mastermind.common import mixins as common_mixins
 from waldur_mastermind.common.enums import Units
 from waldur_mastermind.common.utils import quantize_price
 from waldur_mastermind.invoices.structures import InvoiceDetailsDict
+from waldur_mastermind.marketplace import billing_mode
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.enums import BillingTypes, LimitPeriods
 
@@ -485,9 +486,12 @@ class InvoiceItem(
             return
         if not plan_component.component:
             return
-        if plan_component.component.billing_type == BillingTypes.FIXED or (
-            plan_component.component.billing_type == BillingTypes.LIMIT
-            and plan_component.component.limit_period != LimitPeriods.TOTAL
+        effective = billing_mode.resolve_component(
+            plan_component.component, plan_component.plan
+        )
+        if effective.billing_type == BillingTypes.FIXED or (
+            effective.billing_type == BillingTypes.LIMIT
+            and effective.limit_period != LimitPeriods.TOTAL
         ):
             self._update_quantity()
 
@@ -513,13 +517,49 @@ class InvoiceItem(
             last_period["billing_periods"] = utils.get_full_days(
                 parse_datetime(last_period["start"]), self.end
             )
+            # int() would truncate a fractional limit to zero and bill the
+            # final sub-period as nothing; on a value like "1.4" further down
+            # it raises outright. Compute in Decimal, which is exact and
+            # renders without a binary expansion.
             last_period["total"] = str(
-                int(last_period["quantity"]) * last_period["billing_periods"]
+                decimal.Decimal(str(last_period["quantity"]))
+                * last_period["billing_periods"]
             )
-            self.quantity = sum(
-                int(period["total"]) for period in resource_limit_periods
-            )
+            self.quantity = self.quantity_from_limit_periods()
             self.save(update_fields=["details", "quantity"])
+
+    def quantity_from_limit_periods(self) -> decimal.Decimal:
+        """Quantity of a limit-based item from its ``resource_limit_periods``.
+
+        Items billed per day count ``limit × days`` over every period. Items
+        billed per month (or any other unit) charge the plan's fee for the
+        month whatever the number of days, so their quantity is the day-weighted
+        average limit over the item's span — the same rule
+        ``LimitPeriodProcessor._update_invoice_item`` applies to limit changes.
+        """
+        periods = self.details.get("resource_limit_periods") or []
+        if self.unit == self.Units.PER_DAY:
+            # total is a decimal string once a limit is fractional, and
+            # int("1.4") raises ValueError.
+            return decimal.Decimal(
+                sum(decimal.Decimal(period["total"]) for period in periods)
+            )
+        # Weigh by each period's own day count (a partial day counts as one),
+        # and divide by the same total so equal limits always yield the limit.
+        days = [
+            utils.get_full_days(
+                parse_datetime(period["start"]), parse_datetime(period["end"])
+            )
+            for period in periods
+        ]
+        total_days = sum(days)
+        if total_days <= 0:
+            return decimal.Decimal(0)
+        weighted = sum(
+            decimal.Decimal(str(period["quantity"])) * period_days
+            for period, period_days in zip(periods, days, strict=True)
+        )
+        return quantize_price(decimal.Decimal(weighted) / total_days)
 
     class Meta:
         indexes = [
@@ -609,6 +649,85 @@ class Payment(core_models.UuidMixin, core_models.TimeStampedModel):
         return "payment"
 
 
+def creditable_items(
+    invoice, credit, project=None
+) -> tuple[list["InvoiceItem"], dict[str, decimal.Decimal]]:
+    """Items on an invoice that a credit may be drawn against.
+
+    Returns the chargeable items and, keyed by item uuid, the volume discounts
+    paired with them.
+
+    Eligibility lives here because two callers must agree on it: the monthly
+    compensation run, which draws the credit, and the credit's own report of
+    what the open month will draw, which has to answer before any compensation
+    item exists.
+
+    An item with no resource cannot be attributed to an offering, so no credit
+    covers it. An empty offering list on the credit means unrestricted, not
+    "nothing" — the restriction only applies when one is stated.
+    """
+    items_queryset = invoice.items.exclude(resource__isnull=True).select_related(
+        "resource", "resource__offering", "resource__project", "project"
+    )
+
+    credit_offering_ids = set(credit.offerings.values_list("id", flat=True))
+    if credit_offering_ids:
+        items_queryset = items_queryset.filter(
+            resource__offering_id__in=credit_offering_ids
+        )
+
+    if project is not None:
+        items_queryset = items_queryset.filter(resource__project=project)
+
+    # Volume-discount line items are already negative reductions paired with
+    # a chargeable item (via details["discount_of_item"]). They are not
+    # compensated themselves, but their reduction must lower the credit
+    # drawn for the item they discount — otherwise credit is consumed on the
+    # gross price and the invoice can go negative. Sum each item's paired
+    # discounts so compensation operates on the net cost. Filtered in Python
+    # to avoid JSON-key exclude semantics dropping items whose details lack
+    # the key entirely.
+    discount_by_item: dict[str, decimal.Decimal] = {}
+    chargeable_items: list[InvoiceItem] = []
+    for it in items_queryset:
+        details = it.details or {}
+        # A compensation is a draw already made, not a cost to draw against.
+        # The compensation run clears them before recalculating, so it never
+        # sees one; the open-month report is not so lucky.
+        if details.get("is_compensation"):
+            continue
+        if details.get("is_discount"):
+            target = details.get("discount_of_item")
+            if target:
+                discount_by_item[target] = (
+                    discount_by_item.get(target, decimal.Decimal(0)) + it.price
+                )
+        else:
+            chargeable_items.append(it)
+
+    return chargeable_items, discount_by_item
+
+
+def creditable_cost(invoice, credit, project=None) -> decimal.Decimal:
+    """Cost on an invoice that a credit is eligible to be drawn against.
+
+    Net of paired volume discounts and floored per item, matching what the
+    compensation run will actually draw. Uncapped by the credit balance: this
+    reports the demand on the credit, not what it can afford to meet.
+    """
+    chargeable_items, discount_by_item = creditable_items(invoice, credit, project)
+    return sum(
+        (
+            max(
+                item.price + discount_by_item.get(item.uuid.hex, decimal.Decimal(0)),
+                decimal.Decimal(0),
+            )
+            for item in chargeable_items
+        ),
+        decimal.Decimal(0),
+    )
+
+
 class BaseCredit(core_models.UuidMixin, core_models.TimeStampedModel):
     class MinimalConsumptionLogic:
         FIXED = "fixed"
@@ -695,7 +814,16 @@ class BaseCredit(core_models.UuidMixin, core_models.TimeStampedModel):
 
 class CustomerCredit(BaseCredit):
     customer = models.OneToOneField(structure_models.Customer, on_delete=models.CASCADE)
-    offerings = models.ManyToManyField(marketplace_models.Offering)
+    #: Empty means unrestricted. `creditable_items` applies the restriction only
+    #: when a list is stated, so clearing this widens the credit to every
+    #: offering rather than narrowing it to none.
+    offerings = models.ManyToManyField(
+        marketplace_models.Offering,
+        blank=True,
+        help_text=(
+            "Offerings the credit may be drawn against. Leave empty to allow all offerings: an empty list means unrestricted, not none. Cost on any other offering is invoiced normally and is never compensated from this credit."
+        ),
+    )
 
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
@@ -759,7 +887,13 @@ class ProjectCredit(BaseCredit):
     )
 
     @property
-    def consumption_last_month(self) -> float:
+    def consumption_last_month(self) -> float | None:
+        """Credit drawn by this project in the previous month.
+
+        None when that month has no invoice at all — no billing period is not
+        the same statement as "drew nothing", and callers should be able to
+        tell them apart.
+        """
         last_month = core_utils.get_last_month()
         invoice = Invoice.objects.filter(
             year=last_month.year,
@@ -768,9 +902,17 @@ class ProjectCredit(BaseCredit):
         ).first()
 
         if not invoice:
-            return
+            return None
 
-        credit = CustomerCredit.objects.filter(customer=self.project.customer).get()
+        # Nothing links a ProjectCredit to its CustomerCredit — no FK, no
+        # delete guard — so the organization credit can be removed while
+        # project credits survive. Without it no compensation item can exist,
+        # so nothing was drawn; raising here would 500 every read of the
+        # project credit, which project roles now make.
+        credit = CustomerCredit.objects.filter(customer=self.project.customer).first()
+        if not credit:
+            return 0
+
         items = InvoiceItem.objects.filter(
             invoice=invoice,
             credit=credit,
@@ -779,10 +921,80 @@ class ProjectCredit(BaseCredit):
         consumption = sum([i.total for i in items]) or 0
         return consumption * -1
 
+    @property
+    def creditable_cost_this_month(self) -> float | None:
+        """Cost booked so far this month that this credit will be drawn against.
+
+        Not a draw: compensation is written when the month is closed, so until
+        then the ledger says nothing about the open month and the only honest
+        forecast is the eligible cost standing on the invoice.
+
+        Eligible is the operative word. A credit covers the offerings named on
+        the organization balance and no others, so a project buying storage
+        outside that list carries cost its credit will never touch. Reporting
+        the whole project invoice here instead compares that cost against a
+        credit-scoped target and overstates the draw by whatever the credit
+        does not cover.
+
+        None when the customer has no open invoice for this month — no billing
+        period is not the same statement as "nothing to draw".
+        """
+        today = datetime.date.today()
+        invoice = Invoice.objects.filter(
+            year=today.year,
+            month=today.month,
+            customer=self.project.customer,
+        ).first()
+
+        if not invoice:
+            return None
+
+        # As in consumption_last_month: the organization credit can be deleted
+        # while project allocations survive, and without it nothing defines
+        # which offerings are covered, so nothing is drawable.
+        credit = CustomerCredit.objects.filter(customer=self.project.customer).first()
+        if not credit:
+            return 0
+
+        return creditable_cost(invoice, credit, project=self.project)
+
+    @property
+    def spendable_value(self) -> decimal.Decimal:
+        """Credit this project can actually draw this month.
+
+        `value` is only an allocation: compensation stops as soon as the
+        organization credit is exhausted (see MonthlyCompensation), so a
+        project can show a healthy balance that cannot be spent. Exposing the
+        minimum lets the dashboard say so without revealing organization
+        totals to project members.
+        """
+        customer_credit = CustomerCredit.objects.filter(
+            customer=self.project.customer
+        ).first()
+        if not customer_credit:
+            return decimal.Decimal("0")
+        return min(self.value, customer_credit.value)
+
+    @property
+    def is_limited_by_organization_credit(self) -> bool:
+        """True when the organization balance, not this allocation, is binding."""
+        return self.spendable_value < self.value
+
+    # Also read by the ledger post_save handler, which needs the previous value
+    # to compute the delta it records.
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
     class Permissions:
         customer_path = "project__customer"
+        # Read access for project roles too. The project dashboard renders
+        # credit-adjusted costs and policy saturation to every project member,
+        # but the credit object itself was customer-scoped, so members saw an
+        # empty list — indistinguishable from "this project has no credit" —
+        # and the credit panel silently disappeared. Mirrors ProjectPolicy,
+        # which is customer- and project-visible for the same reason. Writes
+        # stay owner/staff-only: they are guarded by the ViewSet's
+        # update/partial_update/destroy permissions, not by this filter.
+        project_path = "project"
 
     def __str__(self):
         return f"Project credit for {self.project.name}, value {self.value}."
@@ -813,7 +1025,7 @@ class ProjectCredit(BaseCredit):
 
 
 class CreditTransaction(core_models.UuidMixin, models.Model):
-    """Append-only ledger of CustomerCredit value changes.
+    """Append-only ledger of credit value changes, organization and project.
 
     Rows are written by the ``record_credit_transaction`` post_save handler
     for every value mutation; the semantic type comes from the innermost
@@ -825,6 +1037,7 @@ class CreditTransaction(core_models.UuidMixin, models.Model):
     class Types:
         STAFF_GRANT = "staff_grant"
         COMPENSATION = "compensation"
+        MINIMAL_DRAW = "minimal_draw"
         AFFILIATE_FEE = "affiliate_fee"
         TRANSFER_IN = "transfer_in"
         TRANSFER_OUT = "transfer_out"
@@ -837,6 +1050,7 @@ class CreditTransaction(core_models.UuidMixin, models.Model):
         CHOICES = (
             (STAFF_GRANT, "Staff grant"),
             (COMPENSATION, "Compensation"),
+            (MINIMAL_DRAW, "Minimal consumption draw"),
             (AFFILIATE_FEE, "Affiliate fee"),
             (TRANSFER_IN, "Transfer in"),
             (TRANSFER_OUT, "Transfer out"),
@@ -860,8 +1074,33 @@ class CreditTransaction(core_models.UuidMixin, models.Model):
         )
 
     credit = models.ForeignKey(
-        CustomerCredit, on_delete=models.CASCADE, related_name="transactions"
+        CustomerCredit,
+        on_delete=models.CASCADE,
+        related_name="transactions",
+        null=True,
+        blank=True,
     )
+    # Project allocations are drawn on their own — for usage and, separately, to
+    # reach the minimal-consumption floor — and neither movement touches the
+    # organization balance, so they are ledgered in their own rows.
+    project_credit = models.ForeignKey(
+        "ProjectCredit",
+        on_delete=models.SET_NULL,
+        related_name="transactions",
+        null=True,
+        blank=True,
+    )
+    # Denormalised so the trace survives its project: ProjectCredit is deleted
+    # with the project, and a ledger that loses its attribution on a delete is
+    # not a ledger.
+    project_uuid = models.CharField(max_length=32, blank=True, db_index=True)
+    project_name = models.CharField(
+        max_length=structure_models.PROJECT_NAME_LENGTH, blank=True
+    )
+    # First day of the month the movement belongs to. A real column because the
+    # dashboards group by month, and `reference` is a GenericForeignKey that SQL
+    # cannot group on.
+    billing_period = models.DateField(null=True, blank=True, db_index=True)
     created = models.DateTimeField(auto_now_add=True, db_index=True)
     # Signed delta applied to CustomerCredit.value.
     amount = models.DecimalField(max_digits=16, decimal_places=5)
@@ -874,21 +1113,48 @@ class CreditTransaction(core_models.UuidMixin, models.Model):
     object_id = models.PositiveIntegerField(null=True, blank=True)
     reference = GenericForeignKey("content_type", "object_id")
 
+    @property
+    def customer(self):
+        """The organization the movement belongs to, whichever balance moved.
+
+        None once a project allocation has been deleted: the row keeps the
+        project it names, but the path back to the organization went with the
+        allocation. Staff still see such rows; nobody else can, which is the
+        same answer the permission paths below give.
+        """
+        if self.credit_id:
+            return self.credit.customer
+        if self.project_credit_id:
+            return self.project_credit.project.customer
+        return None
+
     class Permissions:
-        customer_path = "credit__customer"
+        # Both balances, because a row moves exactly one of them. An
+        # organization owner reads the whole ledger of their organization;
+        # project roles read their own project's drawdown, mirroring
+        # ProjectCredit itself, which they can already read so that the project
+        # dashboard has something to render.
+        customer_path = ("credit__customer", "project_credit__project__customer")
+        project_path = "project_credit__project"
 
     class Meta:
-        ordering = ["-created"]
+        ordering = ["-created", "id"]
 
     @classmethod
     def get_url_name(cls):
         return "credit-transaction"
 
     def __str__(self):
-        return (
-            f"{self.get_transaction_type_display()} of {self.amount} "
-            f"for {self.credit.customer.name}"
-        )
+        # Project rows carry no organization credit, and a row outlives the
+        # allocation it describes, so the scope is whichever of the three is
+        # still there to name.
+        if self.credit_id:
+            scope = self.credit.customer.name
+        elif self.project_name:
+            scope = self.project_name
+        else:
+            scope = "a removed project"
+        return f"{self.get_transaction_type_display()} of {self.amount} for {scope}"
 
 
 class CustomerAffiliate(core_models.UuidMixin, core_models.TimeStampedModel):
@@ -896,6 +1162,10 @@ class CustomerAffiliate(core_models.UuidMixin, core_models.TimeStampedModel):
     percentage fee from every finalized invoice of the linked customer. All
     fields are writable by staff only; the affiliate organization sees its
     own links read-only.
+
+    A customer has at most one active affiliate. Inactive links are kept for
+    their fee history, so a customer changes affiliate by deactivating the
+    old link rather than deleting it.
     """
 
     customer = models.ForeignKey(
@@ -930,7 +1200,14 @@ class CustomerAffiliate(core_models.UuidMixin, core_models.TimeStampedModel):
 
     class Meta:
         unique_together = ("customer", "affiliate")
-        ordering = ["created"]
+        ordering = ["created", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["customer"],
+                condition=models.Q(is_active=True),
+                name="invoices_one_active_affiliate_per_customer",
+            ),
+        ]
 
     @classmethod
     def get_url_name(cls):
@@ -977,7 +1254,7 @@ class AffiliateFeeAccrual(core_models.UuidMixin, core_models.TimeStampedModel):
 
     class Meta:
         unique_together = ("affiliate_link", "invoice")
-        ordering = ["-created"]
+        ordering = ["-created", "id"]
 
     @classmethod
     def get_url_name(cls):

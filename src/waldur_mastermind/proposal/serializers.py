@@ -4,6 +4,7 @@ from datetime import datetime
 
 from constance import config
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import transaction
 from django.db.models import Q
 from django.db.models.query import QuerySet
 from django.utils import timezone
@@ -17,8 +18,11 @@ from rest_framework.reverse import reverse
 from waldur_core.checklist import enums as checklist_enums
 from waldur_core.checklist import models as checklist_models
 from waldur_core.checklist import serializers as checklist_serializers
+from waldur_core.core import models as core_models
 from waldur_core.core import serializers as core_serializers
+from waldur_core.core.models import DESCRIPTION_LENGTH
 from waldur_core.core.validators import get_project_name_regex_error
+from waldur_core.media.validators import DocumentValidator
 from waldur_core.permissions import enums as permissions_enums
 from waldur_core.permissions import utils as permissions_utils
 from waldur_core.permissions.fixtures import CallRole
@@ -29,27 +33,37 @@ from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import permissions as marketplace_permissions
 from waldur_mastermind.marketplace.serializers import (
     BasePublicPlanSerializer,
+    LimitValueField,
     OfferingComponentSerializer,
     OfferingOptionsField,
     UserAttributeConfigBaseSerializer,
+    validate_prepaid_duration_against_component,
+)
+from waldur_mastermind.proposal import (
+    permissions as proposal_permissions,
 )
 from waldur_mastermind.proposal.enums import (
     MANDATORY_STEPS,
+    PROPOSAL_CONFIGURABLE_FIELDS,
     WORKFLOW_STEPS_MAP,
     AllocationTimes,
     BulkRoundCadence,
     CallStates,
     COISeverityLevels,
     COITypes,
+    NotificationRuleRecipients,
+    NotificationRuleTriggers,
+    ProposalFieldStates,
     ProposalStates,
     RequestedOfferingStates,
     ReviewerPoolInvitationStatuses,
     RoundStatuses,
+    SupportTicketCallers,
     WorkflowStepInstanceStatuses,
     WorkflowStepOutcomes,
 )
 
-from . import models, workflow_service
+from . import models, notification_rules, utils, workflow_service
 from .managers import get_connected_calls
 
 logger = logging.getLogger(__name__)
@@ -208,6 +222,9 @@ class NestedRequestedOfferingSerializer(serializers.HyperlinkedModelSerializer):
     state = serializers.ReadOnlyField()
     offering_name = serializers.ReadOnlyField(source="offering.name")
     offering_uuid = serializers.UUIDField(read_only=True, source="offering.uuid")
+    # The plugin type drives the frontend's per-type component filter, which a
+    # cost estimate has to apply or it prices components the offering hides.
+    offering_type = serializers.ReadOnlyField(source="offering.type")
     category_uuid = serializers.UUIDField(
         read_only=True, source="offering.category.uuid"
     )
@@ -230,6 +247,7 @@ class NestedRequestedOfferingSerializer(serializers.HyperlinkedModelSerializer):
             "offering",
             "offering_name",
             "offering_uuid",
+            "offering_type",
             "provider_name",
             "category_uuid",
             "category_name",
@@ -239,6 +257,7 @@ class NestedRequestedOfferingSerializer(serializers.HyperlinkedModelSerializer):
             "plan_details",
             "options",
             "components",
+            "require_purchase_order",
             "created",
         ]
         extra_kwargs = {
@@ -298,6 +317,18 @@ class NestedRequestedResourceSerializer(serializers.HyperlinkedModelSerializer):
             )
         return None
 
+    # Whether this row needs a purchase order, resolved from the call's setting
+    # so the form does not have to re-derive it from plugin_options.
+    purchase_order_required = serializers.ReadOnlyField()
+    has_purchase_order = serializers.ReadOnlyField()
+    # Written through the dedicated multipart action, as orders do.
+    attachment = serializers.FileField(read_only=True)
+    # Copied verbatim into Order.limits when the proposal is allocated, so this
+    # has to accept exactly what the ordering path accepts rather than staying
+    # an untyped JSONField. Precision is settled per component by
+    # validate_limits on the resulting order.
+    limits = serializers.DictField(child=LimitValueField(), required=False)
+
     class Meta:
         model = models.RequestedResource
         fields = [
@@ -310,6 +341,10 @@ class NestedRequestedResourceSerializer(serializers.HyperlinkedModelSerializer):
             "call_resource_template_name",
             "attributes",
             "limits",
+            "purchase_order_reference",
+            "attachment",
+            "purchase_order_required",
+            "has_purchase_order",
             "description",
             "created_by",
             "created_by_name",
@@ -322,6 +357,76 @@ class NestedRequestedResourceSerializer(serializers.HyperlinkedModelSerializer):
             "created_by": {
                 "lookup_field": "uuid",
                 "view_name": "user-detail",
+            },
+        }
+
+
+class UserRequestedResourceSerializer(serializers.HyperlinkedModelSerializer):
+    """One row of "resources I requested through a proposal".
+
+    Deliberately flat rather than reusing ``NestedRequestedResourceSerializer``:
+    that one embeds the whole requested offering (plan details, components,
+    options), which is far more than a list needs and costs a query per row.
+
+    Proposal state and resource state are reported separately. They are two
+    different lifecycles — the resource does not exist until the proposal is
+    approved — so collapsing them into one column would require inventing a
+    mapping that neither model owns.
+    """
+
+    offering_name = serializers.CharField(
+        read_only=True, source="requested_offering.offering.name"
+    )
+    offering_uuid = serializers.UUIDField(
+        read_only=True, source="requested_offering.offering.uuid"
+    )
+    call_name = serializers.CharField(read_only=True, source="proposal.round.call.name")
+    call_uuid = serializers.UUIDField(read_only=True, source="proposal.round.call.uuid")
+    proposal_name = serializers.CharField(read_only=True, source="proposal.name")
+    proposal_uuid = serializers.UUIDField(read_only=True, source="proposal.uuid")
+    proposal_state = serializers.CharField(read_only=True, source="proposal.state")
+    # resource is null until the proposal is approved. Without allow_null DRF
+    # raises SkipField on the dotted source and drops the key from the payload
+    # entirely, so the SDK sees an absent field rather than an explicit null.
+    resource_name = serializers.CharField(
+        read_only=True, source="resource.name", allow_null=True
+    )
+    resource_uuid = serializers.UUIDField(
+        read_only=True, source="resource.uuid", allow_null=True
+    )
+    resource_state = serializers.SerializerMethodField()
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_resource_state(self, requested_resource) -> str | None:
+        """Null until the proposal is approved and the resource is provisioned."""
+        if not requested_resource.resource:
+            return None
+        return requested_resource.resource.get_state_display()
+
+    class Meta:
+        model = models.RequestedResource
+        fields = [
+            "uuid",
+            "created",
+            "description",
+            "attributes",
+            "limits",
+            "offering_name",
+            "offering_uuid",
+            "call_name",
+            "call_uuid",
+            "proposal",
+            "proposal_name",
+            "proposal_uuid",
+            "proposal_state",
+            "resource_name",
+            "resource_uuid",
+            "resource_state",
+        ]
+        extra_kwargs = {
+            "proposal": {
+                "lookup_field": "uuid",
+                "view_name": "proposal-proposal-detail",
             },
         }
 
@@ -382,8 +487,6 @@ class ProposalReviewSerializer(
             "call_managing_organisation_uuid",
             "comment_project_title",
             "comment_project_summary",
-            "comment_project_is_confidential",
-            "comment_project_has_civilian_purpose",
             "comment_project_description",
             "comment_project_duration",
             "comment_project_supporting_documentation",
@@ -698,6 +801,16 @@ class CallResourceTemplateSerializer(
     requested_offering_uuid = serializers.UUIDField(
         source="requested_offering.uuid", read_only=True
     )
+    # The plan alone cannot be priced: bucketing an amount into recurring or
+    # one-off needs each component's billing type and limit period, and the
+    # plugin type drives the frontend's component filter. Same two fields
+    # NestedRequestedOfferingSerializer carries for the non-template path.
+    requested_offering_type = serializers.ReadOnlyField(
+        source="requested_offering.offering.type"
+    )
+    requested_offering_components = OfferingComponentSerializer(
+        source="requested_offering.offering.components", many=True, read_only=True
+    )
     created_by_name = serializers.ReadOnlyField(source="created_by.full_name")
     url = serializers.SerializerMethodField()
     requested_offering = NestedCallActionHyperlinkedRelatedField(
@@ -705,7 +818,10 @@ class CallResourceTemplateSerializer(
         view_name="proposal-call-offering-detail",
         lookup_field="uuid",
     )
-    limits = serializers.DictField(child=serializers.IntegerField(), required=False)
+    # Copied verbatim into Order.limits when the proposal is allocated, so it
+    # has to accept exactly what the ordering path accepts. Precision is
+    # settled per component by validate_limits on that order.
+    limits = serializers.DictField(child=LimitValueField(), required=False)
 
     class Meta:
         model = models.CallResourceTemplate
@@ -721,6 +837,8 @@ class CallResourceTemplateSerializer(
             "requested_offering_name",
             "requested_offering_uuid",
             "requested_offering_plan",
+            "requested_offering_type",
+            "requested_offering_components",
             "created_by",
             "created_by_name",
             "created",
@@ -768,6 +886,70 @@ class CallResourceTemplateSerializer(
         return super().create(validated_data)
 
 
+class CallProposalFieldConfigSerializer(serializers.ModelSerializer):
+    """The per-call Project details field states, as a flat map of field -> state."""
+
+    class Meta:
+        model = models.CallProposalFieldConfig
+        fields = [
+            models.CallProposalFieldConfig.column_for(field_name)
+            for field_name in models.CallProposalFieldConfig.field_names()
+        ]
+        extra_kwargs = {field: {"required": False} for field in fields}
+
+
+class ProposalFieldMetadataSerializer(serializers.Serializer):
+    """What the call configuration UI needs to render one field's row.
+
+    ``usage`` names the consumers that field feeds, so the manager can see what
+    switching it off costs; ``allowed_states`` and ``locked_reason`` carry the
+    locking rule, so the UI never has to reimplement it.
+    """
+
+    field = serializers.CharField()
+    state = serializers.ChoiceField(choices=ProposalFieldStates.CHOICES)
+    allowed_states = serializers.ListField(child=serializers.CharField())
+    locked_reason = serializers.CharField(allow_null=True)
+    usage = serializers.ListField(child=serializers.CharField())
+
+
+def get_proposal_field_metadata(call) -> list[dict]:
+    """Per-field state, permitted transitions and consumers for one call.
+
+    A field may not become required once the call has a proposal: tightening
+    then invalidates drafts that were complete under the form the applicant was
+    shown, and nothing tells them. Loosening stays open in both directions.
+    """
+    states = models.CallProposalFieldConfig.get_states_for_call(call)
+    has_proposals = models.Proposal.objects.filter(round__call=call).exists()
+    every_state = [state for state, _label in ProposalFieldStates.CHOICES]
+    metadata = []
+    for field_name, usage in PROPOSAL_CONFIGURABLE_FIELDS.items():
+        current = states[field_name]
+        locked = has_proposals and current != ProposalFieldStates.REQUIRED
+        metadata.append(
+            {
+                "field": field_name,
+                "state": current,
+                "allowed_states": [
+                    state
+                    for state in every_state
+                    if not (locked and state == ProposalFieldStates.REQUIRED)
+                ],
+                "locked_reason": (
+                    "A field cannot be made required once the call has proposals: "
+                    "drafts that were complete under the published form would "
+                    "silently stop being submittable. Duplicate the call to run a "
+                    "stricter round."
+                    if locked
+                    else None
+                ),
+                "usage": list(usage),
+            }
+        )
+    return metadata
+
+
 class PublicCallSerializer(
     core_serializers.SlugSerializerMixin,
     core_serializers.RestrictedSerializerMixin,
@@ -775,6 +957,9 @@ class PublicCallSerializer(
     serializers.HyperlinkedModelSerializer,
 ):
     state = serializers.ReadOnlyField()
+    # Read-only here, writable on the protected serializer: the applicant's form
+    # renders from this, the call manager configures it.
+    proposal_field_config = CallProposalFieldConfigSerializer(read_only=True)
     customer_name = serializers.ReadOnlyField(source="manager.customer.name")
     customer_uuid = serializers.UUIDField(
         read_only=True, source="manager.customer.uuid"
@@ -787,8 +972,22 @@ class PublicCallSerializer(
     documents = CallDocumentSerializer(many=True, read_only=True)
     resource_templates = serializers.SerializerMethodField()
     fixed_duration_in_days = serializers.ReadOnlyField()
-    description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
+    max_prepaid_duration_months = serializers.SerializerMethodField(
+        help_text="The longest prepaid subscription, in whole months, that fits "
+        "inside fixed_duration_in_days measured from today; null when the call "
+        "fixes no duration."
+    )
+    description = core_serializers.HTMLCleanField(
+        required=False, allow_blank=True, max_length=DESCRIPTION_LENGTH
+    )
     has_eligibility_restrictions = serializers.SerializerMethodField()
+
+    @extend_schema_field(serializers.IntegerField(allow_null=True))
+    def get_max_prepaid_duration_months(self, call) -> int | None:
+        # Anchored on today: a call has many rounds, and the applicant reads
+        # this before choosing one. The request itself is validated against
+        # the round's own allocation date.
+        return utils.max_prepaid_duration_months(call, datetime.today().date())
 
     class Meta:
         model = models.Call
@@ -811,11 +1010,13 @@ class PublicCallSerializer(
             "documents",
             "resource_templates",
             "fixed_duration_in_days",
+            "max_prepaid_duration_months",
             "backend_id",
             "external_url",
             "reviewer_identity_visible_to_submitters",
             "reviews_visible_to_submitters",
             "has_eligibility_restrictions",
+            "proposal_field_config",
         )
         view_name = "proposal-public-call-detail"
         extra_kwargs = {
@@ -922,6 +1123,13 @@ class RequestedOfferingSerializer(
         read_only_fields = (
             "created_by",
             "approved_by",
+            # The requirement belongs to the offering's provider, whose flag
+            # gates order approval; the call entry only decides what the
+            # proposal collects, and is seeded from that flag when the offering
+            # is added. Writing it here let a call manager lower a provider's
+            # requirement — before the provider had even accepted the entry, and
+            # without either of them being shown the field anywhere.
+            "require_purchase_order",
         )
         protected_fields = ("offering",)
         extra_kwargs = {
@@ -974,6 +1182,56 @@ class RequestedOfferingSerializer(
         return super().create(validated_data)
 
 
+PREPAID_DURATION_FIELD = "attributes.prepaid_duration_months"
+
+
+def _validate_prepaid_duration(attributes, offering, proposal_round):
+    """Hold the requested subscription length to the terms it is sold under.
+
+    The offering's prepaid min/max/step, as the marketplace order path applies
+    them, and the call's fixed duration: that is the length of every project
+    the call awards, so no subscription requested under it may outlast it
+    (``utils.max_prepaid_duration_months``), measured from the day allocation
+    is scheduled for, or today where the call allocates on decision.
+    """
+    attributes = attributes or {}
+    if "prepaid_duration_months" not in attributes:
+        return
+
+    months = attributes["prepaid_duration_months"]
+    if isinstance(months, bool) or not isinstance(months, int) or months < 1:
+        raise serializers.ValidationError(
+            {PREPAID_DURATION_FIELD: _("A whole number of months, at least 1.")}
+        )
+
+    prepaid_components = list(offering.components.filter(is_prepaid=True))
+    if not prepaid_components:
+        raise serializers.ValidationError(
+            {PREPAID_DURATION_FIELD: _("This offering is not sold by the month.")}
+        )
+    for component in prepaid_components:
+        validate_prepaid_duration_against_component(
+            months, component, PREPAID_DURATION_FIELD
+        )
+
+    anchor = utils.allocation_start_date(proposal_round) or datetime.today().date()
+    cap = utils.max_prepaid_duration_months(proposal_round.call, anchor)
+    if cap is not None and months > cap:
+        raise serializers.ValidationError(
+            {
+                PREPAID_DURATION_FIELD: _(
+                    "This call awards projects of %(days)s days, so a subscription "
+                    "may run for at most %(cap)s month(s) from %(anchor)s."
+                )
+                % {
+                    "days": proposal_round.call.fixed_duration_in_days,
+                    "cap": cap,
+                    "anchor": anchor.isoformat(),
+                }
+            }
+        )
+
+
 class RequestedResourceSerializer(
     core_serializers.AugmentedSerializerMixin, NestedRequestedResourceSerializer
 ):
@@ -993,6 +1251,12 @@ class RequestedResourceSerializer(
 
     def validate(self, attrs):
         if self.instance:
+            if "attributes" in attrs:
+                _validate_prepaid_duration(
+                    attrs["attributes"],
+                    self.instance.requested_offering.offering,
+                    self.instance.proposal.round,
+                )
             return attrs
 
         proposal = attrs["proposal"]
@@ -1061,6 +1325,11 @@ class RequestedResourceSerializer(
                 )
             )
 
+        _validate_prepaid_duration(
+            attrs.get("attributes"),
+            attrs["requested_offering"].offering,
+            proposal.round,
+        )
         return attrs
 
     def validate_attributes(self, attributes):
@@ -1080,6 +1349,22 @@ class RequestedResourceSerializer(
     def create(self, validated_data):
         validated_data["created_by"] = self.context["request"].user
         return super().create(validated_data)
+
+
+class RequestedResourcePurchaseOrderSerializer(serializers.ModelSerializer):
+    """Multipart write of the purchase order, mirroring OrderAttachmentSerializer.
+
+    Kept off the main serializer because a file cannot ride along with the JSON
+    body the resource form submits.
+    """
+
+    class Meta:
+        model = models.RequestedResource
+        fields = ("attachment", "purchase_order_reference")
+        extra_kwargs = {
+            "attachment": {"required": False, "allow_null": True},
+            "purchase_order_reference": {"required": False, "allow_blank": True},
+        }
 
 
 class ProviderRequestedResourceSerializer(NestedRequestedResourceSerializer):
@@ -1157,7 +1442,9 @@ class CallApplicantVisibilityConfigSerializer(UserAttributeConfigBaseSerializer)
 
 class ProtectedCallSerializer(PublicCallSerializer):
     reference_code = serializers.CharField(source="backend_id", required=False)
-    fixed_duration_in_days = serializers.IntegerField(required=False, allow_null=True)
+    fixed_duration_in_days = serializers.IntegerField(
+        required=False, allow_null=True, min_value=1
+    )
     reviewer_identity_visible_to_submitters = serializers.BooleanField(
         help_text="Whether proposal applicants can see reviewer identities",
         required=False,
@@ -1174,6 +1461,48 @@ class ProtectedCallSerializer(PublicCallSerializer):
         required=False,
         allow_null=True,
         help_text="Compliance checklist that proposals must complete before submission",
+    )
+    panel_chair = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=core_models.User.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    panel_chair_uuid = serializers.UUIDField(
+        source="panel_chair.uuid", read_only=True, format="hex"
+    )
+    panel_chair_name = serializers.ReadOnlyField(source="panel_chair.full_name")
+    support_ticket_caller = serializers.ChoiceField(
+        choices=SupportTicketCallers.CHOICES,
+        required=False,
+        help_text="Who helpdesk tickets for granted resources are raised for.",
+    )
+    # The queryset is narrowed to the call's own people in get_fields(); what
+    # stands here is only the schema's view of the field.
+    support_ticket_caller_user = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=core_models.User.objects.all(),
+        required=False,
+        allow_null=True,
+        help_text=(
+            "The person tickets go to when the caller is a named contact. "
+            "Must hold a role on this call or on the organisation managing it."
+        ),
+    )
+    # allow_null is load-bearing on a dotted source over a nullable FK: without
+    # it DRF raises SkipField and drops the key from the payload entirely, while
+    # make_readonly_fields_required still marks it required in the generated
+    # SDK. Most calls have no named contact, so that mismatch would be the norm.
+    support_ticket_caller_user_uuid = serializers.UUIDField(
+        source="support_ticket_caller_user.uuid",
+        read_only=True,
+        format="hex",
+        allow_null=True,
+    )
+    support_ticket_caller_user_name = serializers.CharField(
+        source="support_ticket_caller_user.full_name",
+        read_only=True,
+        allow_null=True,
     )
     compliance_checklist_name = serializers.CharField(
         source="compliance_checklist.name", read_only=True
@@ -1226,6 +1555,16 @@ class ProtectedCallSerializer(PublicCallSerializer):
         allow_null=True,
     )
 
+    proposal_field_config = CallProposalFieldConfigSerializer(required=False)
+    proposal_field_metadata = serializers.SerializerMethodField(
+        help_text="Per-field state, permitted transitions and downstream "
+        "consumers for the Project details step."
+    )
+
+    @extend_schema_field(ProposalFieldMetadataSerializer(many=True))
+    def get_proposal_field_metadata(self, obj) -> list[dict]:
+        return get_proposal_field_metadata(obj)
+
     has_proposals = serializers.SerializerMethodField(
         help_text="Whether any proposal has been submitted to this call. "
         "Used by the frontend to gate slug-template and checklist fields."
@@ -1241,6 +1580,9 @@ class ProtectedCallSerializer(PublicCallSerializer):
             "reference_code",
             "compliance_checklist",
             "compliance_checklist_name",
+            "panel_chair",
+            "panel_chair_uuid",
+            "panel_chair_name",
             "proposal_slug_template",
             "user_email_patterns",
             "user_affiliations",
@@ -1249,10 +1591,101 @@ class ProtectedCallSerializer(PublicCallSerializer):
             "user_organization_types",
             "user_assurance_levels",
             "applicant_visibility_config",
+            "proposal_field_config",
+            "proposal_field_metadata",
             "has_proposals",
+            "support_ticket_caller",
+            "support_ticket_caller_user",
+            "support_ticket_caller_user_uuid",
+            "support_ticket_caller_user_name",
         )
         view_name = "proposal-protected-call-detail"
         protected_fields = ("manager",)
+
+    def get_fields(self):
+        fields = super().get_fields()
+        contact = fields.get("support_ticket_caller_user")
+        if contact is not None:
+            contact.queryset = self._ticket_caller_candidates()
+            # Same message whichever way the lookup failed, so the field cannot
+            # be used to tell an unrelated account apart from one that does not
+            # exist. It still says what a usable answer looks like.
+            contact.error_messages["does_not_exist"] = _(
+                "No such user, or they hold no role on this call or on the "
+                "organisation managing it."
+            )
+        return fields
+
+    def _ticket_caller_candidates(self):
+        """Users this call may name as its support contact.
+
+        Whoever is named starts receiving the call's ticket mail -- project
+        name, order description, limits -- and gets an account created for them
+        on the helpdesk. Anyone holding UPDATE_CALL could otherwise point that
+        at an arbitrary account in the deployment, so the choice is kept to
+        people already attached to the call: its own team, the managing
+        organisation, and that organisation's customer.
+
+        Empty when there is no call to read roles from -- during creation, and
+        while drf-spectacular is building the schema.
+        """
+        call = self.instance
+        if not isinstance(call, models.Call):
+            return core_models.User.objects.none()
+        manager = call.manager
+        return (
+            permissions_utils.get_users(call)
+            | permissions_utils.get_users(manager)
+            | permissions_utils.get_users(manager.customer)
+        )
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        self._validate_support_ticket_caller(attrs)
+        return attrs
+
+    def _validate_support_ticket_caller(self, attrs):
+        """A named contact, if given, has to be able to receive a ticket.
+
+        A missing contact is deliberately *not* an error. The settings page
+        edits one field per request, so demanding the contact in the same
+        request that selects "specific_user" would leave the manager unable to
+        select it at all -- and the resolver already falls back to the
+        project's roles rather than failing an order over it.
+        """
+        user = attrs.get("support_ticket_caller_user")
+        if user is not None and not user.email:
+            raise serializers.ValidationError(
+                {
+                    "support_ticket_caller_user": _(
+                        "The named contact has no email address, so the "
+                        "helpdesk cannot raise tickets on their behalf."
+                    )
+                }
+            )
+
+    def validate_panel_chair(self, user):
+        if self.instance is None:
+            if user is None:
+                return None
+            raise serializers.ValidationError(
+                _("Assign panel members first; the chair is set on an existing call.")
+            )
+        # The viewset gates every write on UPDATE_CALL held on the call or its
+        # managing organisation, so no field-level check is needed here.
+        if user is None:
+            return None
+        if (
+            not permissions_utils.get_users(
+                self.instance, permissions_enums.RoleEnum.CALL_PANEL_MEMBER
+            )
+            .filter(pk=user.pk)
+            .exists()
+        ):
+            raise serializers.ValidationError(
+                _("Panel chair must hold the panel member role on this call.")
+            )
+        return user
 
     def validate_manager(self, manager: models.CallManagingOrganisation):
         user = self.context["request"].user
@@ -1269,6 +1702,39 @@ class ProtectedCallSerializer(PublicCallSerializer):
             )
 
         return manager
+
+    def validate_proposal_field_config(self, value):
+        """Refuse to make a field required once the call has proposals.
+
+        Only that direction is refused. Hiding a field, or dropping it back to
+        optional, cannot invalidate a draft that was already complete; demanding
+        something the applicant was never asked for can, and silently — nothing
+        notifies them that the form they filled in has changed under them. A
+        manager who wants a stricter next round duplicates the call, where the
+        copy starts in draft with no proposals.
+        """
+        call: models.Call = self.instance
+        if call is None or not value:
+            return value
+        if not models.Proposal.objects.filter(round__call=call).exists():
+            return value
+
+        current = models.CallProposalFieldConfig.get_states_for_call(call)
+        tightened = [
+            field_name
+            for field_name in models.CallProposalFieldConfig.field_names()
+            if value.get(models.CallProposalFieldConfig.column_for(field_name))
+            == ProposalFieldStates.REQUIRED
+            and current[field_name] != ProposalFieldStates.REQUIRED
+        ]
+        if tightened:
+            raise serializers.ValidationError(
+                "Cannot make %(fields)s required: this call already has proposals, "
+                "and drafts that were complete under the published form would stop "
+                "being submittable. Duplicate the call to run a stricter round."
+                % {"fields": ", ".join(sorted(tightened))}
+            )
+        return value
 
     def validate_compliance_checklist(self, value):
         """Prevent changing compliance checklist if proposals exist."""
@@ -1358,7 +1824,12 @@ class ProtectedCallSerializer(PublicCallSerializer):
         validated_data["created_by"] = request.user
         has_visibility = "applicant_visibility_config" in validated_data
         visibility_data = validated_data.pop("applicant_visibility_config", None)
+        field_config_data = validated_data.pop("proposal_field_config", None)
         call = super().create(validated_data)
+        # The row itself is seeded by the post_save handler from the Constance
+        # defaults; an explicit config on the request overrides those columns.
+        if field_config_data:
+            self._apply_field_config(call, field_config_data)
         if has_visibility and visibility_data is not None:
             seed = models.CallApplicantVisibilityConfig.get_default_exposure_flags()
             models.CallApplicantVisibilityConfig.objects.create(
@@ -1366,20 +1837,18 @@ class ProtectedCallSerializer(PublicCallSerializer):
             )
         return call
 
+    @transaction.atomic
     def update(self, instance, validated_data):
-        if "fixed_duration_in_days" in validated_data:
-            fixed_duration_in_days = validated_data["fixed_duration_in_days"]
-            proposals = models.Proposal.objects.filter(
-                round__call=instance,
-                state__in=[ProposalStates.DRAFT, ProposalStates.IN_REVIEW],
-            )
-            for proposal in proposals:
-                proposal.duration_in_days = fixed_duration_in_days
-                proposal.save()
-
+        # A changed fixed_duration_in_days needs no propagation: allocation
+        # reads it from the call (utils.project_end_date), so it takes effect
+        # for every proposal that has not been allocated yet without rewriting
+        # a single proposal row.
         has_visibility = "applicant_visibility_config" in validated_data
         visibility_data = validated_data.pop("applicant_visibility_config", None)
+        field_config_data = validated_data.pop("proposal_field_config", None)
         call = super().update(instance, validated_data)
+        if field_config_data:
+            self._apply_field_config(call, field_config_data)
         if has_visibility:
             if visibility_data is None:
                 models.CallApplicantVisibilityConfig.objects.filter(call=call).delete()
@@ -1400,6 +1869,19 @@ class ProtectedCallSerializer(PublicCallSerializer):
                     call=call, **{**seed, **visibility_data}
                 )
         return call
+
+    @staticmethod
+    def _apply_field_config(call, field_config_data: dict):
+        """Write the supplied field states onto the call's config row.
+
+        A PATCH carries only the fields it changes, so the row is updated in
+        place rather than replaced. get_or_create covers calls that predate the
+        seeding handler.
+        """
+        config, _ = models.CallProposalFieldConfig.objects.get_or_create(call=call)
+        for column, state in field_config_data.items():
+            setattr(config, column, state)
+        config.save()
 
 
 class ProtectedRoundSerializer(
@@ -1476,6 +1958,7 @@ class ProposalDocumentationSerializer(serializers.ModelSerializer):
         model = models.ProposalDocumentation
         fields = ["uuid", "file", "file_name", "file_size", "created"]
         read_only_fields = ["uuid"]
+        extra_kwargs = {"file": {"validators": [DocumentValidator]}}
 
 
 class ProposalDetachDocumentsSerializer(serializers.Serializer):
@@ -1483,16 +1966,20 @@ class ProposalDetachDocumentsSerializer(serializers.Serializer):
 
 
 class ProposalUpdateProjectDetailsSerializer(serializers.ModelSerializer):
+    science_sub_domain = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=structure_models.ScienceSubDomain.objects.all(),
+        allow_null=True,
+        required=False,
+    )
+
     class Meta:
         model = models.Proposal
         fields = [
             "name",
             "description",
             "project_summary",
-            "project_is_confidential",
-            "project_has_civilian_purpose",
-            "duration_in_days",
-            "oecd_fos_2007_code",
+            "science_sub_domain",
         ]
 
 
@@ -1549,7 +2036,9 @@ class ProposalSerializer(
     created_by_name = serializers.ReadOnlyField(source="created_by.full_name")
     created_by_uuid = serializers.UUIDField(source="created_by.uuid", read_only=True)
     project_name = serializers.ReadOnlyField(source="project.name")
-    description = core_serializers.HTMLCleanField(required=False, allow_blank=True)
+    description = core_serializers.HTMLCleanField(
+        required=False, allow_blank=True, max_length=DESCRIPTION_LENGTH
+    )
 
     # Applicant attributes — gated by CallApplicantVisibilityConfig for reviewers.
     applicant_username = serializers.ReadOnlyField(source="created_by.username")
@@ -1628,8 +2117,6 @@ class ProposalSerializer(
             "description",
             "project_name",
             "project_summary",
-            "project_is_confidential",
-            "project_has_civilian_purpose",
             "supporting_documentation",
             "state",
             "approved_by",
@@ -1664,7 +2151,6 @@ class ProposalSerializer(
             "applicant_civil_number",
             "applicant_birth_date",
             "applicant_active_isds",
-            "duration_in_days",
             "project",
             "round",
             "round_uuid",
@@ -1682,8 +2168,10 @@ class ProposalSerializer(
             "compliance_status",
             "can_submit",
             "awaiting_manual_advance",
+            "workflow_step",
         ]
         read_only_fields = (
+            "workflow_step",
             "created_by",
             "approved_by",
             "project",
@@ -1722,25 +2210,25 @@ class ProposalSerializer(
         if call_round.call.state != CallStates.ACTIVE:
             raise serializers.ValidationError(_("Call is not active."))
 
-        if call_round.status not in (
-            RoundStatuses.SCHEDULED,
-            RoundStatuses.OPEN,
-        ):
-            raise serializers.ValidationError(_("Round is not active."))
+        # A proposal exists only while its round is open — it cannot be drafted
+        # ahead of one opening, and cannot be started after the cutoff. Same
+        # rule as submission, so a proposal can never be created into a state it
+        # could not then be sent from.
+        if call_round.status == RoundStatuses.SCHEDULED:
+            raise serializers.ValidationError(
+                _("Round has not opened yet, so a proposal cannot be created.")
+            )
+        if call_round.status == RoundStatuses.ENDED:
+            raise serializers.ValidationError(
+                _("Round has closed, so a proposal can no longer be created.")
+            )
 
         attrs["round"] = call_round
         return attrs
 
     def create(self, validated_data):
         validated_data["created_by"] = self.context["request"].user
-        proposal = super().create(validated_data)
-
-        # Set fixed duration if specified by call
-        if proposal.round.call.fixed_duration_in_days:
-            proposal.duration_in_days = proposal.round.call.fixed_duration_in_days
-            proposal.save()
-
-        return proposal
+        return super().create(validated_data)
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -1770,34 +2258,6 @@ class ProposalSerializer(
         if request and not (request.user and request.user.is_staff):
             if "slug" in fields:
                 fields["slug"].read_only = True
-
-        # Make duration_in_days read-only if call has fixed duration
-        def is_fixed_duration(instance):
-            try:
-                return instance.round.call.fixed_duration_in_days
-            except AttributeError:
-                return False
-
-        # Handle both single instance and list
-        instances = (
-            self.instance
-            if isinstance(self.instance, (list | tuple))
-            else [self.instance]
-            if self.instance
-            else []
-        )
-
-        if any(is_fixed_duration(obj) for obj in instances):
-            fields["duration_in_days"].read_only = True
-        elif hasattr(self, "initial_data") and "round_uuid" in self.initial_data:
-            # For creation, check if the call has fixed duration
-            try:
-                round_uuid = self.initial_data["round_uuid"]
-                call_round = models.Round.objects.get(uuid=round_uuid)
-                if call_round.call.fixed_duration_in_days:
-                    fields["duration_in_days"].read_only = True
-            except (models.Round.DoesNotExist, KeyError):
-                pass
 
         return fields
 
@@ -2009,10 +2469,11 @@ class ProposalProjectRoleMappingSerializer(serializers.HyperlinkedModelSerialize
             call = self.instance.call
         else:
             call = attrs["call"]
-        if not permissions_utils.has_permission(
+        if not permissions_utils.has_permission_on_any_source(
             self.context["request"],
             permissions_enums.PermissionEnum.UPDATE_CALL,
             call,
+            proposal_permissions.CALL_PERMISSION_SOURCES,
         ):
             raise PermissionDenied()
 
@@ -2407,6 +2868,15 @@ class ReviewerPublicationSerializer(
 ):
     """Serializer for reviewer publications."""
 
+    # Declared explicitly so the schema renders an array; a bare JSONField is
+    # mapped to a free-form object by JSONFieldExtension. The child is left
+    # unconstrained because entries are {"name": ..., "orcid": ...} objects,
+    # and plain name strings are still accepted for legacy records.
+    coauthors = serializers.ListField(
+        required=False,
+        help_text=_("List of co-author names and identifiers"),
+    )
+
     class Meta:
         model = models.ReviewerPublication
         fields = [
@@ -2435,6 +2905,13 @@ class ReviewerProfileSerializer(
     user_uuid = serializers.UUIDField(source="user.uuid", read_only=True)
     affiliations = ReviewerAffiliationSerializer(many=True, read_only=True)
     expertise_set = ReviewerExpertiseSerializer(many=True, read_only=True)
+    # Declared explicitly so the schema renders an array; a bare JSONField is
+    # mapped to a free-form object by JSONFieldExtension.
+    alternative_names = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        help_text=_("List of name variants used in publications"),
+    )
     publications = ReviewerPublicationSerializer(many=True, read_only=True)
     stats = ReviewerStatsSerializer(read_only=True)
     orcid_connected = serializers.SerializerMethodField()
@@ -2502,6 +2979,14 @@ class ReviewerProfileSerializer(
 class ReviewerProfileCreateSerializer(serializers.ModelSerializer):
     """Serializer for creating/updating a reviewer profile."""
 
+    # Declared explicitly so the schema renders an array; a bare JSONField is
+    # mapped to a free-form object by JSONFieldExtension.
+    alternative_names = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        help_text=_("List of name variants used in publications"),
+    )
+
     class Meta:
         model = models.ReviewerProfile
         fields = [
@@ -2530,19 +3015,19 @@ class CallCOIConfigurationSerializer(
     call_uuid = serializers.UUIDField(source="call.uuid", read_only=True)
     call_name = serializers.ReadOnlyField(source="call.name")
 
-    # Explicitly type JSON array fields for proper OpenAPI schema generation
+    # Explicitly type JSON array fields for proper OpenAPI schema generation.
     recusal_required_types = serializers.ListField(
-        child=serializers.CharField(),
+        child=serializers.ChoiceField(choices=COITypes.CHOICES),
         required=False,
         help_text="COI types requiring automatic recusal",
     )
     management_allowed_types = serializers.ListField(
-        child=serializers.CharField(),
+        child=serializers.ChoiceField(choices=COITypes.CHOICES),
         required=False,
         help_text="COI types allowing management plan",
     )
     disclosure_only_types = serializers.ListField(
-        child=serializers.CharField(),
+        child=serializers.ChoiceField(choices=COITypes.CHOICES),
         required=False,
         help_text="COI types requiring disclosure only",
     )
@@ -2576,6 +3061,57 @@ class CallCOIConfigurationSerializer(
                 "view_name": "proposal-protected-call-detail",
             },
         }
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        # Combine incoming values with the persisted ones so partial (PATCH)
+        # updates are validated against the effective post-save state.
+        def effective(field):
+            if field in attrs:
+                return attrs[field] or []
+            if self.instance is not None:
+                return getattr(self.instance, field) or []
+            return []
+
+        overlaps = models.CallCOIConfiguration.find_rule_overlaps(
+            {
+                field: effective(field)
+                for field in models.CallCOIConfiguration.RULE_FIELDS
+            }
+        )
+
+        # Block every overlap this request would create, but leave configurations
+        # that already overlapped alone: they predate the rule, and rewriting or
+        # freezing them is out of scope. An overlap can only be introduced by
+        # rewriting one of the rules holding it, so this still makes new ones
+        # impossible while an untouched legacy one stays editable.
+        # Keyed on the value actually changing, not on the field being present.
+        def is_rewritten(field):
+            if field not in attrs:
+                return False
+            if self.instance is None:
+                return True
+            return set(attrs[field] or []) != set(getattr(self.instance, field) or [])
+
+        introduced = {
+            coi_type: fields
+            for coi_type, fields in overlaps.items()
+            if any(is_rewritten(field) for field in fields)
+        }
+        if introduced:
+            listed = "; ".join(
+                "%s (%s)" % (coi_type, ", ".join(sorted(fields)))
+                for coi_type, fields in sorted(introduced.items())
+            )
+            raise serializers.ValidationError(
+                _(
+                    "Each conflict type may only be assigned to one rule. "
+                    "Remove it from all but one of these: %(conflicts)s."
+                )
+                % {"conflicts": listed}
+            )
+        return attrs
 
 
 class ConflictOfInterestSerializer(
@@ -2654,6 +3190,9 @@ class ConflictOfInterestSerializer(
             "detected_at",
             "evidence_description",
             "evidence_data",
+            # Only dismiss/waive/recuse may move the status: they also stamp
+            # reviewed_by/reviewed_at and unblock the held assignment items.
+            "status",
             "reviewed_by",
             "reviewed_at",
             "conflicting_user",
@@ -3489,6 +4028,7 @@ class DuplicateCallRequestSerializer(serializers.Serializer):
     copy_applicant_visibility_config = serializers.BooleanField(
         required=False, default=True
     )
+    copy_proposal_field_config = serializers.BooleanField(required=False, default=True)
     copy_coi_configuration = serializers.BooleanField(required=False, default=True)
     copy_matching_configuration = serializers.BooleanField(required=False, default=True)
     copy_assignment_configuration = serializers.BooleanField(
@@ -3864,15 +4404,15 @@ class InvitationCOIConfigurationSerializer(serializers.Serializer):
     """COI configuration info for invitation display."""
 
     recusal_required_types = serializers.ListField(
-        child=serializers.CharField(),
+        child=serializers.ChoiceField(choices=COITypes.CHOICES),
         help_text="COI types requiring automatic recusal",
     )
     management_allowed_types = serializers.ListField(
-        child=serializers.CharField(),
+        child=serializers.ChoiceField(choices=COITypes.CHOICES),
         help_text="COI types where a management plan can be submitted",
     )
     disclosure_only_types = serializers.ListField(
-        child=serializers.CharField(),
+        child=serializers.ChoiceField(choices=COITypes.CHOICES),
         help_text="COI types that only need disclosure",
     )
     proposal_disclosure_level = serializers.CharField(
@@ -4469,6 +5009,116 @@ AWARD_RESPONSE_ALLOWED_STEPS = {"allocation_decision"}
 ALLOCATION_TIMING_ALLOWED_STEPS = {"allocation_decision"}
 
 
+class CallWorkflowStepNotificationRuleSerializer(
+    serializers.HyperlinkedModelSerializer
+):
+    workflow_step = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=models.CallWorkflowStep.objects.all(),
+    )
+    workflow_step_uuid = serializers.UUIDField(
+        source="workflow_step.uuid", read_only=True, format="hex"
+    )
+    step = serializers.ReadOnlyField(source="workflow_step.step")
+    call_uuid = serializers.UUIDField(
+        source="workflow_step.call.uuid", read_only=True, format="hex"
+    )
+
+    class Meta:
+        model = models.CallWorkflowStepNotificationRule
+        fields = [
+            "url",
+            "uuid",
+            "created",
+            "modified",
+            "workflow_step",
+            "workflow_step_uuid",
+            "step",
+            "call_uuid",
+            "trigger",
+            "recipient",
+            "days_before",
+            "is_enabled",
+        ]
+        read_only_fields = ("uuid", "created", "modified")
+        extra_kwargs = {
+            "url": {
+                "lookup_field": "uuid",
+                "view_name": "call-workflow-step-notification-rule-detail",
+            },
+        }
+
+    def validate_workflow_step(self, workflow_step):
+        if self.instance and self.instance.workflow_step_id != workflow_step.id:
+            raise serializers.ValidationError(
+                _("A rule cannot be moved to another workflow step.")
+            )
+        if not permissions_utils.has_permission_on_any_source(
+            self.context["request"],
+            permissions_enums.PermissionEnum.UPDATE_CALL,
+            workflow_step.call,
+            proposal_permissions.CALL_PERMISSION_SOURCES,
+        ):
+            raise PermissionDenied()
+        if workflow_step.call.state == CallStates.ARCHIVED:
+            raise serializers.ValidationError(_("Cannot modify an archived call."))
+        return workflow_step
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        get = lambda name: attrs.get(  # noqa: E731
+            name, getattr(self.instance, name, None) if self.instance else None
+        )
+        trigger = get("trigger")
+        days_before = get("days_before")
+        workflow_step = get("workflow_step")
+        recipient = get("recipient")
+
+        if trigger == NotificationRuleTriggers.DEADLINE_APPROACHING:
+            if days_before is None:
+                raise serializers.ValidationError(
+                    {"days_before": _("Required for the deadline_approaching trigger.")}
+                )
+        elif days_before is not None:
+            raise serializers.ValidationError(
+                {"days_before": _("Only applies to the deadline_approaching trigger.")}
+            )
+
+        # Applicants are never told about internal evaluation steps.
+        if (
+            workflow_step is not None
+            and recipient == NotificationRuleRecipients.APPLICANT
+            and workflow_step.step in notification_rules.INTERNAL_STEPS
+        ):
+            raise serializers.ValidationError(
+                {
+                    "recipient": _(
+                        "The applicant cannot be notified about internal "
+                        "evaluation steps."
+                    )
+                }
+            )
+
+        # Uniqueness of (workflow_step, trigger, recipient) is enforced by the
+        # model's unique_together via DRF's UniqueTogetherValidator.
+        return attrs
+
+
+class CallWorkflowStepNotificationRuleNestedSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.CallWorkflowStepNotificationRule
+        fields = ["uuid", "trigger", "recipient", "days_before", "is_enabled"]
+        read_only_fields = fields
+
+
+class WorkflowStepResponsibleUserSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField(format="hex")
+    username = serializers.CharField()
+    full_name = serializers.CharField()
+    email = serializers.EmailField()
+    is_panel_chair = serializers.BooleanField()
+
+
 class CallWorkflowStepSerializer(
     CallNotArchivedCreateMixin,
     core_serializers.AugmentedSerializerMixin,
@@ -4486,6 +5136,10 @@ class CallWorkflowStepSerializer(
     checklist_name = serializers.SerializerMethodField()
     is_mandatory = serializers.SerializerMethodField()
     criteria = WorkflowCriterionSerializer(many=True, required=False)
+    notification_rules = CallWorkflowStepNotificationRuleNestedSerializer(
+        many=True, read_only=True
+    )
+    responsible_users = serializers.SerializerMethodField()
 
     class Meta:
         model = models.CallWorkflowStep
@@ -4513,6 +5167,8 @@ class CallWorkflowStepSerializer(
             "allocation_time",
             "display_order",
             "criteria",
+            "notification_rules",
+            "responsible_users",
         ]
         read_only_fields = ("uuid", "created", "modified")
         protected_fields = ("call", "step")
@@ -4520,6 +5176,23 @@ class CallWorkflowStepSerializer(
     @extend_schema_field(serializers.CharField(allow_null=True))
     def get_checklist_name(self, obj):
         return obj.checklist.name if obj.checklist else None
+
+    @extend_schema_field(WorkflowStepResponsibleUserSerializer(many=True))
+    def get_responsible_users(self, obj):
+        """Everyone currently holding the step's responsible role — the call
+        manager's answer to "who evaluates this step". Provider-side offering
+        managers appear once their offering is accepted into the call."""
+        chair_id = obj.call.panel_chair_id
+        return [
+            {
+                "uuid": user.uuid.hex,
+                "username": user.username,
+                "full_name": user.full_name,
+                "email": user.email,
+                "is_panel_chair": user.id == chair_id,
+            }
+            for user in notification_rules.responsible_users_for_step(obj)
+        ]
 
     @extend_schema_field(serializers.BooleanField())
     def get_is_mandatory(self, obj):
@@ -4623,11 +5296,15 @@ class CallWorkflowStepSerializer(
         if instance.step != "allocation_decision":
             return
         if instance.include_award_response:
-            models.CallWorkflowStep.objects.update_or_create(
+            award_step, created = models.CallWorkflowStep.objects.update_or_create(
                 call=instance.call,
                 step="award_response",
                 defaults={"is_enabled": True},
             )
+            if created:
+                from waldur_mastermind.proposal.handlers import seed_notification_rules
+
+                seed_notification_rules(award_step)
         else:
             models.CallWorkflowStep.objects.filter(
                 call=instance.call, step="award_response"
@@ -4927,3 +5604,48 @@ class CompleteWorkflowStepResponseSerializer(serializers.Serializer):
 class RejectWorkflowStepResponseSerializer(serializers.Serializer):
     detail = serializers.CharField()
     proposal_state = serializers.CharField()
+
+
+class DashboardReviewDeadlineSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField(read_only=True)
+    proposal_uuid = serializers.UUIDField(read_only=True)
+    proposal_name = serializers.CharField(read_only=True)
+    call_uuid = serializers.UUIDField(read_only=True)
+    call_name = serializers.CharField(read_only=True)
+    due_date = serializers.DateTimeField(read_only=True, allow_null=True)
+
+
+class DashboardReviewerStatsSerializer(serializers.Serializer):
+    assigned = serializers.IntegerField(read_only=True)
+    pending = serializers.IntegerField(read_only=True)
+    completed = serializers.IntegerField(read_only=True)
+    deadlines = DashboardReviewDeadlineSerializer(many=True, read_only=True)
+    # How many reviews have a deadline at all, which is not `pending`: a review
+    # whose round leaves review_duration_in_days unset is pending but has no
+    # deadline. `deadlines` above is capped, so this is the only way a client
+    # can tell a full list from a truncated one.
+    deadlines_total = serializers.IntegerField(read_only=True)
+
+
+class DashboardCallManagerStatsSerializer(serializers.Serializer):
+    pending_assessments = serializers.IntegerField(read_only=True)
+    active_calls = serializers.IntegerField(read_only=True)
+    overdue_reviews = serializers.IntegerField(read_only=True)
+
+
+class DashboardUpcomingDeadlineSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField(read_only=True)
+    call_uuid = serializers.UUIDField(read_only=True)
+    call_name = serializers.CharField(read_only=True)
+    round_name = serializers.CharField(read_only=True)
+    due_date = serializers.DateTimeField(read_only=True, allow_null=True)
+
+
+class DashboardSubmitterStatsSerializer(serializers.Serializer):
+    total = serializers.IntegerField(read_only=True)
+    draft = serializers.IntegerField(read_only=True)
+    submitted = serializers.IntegerField(read_only=True)
+    in_review = serializers.IntegerField(read_only=True)
+    accepted = serializers.IntegerField(read_only=True)
+    rejected = serializers.IntegerField(read_only=True)
+    canceled = serializers.IntegerField(read_only=True)

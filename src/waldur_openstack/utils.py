@@ -1,3 +1,5 @@
+from ipaddress import ip_network
+
 from django.utils.translation import gettext_lazy as _
 
 from waldur_core.core import exceptions as core_exceptions
@@ -6,11 +8,13 @@ from waldur_core.permissions.fixtures import CustomerRole
 from waldur_openstack.models import (
     CustomerOpenStack,
     ExternalNetwork,
+    ExternalSubnet,
     Flavor,
     Image,
     Instance,
     SecurityGroup,
     SecurityGroupRule,
+    SubNet,
     Tenant,
     VolumeType,
 )
@@ -139,6 +143,85 @@ def get_external_network_id(tenant: Tenant):
     except CustomerOpenStack.DoesNotExist:
         pass
     return external_network_id
+
+
+def get_external_network_without_ipv4(tenant: Tenant) -> ExternalNetwork | None:
+    """Return the tenant's external network if it is known to have no IPv4 subnet.
+
+    Neutron allocates floating IPs from IPv4 subnets only, so on such a network
+    every allocation is accepted by the API and then fails in the backend.
+    Returns None whenever the answer is unknown -- the network, or its subnets,
+    have not been imported -- so that an incomplete catalog never blocks a
+    request which might succeed.
+    """
+    external_network_id = get_external_network_id(tenant)
+    if not external_network_id:
+        return None
+    network = ExternalNetwork.objects.filter(
+        settings=tenant.service_settings, backend_id=external_network_id
+    ).first()
+    if network is None:
+        return None
+    ip_versions = set(network.subnets.values_list("ip_version", flat=True))
+    if not ip_versions or 4 in ip_versions:
+        return None
+    return network
+
+
+def get_no_ipv4_external_network_message(tenant: Tenant):
+    """Why a floating IP cannot be allocated for this tenant, or None when it can.
+
+    Shared so that the API and the admin action refuse in the same words.
+    """
+    network = get_external_network_without_ipv4(tenant)
+    if network is None:
+        return None
+    return _(
+        "External network %s has no IPv4 subnet, so no floating IP can be "
+        "allocated from it. Floating IPs are IPv4 only: IPv6 addresses are "
+        "routed rather than floating, so reach the instance on its own IPv6 "
+        "address instead."
+    ) % (network.name or network.backend_id)
+
+
+def _is_ipv6(ip_version: int, cidr: str) -> bool:
+    # A subnet created by Waldur keeps the default ip_version of 4 until it is
+    # pulled from Neutron, so the CIDR decides as well.
+    if ip_version == 6:
+        return True
+    try:
+        return ip_network(cidr, strict=False).version == 6
+    except ValueError:
+        return False
+
+
+def tenant_has_ipv6(tenant: Tenant) -> bool:
+    """
+    Whether the tenant has IPv6: one of its subnets has an IPv6 CIDR, or the
+    external network it uses has an IPv6 subnet. When no external network is
+    resolved for the tenant, any external network of its service settings
+    counts. A tenant whose external subnets were never pulled counts as
+    IPv4-only.
+    """
+    subnets = SubNet.objects.filter(tenant=tenant)
+    if any(
+        _is_ipv6(ip_version, cidr)
+        for ip_version, cidr in subnets.values_list("ip_version", "cidr")
+    ):
+        return True
+
+    external_subnets = ExternalSubnet.objects.filter(
+        network__settings=tenant.service_settings
+    )
+    external_network_id = get_external_network_id(tenant)
+    if external_network_id:
+        external_subnets = external_subnets.filter(
+            network__backend_id=external_network_id
+        )
+    return any(
+        _is_ipv6(ip_version, cidr)
+        for ip_version, cidr in external_subnets.values_list("ip_version", "cidr")
+    )
 
 
 def check_volume_resize_enabled(volume):

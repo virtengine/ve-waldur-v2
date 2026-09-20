@@ -4,7 +4,7 @@ import uuid
 from decimal import Decimal
 
 from dateutil.relativedelta import relativedelta
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import F, Q, QuerySet, Sum
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
@@ -1138,6 +1138,9 @@ class CustomerCreditViewSet(core_views.ActionsViewSet):
         compensations.MonthlyCompensation(
             customer_credit.customer
         ).apply_compensations()
+        # DRF asserts on a None return, so without this the action always 500s
+        # after doing its work.
+        return Response(status=status.HTTP_200_OK)
 
     @extend_schema(responses={status.HTTP_200_OK: None}, request=None)
     @transaction.atomic
@@ -1147,6 +1150,7 @@ class CustomerCreditViewSet(core_views.ActionsViewSet):
         compensations.MonthlyCompensation(
             customer_credit.customer
         ).clear_compensations()
+        return Response(status=status.HTTP_200_OK)
 
     apply_compensations_permissions = clear_compensations_permissions = [
         structure_permissions.is_staff
@@ -1284,6 +1288,27 @@ class CustomerAffiliateViewSet(core_views.ActionsViewSet):
         partial_update_serializer_class
     ) = serializers.CreateCustomerAffiliateSerializer
 
+    def perform_create(self, serializer):
+        self._save_link(serializer)
+
+    def perform_update(self, serializer):
+        self._save_link(serializer)
+
+    def _save_link(self, serializer):
+        # The serializer checks for another active link without a lock, so a
+        # concurrent request can save one first. Report the constraint
+        # violation as a 400 instead of a 500.
+        try:
+            with transaction.atomic():
+                serializer.save()
+        except IntegrityError:
+            raise exceptions.ValidationError(
+                _(
+                    "Another affiliate link for this organization was saved "
+                    "at the same time. Reload the list and try again."
+                )
+            )
+
     @extend_schema(
         description="List fees accrued from this affiliate link. Exposes the "
         "fee amount and invoice period only — never the referred customer's "
@@ -1337,14 +1362,18 @@ class CustomerAffiliateViewSet(core_views.ActionsViewSet):
 
 
 class CreditTransactionViewSet(core_views.ReadOnlyActionsViewSet):
-    """Read-only ledger of a customer credit's value changes (the withdrawable
-    balance trace). Visible to staff and to the credit's customer organization
-    owner via ``GenericRoleFilter`` against ``Permissions.customer_path``.
+    """Read-only ledger of credit value changes: the withdrawable balance trace
+    for an organization credit, and the drawdown history — used against usage,
+    lost to the minimal-consumption floor — for a project allocation.
+
+    ``GenericRoleFilter`` scopes it against ``Permissions``: staff see
+    everything, an organization owner their organization's rows on either
+    balance, and project roles their own project's.
     """
 
     lookup_field = "uuid"
     queryset = models.CreditTransaction.objects.select_related(
-        "credit__customer"
+        "credit__customer", "project_credit__project__customer"
     ).order_by("-created")
     serializer_class = serializers.CreditTransactionSerializer
     filter_backends = (

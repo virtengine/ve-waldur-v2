@@ -10,10 +10,11 @@ from rest_framework.exceptions import ValidationError
 from waldur_core.core.enums import CoreStates
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
+from waldur_mastermind.common.serializers import strip_hidden_options
 from waldur_mastermind.marketplace.enums import OrderStates, OrderTypes, ResourceStates
 
-from . import log, models, signals, tasks
-from .utils import format_limits_list
+from . import billing_mode, log, models, signals, tasks
+from .utils import format_limits_list, parse_date
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +231,14 @@ def resource_update_succeeded(resource: models.Resource, validate=False):
             if new_options:
                 current_options = locked_resource.options or {}
                 current_options.update(new_options)
+                resource_options = (
+                    locked_resource.offering.resource_options or {}
+                ).get("options")
+                if resource_options:
+                    # Options hidden by the new values lose their stored values.
+                    current_options = strip_hidden_options(
+                        resource_options, current_options
+                    )
                 locked_resource.options = current_options
                 logger.info(
                     "Updated options for resource %s (UUID: %s) from order %s",
@@ -238,14 +247,45 @@ def resource_update_succeeded(resource: models.Resource, validate=False):
                     order.uuid.hex,
                 )
 
+            # Handle end date changes from order attributes. This is the single
+            # place an approved order writes an end date, so it covers both
+            # completion routes: processors that finish synchronously delegate
+            # here, and offerings whose backend call is asynchronous arrive here
+            # when the backend reports back. Renewal orders carry new_end_date
+            # too, so keying on the attribute rather than on the action also
+            # applies renewals that finish asynchronously — those used to be
+            # marked done with no end date ever written.
+            new_end_date = parse_date(order.attributes.get("new_end_date"))
+            if new_end_date and locked_resource.end_date != new_end_date:
+                locked_resource.end_date = new_end_date
+                locked_resource.end_date_requested_by = (
+                    order.consumer_reviewed_by or order.created_by
+                )
+                logger.info(
+                    "Updated end date for resource %s (UUID: %s) to %s from order %s",
+                    locked_resource.name,
+                    locked_resource.uuid.hex,
+                    new_end_date,
+                    order.uuid.hex,
+                )
+
             if plan_changed:
+                old_plan = locked_resource.plan
+                old_billing = billing_mode.describe_plan_billing(old_plan)
+                new_billing = billing_mode.describe_plan_billing(order.plan)
                 email_context.update(
                     {
-                        "resource_old_plan": locked_resource.plan.name,
+                        "resource_old_plan": old_plan.name,
                         "resource_plan": order.plan.name,
+                        "billing_consequence": billing_mode.describe_switch_consequence(
+                            old_billing, new_billing
+                        ),
                     }
                 )
                 locked_resource.plan = order.plan
+                log.log_resource_plan_switched(
+                    locked_resource, old_plan, order.plan, old_billing, new_billing
+                )
                 transaction.on_commit(
                     lambda: tasks.notify_about_resource_change.delay(
                         "marketplace_resource_update_succeeded",
@@ -254,7 +294,9 @@ def resource_update_succeeded(resource: models.Resource, validate=False):
                     )
                 )
             if limits_changed:
-                components_map = order.offering.get_limit_components()
+                components_map = order.offering.get_limit_components(
+                    order.plan or locked_resource.plan
+                )
                 email_context.update(
                     {
                         "resource_old_limits": format_limits_list(

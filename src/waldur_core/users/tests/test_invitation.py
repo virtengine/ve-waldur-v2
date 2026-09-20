@@ -8,21 +8,28 @@ from ddt import data, ddt
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core import mail
-from django.test import override_settings
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from freezegun import freeze_time
 from rest_framework import status, test
 
+from waldur_core.core import models as core_models
 from waldur_core.core.enums import ReviewStates
 from waldur_core.core.tests.helpers import override_waldur_core_settings
 from waldur_core.logging import models as logging_models
 from waldur_core.permissions.enums import PermissionEnum
-from waldur_core.permissions.fixtures import CustomerRole, ProjectRole, ProposalRole
+from waldur_core.permissions.fixtures import (
+    CallRole,
+    CustomerRole,
+    ProjectRole,
+    ProposalRole,
+)
 from waldur_core.permissions.models import (
     CustomerRoleConcealment,
     Role,
     RoleAvailability,
 )
+from waldur_core.permissions.serializers import clone_role_for_customer
 from waldur_core.permissions.utils import get_permissions
 from waldur_core.structure.models import Customer, Project
 from waldur_core.structure.tests import factories as structure_factories
@@ -30,7 +37,7 @@ from waldur_core.users import models, tasks
 from waldur_core.users.enums import InvitationState
 from waldur_core.users.tests import factories
 from waldur_core.users.utils import get_invitation_link, get_invitation_token
-from waldur_mastermind.proposal.tests.factories import ProposalFactory
+from waldur_mastermind.proposal.tests.factories import CallFactory, ProposalFactory
 
 
 class InvitationFieldValidationTest(test.APITestCase):
@@ -122,7 +129,7 @@ class InvitationFieldValidationTest(test.APITestCase):
         self.assertEqual(invitation.extra_invitation_text, "")
 
 
-class BaseInvitationTest(test.APITransactionTestCase):
+class BaseInvitationTest(test.APITestCase):
     def setUp(self):
         CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_PROJECT_PERMISSION)
         CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_CUSTOMER_PERMISSION)
@@ -198,7 +205,8 @@ class InvitationDuplicateCheckTest(BaseInvitationTest):
                         "role": CustomerRole.OWNER.uuid.hex,
                         "existing_invitation_uuid": str(invitation.uuid),
                     }
-                ]
+                ],
+                "existing_roles": [],
             },
         )
 
@@ -226,7 +234,7 @@ class InvitationDuplicateCheckTest(BaseInvitationTest):
         response = self.client.post(self.check_duplicates_url, data=payload)
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data, {"duplicates": []})
+        self.assertEqual(response.data, {"duplicates": [], "existing_roles": []})
 
     def test_returns_duplicates_within_request(self):
         payload = {
@@ -249,9 +257,151 @@ class InvitationDuplicateCheckTest(BaseInvitationTest):
                         "role": CustomerRole.OWNER.uuid.hex,
                         "existing_invitation_uuid": None,
                     }
-                ]
+                ],
+                "existing_roles": [],
             },
         )
+
+    def check_project_duplicates(self, email, role):
+        payload = {
+            "scope": structure_factories.ProjectFactory.get_url(self.project),
+            "invitations": [{"email": email, "role": role.uuid.hex}],
+        }
+        response = self.client.post(self.check_duplicates_url, data=payload)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return response.data["existing_roles"]
+
+    def test_returns_existing_role_when_user_has_same_role_in_scope(self):
+        existing_roles = self.check_project_duplicates(
+            self.project_admin.email, ProjectRole.ADMIN
+        )
+
+        self.assertEqual(
+            existing_roles,
+            [
+                {
+                    "email": self.project_admin.email,
+                    "role": ProjectRole.ADMIN.uuid.hex,
+                    "existing_role": ProjectRole.ADMIN.uuid.hex,
+                    "existing_role_name": ProjectRole.ADMIN.name,
+                    "existing_role_description": ProjectRole.ADMIN.description,
+                    "is_same_role": True,
+                }
+            ],
+        )
+
+    def test_returns_existing_role_when_user_has_different_role_in_scope(self):
+        existing_roles = self.check_project_duplicates(
+            self.project_admin.email, ProjectRole.MANAGER
+        )
+
+        self.assertEqual(
+            existing_roles,
+            [
+                {
+                    "email": self.project_admin.email,
+                    "role": ProjectRole.MANAGER.uuid.hex,
+                    "existing_role": ProjectRole.ADMIN.uuid.hex,
+                    "existing_role_name": ProjectRole.ADMIN.name,
+                    "existing_role_description": ProjectRole.ADMIN.description,
+                    "is_same_role": False,
+                }
+            ],
+        )
+
+    def test_does_not_return_existing_roles_for_user_without_role_in_scope(self):
+        self.assertEqual(
+            self.check_project_duplicates(self.user.email, ProjectRole.ADMIN), []
+        )
+
+    def test_matches_existing_roles_by_email_case_insensitively(self):
+        existing_roles = self.check_project_duplicates(
+            self.project_admin.email.upper(), ProjectRole.ADMIN
+        )
+
+        self.assertEqual(len(existing_roles), 1)
+        self.assertEqual(existing_roles[0]["email"], self.project_admin.email.upper())
+        self.assertTrue(existing_roles[0]["is_same_role"])
+
+    def test_ignores_revoked_roles(self):
+        self.project.add_user(self.user, ProjectRole.MANAGER)
+        get_permissions(self.project, self.user).update(is_active=False)
+
+        self.assertEqual(
+            self.check_project_duplicates(self.user.email, ProjectRole.ADMIN), []
+        )
+
+    def test_reports_every_user_sharing_the_same_email(self):
+        # User.email carries no unique constraint, so an email may resolve to
+        # several accounts, each with its own role in the scope.
+        namesake = structure_factories.UserFactory(email=self.project_admin.email)
+        self.project.add_user(namesake, ProjectRole.MANAGER)
+
+        existing_roles = self.check_project_duplicates(
+            self.project_admin.email, ProjectRole.ADMIN
+        )
+
+        # Ordered by role name across both accounts, not by whatever order the
+        # database returned the users in.
+        self.assertEqual(
+            [item["existing_role_name"] for item in existing_roles],
+            [ProjectRole.ADMIN.name, ProjectRole.MANAGER.name],
+        )
+
+    def test_reports_each_case_variant_of_the_same_email(self):
+        payload = {
+            "scope": structure_factories.ProjectFactory.get_url(self.project),
+            "invitations": [
+                {
+                    "email": self.project_admin.email.upper(),
+                    "role": ProjectRole.ADMIN.uuid.hex,
+                },
+                {
+                    "email": self.project_admin.email,
+                    "role": ProjectRole.ADMIN.uuid.hex,
+                },
+            ],
+        }
+
+        response = self.client.post(self.check_duplicates_url, data=payload)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # Both rows are reported with their own spelling, so a caller matching
+        # entries back to rows by email flags both of them.
+        self.assertEqual(
+            [item["email"] for item in response.data["existing_roles"]],
+            [self.project_admin.email.upper(), self.project_admin.email],
+        )
+
+    @override_config(INVITATION_DISABLE_MULTIPLE_ROLES=True)
+    def test_reports_existing_roles_when_multiple_roles_are_disabled(self):
+        self.assertEqual(
+            self.check_project_duplicates(
+                self.project_admin.email, ProjectRole.MANAGER
+            ),
+            self.expected_different_role_entry(),
+        )
+
+    @override_config(INVITATION_DISABLE_MULTIPLE_ROLES=False)
+    def test_reports_existing_roles_when_multiple_roles_are_allowed(self):
+        self.assertEqual(
+            self.check_project_duplicates(
+                self.project_admin.email, ProjectRole.MANAGER
+            ),
+            self.expected_different_role_entry(),
+        )
+
+    def expected_different_role_entry(self):
+        return [
+            {
+                "email": self.project_admin.email,
+                "role": ProjectRole.MANAGER.uuid.hex,
+                "existing_role": ProjectRole.ADMIN.uuid.hex,
+                "existing_role_name": ProjectRole.ADMIN.name,
+                "existing_role_description": ProjectRole.ADMIN.description,
+                "is_same_role": False,
+            }
+        ]
 
 
 @ddt
@@ -1043,6 +1193,30 @@ class InvitationReminderTest(BaseInvitationTest):
         self.assertEqual(len(mail.outbox), 1)
         self.assertTrue("REMINDER" in mail.outbox[0].subject)
 
+    @override_config(HOMEPORT_URL="TEST")
+    def test_send_reminder_skips_soft_deleted_project_invitation(self):
+        """Pending invites for terminated projects must not get reminder emails."""
+        waldur_section = settings.WALDUR_CORE.copy()
+        waldur_section["INVITATION_LIFETIME"] = timedelta(weeks=1)
+        waldur_section["TRANSLATION_DOMAIN"] = "TEST"
+        event_type = "invitation_created"
+        structure_factories.NotificationFactory(key=f"users.{event_type}")
+
+        with self.settings(WALDUR_CORE=waldur_section):
+            factories.ProjectInvitationFactory(
+                scope=self.project,
+                created=timezone.now()
+                - waldur_section["INVITATION_LIFETIME"]
+                + timedelta(days=1),
+                created_by=self.project_admin,
+            )
+            self.project.delete()
+            self.assertTrue(self.project.is_removed)
+
+            tasks.send_reminder_for_pending_invitations()
+
+        self.assertEqual(len(mail.outbox), 0)
+
 
 class InvitationEmailRestrictionTest(test.APITestCase):
     def setUp(self):
@@ -1082,6 +1256,23 @@ class InvitationEmailRestrictionTest(test.APITestCase):
             factories.InvitationBaseFactory.get_list_url(), data=payload
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_invitation_blocked_for_lookalike_domain(self):
+        # Deliberately without "$": the pattern must still cover the whole address.
+        self.customer.user_email_patterns = [r".*@example\.com"]
+        self.customer.save()
+
+        self.client.force_authenticate(user=self.staff)
+        payload = {
+            "email": "user@example.com.attacker.net",
+            "scope": structure_factories.CustomerFactory.get_url(self.customer),
+            "role": CustomerRole.OWNER.uuid.hex,
+        }
+        response = self.client.post(
+            factories.InvitationBaseFactory.get_list_url(), data=payload
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("email", response.data)
 
     def test_invitation_blocked_by_parent_customer_pattern_for_project_scope(self):
         self.customer.user_email_patterns = [r".*@example\.com$"]
@@ -1249,6 +1440,99 @@ class InvitationCancelTest(BaseInvitationTest):
 
         invitation.refresh_from_db()
         self.assertEqual(invitation.state, InvitationState.EXPIRED)
+
+
+class CancelInvitationsOnProjectDeletionTest(TestCase):
+    def setUp(self):
+        self.project = structure_factories.ProjectFactory()
+        self.customer = self.project.customer
+
+    def test_pending_invitation_is_canceled_on_soft_delete(self):
+        invitation = factories.ProjectInvitationFactory(
+            scope=self.project,
+            role=ProjectRole.ADMIN,
+            state=InvitationState.PENDING,
+        )
+
+        self.project.delete()
+
+        invitation.refresh_from_db()
+        self.assertEqual(invitation.state, InvitationState.CANCELED)
+
+    def test_pending_project_invitation_is_canceled_on_soft_delete(self):
+        invitation = factories.ProjectInvitationFactory(
+            scope=self.project,
+            role=ProjectRole.ADMIN,
+            state=InvitationState.PENDING_PROJECT,
+        )
+
+        self.project.delete()
+
+        invitation.refresh_from_db()
+        self.assertEqual(invitation.state, InvitationState.CANCELED)
+
+    def test_requested_invitation_is_canceled_on_soft_delete(self):
+        invitation = factories.ProjectInvitationFactory(
+            scope=self.project,
+            role=ProjectRole.ADMIN,
+            state=InvitationState.REQUESTED,
+        )
+
+        self.project.delete()
+
+        invitation.refresh_from_db()
+        self.assertEqual(invitation.state, InvitationState.CANCELED)
+
+    def test_accepted_invitation_is_not_changed(self):
+        invitation = factories.ProjectInvitationFactory(
+            scope=self.project,
+            role=ProjectRole.ADMIN,
+            state=InvitationState.ACCEPTED,
+        )
+
+        self.project.delete()
+
+        invitation.refresh_from_db()
+        self.assertEqual(invitation.state, InvitationState.ACCEPTED)
+
+    def test_group_invitation_is_deactivated_on_soft_delete(self):
+        group_invitation = factories.ProjectGroupInvitationFactory(
+            scope=self.project,
+            role=ProjectRole.ADMIN,
+            is_active=True,
+        )
+
+        self.project.delete()
+
+        group_invitation.refresh_from_db()
+        self.assertFalse(group_invitation.is_active)
+
+    def test_customer_invitations_are_not_affected(self):
+        customer_invitation = factories.CustomerInvitationFactory(
+            scope=self.customer,
+            role=CustomerRole.OWNER,
+            state=InvitationState.PENDING,
+        )
+        customer_group_invitation = factories.CustomerGroupInvitationFactory(
+            scope=self.customer,
+            role=CustomerRole.OWNER,
+            is_active=True,
+        )
+        other_project = structure_factories.ProjectFactory(customer=self.customer)
+        other_invitation = factories.ProjectInvitationFactory(
+            scope=other_project,
+            role=ProjectRole.ADMIN,
+            state=InvitationState.PENDING,
+        )
+
+        self.project.delete()
+
+        customer_invitation.refresh_from_db()
+        customer_group_invitation.refresh_from_db()
+        other_invitation.refresh_from_db()
+        self.assertEqual(customer_invitation.state, InvitationState.PENDING)
+        self.assertTrue(customer_group_invitation.is_active)
+        self.assertEqual(other_invitation.state, InvitationState.PENDING)
 
 
 @ddt
@@ -1471,6 +1755,28 @@ class InvitationAcceptTest(BaseInvitationTest):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(
             response.data, ["User has already the same role in this scope."]
+        )
+
+    def test_template_holder_can_accept_invitation_to_org_scoped_clone(self):
+        # The duplicate-role guard is identity-strict: holding the system role
+        # must not block accepting an invitation to its organization clone.
+        clone = clone_role_for_customer(
+            ProjectRole.ADMIN, self.customer, conceal_template=False
+        )
+        project_invitation = factories.ProjectInvitationFactory(
+            scope=self.project, role=clone
+        )
+        self.project.add_user(self.user, ProjectRole.ADMIN)
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post(
+            factories.ProjectInvitationFactory.get_url(
+                project_invitation, action="accept"
+            )
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertTrue(
+            get_permissions(self.project, self.user).filter(role=clone).exists()
         )
 
     @override_config(INVITATION_DISABLE_MULTIPLE_ROLES=True)
@@ -2216,6 +2522,7 @@ class GroupInvitationSubmitRequestTest(test.APITestCase):
             "uuid",
             "scope_name",
             "scope_uuid",
+            "scope_type",
             "auto_approved",
             "project_uuid",
             "project_created",
@@ -2748,6 +3055,20 @@ class InvitationResendStuckTaskTest(test.APITestCase):
                 self.sender.full_name or self.sender.username,
             )
 
+    def test_skips_soft_deleted_project_invitation(self):
+        """Stuck invites for terminated projects must not be reprocessed."""
+        invitation = factories.ProjectInvitationFactory(
+            state=InvitationState.PENDING,
+            execution_state=models.Invitation.ExecutionState.SCHEDULED,
+            created_by=self.sender,
+        )
+        invitation.scope.delete()
+        self.assertTrue(invitation.scope.is_removed)
+
+        with mock.patch("waldur_core.users.tasks.process_invitation") as process:
+            tasks.resend_stuck_invitations()
+            process.delay.assert_not_called()
+
 
 class InvitationWebhookScopeTest(test.APITestCase):
     """Tests for webhook scope filtering - webhooks only support project invitations."""
@@ -2805,6 +3126,26 @@ class InvitationWebhookScopeTest(test.APITestCase):
             tasks.send_invitation_created(invitation.uuid.hex, self.sender.full_name)
             mock_webhook.assert_not_called()
             mock_email.assert_called_once()
+
+    @override_waldur_core_settings(INVITATION_USE_WEBHOOKS=False)
+    def test_send_invitation_created_skips_soft_deleted_project(self):
+        """Do not email invites whose project scope has been soft-deleted."""
+        invitation = factories.ProjectInvitationFactory(
+            state=InvitationState.PENDING,
+            created_by=self.sender,
+        )
+        invitation.scope.delete()
+        self.assertTrue(invitation.scope.is_removed)
+
+        with mock.patch("waldur_core.users.tasks.broadcast_mail") as mock_email:
+            tasks.send_invitation_created(invitation.uuid.hex, self.sender.full_name)
+            mock_email.assert_not_called()
+
+        invitation.refresh_from_db()
+        self.assertEqual(
+            invitation.execution_state, models.Invitation.ExecutionState.ERRED
+        )
+        self.assertIn("deleted or terminated", invitation.error_message)
 
 
 class InvitationOrgScopedRoleTest(test.APITestCase):
@@ -2866,3 +3207,116 @@ class InvitationOrgScopedRoleTest(test.APITestCase):
     def test_system_role_invitation_still_works(self):
         response = self._post_invitation(ProjectRole.MANAGER)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+
+@override_settings(task_always_eager=True)
+@override_config(HOMEPORT_URL="https://example.com/")
+class CallAndProposalInvitationTemplateTest(test.APITestCase):
+    """Calls and proposals render their own invitation emails.
+
+    The shared users.invitation_created template is phrased for organization and
+    project roles, which reads wrong for the call for proposals workflow.
+    """
+
+    def setUp(self):
+        # The call and proposal notifications are seeded by a data migration,
+        # so they are enabled in place rather than created from scratch.
+        for event_type in (
+            "invitation_created",
+            "call_invitation_created",
+            "proposal_invitation_created",
+        ):
+            core_models.Notification.objects.update_or_create(
+                key=f"users.{event_type}", defaults={"enabled": True}
+            )
+        self.sender = structure_factories.UserFactory()
+
+    def _create_call_invitation(self):
+        call = CallFactory()
+        return models.Invitation.objects.create(
+            email="manager@example.com",
+            scope=call,
+            customer=call.manager.customer,
+            role=CallRole.MANAGER,
+            created_by=self.sender,
+        )
+
+    def _create_proposal_invitation(self):
+        proposal = ProposalFactory()
+        return models.Invitation.objects.create(
+            email="member@example.com",
+            scope=proposal,
+            customer=proposal.round.call.manager.customer,
+            role=ProposalRole.MEMBER,
+            created_by=self.sender,
+        )
+
+    def test_call_invitation_uses_call_template(self):
+        invitation = self._create_call_invitation()
+
+        tasks.send_invitation_created(invitation.uuid.hex, self.sender.full_name)
+
+        self.assertEqual(len(mail.outbox), 1)
+        message = mail.outbox[0]
+        self.assertEqual(
+            f'Invitation to the call "{invitation.scope.name}"', message.subject
+        )
+        self.assertIn("call for proposals", message.body)
+        self.assertIn(invitation.scope.manager.customer.name, message.body)
+
+    def test_proposal_invitation_uses_proposal_template(self):
+        invitation = self._create_proposal_invitation()
+
+        tasks.send_invitation_created(invitation.uuid.hex, self.sender.full_name)
+
+        self.assertEqual(len(mail.outbox), 1)
+        message = mail.outbox[0]
+        self.assertEqual(
+            f'Invitation to the proposal "{invitation.scope.name}"', message.subject
+        )
+        self.assertIn("team of the proposal", message.body)
+        self.assertIn(invitation.scope.round.call.name, message.body)
+
+    def test_proposal_invitation_links_to_proposal_page(self):
+        invitation = self._create_proposal_invitation()
+
+        tasks.send_invitation_created(invitation.uuid.hex, self.sender.full_name)
+
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn(
+            f"proposals/{invitation.scope.uuid.hex}/",
+            mail.outbox[0].body,
+        )
+
+    def test_project_invitation_still_uses_shared_template(self):
+        invitation = factories.ProjectInvitationFactory(created_by=self.sender)
+
+        tasks.send_invitation_created(invitation.uuid.hex, self.sender.full_name)
+
+        self.assertEqual(len(mail.outbox), 1)
+        message = mail.outbox[0]
+        self.assertEqual(
+            f"Invitation to {invitation.scope.name} project", message.subject
+        )
+        self.assertIn("has invited you to join", message.body)
+
+    def test_proposal_invitation_reminder_uses_proposal_template(self):
+        waldur_section = settings.WALDUR_CORE.copy()
+        waldur_section["INVITATION_LIFETIME"] = timedelta(weeks=1)
+        invitation = self._create_proposal_invitation()
+
+        with self.settings(WALDUR_CORE=waldur_section):
+            models.Invitation.objects.filter(pk=invitation.pk).update(
+                created=timezone.now()
+                - waldur_section["INVITATION_LIFETIME"]
+                + timedelta(days=1)
+            )
+            tasks.send_reminder_for_pending_invitations()
+
+        self.assertEqual(len(mail.outbox), 1)
+        message = mail.outbox[0]
+        self.assertEqual(
+            f'REMINDER: Invitation to the proposal "{invitation.scope.name}"',
+            message.subject,
+        )
+        self.assertIn(invitation.scope.round.call.name, message.body)

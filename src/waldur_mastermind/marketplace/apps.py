@@ -11,6 +11,7 @@ class MarketplaceConfig(AppConfig):
     def ready(self):
         from waldur_core.core import models as core_models
         from waldur_core.core import signals as core_signals
+        from waldur_core.logging import availability as event_availability
         from waldur_core.permissions import signals as permission_signals
         from waldur_core.quotas import signals as quota_signals
         from waldur_core.structure import models as structure_models
@@ -34,6 +35,35 @@ class MarketplaceConfig(AppConfig):
             dispatch_uid="waldur_mastermind.marketplace.process_billing_on_resource_save",
         )
 
+        # The advertised event-group catalogue is derived from the offering
+        # types a deployment holds, so the first offering of a plugin has to
+        # make that plugin's groups appear without waiting for a restart.
+        for signal in (signals.post_save, signals.post_delete):
+            signal.connect(
+                event_availability.invalidate_cache_on_commit,
+                sender=models.Offering,
+                dispatch_uid="waldur_core.logging.availability.invalidate_cache_on_commit",
+            )
+
+        # Pub/sub state-change events: one emitter per model, every transition,
+        # any offering type. Consumers (site agents, UI clients) demultiplex on
+        # the state carried in the payload.
+        signals.post_save.connect(
+            handlers.send_order_state_change_to_message_queue,
+            sender=models.Order,
+            dispatch_uid="waldur_mastermind.marketplace.send_order_state_change_to_message_queue",
+        )
+        signals.post_save.connect(
+            handlers.send_resource_state_change_to_message_queue,
+            sender=models.Resource,
+            dispatch_uid="waldur_mastermind.marketplace.send_resource_state_change_to_message_queue",
+        )
+        signals.post_save.connect(
+            handlers.send_end_date_change_request_to_message_queue,
+            sender=models.ResourceEndDateChangeRequest,
+            dispatch_uid="waldur_mastermind.marketplace.send_end_date_change_request_to_message_queue",
+        )
+
         # OfferingProfile sync — schedule async reconciliation when profile
         # roles change or when an offering is bound/unbound.
         signals.m2m_changed.connect(
@@ -45,6 +75,11 @@ class MarketplaceConfig(AppConfig):
             handlers.reconcile_offering_profile_on_offering_changed,
             sender=models.Offering,
             dispatch_uid="waldur_mastermind.marketplace.reconcile_offering_profile_on_offering_changed",
+        )
+        signals.pre_save.connect(
+            handlers.encrypt_secret_options_on_raw_save,
+            sender=models.Offering,
+            dispatch_uid="waldur_mastermind.marketplace.encrypt_secret_options_on_raw_save",
         )
 
         from waldur_core.core.handlers import create_initial_revision
@@ -106,6 +141,12 @@ class MarketplaceConfig(AppConfig):
             handlers.notify_approvers_when_order_is_created,
             sender=models.Order,
             dispatch_uid="waldur_mastermind.marketplace.notify_approvers_when_order_is_created",
+        )
+
+        signals.post_save.connect(
+            handlers.notify_recipients_when_order_is_created,
+            sender=models.Order,
+            dispatch_uid="waldur_mastermind.marketplace.notify_recipients_when_order_is_created",
         )
 
         signals.post_save.connect(
@@ -370,6 +411,7 @@ class MarketplaceConfig(AppConfig):
 
         for posix_consumer_model in (
             models.OfferingUser,
+            models.ServiceProviderAccount,
             models.RobotAccount,
             models.OfferingUserGroup,
             models.OfferingRoleGroup,
@@ -382,9 +424,9 @@ class MarketplaceConfig(AppConfig):
             )
 
         signals.post_save.connect(
-            handlers.log_offering_user_username_updated,
+            handlers.log_offering_user_fields_updated,
             sender=models.OfferingUser,
-            dispatch_uid="waldur_mastermind.marketplace.log_offering_user_username_updated",
+            dispatch_uid="waldur_mastermind.marketplace.log_offering_user_fields_updated",
         )
 
         signals.post_save.connect(
@@ -403,6 +445,28 @@ class MarketplaceConfig(AppConfig):
             handlers.send_offering_user_created_message,
             sender=models.OfferingUser,
             dispatch_uid="waldur_mastermind.marketplace.send_offering_user_created_message",
+        )
+
+        # Provider-level accounts announce themselves on their own object type,
+        # anchored on the provider's customer. The per-offering OFFERING_USER
+        # events keep firing too, so a consumer that only knows those is
+        # unaffected by this.
+        signals.post_save.connect(
+            handlers.send_provider_account_created_message,
+            sender=models.ServiceProviderAccount,
+            dispatch_uid="waldur_mastermind.marketplace.send_provider_account_created_message",
+        )
+
+        signals.post_save.connect(
+            handlers.send_provider_account_updated_message,
+            sender=models.ServiceProviderAccount,
+            dispatch_uid="waldur_mastermind.marketplace.send_provider_account_updated_message",
+        )
+
+        signals.post_delete.connect(
+            handlers.send_provider_account_deleted_message,
+            sender=models.ServiceProviderAccount,
+            dispatch_uid="waldur_mastermind.marketplace.send_provider_account_deleted_message",
         )
 
         signals.post_save.connect(
@@ -529,6 +593,12 @@ class MarketplaceConfig(AppConfig):
         )
 
         signals.post_save.connect(
+            handlers.update_offering_user_username_after_provider_settings_change,
+            sender=models.ServiceProvider,
+            dispatch_uid="waldur_mastermind.marketplace.update_offering_user_username_after_provider_settings_change",
+        )
+
+        signals.post_save.connect(
             handlers.update_offering_user_username_after_freeipa_profile_update,
             sender=freeipa_models.Profile,
             dispatch_uid="waldur_mastermind.marketplace.update_offering_user_username_after_freeipa_profile_update",
@@ -607,14 +677,20 @@ class MarketplaceConfig(AppConfig):
         )
 
         signals.post_save.connect(
-            handlers.log_resource_access_subnet_save,
-            sender=models.ResourceAccessSubnet,
-            dispatch_uid="waldur_mastermind.marketplace.log_resource_access_subnet_save",
+            handlers.log_resource_end_date_change_request_events,
+            sender=models.ResourceEndDateChangeRequest,
+            dispatch_uid="waldur_mastermind.marketplace.log_resource_end_date_change_request_events",
+        )
+
+        signals.post_save.connect(
+            handlers.log_access_subnet_offering_scope_save,
+            sender=models.AccessSubnetOfferingScope,
+            dispatch_uid="waldur_mastermind.marketplace.log_access_subnet_offering_scope_save",
         )
         signals.post_delete.connect(
-            handlers.log_resource_access_subnet_deletion,
-            sender=models.ResourceAccessSubnet,
-            dispatch_uid="waldur_mastermind.marketplace.log_resource_access_subnet_deletion",
+            handlers.log_access_subnet_offering_scope_deletion,
+            sender=models.AccessSubnetOfferingScope,
+            dispatch_uid="waldur_mastermind.marketplace.log_access_subnet_offering_scope_deletion",
         )
 
         signals.post_save.connect(

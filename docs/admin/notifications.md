@@ -1,5 +1,7 @@
 # Notifications
 
+When a notification is removed from a release, its database row is not deleted automatically. Run `waldur load_notifications <file> --prune` to report and remove notifications whose key is no longer listed below, along with any of their templates that no other notification declares and that have no operator-customised content. Customised template content is never deleted automatically.
+
 ## WALDUR_CORE.STRUCTURE
 
 ### structure.change_email_request
@@ -293,6 +295,77 @@ A notification sent out when a role is granted. The recipient is the user who re
 ```
 
 ## WALDUR_CORE.USERS
+
+### users.call_invitation_created
+
+Sent to a user invited to a call for proposals so they can accept the invitation.
+
+#### Templates
+
+=== "users/call_invitation_created_subject.txt"
+
+```txt
+
+    {% if reminder %}
+    REMINDER: Invitation to the call "{{ name }}"
+    {% else %}
+    Invitation to the call "{{ name }}"
+    {% endif %}
+
+```
+
+=== "users/call_invitation_created_message.txt"
+
+```txt
+
+    Hello!
+
+    {{ sender }} has invited you to take part in the call for proposals "{{ name }}"{% if organizer_name %} organised by {{ organizer_name }}{% endif %} as {{ role }}.
+
+    Please visit the link below to sign up and accept your invitation:
+    {{ link }}
+
+    Please note: this invitation expires at {{ invitation.get_expiration_time|date:'d.m.Y H:i' }}!
+    {% if scope_link %}
+    Once you have accepted it, the call is available at:
+    {{ scope_link }}
+    {% endif %}
+    {{ extra_invitation_text }}
+
+```
+
+=== "users/call_invitation_created_message.html"
+
+```txt
+
+    <html>
+    <head lang="en">
+        <meta charset="UTF-8">
+        <title>Invitation to the call "{{ name }}"</title>
+    </head>
+    <body>
+    <p>
+        Hello!
+    </p>
+    <p>
+        {{ sender }} has invited you to take part in the call for proposals
+        "<strong>{{ name }}</strong>"{% if organizer_name %} organised by {{ organizer_name }}{% endif %}
+        as {{ role }}.<br>
+        Please visit <a href="{{ link }}">this page</a> to sign up and accept your invitation.
+        Please note: this invitation expires at {{ invitation.get_expiration_time|date:'d.m.Y H:i' }}!
+    </p>
+    {% if scope_link %}
+    <p>
+        Once you have accepted it, the call is available <a href="{{ scope_link }}">here</a>.
+    </p>
+    {% endif %}
+    <p>
+        {{ extra_invitation_text }}
+    </p>
+    </body>
+    </html>
+
+```
 
 ### users.invitation_approved
 
@@ -743,6 +816,80 @@ Sent about a submitted permission request to the organization owners and manager
     </p>
     <p>
       Please visit the <a href="{{ requests_link }}">link</a> to approve or reject permission request.
+    </p>
+    </body>
+    </html>
+
+```
+
+### users.proposal_invitation_created
+
+Sent to a user invited to a proposal team so they can accept the invitation.
+
+#### Templates
+
+=== "users/proposal_invitation_created_subject.txt"
+
+```txt
+
+    {% if reminder %}
+    REMINDER: Invitation to the proposal "{{ name }}"
+    {% else %}
+    Invitation to the proposal "{{ name }}"
+    {% endif %}
+
+```
+
+=== "users/proposal_invitation_created_message.txt"
+
+```txt
+
+    Hello!
+
+    {{ sender }} has invited you to join the team of the proposal "{{ name }}"{% if call_name %} submitted to the call for proposals "{{ call_name }}"{% endif %} as {{ role }}.
+    {% if round_cutoff_time %}
+    The submission deadline of the round is {{ round_cutoff_time|date:'d.m.Y H:i' }}.
+    {% endif %}
+    Please visit the link below to sign up and accept your invitation:
+    {{ link }}
+
+    Please note: this invitation expires at {{ invitation.get_expiration_time|date:'d.m.Y H:i' }}!
+    {% if scope_link %}
+    Once you have accepted it, the proposal is available at:
+    {{ scope_link }}
+    {% endif %}
+    {{ extra_invitation_text }}
+
+```
+
+=== "users/proposal_invitation_created_message.html"
+
+```txt
+
+    <html>
+    <head lang="en">
+        <meta charset="UTF-8">
+        <title>Invitation to the proposal "{{ name }}"</title>
+    </head>
+    <body>
+    <p>
+        Hello!
+    </p>
+    <p>
+        {{ sender }} has invited you to join the team of the proposal
+        "<strong>{{ name }}</strong>"{% if call_name %} submitted to the call for proposals
+        "{{ call_name }}"{% endif %} as {{ role }}.<br>
+        {% if round_cutoff_time %}The submission deadline of the round is {{ round_cutoff_time|date:'d.m.Y H:i' }}.<br>{% endif %}
+        Please visit <a href="{{ link }}">this page</a> to sign up and accept your invitation.
+        Please note: this invitation expires at {{ invitation.get_expiration_time|date:'d.m.Y H:i' }}!
+    </p>
+    {% if scope_link %}
+    <p>
+        Once you have accepted it, the proposal is available <a href="{{ scope_link }}">here</a>.
+    </p>
+    {% endif %}
+    <p>
+        {{ extra_invitation_text }}
     </p>
     </body>
     </html>
@@ -1365,6 +1512,7 @@ A notification of a successful resource plan update. The recipients are all the 
 
     {% if resource_old_plan %}
     The plan has been changed from {{ resource_old_plan }} to {{ resource_plan }}.
+    {% if billing_consequence %}{{ billing_consequence }}{% endif %}
     {% endif %}
 
     {% if support_email or support_phone %}
@@ -1399,6 +1547,11 @@ A notification of a successful resource plan update. The recipients are all the 
     <p>
         The plan has been changed from {{ resource_old_plan }} to {{ resource_plan }}.
     </p>
+    {% if billing_consequence %}
+    <p>
+        {{ billing_consequence }}
+    </p>
+    {% endif %}
     {% endif %}
     {% if support_email or support_phone %}
     <p>
@@ -1848,6 +2001,82 @@ A notification about usages. The recipients are organization owners.
 
     <p>
         You can submit resource usage via API or do it <a href='{{ public_resources_url }}'>manually</a>.
+    </p>
+    </body>
+    </html>
+
+```
+
+### marketplace.notify_about_new_order
+
+Notifies the recipients configured on the offering about every new order for it, regardless of whether the order needs approval.
+
+#### Templates
+
+=== "marketplace/notify_about_new_order_subject.txt"
+
+```txt
+
+    A new {{ order_type }} order for {{ order.offering.name }} has been placed by {{ order.created_by.get_full_name|default:"a user" }}.
+
+```
+
+=== "marketplace/notify_about_new_order_message.txt"
+
+```txt
+
+    Hello!
+
+    {{ order.created_by.get_full_name|default:"A user" }} has placed a new {{ order_type }} order for {{ order.offering.name }}
+    in project {{ order.project.name }} of organization {{ order.project.customer.name }}.
+    {% if order_attributes %}
+    Requested configuration:
+    {% for label, value in order_attributes %}* {{ label }}: {{ value }}
+    {% endfor %}{% endif %}{% if order_limits %}
+    Requested limits:
+    {% for label, value in order_limits %}* {{ label }}: {{ value }}
+    {% endfor %}{% endif %}
+    Please visit {{ order_url }} to find out more details.
+
+```
+
+=== "marketplace/notify_about_new_order_message.html"
+
+```txt
+
+    <html>
+    <head lang="en">
+        <meta charset="UTF-8">
+        <title>A new {{ order_type }} order for {{ order.offering.name }} has been placed by {{ order.created_by.get_full_name|default:"a user" }}.</title>
+    </head>
+    <body>
+    <p>
+        Hello!
+    </p>
+    <p>
+        {{ order.created_by.get_full_name|default:"A user" }} has placed a new {{ order_type }} order for {{ order.offering.name }}
+        in project {{ order.project.name }} of organization {{ order.project.customer.name }}.
+    </p>
+    {% if order_attributes %}
+    <p>
+        Requested configuration:
+    </p>
+    <ul>
+        {% for label, value in order_attributes %}<li>{{ label|escape }}: {{ value|escape }}</li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+    {% if order_limits %}
+    <p>
+        Requested limits:
+    </p>
+    <ul>
+        {% for label, value in order_limits %}<li>{{ label|escape }}: {{ value|escape }}</li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+    <p>
+        Please visit <a href="{{ order_url }}">{{ site_name }}</a> to find out more details.
     </p>
     </body>
     </html>
@@ -2562,6 +2791,57 @@ Notification about a new comment in the issue. The recipient is issue caller.
 
 ```
 
+### support.notification_comment_added_staff
+
+Notification to the assignee, or to all staff and support users when the ticket is unassigned, about a comment the issue caller added. Sent only by the built-in service desk — the Atlassian, Zammad and SMAX backends notify their own agents.
+
+#### Templates
+
+=== "support/notification_comment_added_staff_subject.txt"
+
+```txt
+
+    [{{ issue.key }}] New comment from {{ comment.author.name|default:"the requester" }}: {{ issue.summary.strip }}
+
+```
+
+=== "support/notification_comment_added_staff_message.txt"
+
+```txt
+
+    {{ comment.author.name|default:"The requester" }} has commented on a support request.
+
+    Request: {{ issue.key }}
+    Summary: {{ issue.summary.strip }}
+    Status: {{ issue.status }}
+    {% if issue.assignee %}Assignee: {{ issue.assignee.name }}
+    {% endif %}{% if issue.customer %}Organization: {{ issue.customer.name }}
+    {% endif %}{% if issue.project %}Project: {{ issue.project.name }}
+    {% endif %}
+    Comment:
+    {{ comment.description.strip }}
+
+    Open the request: {{ issue_url }}
+
+```
+
+=== "support/notification_comment_added_staff_message.html"
+
+```txt
+
+    <p>{{ comment.author.name|default:"The requester" }} has commented on a support request.</p>
+    <p><strong>Request:</strong> {{ issue.key }}<br>
+    <strong>Summary:</strong> {{ issue.summary.strip }}<br>
+    <strong>Status:</strong> {{ issue.status }}
+    {% if issue.assignee %}<br><strong>Assignee:</strong> {{ issue.assignee.name }}{% endif %}
+    {% if issue.customer %}<br><strong>Organization:</strong> {{ issue.customer.name }}{% endif %}
+    {% if issue.project %}<br><strong>Project:</strong> {{ issue.project.name }}{% endif %}</p>
+    <p><strong>Comment:</strong></p>
+    <p>{{ comment.description.strip }}</p>
+    <p><a href="{{ issue_url }}">Open the request</a></p>
+
+```
+
 ### support.notification_comment_updated
 
 Notification about an update in the issue comment. The recipient is issue caller.
@@ -2616,6 +2896,98 @@ Notification about an update in the issue comment. The recipient is issue caller
     </p>
     </body>
     </html>
+
+```
+
+### support.notification_issue_created
+
+Notification to staff and support users about a newly created support request. Sent only by the built-in service desk — the Atlassian, Zammad and SMAX backends notify their own agents.
+
+#### Templates
+
+=== "support/notification_issue_created_subject.txt"
+
+```txt
+
+    [{{ issue.key }}] New support request: {{ issue.summary.strip }}
+
+```
+
+=== "support/notification_issue_created_message.txt"
+
+```txt
+
+    A new support request has been created.
+
+    Request: {{ issue.key }}
+    Summary: {{ issue.summary.strip }}
+    Type: {{ issue.type }}
+    {% if issue.priority %}Priority: {{ issue.priority }}
+    {% endif %}Reported by: {{ issue.caller.full_name|default:issue.caller.username|default:"unknown" }}
+    {% if issue.customer %}Organization: {{ issue.customer.name }}
+    {% endif %}{% if issue.project %}Project: {{ issue.project.name }}
+    {% endif %}
+    Description:
+    {{ issue.description.strip }}
+
+```
+
+=== "support/notification_issue_created_message.html"
+
+```txt
+
+    <p>A new support request has been created.</p>
+    <p><strong>Request:</strong> {{ issue.key }}<br>
+    <strong>Summary:</strong> {{ issue.summary.strip }}<br>
+    <strong>Type:</strong> {{ issue.type }}<br>
+    {% if issue.priority %}<strong>Priority:</strong> {{ issue.priority }}<br>{% endif %}
+    <strong>Reported by:</strong> {{ issue.caller.full_name|default:issue.caller.username|default:"unknown" }}
+    {% if issue.customer %}<br><strong>Organization:</strong> {{ issue.customer.name }}{% endif %}
+    {% if issue.project %}<br><strong>Project:</strong> {{ issue.project.name }}{% endif %}</p>
+    <p><strong>Description:</strong></p>
+    <p>{{ issue.description.strip }}</p>
+
+```
+
+### support.notification_issue_escalated
+
+Notification to staff and support users that a support request has been escalated. Sent only by the built-in service desk.
+
+#### Templates
+
+=== "support/notification_issue_escalated_subject.txt"
+
+```txt
+
+    [{{ issue.key }}] Escalated: {{ issue.summary.strip }}
+
+```
+
+=== "support/notification_issue_escalated_message.txt"
+
+```txt
+
+    A support request has been escalated.
+
+    Request: {{ issue.key }}
+    Summary: {{ issue.summary.strip }}
+    {% if issue.customer %}Organization: {{ issue.customer.name }}
+    {% endif %}
+    Reason for escalation:
+    {{ reason }}
+
+```
+
+=== "support/notification_issue_escalated_message.html"
+
+```txt
+
+    <p>A support request has been escalated.</p>
+    <p><strong>Request:</strong> {{ issue.key }}<br>
+    <strong>Summary:</strong> {{ issue.summary.strip }}
+    {% if issue.customer %}<br><strong>Organization:</strong> {{ issue.customer.name }}{% endif %}</p>
+    <p><strong>Reason for escalation:</strong></p>
+    <p>{{ reason }}</p>
 
 ```
 
@@ -2780,6 +3152,41 @@ Notification about an update in the issue. The recipient is issue caller.
 
 ```
 
+### support.provider_customer_comment
+
+Notify a provider helpdesk that the customer commented on a ticket routed to them.
+
+#### Templates
+
+=== "support/provider_customer_comment_subject.txt"
+
+```txt
+
+    [{{ issue.key }}] Customer comment: {{ issue.summary }}
+
+```
+
+=== "support/provider_customer_comment_message.txt"
+
+```txt
+
+    A customer has added a comment to ticket {{ issue.key }}.
+
+    Comment:
+    {{ comment.description }}
+
+```
+
+=== "support/provider_customer_comment_message.html"
+
+```txt
+
+    <p>A customer has added a comment to ticket <strong>{{ issue.key }}</strong>.</p>
+    <p><strong>Comment:</strong></p>
+    <p>{{ comment.description }}</p>
+
+```
+
 ### support.provider_email_comment
 
 Email a provider a customer comment via the email support backend.
@@ -2938,6 +3345,44 @@ Notify a provider helpdesk about a new ticket routed to them.
     <strong>Priority:</strong> {{ issue.priority }}</p>
     <p><strong>Description:</strong></p>
     <p>{{ issue.description }}</p>
+
+```
+
+### support.provider_sla_warning
+
+Notify a provider helpdesk that a routed ticket is approaching its SLA deadline.
+
+#### Templates
+
+=== "support/provider_sla_warning_subject.txt"
+
+```txt
+
+    [{{ issue.key }}] SLA Warning: {{ issue.summary }}
+
+```
+
+=== "support/provider_sla_warning_message.txt"
+
+```txt
+
+    Ticket {{ issue.key }} is approaching its SLA deadline.
+
+    Summary: {{ issue.summary }}
+    Priority: {{ issue.priority }}
+
+    Please take action to avoid an SLA breach.
+
+```
+
+=== "support/provider_sla_warning_message.html"
+
+```txt
+
+    <p>Ticket <strong>{{ issue.key }}</strong> is approaching its SLA deadline.</p>
+    <p><strong>Summary:</strong> {{ issue.summary }}<br>
+    <strong>Priority:</strong> {{ issue.priority }}</p>
+    <p>Please take action to avoid an SLA breach.</p>
 
 ```
 
@@ -3294,7 +3739,7 @@ A notification to the reviewer about the proposal decision (approved/rejected) w
 
 ### proposal.proposal_state_changed
 
-A notification about the proposal state changes (submitted → in review → accepted/rejected).
+A notification about the proposal state changes (submitted → in review → accepted/rejected). Deployments that hide calls from applicants (SERVICE_ACCESS_MODE = 'marketplace') send the access_request_* templates below instead, which say the same thing without naming a call or a round. One event, one switch, two sets of words — a deployment only ever sends one of them.
 
 #### Templates
 
@@ -3322,7 +3767,7 @@ A notification about the proposal state changes (submitted → in review → acc
     {% if new_state == 'accepted' %}
     Project created: {{ project_name }}
     Allocation start date: {{ allocation_date }}
-    Duration: {{ duration }} days
+    {% if duration %}Duration: {{ duration }}{% endif %}
 
     Allocated resources:
     {% for resource in allocated_resources %}
@@ -3415,7 +3860,7 @@ A notification about the proposal state changes (submitted → in review → acc
             <ul>
                 <li><strong>Project created:</strong> {{ project_name }}</li>
                 <li><strong>Allocation start date:</strong> {{ allocation_date }}</li>
-                <li><strong>Duration:</strong> {{ duration }} days</li>
+                {% if duration %}<li><strong>Duration:</strong> {{ duration }}</li>{% endif %}
             </ul>
             <div>
                 <h4>Allocated resources:</h4>
@@ -3453,6 +3898,174 @@ A notification about the proposal state changes (submitted → in review → acc
         </div>
 
         <a href="{{ proposal_url }}">View Proposal</a>
+        <br>
+        {% if new_state == 'accepted' and project_url %}
+        <a href="{{ project_url }}">View Project</a>
+        {% endif %}
+
+        <div class="footer">
+            <p>This is an automated message from the {{ site_name }}. Please do not reply to this email.</p>
+        </div>
+    </body>
+    </html>
+
+```
+
+=== "proposal/access_request_state_changed_subject.txt"
+
+```txt
+
+    Access request update: {{ proposal_name }} - {{ new_state }}
+
+```
+
+=== "proposal/access_request_state_changed_message.txt"
+
+```txt
+
+    Dear {{ proposal_creator_name }},
+
+    The state of your access request "{{ proposal_name }}" has been updated.
+
+    State change:
+    - Previous state: {{ previous_state }}
+    - New state: {{ new_state }}
+    - Updated on: {{ update_date }}
+
+    {% if new_state == 'accepted' %}
+    Project created: {{ project_name }}
+    {% if allocation_date %}Allocation start date: {{ allocation_date }}
+    {% endif %}{% if duration %}Duration: {{ duration }} days
+    {% endif %}
+    Allocated resources:
+    {% for resource in allocated_resources %}
+    {{ forloop.counter }}. {{ resource.name }} - {{ resource.provider_name }} - {{ resource.plan_name }} - Provisioned
+    {% empty %}
+    No resources allocated yet.
+    {% endfor %}
+    {% endif %}
+
+    {% if new_state == 'rejected' %}
+    Feedback: {{ rejection_feedback }}
+    {% endif %}
+
+    {% if new_state == 'submitted' %}
+    Your access request has been submitted and is now being processed. You will receive further notifications as it moves forward.
+    {% endif %}
+
+    {% if new_state == 'in_review' %}
+    Your access request is being evaluated. You will be notified as soon as a decision has been made.
+    {% endif %}
+
+    {% if new_state == 'accepted' %}
+    Your access request has been approved. A project has been created with the resources you asked for, and you can open it using the link below.
+    {% endif %}
+
+    {% if new_state == 'rejected' %}
+    Your access request has not been approved at this time. Please review any feedback provided above. You are welcome to submit a new request later.
+    {% endif %}
+
+    View access request: {{ proposal_url }}
+    {% if new_state == 'accepted' and project_url %}
+    View Project: {{ project_url }}
+    {% endif %}
+
+    This is an automated message from the {{ site_name }}. Please do not reply to this email.
+
+```
+
+=== "proposal/access_request_state_changed_message.html"
+
+```txt
+
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>Access Request Update</title>
+        <style>
+            body {
+                color: #333;
+                max-width: 600px;
+                margin: 0 auto;
+                padding: 20px;
+            }
+            .header {
+                margin-bottom: 20px;
+            }
+            .state-change {
+                background-color: #f9f9f9;
+                padding: 15px;
+                border-radius: 5px;
+                margin-bottom: 20px;
+            }
+            .message-box {
+                padding: 15px;
+                margin: 15px 0;
+            }
+            .footer {
+                margin-top: 30px;
+                color: #777;
+                border-top: 1px solid #eee;
+                padding-top: 10px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <p>Dear {{ proposal_creator_name }},</p>
+            <p>The state of your access request "<strong>{{ proposal_name }}</strong>" has been updated.</p>
+        </div>
+
+        <div class="state-change">
+            <h3>State change:</h3>
+            <ul>
+                <li><strong>Previous state:</strong> {{ previous_state }}</li>
+                <li><strong>New state:</strong> {{ new_state }}</li>
+                <li><strong>Updated on:</strong> {{ update_date }}</li>
+            </ul>
+
+            {% if new_state == 'accepted' %}
+            <ul>
+                <li><strong>Project created:</strong> {{ project_name }}</li>
+                {% if allocation_date %}<li><strong>Allocation start date:</strong> {{ allocation_date }}</li>{% endif %}
+                {% if duration %}<li><strong>Duration:</strong> {{ duration }} days</li>{% endif %}
+            </ul>
+            <div>
+                <h4>Allocated resources:</h4>
+                {% for resource in allocated_resources %}
+                <div>
+                    <strong>{{ forloop.counter }}.</strong> {{ resource.name }} - {{ resource.provider_name }} - {{ resource.plan_name }} - Provisioned
+                </div>
+                {% empty %}
+                <p><em>No resources allocated yet.</em></p>
+                {% endfor %}
+            </div>
+            {% endif %}
+
+            {% if new_state == 'rejected' %}
+            <p><strong>Feedback:</strong> {{ rejection_feedback }}</p>
+            {% endif %}
+        </div>
+
+        <div class="message-box">
+            {% if new_state == 'submitted' %}
+            <p>Your access request has been submitted and is now being processed. You will receive further notifications as it moves forward.</p>
+            {% endif %}
+
+            {% if new_state == 'in_review' %}
+            <p>Your access request is being evaluated. You will be notified as soon as a decision has been made.</p>
+            {% endif %}
+
+            {% if new_state == 'accepted' %}
+            <p>Your access request has been approved. A project has been created with the resources you asked for, and you can open it using the link below.</p>
+            {% endif %}
+
+            {% if new_state == 'rejected' %}
+            <p>Your access request has not been approved at this time. Please review any feedback provided above. You are welcome to submit a new request later.</p>
+            {% endif %}
+        </div>
+
+        <a href="{{ proposal_url }}">View access request</a>
         <br>
         {% if new_state == 'accepted' and project_url %}
         <a href="{{ project_url }}">View Project</a>
@@ -4011,13 +4624,13 @@ Notifies call managers that a round has ended, with a summary of proposals and r
 
     Round summary:
     - Total proposals submitted: {{ total_proposals }}
+    - Reviews on record: {{ total_reviews }}
     - Start date: {{ start_date }}
     - Closed date: {{ close_date }}
 
-    Based on the review strategy selected for this round ({{ review_strategy }}), the system has:
-    - Set all draft proposals to "canceled" state
-    - Moved all submitted proposals to "in_review" state
-    - Created {{ total_reviews }} review assignments
+    No further proposals can be submitted to this round. Proposals that had not been
+    accepted or rejected by the cutoff are cancelled automatically, drafts included,
+    so only proposals with a final decision remain.
 
     You can view the round details and manage proposals by visiting:
     {{ round_url }}
@@ -4043,16 +4656,12 @@ Notifies call managers that a round has ended, with a summary of proposals and r
         <h4>Round summary:</h4>
         <ul>
             <li><strong>Total proposals submitted:</strong> {{ total_proposals }}</li>
+            <li><strong>Reviews on record:</strong> {{ total_reviews }}</li>
             <li><strong>Start date:</strong> {{ start_date }}</li>
             <li><strong>Closed date:</strong> {{ close_date }}</li>
         </ul>
 
-        <p>Based on the review strategy selected for this round ({{ review_strategy }}), the system has:</p>
-        <ul>
-            <li>Set all draft proposals to "canceled" state</li>
-            <li>Moved all submitted proposals to "in_review" state</li>
-            <li>Created {{ total_reviews }} review assignments</li>
-        </ul>
+        <p>No further proposals can be submitted to this round. Proposals that had not been accepted or rejected by the cutoff are cancelled automatically, drafts included, so only proposals with a final decision remain.</p>
 
         <p>You can view the round details and manage proposals by visiting: <a href="{{ round_url }}">{{ round_url }}</a></p>
 
@@ -4127,6 +4736,85 @@ A notification to reviewers about a new call round opening.
 
         <p><em>This is an automated message from the {{ site_name }}. Please do not reply to this email.</em></p>
 
+    </body>
+    </html>
+
+```
+
+### proposal.workflow_step_event
+
+Sent when a call's workflow notification rule fires: a workflow step started, completed, was rejected, expired, or its deadline is approaching. Audience is configured per call and step.
+
+#### Templates
+
+=== "proposal/workflow_step_event_subject.txt"
+
+```txt
+
+    {% if trigger == "deadline_approaching" %}Reminder: {{ step_name }} for "{{ proposal_name }}" is due in {{ days_before }} day{{ days_before|pluralize }}{% elif trigger == "step_started" %}{{ step_name }} has started for "{{ proposal_name }}"{% elif trigger == "step_completed" %}{{ step_name }} completed for "{{ proposal_name }}"{% elif trigger == "step_rejected" %}"{{ proposal_name }}" was rejected at {{ step_name }}{% elif trigger == "step_expired" %}{{ step_name }} for "{{ proposal_name }}" has expired{% else %}Update on "{{ proposal_name }}"{% endif %}
+
+```
+
+=== "proposal/workflow_step_event_message.txt"
+
+```txt
+
+    Dear {% if is_applicant %}applicant{% else %}colleague{% endif %},
+
+    {% if trigger == "deadline_approaching" %}The "{{ step_name }}" step for proposal "{{ proposal_name }}" (call "{{ call_name }}", round "{{ round_name }}") is due on {{ deadline|date:"Y-m-d" }} — in {{ days_before }} day{{ days_before|pluralize }}.{% if is_applicant %} Please respond before the deadline.{% else %} Please complete the step or follow up before it expires.{% endif %}
+    {% elif trigger == "step_started" %}The "{{ step_name }}" step has started for proposal "{{ proposal_name }}" (call "{{ call_name }}", round "{{ round_name }}").{% if deadline %} It is due on {{ deadline|date:"Y-m-d" }}.{% endif %}
+    {% elif trigger == "step_completed" %}The "{{ step_name }}" step has been completed for proposal "{{ proposal_name }}" (call "{{ call_name }}", round "{{ round_name }}").{% if outcome %} Outcome: {{ outcome }}.{% endif %}{% if outcome_reason %}
+    Reason: {{ outcome_reason }}{% endif %}
+    {% elif trigger == "step_rejected" %}Proposal "{{ proposal_name }}" (call "{{ call_name }}", round "{{ round_name }}") was rejected at the "{{ step_name }}" step.{% if outcome_reason %}
+    Reason: {{ outcome_reason }}{% endif %}
+    {% elif trigger == "step_expired" %}The "{{ step_name }}" step for proposal "{{ proposal_name }}" (call "{{ call_name }}", round "{{ round_name }}") has expired without being completed.{% if not is_applicant %} Please follow up so the workflow can continue.{% endif %}
+    {% endif %}
+    You can view the proposal here:
+    {{ proposal_url }}
+
+    This is an automated message from the {{ site_name }}. Please do not reply to this email.
+
+```
+
+=== "proposal/workflow_step_event_message.html"
+
+```txt
+
+    <html>
+    <head>
+        <meta charset="UTF-8">
+    </head>
+    <body>
+        <p>Dear {% if is_applicant %}applicant{% else %}colleague{% endif %},</p>
+
+        <p>
+        {% if trigger == "deadline_approaching" %}
+            The "{{ step_name }}" step for proposal "{{ proposal_name }}" (call "{{ call_name }}", round "{{ round_name }}") is due on {{ deadline|date:"Y-m-d" }} — in {{ days_before }} day{{ days_before|pluralize }}.
+            {% if is_applicant %}Please respond before the deadline.{% else %}Please complete the step or follow up before it expires.{% endif %}
+        {% elif trigger == "step_started" %}
+            The "{{ step_name }}" step has started for proposal "{{ proposal_name }}" (call "{{ call_name }}", round "{{ round_name }}").
+            {% if deadline %}It is due on {{ deadline|date:"Y-m-d" }}.{% endif %}
+        {% elif trigger == "step_completed" %}
+            The "{{ step_name }}" step has been completed for proposal "{{ proposal_name }}" (call "{{ call_name }}", round "{{ round_name }}").
+            {% if outcome %}Outcome: {{ outcome }}.{% endif %}
+            {% if outcome_reason %}<br>Reason: {{ outcome_reason }}{% endif %}
+        {% elif trigger == "step_rejected" %}
+            Proposal "{{ proposal_name }}" (call "{{ call_name }}", round "{{ round_name }}") was rejected at the "{{ step_name }}" step.
+            {% if outcome_reason %}<br>Reason: {{ outcome_reason }}{% endif %}
+        {% elif trigger == "step_expired" %}
+            The "{{ step_name }}" step for proposal "{{ proposal_name }}" (call "{{ call_name }}", round "{{ round_name }}") has expired without being completed.
+            {% if not is_applicant %}Please follow up so the workflow can continue.{% endif %}
+        {% endif %}
+        </p>
+
+        <p>
+            You can view the proposal here:<br>
+            <a href="{{ proposal_url }}">{{ proposal_url }}</a>
+        </p>
+
+        <p>
+            This is an automated message from the {{ site_name }}. Please do not reply to this email.
+        </p>
     </body>
     </html>
 

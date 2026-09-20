@@ -516,6 +516,18 @@ Invitation has expired
 
 ```
 
+### call_invitation_created_subject.txt (waldur_core.users)
+
+```txt
+
+{% if reminder %}
+REMINDER: Invitation to the call "{{ name }}"
+{% else %}
+Invitation to the call "{{ name }}"
+{% endif %}
+
+```
+
 ### invitation_created_message.html (waldur_core.users)
 
 ```html
@@ -550,11 +562,86 @@ Account has been created
 
 ```
 
+### call_invitation_created_message.html (waldur_core.users)
+
+```html
+
+<html>
+<head lang="en">
+    <meta charset="UTF-8">
+    <title>Invitation to the call "{{ name }}"</title>
+</head>
+<body>
+<p>
+    Hello!
+</p>
+<p>
+    {{ sender }} has invited you to take part in the call for proposals
+    "<strong>{{ name }}</strong>"{% if organizer_name %} organised by {{ organizer_name }}{% endif %}
+    as {{ role }}.<br>
+    Please visit <a href="{{ link }}">this page</a> to sign up and accept your invitation.
+    Please note: this invitation expires at {{ invitation.get_expiration_time|date:'d.m.Y H:i' }}!
+</p>
+{% if scope_link %}
+<p>
+    Once you have accepted it, the call is available <a href="{{ scope_link }}">here</a>.
+</p>
+{% endif %}
+<p>
+    {{ extra_invitation_text }}
+</p>
+</body>
+</html>
+
+```
+
+### proposal_invitation_created_message.txt (waldur_core.users)
+
+```txt
+
+Hello!
+
+{{ sender }} has invited you to join the team of the proposal "{{ name }}"{% if call_name %} submitted to the call for proposals "{{ call_name }}"{% endif %} as {{ role }}.
+{% if round_cutoff_time %}
+The submission deadline of the round is {{ round_cutoff_time|date:'d.m.Y H:i' }}.
+{% endif %}
+Please visit the link below to sign up and accept your invitation:
+{{ link }}
+
+Please note: this invitation expires at {{ invitation.get_expiration_time|date:'d.m.Y H:i' }}!
+{% if scope_link %}
+Once you have accepted it, the proposal is available at:
+{{ scope_link }}
+{% endif %}
+{{ extra_invitation_text }}
+
+```
+
 ### permission_request_submitted_subject.txt (waldur_core.users)
 
 ```txt
 
 Permission request has been submitted.
+
+```
+
+### call_invitation_created_message.txt (waldur_core.users)
+
+```txt
+
+Hello!
+
+{{ sender }} has invited you to take part in the call for proposals "{{ name }}"{% if organizer_name %} organised by {{ organizer_name }}{% endif %} as {{ role }}.
+
+Please visit the link below to sign up and accept your invitation:
+{{ link }}
+
+Please note: this invitation expires at {{ invitation.get_expiration_time|date:'d.m.Y H:i' }}!
+{% if scope_link %}
+Once you have accepted it, the call is available at:
+{{ scope_link }}
+{% endif %}
+{{ extra_invitation_text }}
 
 ```
 
@@ -641,6 +728,18 @@ Job title: {{ invitation.job_title }}
 Please visit the link below to approve invitation: {{ approve_link }}
 
 Alternatively, you may reject invitation: {{ reject_link }}
+
+```
+
+### proposal_invitation_created_subject.txt (waldur_core.users)
+
+```txt
+
+{% if reminder %}
+REMINDER: Invitation to the proposal "{{ name }}"
+{% else %}
+Invitation to the proposal "{{ name }}"
+{% endif %}
 
 ```
 
@@ -890,6 +989,40 @@ Reviewer comment: {{ permission_request.review_comment }}
 
 ```
 
+### proposal_invitation_created_message.html (waldur_core.users)
+
+```html
+
+<html>
+<head lang="en">
+    <meta charset="UTF-8">
+    <title>Invitation to the proposal "{{ name }}"</title>
+</head>
+<body>
+<p>
+    Hello!
+</p>
+<p>
+    {{ sender }} has invited you to join the team of the proposal
+    "<strong>{{ name }}</strong>"{% if call_name %} submitted to the call for proposals
+    "{{ call_name }}"{% endif %} as {{ role }}.<br>
+    {% if round_cutoff_time %}The submission deadline of the round is {{ round_cutoff_time|date:'d.m.Y H:i' }}.<br>{% endif %}
+    Please visit <a href="{{ link }}">this page</a> to sign up and accept your invitation.
+    Please note: this invitation expires at {{ invitation.get_expiration_time|date:'d.m.Y H:i' }}!
+</p>
+{% if scope_link %}
+<p>
+    Once you have accepted it, the proposal is available <a href="{{ scope_link }}">here</a>.
+</p>
+{% endif %}
+<p>
+    {{ extra_invitation_text }}
+</p>
+</body>
+</html>
+
+```
+
 ### invitation_rejected_subject.txt (waldur_core.users)
 
 ```txt
@@ -988,6 +1121,125 @@ Please acknowledge or resolve these actions here:
 
 Sincerely,
 The {{ site_name }} Team
+
+```
+
+## waldur_core.passkeys
+
+### admin_passkey.html (waldur_core.passkeys)
+
+```html
+
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block content %}
+<div id="content-main">
+  {% if has_credential %}
+    <p>{% trans "This deployment requires a passkey for staff accounts. Confirm with your passkey to continue." %}</p>
+    <p>
+      <button type="button" class="button" id="passkey-verify">{% trans "Confirm with passkey" %}</button>
+    </p>
+    <p id="passkey-error" class="errornote" style="display:none"></p>
+    {{ next|json_script:"passkey-next" }}
+  {% else %}
+    <p class="errornote">
+      {% trans "This deployment requires a passkey for staff accounts, and this account has none registered. Sign in to the portal with your password and add a passkey from your profile, then return here." %}
+    </p>
+  {% endif %}
+</div>
+
+{% if has_credential %}
+<script>
+(function () {
+  // Vanilla WebAuthn: the admin cannot import the SPA's bundled helper, and
+  // pulling one in for two conversions is not worth a build step.
+  const b64urlToBytes = (value) => {
+    const padded = value.replace(/-/g, '+').replace(/_/g, '/');
+    const raw = atob(padded + '='.repeat((4 - padded.length % 4) % 4));
+    return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+  };
+  const bytesToB64url = (buffer) =>
+    btoa(String.fromCharCode(...new Uint8Array(buffer)))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+  const csrf = document.cookie.split('; ')
+    .find((row) => row.startsWith('csrftoken='))?.split('=')[1];
+
+  const post = (url, body) => fetch(url, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrf || ''},
+    body: body ? JSON.stringify(body) : '{}',
+  });
+
+  const showError = (message) => {
+    const box = document.getElementById('passkey-error');
+    box.textContent = message;
+    box.style.display = '';
+  };
+
+  document.getElementById('passkey-verify').addEventListener('click', async () => {
+    try {
+      const begun = await post('{% url "admin:passkey_options" %}');
+      if (!begun.ok) {
+        showError((await begun.json()).detail || 'Unable to start the passkey challenge.');
+        return;
+      }
+      const { options } = await begun.json();
+
+      const assertion = await navigator.credentials.get({
+        publicKey: {
+          challenge: b64urlToBytes(options.challenge),
+          rpId: options.rpId,
+          timeout: options.timeout,
+          userVerification: options.userVerification,
+          allowCredentials: (options.allowCredentials || []).map((c) => ({
+            type: 'public-key',
+            id: b64urlToBytes(c.id),
+            transports: c.transports,
+          })),
+        },
+      });
+
+      const verified = await post('{% url "admin:passkey_verify" %}', {
+        credential: {
+          id: assertion.id,
+          rawId: bytesToB64url(assertion.rawId),
+          type: assertion.type,
+          response: {
+            clientDataJSON: bytesToB64url(assertion.response.clientDataJSON),
+            authenticatorData: bytesToB64url(assertion.response.authenticatorData),
+            signature: bytesToB64url(assertion.response.signature),
+            userHandle: assertion.response.userHandle
+              ? bytesToB64url(assertion.response.userHandle) : null,
+          },
+          clientExtensionResults: {},
+        },
+      });
+
+      if (verified.ok) {
+        // json_script so the destination cannot break out of the literal.
+        window.location = JSON.parse(
+          document.getElementById('passkey-next').textContent
+        );
+      } else {
+        showError((await verified.json()).detail || 'Passkey could not be verified.');
+      }
+    } catch (error) {
+      // NotAllowedError covers both a dismissed prompt and a refused call, so
+      // say both rather than guessing which.
+      showError(
+        error && error.name === 'NotAllowedError'
+          ? 'The passkey prompt was dismissed or refused by the browser.'
+          : (error && error.message) || 'Passkey verification failed.'
+      );
+    }
+  });
+})();
+</script>
+{% endif %}
+{% endblock %}
 
 ```
 
@@ -1407,6 +1659,49 @@ You can submit resource usage via API or do it manually at {{ public_resources_u
 
 ```
 
+### notify_about_new_order_message.html (waldur_mastermind.marketplace)
+
+```html
+
+<html>
+<head lang="en">
+    <meta charset="UTF-8">
+    <title>A new {{ order_type }} order for {{ order.offering.name }} has been placed by {{ order.created_by.get_full_name|default:"a user" }}.</title>
+</head>
+<body>
+<p>
+    Hello!
+</p>
+<p>
+    {{ order.created_by.get_full_name|default:"A user" }} has placed a new {{ order_type }} order for {{ order.offering.name }}
+    in project {{ order.project.name }} of organization {{ order.project.customer.name }}.
+</p>
+{% if order_attributes %}
+<p>
+    Requested configuration:
+</p>
+<ul>
+    {% for label, value in order_attributes %}<li>{{ label|escape }}: {{ value|escape }}</li>
+    {% endfor %}
+</ul>
+{% endif %}
+{% if order_limits %}
+<p>
+    Requested limits:
+</p>
+<ul>
+    {% for label, value in order_limits %}<li>{{ label|escape }}: {{ value|escape }}</li>
+    {% endfor %}
+</ul>
+{% endif %}
+<p>
+    Please visit <a href="{{ order_url }}">{{ site_name }}</a> to find out more details.
+</p>
+</body>
+</html>
+
+```
+
 ### notification_to_user_that_order_been_rejected_message.txt (waldur_mastermind.marketplace)
 
 ```txt
@@ -1686,6 +1981,7 @@ Following request from {{ order_user }}, resource {{ resource_name }} has been u
 
 {% if resource_old_plan %}
 The plan has been changed from {{ resource_old_plan }} to {{ resource_plan }}.
+{% if billing_consequence %}{{ billing_consequence }}{% endif %}
 {% endif %}
 
 {% if support_email or support_phone %}
@@ -1739,6 +2035,11 @@ Response from {{ order.created_by.get_full_name }} regarding order for {{ order.
 <p>
     The plan has been changed from {{ resource_old_plan }} to {{ resource_plan }}.
 </p>
+{% if billing_consequence %}
+<p>
+    {{ billing_consequence }}
+</p>
+{% endif %}
 {% endif %}
 {% if support_email or support_phone %}
 <p>
@@ -2161,6 +2462,25 @@ Thank you!
 
 ```
 
+### notify_about_new_order_message.txt (waldur_mastermind.marketplace)
+
+```txt
+
+Hello!
+
+{{ order.created_by.get_full_name|default:"A user" }} has placed a new {{ order_type }} order for {{ order.offering.name }}
+in project {{ order.project.name }} of organization {{ order.project.customer.name }}.
+{% if order_attributes %}
+Requested configuration:
+{% for label, value in order_attributes %}* {{ label }}: {{ value }}
+{% endfor %}{% endif %}{% if order_limits %}
+Requested limits:
+{% for label, value in order_limits %}* {{ label }}: {{ value }}
+{% endfor %}{% endif %}
+Please visit {{ order_url }} to find out more details.
+
+```
+
 ### tos_reconsent_required_message.html (waldur_mastermind.marketplace)
 
 ```html
@@ -2497,6 +2817,14 @@ Resource {{ resource_name }} creation has failed.
 ```txt
 
 Resource {{ resource_name }} has been deleted.
+
+```
+
+### notify_about_new_order_subject.txt (waldur_mastermind.marketplace)
+
+```txt
+
+A new {{ order_type }} order for {{ order.offering.name }} has been placed by {{ order.created_by.get_full_name|default:"a user" }}.
 
 ```
 
@@ -2954,6 +3282,14 @@ New limits: {{ new_limits }}.
 
 ```
 
+### access_request_state_changed_subject.txt (waldur_mastermind.proposal)
+
+```txt
+
+Access request update: {{ proposal_name }} - {{ new_state }}
+
+```
+
 ### round_closing_for_managers_message.txt (waldur_mastermind.proposal)
 
 ```txt
@@ -2964,13 +3300,13 @@ The round "{{ round_name }}" for call "{{ call_name }}" has now closed.
 
 Round summary:
 - Total proposals submitted: {{ total_proposals }}
+- Reviews on record: {{ total_reviews }}
 - Start date: {{ start_date }}
 - Closed date: {{ close_date }}
 
-Based on the review strategy selected for this round ({{ review_strategy }}), the system has:
-- Set all draft proposals to "canceled" state
-- Moved all submitted proposals to "in_review" state
-- Created {{ total_reviews }} review assignments
+No further proposals can be submitted to this round. Proposals that had not been
+accepted or rejected by the cutoff are cancelled automatically, drafts included,
+so only proposals with a final decision remain.
 
 You can view the round details and manage proposals by visiting:
 {{ round_url }}
@@ -3067,6 +3403,111 @@ This is an automated message from the {{ site_name }}. Please do not reply to th
     <p>View proposal: <a href="{{ proposal_url }}">{{ proposal_url }}</a></p>
 
     <p><em>This is an automated message from {{ site_name }}. Please do not reply to this email.</em></p>
+</body>
+</html>
+
+```
+
+### access_request_state_changed_message.html (waldur_mastermind.proposal)
+
+```html
+
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Access Request Update</title>
+    <style>
+        body {
+            color: #333;
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .header {
+            margin-bottom: 20px;
+        }
+        .state-change {
+            background-color: #f9f9f9;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        .message-box {
+            padding: 15px;
+            margin: 15px 0;
+        }
+        .footer {
+            margin-top: 30px;
+            color: #777;
+            border-top: 1px solid #eee;
+            padding-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <p>Dear {{ proposal_creator_name }},</p>
+        <p>The state of your access request "<strong>{{ proposal_name }}</strong>" has been updated.</p>
+    </div>
+
+    <div class="state-change">
+        <h3>State change:</h3>
+        <ul>
+            <li><strong>Previous state:</strong> {{ previous_state }}</li>
+            <li><strong>New state:</strong> {{ new_state }}</li>
+            <li><strong>Updated on:</strong> {{ update_date }}</li>
+        </ul>
+
+        {% if new_state == 'accepted' %}
+        <ul>
+            <li><strong>Project created:</strong> {{ project_name }}</li>
+            {% if allocation_date %}<li><strong>Allocation start date:</strong> {{ allocation_date }}</li>{% endif %}
+            {% if duration %}<li><strong>Duration:</strong> {{ duration }} days</li>{% endif %}
+        </ul>
+        <div>
+            <h4>Allocated resources:</h4>
+            {% for resource in allocated_resources %}
+            <div>
+                <strong>{{ forloop.counter }}.</strong> {{ resource.name }} - {{ resource.provider_name }} - {{ resource.plan_name }} - Provisioned
+            </div>
+            {% empty %}
+            <p><em>No resources allocated yet.</em></p>
+            {% endfor %}
+        </div>
+        {% endif %}
+
+        {% if new_state == 'rejected' %}
+        <p><strong>Feedback:</strong> {{ rejection_feedback }}</p>
+        {% endif %}
+    </div>
+
+    <div class="message-box">
+        {% if new_state == 'submitted' %}
+        <p>Your access request has been submitted and is now being processed. You will receive further notifications as it moves forward.</p>
+        {% endif %}
+
+        {% if new_state == 'in_review' %}
+        <p>Your access request is being evaluated. You will be notified as soon as a decision has been made.</p>
+        {% endif %}
+
+        {% if new_state == 'accepted' %}
+        <p>Your access request has been approved. A project has been created with the resources you asked for, and you can open it using the link below.</p>
+        {% endif %}
+
+        {% if new_state == 'rejected' %}
+        <p>Your access request has not been approved at this time. Please review any feedback provided above. You are welcome to submit a new request later.</p>
+        {% endif %}
+    </div>
+
+    <a href="{{ proposal_url }}">View access request</a>
+    <br>
+    {% if new_state == 'accepted' and project_url %}
+    <a href="{{ project_url }}">View Project</a>
+    {% endif %}
+
+    <div class="footer">
+        <p>This is an automated message from the {{ site_name }}. Please do not reply to this email.</p>
+    </div>
 </body>
 </html>
 
@@ -3182,6 +3623,105 @@ You can still view your proposal by visiting:
 {{ proposal_url }}
 
 If you would like to resubmit your proposal, please check for upcoming rounds in this call or other relevant calls.
+
+This is an automated message from the {{ site_name }}. Please do not reply to this email.
+
+```
+
+### workflow_step_event_message.html (waldur_mastermind.proposal)
+
+```html
+
+<html>
+<head>
+    <meta charset="UTF-8">
+</head>
+<body>
+    <p>Dear {% if is_applicant %}applicant{% else %}colleague{% endif %},</p>
+
+    <p>
+    {% if trigger == "deadline_approaching" %}
+        The "{{ step_name }}" step for proposal "{{ proposal_name }}" (call "{{ call_name }}", round "{{ round_name }}") is due on {{ deadline|date:"Y-m-d" }} — in {{ days_before }} day{{ days_before|pluralize }}.
+        {% if is_applicant %}Please respond before the deadline.{% else %}Please complete the step or follow up before it expires.{% endif %}
+    {% elif trigger == "step_started" %}
+        The "{{ step_name }}" step has started for proposal "{{ proposal_name }}" (call "{{ call_name }}", round "{{ round_name }}").
+        {% if deadline %}It is due on {{ deadline|date:"Y-m-d" }}.{% endif %}
+    {% elif trigger == "step_completed" %}
+        The "{{ step_name }}" step has been completed for proposal "{{ proposal_name }}" (call "{{ call_name }}", round "{{ round_name }}").
+        {% if outcome %}Outcome: {{ outcome }}.{% endif %}
+        {% if outcome_reason %}<br>Reason: {{ outcome_reason }}{% endif %}
+    {% elif trigger == "step_rejected" %}
+        Proposal "{{ proposal_name }}" (call "{{ call_name }}", round "{{ round_name }}") was rejected at the "{{ step_name }}" step.
+        {% if outcome_reason %}<br>Reason: {{ outcome_reason }}{% endif %}
+    {% elif trigger == "step_expired" %}
+        The "{{ step_name }}" step for proposal "{{ proposal_name }}" (call "{{ call_name }}", round "{{ round_name }}") has expired without being completed.
+        {% if not is_applicant %}Please follow up so the workflow can continue.{% endif %}
+    {% endif %}
+    </p>
+
+    <p>
+        You can view the proposal here:<br>
+        <a href="{{ proposal_url }}">{{ proposal_url }}</a>
+    </p>
+
+    <p>
+        This is an automated message from the {{ site_name }}. Please do not reply to this email.
+    </p>
+</body>
+</html>
+
+```
+
+### access_request_state_changed_message.txt (waldur_mastermind.proposal)
+
+```txt
+
+Dear {{ proposal_creator_name }},
+
+The state of your access request "{{ proposal_name }}" has been updated.
+
+State change:
+- Previous state: {{ previous_state }}
+- New state: {{ new_state }}
+- Updated on: {{ update_date }}
+
+{% if new_state == 'accepted' %}
+Project created: {{ project_name }}
+{% if allocation_date %}Allocation start date: {{ allocation_date }}
+{% endif %}{% if duration %}Duration: {{ duration }} days
+{% endif %}
+Allocated resources:
+{% for resource in allocated_resources %}
+{{ forloop.counter }}. {{ resource.name }} - {{ resource.provider_name }} - {{ resource.plan_name }} - Provisioned
+{% empty %}
+No resources allocated yet.
+{% endfor %}
+{% endif %}
+
+{% if new_state == 'rejected' %}
+Feedback: {{ rejection_feedback }}
+{% endif %}
+
+{% if new_state == 'submitted' %}
+Your access request has been submitted and is now being processed. You will receive further notifications as it moves forward.
+{% endif %}
+
+{% if new_state == 'in_review' %}
+Your access request is being evaluated. You will be notified as soon as a decision has been made.
+{% endif %}
+
+{% if new_state == 'accepted' %}
+Your access request has been approved. A project has been created with the resources you asked for, and you can open it using the link below.
+{% endif %}
+
+{% if new_state == 'rejected' %}
+Your access request has not been approved at this time. Please review any feedback provided above. You are welcome to submit a new request later.
+{% endif %}
+
+View access request: {{ proposal_url }}
+{% if new_state == 'accepted' and project_url %}
+View Project: {{ project_url }}
+{% endif %}
 
 This is an automated message from the {{ site_name }}. Please do not reply to this email.
 
@@ -3315,7 +3855,7 @@ State change:
 {% if new_state == 'accepted' %}
 Project created: {{ project_name }}
 Allocation start date: {{ allocation_date }}
-Duration: {{ duration }} days
+{% if duration %}Duration: {{ duration }}{% endif %}
 
 Allocated resources:
 {% for resource in allocated_resources %}
@@ -3379,16 +3919,12 @@ All reviews complete for proposal: {{ proposal_name }}
     <h4>Round summary:</h4>
     <ul>
         <li><strong>Total proposals submitted:</strong> {{ total_proposals }}</li>
+        <li><strong>Reviews on record:</strong> {{ total_reviews }}</li>
         <li><strong>Start date:</strong> {{ start_date }}</li>
         <li><strong>Closed date:</strong> {{ close_date }}</li>
     </ul>
 
-    <p>Based on the review strategy selected for this round ({{ review_strategy }}), the system has:</p>
-    <ul>
-        <li>Set all draft proposals to "canceled" state</li>
-        <li>Moved all submitted proposals to "in_review" state</li>
-        <li>Created {{ total_reviews }} review assignments</li>
-    </ul>
+    <p>No further proposals can be submitted to this round. Proposals that had not been accepted or rejected by the cutoff are cancelled automatically, drafts included, so only proposals with a final decision remain.</p>
 
     <p>You can view the round details and manage proposals by visiting: <a href="{{ round_url }}">{{ round_url }}</a></p>
 
@@ -3462,6 +3998,27 @@ Round closed: {{ round_name }} - {{ call_name }}
     </p>
   </body>
 </html>
+
+```
+
+### workflow_step_event_message.txt (waldur_mastermind.proposal)
+
+```txt
+
+Dear {% if is_applicant %}applicant{% else %}colleague{% endif %},
+
+{% if trigger == "deadline_approaching" %}The "{{ step_name }}" step for proposal "{{ proposal_name }}" (call "{{ call_name }}", round "{{ round_name }}") is due on {{ deadline|date:"Y-m-d" }} — in {{ days_before }} day{{ days_before|pluralize }}.{% if is_applicant %} Please respond before the deadline.{% else %} Please complete the step or follow up before it expires.{% endif %}
+{% elif trigger == "step_started" %}The "{{ step_name }}" step has started for proposal "{{ proposal_name }}" (call "{{ call_name }}", round "{{ round_name }}").{% if deadline %} It is due on {{ deadline|date:"Y-m-d" }}.{% endif %}
+{% elif trigger == "step_completed" %}The "{{ step_name }}" step has been completed for proposal "{{ proposal_name }}" (call "{{ call_name }}", round "{{ round_name }}").{% if outcome %} Outcome: {{ outcome }}.{% endif %}{% if outcome_reason %}
+Reason: {{ outcome_reason }}{% endif %}
+{% elif trigger == "step_rejected" %}Proposal "{{ proposal_name }}" (call "{{ call_name }}", round "{{ round_name }}") was rejected at the "{{ step_name }}" step.{% if outcome_reason %}
+Reason: {{ outcome_reason }}{% endif %}
+{% elif trigger == "step_expired" %}The "{{ step_name }}" step for proposal "{{ proposal_name }}" (call "{{ call_name }}", round "{{ round_name }}") has expired without being completed.{% if not is_applicant %} Please follow up so the workflow can continue.{% endif %}
+{% endif %}
+You can view the proposal here:
+{{ proposal_url }}
+
+This is an automated message from the {{ site_name }}. Please do not reply to this email.
 
 ```
 
@@ -3725,7 +4282,7 @@ This is an automated message from the {{ site_name }}. Please do not reply to th
         <ul>
             <li><strong>Project created:</strong> {{ project_name }}</li>
             <li><strong>Allocation start date:</strong> {{ allocation_date }}</li>
-            <li><strong>Duration:</strong> {{ duration }} days</li>
+            {% if duration %}<li><strong>Duration:</strong> {{ duration }}</li>{% endif %}
         </ul>
         <div>
             <h4>Allocated resources:</h4>
@@ -3819,6 +4376,14 @@ You can view the full review details at:
 {{ review_url }}
 
 This is an automated message from the {{ site_name }}. Please do not reply to this email.
+
+```
+
+### workflow_step_event_subject.txt (waldur_mastermind.proposal)
+
+```txt
+
+{% if trigger == "deadline_approaching" %}Reminder: {{ step_name }} for "{{ proposal_name }}" is due in {{ days_before }} day{{ days_before|pluralize }}{% elif trigger == "step_started" %}{{ step_name }} has started for "{{ proposal_name }}"{% elif trigger == "step_completed" %}{{ step_name }} completed for "{{ proposal_name }}"{% elif trigger == "step_rejected" %}"{{ proposal_name }}" was rejected at {{ step_name }}{% elif trigger == "step_expired" %}{{ step_name }} for "{{ proposal_name }}" has expired{% else %}Update on "{{ proposal_name }}"{% endif %}
 
 ```
 
@@ -4003,6 +4568,42 @@ This is an automated message from {{ site_name }}. Please do not reply to this e
 
 ```
 
+### notification_issue_created_message.txt (waldur_mastermind.support)
+
+```txt
+
+A new support request has been created.
+
+Request: {{ issue.key }}
+Summary: {{ issue.summary.strip }}
+Type: {{ issue.type }}
+{% if issue.priority %}Priority: {{ issue.priority }}
+{% endif %}Reported by: {{ issue.caller.full_name|default:issue.caller.username|default:"unknown" }}
+{% if issue.customer %}Organization: {{ issue.customer.name }}
+{% endif %}{% if issue.project %}Project: {{ issue.project.name }}
+{% endif %}
+Description:
+{{ issue.description.strip }}
+
+```
+
+### notification_comment_added_staff_message.html (waldur_mastermind.support)
+
+```html
+
+<p>{{ comment.author.name|default:"The requester" }} has commented on a support request.</p>
+<p><strong>Request:</strong> {{ issue.key }}<br>
+<strong>Summary:</strong> {{ issue.summary.strip }}<br>
+<strong>Status:</strong> {{ issue.status }}
+{% if issue.assignee %}<br><strong>Assignee:</strong> {{ issue.assignee.name }}{% endif %}
+{% if issue.customer %}<br><strong>Organization:</strong> {{ issue.customer.name }}{% endif %}
+{% if issue.project %}<br><strong>Project:</strong> {{ issue.project.name }}{% endif %}</p>
+<p><strong>Comment:</strong></p>
+<p>{{ comment.description.strip }}</p>
+<p><a href="{{ issue_url }}">Open the request</a></p>
+
+```
+
 ### notification_issue_updated_message.html (waldur_mastermind.support)
 
 ```html
@@ -4117,6 +4718,22 @@ This is an automated message from {{ site_name }}. Please do not reply to this e
 
 ```
 
+### notification_issue_created_subject.txt (waldur_mastermind.support)
+
+```txt
+
+[{{ issue.key }}] New support request: {{ issue.summary.strip }}
+
+```
+
+### notification_comment_added_staff_subject.txt (waldur_mastermind.support)
+
+```txt
+
+[{{ issue.key }}] New comment from {{ comment.author.name|default:"the requester" }}: {{ issue.summary.strip }}
+
+```
+
 ### provider_sla_warning_message.html (waldur_mastermind.support)
 
 ```html
@@ -4181,6 +4798,23 @@ Comment:
 
 ```
 
+### notification_issue_created_message.html (waldur_mastermind.support)
+
+```html
+
+<p>A new support request has been created.</p>
+<p><strong>Request:</strong> {{ issue.key }}<br>
+<strong>Summary:</strong> {{ issue.summary.strip }}<br>
+<strong>Type:</strong> {{ issue.type }}<br>
+{% if issue.priority %}<strong>Priority:</strong> {{ issue.priority }}<br>{% endif %}
+<strong>Reported by:</strong> {{ issue.caller.full_name|default:issue.caller.username|default:"unknown" }}
+{% if issue.customer %}<br><strong>Organization:</strong> {{ issue.customer.name }}{% endif %}
+{% if issue.project %}<br><strong>Project:</strong> {{ issue.project.name }}{% endif %}</p>
+<p><strong>Description:</strong></p>
+<p>{{ issue.description.strip }}</p>
+
+```
+
 ### provider_ticket_withdrawn_message.html (waldur_mastermind.support)
 
 ```html
@@ -4189,6 +4823,19 @@ Comment:
 <p><strong>Ticket:</strong> {{ issue.key }}<br>
 <strong>Summary:</strong> {{ issue.summary }}</p>
 <p>No further action is required on your side. If you have already opened a corresponding ticket in your system, you may close it.</p>
+
+```
+
+### notification_issue_escalated_message.html (waldur_mastermind.support)
+
+```html
+
+<p>A support request has been escalated.</p>
+<p><strong>Request:</strong> {{ issue.key }}<br>
+<strong>Summary:</strong> {{ issue.summary.strip }}
+{% if issue.customer %}<br><strong>Organization:</strong> {{ issue.customer.name }}{% endif %}</p>
+<p><strong>Reason for escalation:</strong></p>
+<p>{{ reason }}</p>
 
 ```
 
@@ -4217,6 +4864,26 @@ The issue you have created has a new comment. Please go to {{issue_url}} to see 
 ```txt
 
 [{{ issue.key }}] New ticket: {{ issue.summary }}
+
+```
+
+### notification_comment_added_staff_message.txt (waldur_mastermind.support)
+
+```txt
+
+{{ comment.author.name|default:"The requester" }} has commented on a support request.
+
+Request: {{ issue.key }}
+Summary: {{ issue.summary.strip }}
+Status: {{ issue.status }}
+{% if issue.assignee %}Assignee: {{ issue.assignee.name }}
+{% endif %}{% if issue.customer %}Organization: {{ issue.customer.name }}
+{% endif %}{% if issue.project %}Project: {{ issue.project.name }}
+{% endif %}
+Comment:
+{{ comment.description.strip }}
+
+Open the request: {{ issue_url }}
 
 ```
 
@@ -4282,6 +4949,21 @@ No further action is required on your side. If you have already opened a corresp
 ```txt
 
 {% if issue.customer.abbreviation %}{{issue.customer.abbreviation}}: {% endif %}{{issue.summary}}
+
+```
+
+### notification_issue_escalated_message.txt (waldur_mastermind.support)
+
+```txt
+
+A support request has been escalated.
+
+Request: {{ issue.key }}
+Summary: {{ issue.summary.strip }}
+{% if issue.customer %}Organization: {{ issue.customer.name }}
+{% endif %}
+Reason for escalation:
+{{ reason }}
 
 ```
 
@@ -4384,6 +5066,14 @@ Updated issue: {{issue.key}} {{issue.summary}}
 <strong>Priority:</strong> {{ issue.priority }}</p>
 <p><strong>Description:</strong></p>
 <p>{{ issue.description }}</p>
+
+```
+
+### notification_issue_escalated_subject.txt (waldur_mastermind.support)
+
+```txt
+
+[{{ issue.key }}] Escalated: {{ issue.summary.strip }}
 
 ```
 

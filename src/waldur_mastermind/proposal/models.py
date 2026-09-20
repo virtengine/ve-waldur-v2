@@ -2,6 +2,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Literal, cast
 
+from constance import config as constance_config
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -25,12 +26,14 @@ from waldur_core.permissions.models import Role
 from waldur_core.permissions.utils import get_users
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace.enums import BillingTypes
 from waldur_mastermind.marketplace.models import (
     SafeAttributesMixin,
     UserAttributeConfigBase,
 )
 from waldur_mastermind.proposal import enums
 from waldur_mastermind.proposal.enums import (
+    PROPOSAL_CONFIGURABLE_FIELDS,
     AssignmentBatchStatuses,
     AssignmentItemStatuses,
     AssignmentSources,
@@ -48,6 +51,7 @@ from waldur_mastermind.proposal.enums import (
     MatchingAffinityMethods,
     MatchingAlgorithms,
     ProposalDisclosureLevels,
+    ProposalFieldStates,
     ProposalStates,
     PublicationVenueTypes,
     RequestedOfferingStates,
@@ -57,6 +61,7 @@ from waldur_mastermind.proposal.enums import (
     ReviewerSuggestionStatuses,
     RoundStatuses,
     SuggestionSourceTypes,
+    SupportTicketCallers,
 )
 
 from . import managers
@@ -132,7 +137,13 @@ class Call(
 ):
     """Main entity representing calls for proposals with states (draft, active, archived). Contains configuration for reviewer visibility, review settings, and fixed duration parameters."""
 
+    class Meta:
+        ordering = ["-created", "id"]
+
     class States(CallStates):
+        pass
+
+    class TicketCaller(SupportTicketCallers):
         pass
 
     manager = models.ForeignKey(CallManagingOrganisation, on_delete=models.PROTECT)
@@ -196,6 +207,43 @@ class Call(
         ),
     )
 
+    panel_chair = models.ForeignKey(
+        core_models.User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text=(
+            "Panel member who chairs this call's review panel. Must hold the "
+            "panel member role on the call; cleared automatically when that "
+            "role is revoked. Addressable by notification rules as panel_chair."
+        ),
+    )
+
+    support_ticket_caller = models.CharField(
+        max_length=20,
+        choices=TicketCaller.CHOICES,
+        default=TicketCaller.APPLICANT,
+        help_text=(
+            "Who helpdesk tickets for granted resources are raised for. They "
+            "receive the helpdesk's replies; reading the ticket in Waldur "
+            "also needs a role on the project. If that person has no email "
+            "address, the project's roles decide instead."
+        ),
+    )
+    support_ticket_caller_user = models.ForeignKey(
+        core_models.User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text=(
+            "The person tickets go to when the caller is set to a named "
+            "contact. Useful for routing a whole call to a shared mailbox. "
+            "Must hold a role on this call or on the organisation managing it."
+        ),
+    )
+
     objects = managers.CallManager()
     tracker = cast(FieldInstanceTracker, FieldTracker())
 
@@ -221,6 +269,17 @@ class Call(
 
     def clean(self):
         """Prevent changing checklist or slug template if proposals exist."""
+        if (
+            self.panel_chair_id
+            and not get_users(self, RoleEnum.CALL_PANEL_MEMBER)
+            .filter(pk=self.panel_chair_id)
+            .exists()
+        ):
+            raise ValidationError(
+                {
+                    "panel_chair": "Panel chair must hold the panel member role on this call."
+                }
+            )
         if self.pk and self.proposal_set.exists():
             if self.tracker.has_changed("compliance_checklist"):
                 raise ValidationError(
@@ -250,6 +309,105 @@ class CallApplicantVisibilityConfig(UserAttributeConfigBase):
     @classmethod
     def get_exposed_fields_for_call(cls, call, default_attributes=None) -> list[str]:
         return cls.get_exposed_fields_for_scope(call, default_attributes)
+
+
+class CallProposalFieldConfig(TimeStampedModel, core_models.UuidMixin):
+    """Which Project details fields this call asks for, and which it insists on.
+
+    One row per call, seeded at call creation from the Constance defaults (see
+    ``handlers.seed_proposal_field_config``) rather than resolved lazily. A call
+    that resolved its defaults at read time would tighten retroactively the day
+    an operator raised the installation default, which the locking rule below
+    exists to prevent.
+
+    ``name`` is deliberately absent: it names the proposal and forms the last
+    part of the awarded project's name (see ``allocate_proposal``, which
+    prefixes the call and the round's start date). The length of the award is
+    not a form field either: it is derived at allocation from the requested
+    resources' ``attributes.prepaid_duration_months``, else from
+    ``call.fixed_duration_in_days`` (see ``utils.project_end_date``).
+    """
+
+    FIELD_PREFIX = "field_"
+
+    call = models.OneToOneField(
+        Call,
+        on_delete=models.CASCADE,
+        related_name="proposal_field_config",
+    )
+
+    field_project_summary = models.CharField(
+        max_length=10,
+        choices=ProposalFieldStates.CHOICES,
+        default=ProposalFieldStates.REQUIRED,
+    )
+    field_description = models.CharField(
+        max_length=10,
+        choices=ProposalFieldStates.CHOICES,
+        default=ProposalFieldStates.OPTIONAL,
+    )
+    field_science_sub_domain = models.CharField(
+        max_length=10,
+        choices=ProposalFieldStates.CHOICES,
+        default=ProposalFieldStates.OPTIONAL,
+    )
+    field_supporting_documentation = models.CharField(
+        max_length=10,
+        choices=ProposalFieldStates.CHOICES,
+        default=ProposalFieldStates.OPTIONAL,
+    )
+
+    def __str__(self):
+        return f"Proposal field config for {self.call}"
+
+    @classmethod
+    def field_names(cls) -> list[str]:
+        return list(PROPOSAL_CONFIGURABLE_FIELDS)
+
+    @classmethod
+    def column_for(cls, field_name: str) -> str:
+        return f"{cls.FIELD_PREFIX}{field_name}"
+
+    @classmethod
+    def default_states(cls) -> dict[str, str]:
+        """Installation defaults, as a field -> state map.
+
+        Read from Constance so an operator can set the house style once, and
+        applied only when a call is created. Anything neither required nor
+        hidden is optional.
+        """
+        required = set(constance_config.DEFAULT_PROPOSAL_REQUIRED_FIELDS or [])
+        hidden = set(constance_config.DEFAULT_PROPOSAL_HIDDEN_FIELDS or [])
+        states = {}
+        for field_name in cls.field_names():
+            if field_name in hidden:
+                states[field_name] = ProposalFieldStates.HIDDEN
+            elif field_name in required:
+                states[field_name] = ProposalFieldStates.REQUIRED
+            else:
+                states[field_name] = ProposalFieldStates.OPTIONAL
+        return states
+
+    def get_states(self) -> dict[str, str]:
+        return {
+            field_name: getattr(self, self.column_for(field_name))
+            for field_name in self.field_names()
+        }
+
+    @classmethod
+    def get_states_for_call(cls, call) -> dict[str, str]:
+        """States for a call, falling back to the model defaults.
+
+        Calls created before this model existed have no row; they keep the
+        behaviour the form had before it was configurable.
+        """
+        config = getattr(call, "proposal_field_config", None)
+        if config is not None:
+            return config.get_states()
+        return {
+            field_name: cls._meta.get_field(cls.column_for(field_name)).default
+            for field_name in cls.field_names()
+        }
 
 
 class CallWorkflowStep(
@@ -377,7 +535,7 @@ class CallWorkflowStep(
 
     class Meta:
         unique_together = ("call", "step")
-        ordering = ["created"]
+        ordering = ["created", "id"]
         verbose_name = _("Workflow step")
         verbose_name_plural = _("Workflow steps")
 
@@ -413,10 +571,78 @@ class CallWorkflowStep(
             )
             for dep in step_def.dependencies:
                 if dep not in enabled_steps:
-                    dep_name = enums.WORKFLOW_STEPS_MAP.get(dep, dep)
+                    # The map holds definitions, not labels -- interpolating one
+                    # whole puts its dataclass repr in front of the call manager.
+                    dep_def = enums.WORKFLOW_STEPS_MAP.get(dep)
+                    dep_name = dep_def.name if dep_def else dep
                     raise DjangoValidationError(
                         f"Step '{step_def.name}' requires '{dep_name}' to be enabled."
                     )
+
+
+class CallWorkflowStepNotificationRule(
+    TimeStampedModel,
+    core_models.UuidMixin,
+):
+    """Call-level rule: on a workflow event for a step, e-mail an audience.
+
+    Rules are configuration owned by the call manager, seeded per call from
+    the built-in defaults (see ``handlers.seed_notification_rules``) and
+    resolved against a concrete proposal only when the event fires
+    (``notification_rules.dispatch_step_event``). ``days_before`` is the lead
+    time for ``deadline_approaching`` and is meaningless for the other
+    triggers, which fire the moment the step changes status.
+    """
+
+    class Permissions:
+        customer_path = "workflow_step__call__manager__customer"
+
+    workflow_step = models.ForeignKey(
+        CallWorkflowStep,
+        on_delete=models.CASCADE,
+        related_name="notification_rules",
+    )
+    trigger = models.CharField(
+        max_length=32,
+        choices=enums.NotificationRuleTriggers.CHOICES,
+    )
+    recipient = models.CharField(
+        max_length=32,
+        choices=enums.NotificationRuleRecipients.CHOICES,
+    )
+    days_before = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Only for deadline_approaching: how many days before the step's "
+            "deadline the reminder is sent."
+        ),
+    )
+    is_enabled = models.BooleanField(default=True)
+
+    class Meta:
+        unique_together = ("workflow_step", "trigger", "recipient")
+        ordering = ["created", "id"]
+        verbose_name = _("Workflow step notification rule")
+        verbose_name_plural = _("Workflow step notification rules")
+
+    def __str__(self):
+        return f"{self.workflow_step} — {self.trigger} → {self.recipient}"
+
+    @property
+    def call(self):
+        return self.workflow_step.call
+
+    def clean(self):
+        if self.trigger == enums.NotificationRuleTriggers.DEADLINE_APPROACHING:
+            if self.days_before is None:
+                raise DjangoValidationError(
+                    {"days_before": "Required for the deadline_approaching trigger."}
+                )
+        elif self.days_before is not None:
+            raise DjangoValidationError(
+                {"days_before": "Only applies to the deadline_approaching trigger."}
+            )
 
 
 class WorkflowCriterion(
@@ -528,6 +754,28 @@ class RequestedOffering(
     plan = models.ForeignKey(
         on_delete=models.CASCADE, to=marketplace_models.Plan, null=True, blank=True
     )
+    require_purchase_order = models.BooleanField(
+        default=False,
+        help_text=(
+            "Whether a purchase order must accompany a resource request for this "
+            "offering before the proposal can be submitted. Defaults to the "
+            "offering's require_purchase_order_upload, and stays under the call "
+            "manager's control afterwards."
+        ),
+    )
+
+    objects = managers.RequestedOfferingQuerySet.as_manager()
+
+    def save(self, *args, **kwargs):
+        # Seed from the offering the first time only. The offering flag gates
+        # order *approval*, which happens after allocation; a call may need it
+        # earlier (or not at all), so the call manager owns it from here on and
+        # later offering changes must not silently rewrite the call's setting.
+        if self._state.adding and not self.require_purchase_order:
+            self.require_purchase_order = bool(
+                self.offering.plugin_options.get("require_purchase_order_upload")
+            )
+        return super().save(*args, **kwargs)
 
 
 class CallResourceTemplate(
@@ -593,6 +841,9 @@ class Round(
     step configuration (``CallWorkflowStep``), not here — the Round only carries
     scheduling (submission window, review duration, allocation timing).
     """
+
+    class Meta:
+        ordering = ["-created", "id"]
 
     class Statuses(RoundStatuses):
         pass
@@ -706,11 +957,6 @@ class Proposal(
     project = models.ForeignKey(
         structure_models.Project, on_delete=models.PROTECT, editable=False, null=True
     )
-    duration_in_days = models.PositiveIntegerField(
-        null=True,
-        blank=True,
-        help_text="Duration in days after provisioning of resources.",
-    )
     approved_by = models.ForeignKey(
         core_models.User,
         on_delete=models.SET_NULL,
@@ -726,8 +972,6 @@ class Proposal(
     )
     project_summary = models.TextField(blank=True)
     project_duration = models.PositiveIntegerField(null=True, blank=True)
-    project_is_confidential = models.BooleanField(default=False)
-    project_has_civilian_purpose = models.BooleanField(default=False)
 
     resources = models.ManyToManyField(RequestedOffering, through="RequestedResource")
     allocation_comment = models.CharField(blank=True, max_length=150, null=True)
@@ -768,7 +1012,7 @@ class Proposal(
         return "proposal-proposal"
 
     class Meta:
-        ordering = ["round__start_time"]
+        ordering = ["round__start_time", "id"]
 
     @property
     def checklist_completion(self):
@@ -810,10 +1054,72 @@ class Proposal(
         )
         return completion
 
+    def offerings_missing_purchase_orders(self) -> list[str]:
+        """Offerings whose call entry demands a purchase order and has none.
+
+        Filtered in Python rather than in the query. ``can_submit`` reports this
+        on every proposal a list serializes, and a ``.filter()`` on the relation
+        ignores whatever the viewset prefetched — one query per row, which is
+        what the annotations on ProposalViewSet.get_queryset exist to avoid.
+        """
+        return sorted(
+            {
+                requested_resource.requested_offering.offering.name
+                for requested_resource in self.requestedresource_set.all()
+                if requested_resource.requested_offering.require_purchase_order
+                and not requested_resource.has_purchase_order
+            }
+        )
+
+    def offerings_missing_requested_amounts(self) -> list[str]:
+        """Offerings asked for without naming any amount.
+
+        Offerings with nothing to ask for (no limit or prepaid component) are
+        exempt: there is no amount to name in the first place.
+        """
+        missing = set()
+        for requested_resource in self.requestedresource_set.all():
+            offering = requested_resource.requested_offering.offering
+            # The same components get_limit_components() selects, read off the
+            # prefetched list instead of querying per offering.
+            requestable = [
+                component.type
+                for component in offering.components.all()
+                if component.billing_type == BillingTypes.LIMIT
+                or (
+                    component.billing_type == BillingTypes.ONE_TIME
+                    and component.is_prepaid
+                )
+            ]
+            if not requestable:
+                continue
+            limits = requested_resource.limits or {}
+            if not any(limits.get(component_type) for component_type in requestable):
+                missing.add(offering.name)
+        return sorted(missing)
+
     def can_submit(self):
-        """Check if proposal can be submitted."""
-        # Compliance checklists are for evaluation only, not submission blocking
-        # Only basic validation - proposals can always be submitted
+        """Whether the proposal may leave draft, and why not when it may not.
+
+        Reports the same conditions the submit action enforces, so the form can
+        say what is missing instead of letting the applicant find out from a
+        rejected request. Compliance checklists are for evaluation only and
+        never block submission.
+        """
+        missing_amounts = self.offerings_missing_requested_amounts()
+        if missing_amounts:
+            return False, _(
+                "Requested amounts are missing for the following offerings: "
+                "%(offerings)s."
+            ) % {"offerings": ", ".join(missing_amounts)}
+
+        missing_orders = self.offerings_missing_purchase_orders()
+        if missing_orders:
+            return False, _(
+                "A purchase order is required for the following offerings: "
+                "%(offerings)s."
+            ) % {"offerings": ", ".join(missing_orders)}
+
         return True, None
 
     def save(self, *args, **kwargs):
@@ -901,6 +1207,9 @@ class RequestedResource(
 ):
     """Specific resource requests within proposals, linking to marketplace resources with attributes and limits configuration."""
 
+    class Meta:
+        ordering = ["-created", "id"]
+
     class Permissions:
         project_path = "proposal__project"
 
@@ -919,6 +1228,15 @@ class RequestedResource(
     )
     attributes = models.JSONField(blank=True, default=dict)
     limits = models.JSONField(blank=True, default=dict)
+    # Collected here rather than at order approval so the reviewer sees the
+    # authorisation alongside the amounts, and so allocate_proposal can hand it
+    # to the order it creates instead of asking the applicant a second time.
+    purchase_order_reference = models.CharField(max_length=255, blank=True)
+    attachment = models.FileField(
+        upload_to="proposal_requested_resource_attachments",
+        blank=True,
+        null=True,
+    )
     created_by = models.ForeignKey(
         core_models.User,
         on_delete=models.SET_NULL,
@@ -932,6 +1250,20 @@ class RequestedResource(
         null=True,
     )
     proposal = models.ForeignKey(Proposal, on_delete=models.CASCADE)
+
+    @property
+    def purchase_order_required(self) -> bool:
+        return self.requested_offering.require_purchase_order
+
+    @property
+    def has_purchase_order(self) -> bool:
+        """Either half satisfies the requirement.
+
+        Some providers want the document, others only need the reference from
+        the customer's finance system; demanding both would block the second
+        group for no gain.
+        """
+        return bool(self.attachment) or bool(self.purchase_order_reference)
 
 
 class ProposalWorkflowStepInstance(
@@ -988,6 +1320,15 @@ class ProposalWorkflowStepInstance(
         blank=True,
         help_text="Computed from started_at + step duration_in_days.",
     )
+    sent_notifications = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "Ledger of notification-rule events already dispatched for this "
+            'instance ("<trigger>" or "deadline_approaching:<days>"), so '
+            "a reminder is never sent twice."
+        ),
+    )
     internal_notes = models.TextField(
         blank=True,
         help_text=(
@@ -1000,7 +1341,7 @@ class ProposalWorkflowStepInstance(
 
     class Meta:
         unique_together = ("proposal", "step")
-        ordering = ["created"]
+        ordering = ["created", "id"]
         verbose_name = _("Proposal workflow step")
         verbose_name_plural = _("Proposal workflow steps")
         constraints = [
@@ -1020,6 +1361,9 @@ class Review(
     core_models.UuidMixin,
 ):
     """Peer review system with detailed scoring, public/private comments, and field-specific feedback for all proposal aspects."""
+
+    class Meta:
+        ordering = ["-created", "id"]
 
     class States:
         IN_REVIEW = "in_review"
@@ -1051,12 +1395,6 @@ class Review(
         max_length=255, null=True, blank=True
     )
     comment_project_duration = models.CharField(max_length=255, null=True, blank=True)
-    comment_project_is_confidential = models.CharField(
-        max_length=255, null=True, blank=True
-    )
-    comment_project_has_civilian_purpose = models.CharField(
-        max_length=255, null=True, blank=True
-    )
     comment_project_supporting_documentation = models.CharField(
         max_length=255, null=True, blank=True
     )
@@ -1253,7 +1591,7 @@ class ReviewerAffiliation(
     class Meta:
         verbose_name = _("Reviewer affiliation")
         verbose_name_plural = _("Reviewer affiliations")
-        ordering = ["-start_date"]
+        ordering = ["-start_date", "id"]
         indexes = [
             models.Index(fields=["organization"]),
             models.Index(fields=["organization_name"]),
@@ -1355,6 +1693,7 @@ class ReviewerExpertise(
     )
 
     class Meta:
+        ordering = ["-created", "id"]
         verbose_name = _("Reviewer expertise")
         verbose_name_plural = _("Reviewer expertise")
         unique_together = ("reviewer_profile", "expertise_keyword")
@@ -1419,7 +1758,7 @@ class ReviewerPublication(
     class Meta:
         verbose_name = _("Reviewer publication")
         verbose_name_plural = _("Reviewer publications")
-        ordering = ["-publication_year"]
+        ordering = ["-publication_year", "id"]
         indexes = [
             models.Index(fields=["doi"]),
             models.Index(fields=["publication_year"]),
@@ -1478,6 +1817,16 @@ class CallCOIConfiguration(
     """
     Per-call COI detection settings and thresholds.
     """
+
+    # The three type-handling rules must stay mutually exclusive and hold only
+    # known type codes. Both the API serializer and the bulk importer write
+    # these lists, so the invariant lives with the model rather than in either
+    # caller.
+    RULE_FIELDS = (
+        "recusal_required_types",
+        "management_allowed_types",
+        "disclosure_only_types",
+    )
 
     call = models.OneToOneField(
         Call,
@@ -1556,6 +1905,32 @@ class CallCOIConfiguration(
     @classmethod
     def get_url_name(cls):
         return "call-coi-configuration"
+
+    @classmethod
+    def find_rule_overlaps(cls, rules) -> dict[str, set[str]]:
+        """Map each COI type assigned to more than one rule to those rule names."""
+        assignments = {}
+        for field in cls.RULE_FIELDS:
+            for coi_type in rules.get(field) or []:
+                assignments.setdefault(coi_type, set()).add(field)
+        return {
+            coi_type: fields
+            for coi_type, fields in assignments.items()
+            if len(fields) > 1
+        }
+
+    @classmethod
+    def find_unknown_types(cls, rules) -> dict[str, list[str]]:
+        """Map each rule name to the type codes it holds that are not valid COI types."""
+        known = {choice[0] for choice in COITypes.CHOICES}
+        problems = {}
+        for field in cls.RULE_FIELDS:
+            unknown = [
+                coi_type for coi_type in rules.get(field) or [] if coi_type not in known
+            ]
+            if unknown:
+                problems[field] = unknown
+        return problems
 
 
 def filter_conflicts_of_interest(user):
@@ -1677,7 +2052,7 @@ class ConflictOfInterest(
     class Meta:
         verbose_name = _("Conflict of interest")
         verbose_name_plural = _("Conflicts of interest")
-        ordering = ["-detected_at"]
+        ordering = ["-detected_at", "id"]
         indexes = [
             models.Index(fields=["call", "status"]),
             models.Index(fields=["reviewer", "proposal"]),
@@ -1751,7 +2126,7 @@ class COIDisclosureForm(
     class Meta:
         verbose_name = _("COI disclosure form")
         verbose_name_plural = _("COI disclosure forms")
-        ordering = ["-certification_date"]
+        ordering = ["-certification_date", "id"]
         indexes = [
             models.Index(fields=["reviewer", "call"]),
             models.Index(fields=["is_current", "valid_until"]),
@@ -1914,7 +2289,7 @@ class CallReviewerPool(
     class Meta:
         verbose_name = _("Call reviewer pool member")
         verbose_name_plural = _("Call reviewer pool members")
-        ordering = ["-invited_at"]
+        ordering = ["-invited_at", "id"]
         indexes = [
             models.Index(fields=["invitation_status"]),
             models.Index(fields=["invitation_token"]),
@@ -2037,7 +2412,7 @@ class ReviewerSuggestion(
         verbose_name = _("Reviewer suggestion")
         verbose_name_plural = _("Reviewer suggestions")
         unique_together = ("call", "reviewer")
-        ordering = ["-affinity_score"]
+        ordering = ["-affinity_score", "id"]
         indexes = [
             models.Index(fields=["status"]),
         ]
@@ -2086,7 +2461,7 @@ class COIDetectionJob(
     class Meta:
         verbose_name = _("COI detection job")
         verbose_name_plural = _("COI detection jobs")
-        ordering = ["-created"]
+        ordering = ["-created", "id"]
 
     def __str__(self):
         return f"COI Job {self.uuid} - {self.call.name} ({self.state})"
@@ -2273,7 +2648,7 @@ class ProposedAssignment(
         verbose_name = _("Proposed assignment")
         verbose_name_plural = _("Proposed assignments")
         unique_together = ("call", "reviewer", "proposal")
-        ordering = ["proposal", "rank"]
+        ordering = ["proposal", "rank", "id"]
 
     def __str__(self):
         return (
@@ -2325,7 +2700,7 @@ class ReviewerBid(
         verbose_name = _("Reviewer bid")
         verbose_name_plural = _("Reviewer bids")
         unique_together = ("call", "reviewer", "proposal")
-        ordering = ["-submitted_at"]
+        ordering = ["-submitted_at", "id"]
 
     def __str__(self):
         return f"{self.reviewer.user.full_name} - {self.proposal.name}: {self.bid}"
@@ -2384,6 +2759,7 @@ class CallAssignmentConfiguration(
     )
 
     class Meta:
+        ordering = ["-created", "id"]
         verbose_name = _("Call assignment configuration")
         verbose_name_plural = _("Call assignment configurations")
 
@@ -2502,7 +2878,7 @@ class AssignmentBatch(
     class Meta:
         verbose_name = _("Assignment batch")
         verbose_name_plural = _("Assignment batches")
-        ordering = ["-created"]
+        ordering = ["-created", "id"]
         indexes = [
             models.Index(fields=["status"]),
             models.Index(fields=["invitation_token"]),
@@ -2689,7 +3065,7 @@ class AssignmentItem(
         verbose_name = _("Assignment item")
         verbose_name_plural = _("Assignment items")
         unique_together = ("batch", "proposal")
-        ordering = ["-affinity_score"]
+        ordering = ["-affinity_score", "id"]
         indexes = [
             models.Index(fields=["status"]),
         ]

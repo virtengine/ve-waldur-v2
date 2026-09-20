@@ -53,8 +53,11 @@ from waldur_mastermind.marketplace.models import (
     ResourcePlanPeriod,
     RobotAccount,
     ServiceProvider,
+    SlurmOfferingQoS,
+    SlurmPartitionQoS,
     SoftwareCatalog,
 )
+from waldur_mastermind.marketplace.utils import narrow_limit_value
 from waldur_mastermind.policy.models import (
     CustomerEstimatedCostPolicy,
     ProjectEstimatedCostPolicy,
@@ -302,6 +305,12 @@ class Command(BaseCommand):
             ),
             "offering_partitions": self.log_export_step(
                 "offering_partitions", self.export_offering_partitions
+            ),
+            "slurm_offering_qos": self.log_export_step(
+                "slurm_offering_qos", self.export_slurm_offering_qos
+            ),
+            "slurm_partition_qos": self.log_export_step(
+                "slurm_partition_qos", self.export_slurm_partition_qos
             ),
             "offering_software_catalogs": self.log_export_step(
                 "offering_software_catalogs", self.export_offering_software_catalogs
@@ -635,7 +644,6 @@ class Command(BaseCommand):
                     "backend_id": category.backend_id,
                     "default_vm_category": category.default_vm_category,
                     "default_volume_category": category.default_volume_category,
-                    "default_tenant_category": category.default_tenant_category,
                     "group_uuid": category.group.uuid.hex if category.group else None,
                     "created": category.created.isoformat()
                     if category.created
@@ -995,9 +1003,16 @@ class Command(BaseCommand):
                     "name": component.name,
                     "description": component.description,
                     "billing_type": component.billing_type,
+                    "billed_per_plan": component.billed_per_plan,
                     "measured_unit": component.measured_unit,
                     "limit_period": component.limit_period,
-                    "limit_amount": component.limit_amount,
+                    # A Decimal column, but exported as a JSON number to
+                    # match the API rather than as the decimal string this
+                    # file uses for prices.
+                    "limit_amount": narrow_limit_value(component.limit_amount)
+                    if component.limit_amount is not None
+                    else None,
+                    "limit_decimal_places": component.limit_decimal_places,
                     "article_code": component.article_code,
                     "backend_id": component.backend_id,
                 }
@@ -1026,7 +1041,7 @@ class Command(BaseCommand):
                     "billing_period": usage.billing_period.isoformat()
                     if usage.billing_period
                     else None,
-                    "recurring": usage.recurring,
+                    "missing_usage_policy": usage.missing_usage_policy,
                     "description": usage.description,
                     "backend_id": usage.backend_id,
                     "modified": usage.modified.isoformat() if usage.modified else None,
@@ -1056,6 +1071,7 @@ class Command(BaseCommand):
                     "max_amount": plan.max_amount,
                     "article_code": plan.article_code,
                     "backend_id": plan.backend_id,
+                    "billing_mode": plan.billing_mode,
                     "created": plan.created.isoformat() if plan.created else None,
                     "modified": plan.modified.isoformat() if plan.modified else None,
                 }
@@ -1845,11 +1861,8 @@ class Command(BaseCommand):
                     "approved_by_uuid": proposal.approved_by.uuid.hex
                     if proposal.approved_by
                     else None,
-                    "duration_in_days": proposal.duration_in_days,
                     "project_summary": proposal.project_summary,
                     "project_duration": proposal.project_duration,
-                    "project_is_confidential": proposal.project_is_confidential,
-                    "project_has_civilian_purpose": proposal.project_has_civilian_purpose,
                     "allocation_comment": proposal.allocation_comment,
                     "slug": proposal.slug,
                     "created": proposal.created.isoformat()
@@ -1917,8 +1930,6 @@ class Command(BaseCommand):
                     "comment_project_summary": review.comment_project_summary,
                     "comment_project_description": review.comment_project_description,
                     "comment_project_duration": review.comment_project_duration,
-                    "comment_project_is_confidential": review.comment_project_is_confidential,
-                    "comment_project_has_civilian_purpose": review.comment_project_has_civilian_purpose,
                     "comment_project_supporting_documentation": review.comment_project_supporting_documentation,
                     "comment_resource_requests": review.comment_resource_requests,
                     "comment_team": review.comment_team,
@@ -2159,6 +2170,55 @@ class Command(BaseCommand):
                 }
             )
         return partitions
+
+    def export_slurm_offering_qos(self):
+        """Export SLURM QoS profiles (offering-scoped QoS catalog)."""
+        profiles = []
+        for qos in SlurmOfferingQoS.objects.select_related("offering").order_by(
+            "offering__name", "name"
+        ):
+            profiles.append(
+                {
+                    "uuid": qos.uuid.hex,
+                    "offering_uuid": qos.offering.uuid.hex,
+                    "offering_name": qos.offering.name,
+                    "name": qos.name,
+                    "description": qos.description,
+                    "max_nodes": qos.max_nodes,
+                    "min_nodes": qos.min_nodes,
+                    "default_time": qos.default_time,
+                    "max_time": qos.max_time,
+                    "grace_time": qos.grace_time,
+                    "priority": qos.priority,
+                    "grp_tres": qos.grp_tres,
+                    "max_tres_per_job": qos.max_tres_per_job,
+                    "max_tres_per_node": qos.max_tres_per_node,
+                    "max_tres_per_user": qos.max_tres_per_user,
+                    "min_tres_per_job": qos.min_tres_per_job,
+                    "flags": qos.flags,
+                    "created": qos.created.isoformat() if qos.created else None,
+                    "modified": qos.modified.isoformat() if qos.modified else None,
+                }
+            )
+        return profiles
+
+    def export_slurm_partition_qos(self):
+        """Export partition QoS allow-list links (SLURM AllowQos gate)."""
+        links = []
+        for link in SlurmPartitionQoS.objects.select_related(
+            "partition", "qos"
+        ).order_by("partition__partition_name", "qos__name"):
+            links.append(
+                {
+                    "uuid": link.uuid.hex,
+                    "partition_uuid": link.partition.uuid.hex,
+                    "qos_uuid": link.qos.uuid.hex,
+                    "is_default": link.is_default,
+                    "created": link.created.isoformat() if link.created else None,
+                    "modified": link.modified.isoformat() if link.modified else None,
+                }
+            )
+        return links
 
     def export_offering_software_catalogs(self):
         """Export offering-to-software-catalog links."""

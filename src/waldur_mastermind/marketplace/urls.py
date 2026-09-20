@@ -88,11 +88,6 @@ def register_in(router):
         basename="marketplace-provider-resource",
     )
     router.register(
-        r"marketplace-resource-access-subnets",
-        views.ResourceAccessSubnetViewSet,
-        basename="marketplace-resource-access-subnet",
-    )
-    router.register(
         r"marketplace-offering-access-subnets",
         views.OfferingAccessSubnetViewSet,
         basename="marketplace-offering-access-subnet",
@@ -136,6 +131,11 @@ def register_in(router):
         r"marketplace-offering-users",
         views.OfferingUsersViewSet,
         basename="marketplace-offering-user",
+    )
+    router.register(
+        r"marketplace-service-provider-accounts",
+        views.ServiceProviderAccountViewSet,
+        basename="marketplace-service-provider-account",
     )
     router.register(
         r"marketplace-offering-user-checklist-completions",
@@ -338,6 +338,11 @@ def register_in(router):
         r"marketplace-resource-limit-change-requests",
         views.ResourceLimitChangeRequestViewSet,
         basename="marketplace-resource-limit-change-request",
+    )
+    router.register(
+        r"marketplace-resource-end-date-change-requests",
+        views.ResourceEndDateChangeRequestViewSet,
+        basename="marketplace-resource-end-date-change-request",
     )
 
 

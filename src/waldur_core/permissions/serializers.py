@@ -13,6 +13,7 @@ from waldur_core.core.serializers import (
     TranslatedModelSerializerMixin,
 )
 from waldur_core.core.utils import is_uuid_like
+from waldur_core.permissions import hygiene
 from waldur_core.permissions.enums import TYPE_KEYS, TYPE_MAP, PermissionEnum
 from waldur_core.permissions.utils import (
     build_org_role_name,
@@ -294,6 +295,12 @@ def clone_role_for_customer(
         raise ValidationError(
             "Only customer and project roles can be cloned into an organization."
         )
+    # Access checks resolve clones one level deep (role or role.template), so a
+    # chain would silently escape them — and double up the slug in the name.
+    if template.template_id is not None:
+        raise ValidationError(
+            "A clone cannot be cloned. Clone the original role instead."
+        )
     customer_ct = ContentType.objects.get_for_model(structure_models.Customer)
     already_cloned = models.Role.objects.filter(
         template=template,
@@ -462,6 +469,7 @@ class UserRoleDetailsSerializer(serializers.ModelSerializer):
     user_image = serializers.ImageField(source="user.image", read_only=True)
     created_by_full_name = serializers.ReadOnlyField(source="created_by.full_name")
     created_by_uuid = serializers.UUIDField(read_only=True, source="created_by.uuid")
+    source = serializers.CharField(read_only=True)
 
     class Meta:
         model = models.UserRole
@@ -479,6 +487,7 @@ class UserRoleDetailsSerializer(serializers.ModelSerializer):
             "user_image",
             "created_by_full_name",
             "created_by_uuid",
+            "source",
         )
 
 
@@ -507,11 +516,13 @@ class PermissionSerializer(serializers.ModelSerializer):
     scope_type = serializers.SerializerMethodField()
     scope_uuid = serializers.UUIDField(read_only=True, source="scope.uuid")
     scope_name = serializers.CharField(read_only=True, source="scope.name")
-    customer_uuid = serializers.UUIDField(read_only=True, source="scope.customer.uuid")
-    customer_name = serializers.CharField(read_only=True, source="scope.customer.name")
+    customer_uuid = serializers.SerializerMethodField()
+    customer_name = serializers.SerializerMethodField()
     resource_uuid = serializers.SerializerMethodField()
     project_uuid = serializers.SerializerMethodField()
     scope_is_removed = serializers.SerializerMethodField()
+    # Provenance of a machine-issued grant; never settable over the API.
+    source = serializers.CharField(read_only=True)
 
     class Meta:
         model = models.UserRole
@@ -530,6 +541,7 @@ class PermissionSerializer(serializers.ModelSerializer):
             "revoked_by_full_name",
             "revoked_by_username",
             "revoke_reason",
+            "source",
             "role_name",
             "role_description",
             "role_uuid",
@@ -561,6 +573,46 @@ class PermissionSerializer(serializers.ModelSerializer):
             if model == model_name:
                 return key
         return model_name
+
+    def _resolve_customer(self, obj):
+        """The organisation a role's scope belongs to.
+
+        Most scopes carry ``customer`` themselves, directly or as a property.
+        When the scope *is* a customer (e.g. CUSTOMER.OWNER), that organisation
+        is the scope itself — there is no nested ``.customer``.
+
+        Proposals deliberately do not expose ``customer``: ``get_scope_ancestors``
+        appends ``scope.customer`` when it exists, and ``pat_filtering`` mirrors
+        that walk exactly, so giving ``Proposal`` the attribute would hand it an
+        ancestor it is documented not to have — a permission-surface change,
+        made silently, for the sake of a display column. Resolve it here
+        instead, where it only ever reaches the response.
+
+        The chain is the one ``Proposal.Permissions.customer_path`` already
+        names: the organisation running the call the proposal was submitted to.
+        """
+        scope = obj.scope
+        if scope is None:
+            return None
+        model_name = scope._meta.model_name
+        if model_name == "customer":
+            return scope
+        if model_name == "proposal":
+            round_ = getattr(scope, "round", None)
+            call = getattr(round_, "call", None)
+            manager = getattr(call, "manager", None)
+            return getattr(manager, "customer", None)
+        return getattr(scope, "customer", None)
+
+    @extend_schema_field(serializers.UUIDField(allow_null=True))
+    def get_customer_uuid(self, obj) -> str | None:
+        customer = self._resolve_customer(obj)
+        return customer.uuid.hex if customer is not None else None
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_customer_name(self, obj) -> str | None:
+        customer = self._resolve_customer(obj)
+        return customer.name if customer is not None else None
 
     @extend_schema_field(serializers.UUIDField(allow_null=True))
     def get_resource_uuid(self, obj) -> str | None:
@@ -723,3 +775,29 @@ class UserRolePermissionActionSerializer(serializers.Serializer):
     """Input for revoke/restore actions on a specific user role grant."""
 
     reason = serializers.CharField(required=False, allow_blank=True, max_length=255)
+
+
+class RoleHygieneFindingSerializer(serializers.Serializer):
+    """One problem found with one role. See waldur_core.permissions.hygiene."""
+
+    check = serializers.CharField()
+    severity = serializers.ChoiceField(choices=hygiene.SEVERITY_ORDER)
+    role_uuid = serializers.CharField()
+    role_name = serializers.CharField()
+    role_description = serializers.CharField(allow_blank=True)
+    # A ChoiceField rather than a CharField: _scope_type only ever returns a
+    # TYPE_MAP key or None, so the generated SDK gets a union instead of a bare
+    # string, and the frontend can switch on it without casting.
+    scope_type = serializers.ChoiceField(choices=list(TYPE_MAP), allow_null=True)
+    is_system_role = serializers.BooleanField()
+    message = serializers.CharField()
+    details = serializers.DictField()
+
+
+class RoleHygieneReportSerializer(serializers.Serializer):
+    roles_checked = serializers.IntegerField()
+    roles_with_findings = serializers.IntegerField()
+    error_count = serializers.IntegerField()
+    warning_count = serializers.IntegerField()
+    info_count = serializers.IntegerField()
+    findings = RoleHygieneFindingSerializer(many=True)

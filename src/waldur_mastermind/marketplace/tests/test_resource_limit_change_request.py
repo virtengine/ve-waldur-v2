@@ -12,6 +12,14 @@ from waldur_mastermind.marketplace import models, tasks
 from waldur_mastermind.marketplace.enums import BillingTypes
 from waldur_mastermind.marketplace.tests import factories, fixtures
 
+OPTION = "enable_resource_limit_change_requests"
+
+
+def set_limit_change_requests(offering, enabled=True):
+    """Opt the offering in to (or out of) limit change requests."""
+    offering.plugin_options = {**offering.plugin_options, OPTION: enabled}
+    offering.save()
+
 
 class ResourceLimitChangeRequestCreateTest(test.APITestCase):
     def setUp(self):
@@ -19,6 +27,7 @@ class ResourceLimitChangeRequestCreateTest(test.APITestCase):
         self.resource = self.fixture.resource
         self.resource.state = models.Resource.States.OK
         self.resource.save()
+        set_limit_change_requests(self.resource.offering)
         self.list_url = factories.ResourceLimitChangeRequestFactory.get_list_url()
 
     def get_valid_payload(self):
@@ -26,6 +35,86 @@ class ResourceLimitChangeRequestCreateTest(test.APITestCase):
             "resource": self.resource.uuid.hex,
             "requested_limits": {"storage": 500},
         }
+
+    def post_limits(self, limits):
+        self.client.force_authenticate(self.fixture.manager)
+        return self.client.post(
+            self.list_url,
+            {"resource": self.resource.uuid.hex, "requested_limits": limits},
+            format="json",
+        )
+
+    def test_request_is_refused_when_offering_does_not_opt_in(self):
+        set_limit_change_requests(self.resource.offering, enabled=False)
+        self.client.force_authenticate(self.fixture.manager)
+        response = self.client.post(
+            self.list_url, self.get_valid_payload(), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("resource", response.data)
+        self.assertFalse(models.ResourceLimitChangeRequest.objects.exists())
+
+    def test_request_is_refused_when_option_is_absent(self):
+        self.resource.offering.plugin_options = {}
+        self.resource.offering.save()
+        self.client.force_authenticate(self.fixture.manager)
+        response = self.client.post(
+            self.list_url, self.get_valid_payload(), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("resource", response.data)
+        self.assertFalse(models.ResourceLimitChangeRequest.objects.exists())
+
+    def test_child_offering_follows_parent_option(self):
+        # The API shows a child offering with its parent's plugin options, so
+        # the parent's switch is the one that applies.
+        offering = self.resource.offering
+        offering.parent = factories.OfferingFactory(plugin_options={OPTION: True})
+        offering.plugin_options = {}
+        offering.save()
+        self.client.force_authenticate(self.fixture.manager)
+        response = self.client.post(
+            self.list_url, self.get_valid_payload(), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_child_offering_own_option_is_ignored(self):
+        offering = self.resource.offering
+        offering.parent = factories.OfferingFactory(plugin_options={})
+        offering.save()  # the child itself still carries OPTION: True
+        self.client.force_authenticate(self.fixture.manager)
+        response = self.client.post(
+            self.list_url, self.get_valid_payload(), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_access_is_checked_before_the_offering_option(self):
+        """A user who cannot see the resource learns nothing about its offering."""
+        set_limit_change_requests(self.resource.offering, enabled=False)
+        self.client.force_authenticate(structure_factories.UserFactory())
+        response = self.client.post(
+            self.list_url, self.get_valid_payload(), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("access", str(response.data["resource"][0]))
+
+    def test_fractional_requested_limit_is_accepted_at_creation(self):
+        # Whether a fraction is allowed belongs to the offering component, and
+        # that is settled by validate_limits when the request is approved —
+        # the same place a limit over the component maximum is caught. The
+        # serializer's job here is only to keep non-numeric values out.
+        response = self.post_limits({"storage": 0.5})
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_non_numeric_requested_limit_is_rejected(self):
+        response = self.post_limits({"storage": "a lot"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("requested_limits", response.data)
+
+    def test_negative_requested_limit_is_rejected(self):
+        response = self.post_limits({"storage": -1})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("requested_limits", response.data)
 
     def test_project_member_without_update_permission_can_create_request(self):
         """Project member without UPDATE_RESOURCE_LIMITS can create request."""
@@ -42,13 +131,19 @@ class ResourceLimitChangeRequestCreateTest(test.APITestCase):
             1,
         )
 
-    def test_user_with_update_resource_limits_permission_cannot_create_request(self):
-        """User with UPDATE_RESOURCE_LIMITS should update directly, not create request."""
-        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_RESOURCE_LIMITS)
-        self.addCleanup(
-            lambda: CustomerRole.OWNER.delete_permission(
-                PermissionEnum.UPDATE_RESOURCE_LIMITS
+    def grant_owner(self, *permissions):
+        for permission in permissions:
+            CustomerRole.OWNER.add_permission(permission)
+            self.addCleanup(
+                lambda permission=permission: CustomerRole.OWNER.delete_permission(
+                    permission
+                )
             )
+
+    def test_user_who_can_update_limits_directly_cannot_create_request(self):
+        """A user able to perform the update outright is sent down that route."""
+        self.grant_owner(
+            PermissionEnum.UPDATE_RESOURCE_LIMITS, PermissionEnum.CREATE_ORDER
         )
         self.client.force_authenticate(self.fixture.owner)
         response = self.client.post(
@@ -56,6 +151,22 @@ class ResourceLimitChangeRequestCreateTest(test.APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertFalse(
+            models.ResourceLimitChangeRequest.objects.filter(
+                resource=self.resource
+            ).exists()
+        )
+
+    def test_user_without_order_permission_can_still_create_request(self):
+        """Holding the limits permission alone is not enough to update directly,
+        so the request flow has to stay open — otherwise such a user would have
+        no way to change limits at all."""
+        self.grant_owner(PermissionEnum.UPDATE_RESOURCE_LIMITS)
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.post(
+            self.list_url, self.get_valid_payload(), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertTrue(
             models.ResourceLimitChangeRequest.objects.filter(
                 resource=self.resource
             ).exists()
@@ -180,12 +291,19 @@ class ResourceLimitChangeRequestApproveRejectTest(test.APITestCase):
         self.resource.save()
         self.resource.offering.shared = True
         self.resource.offering.save()
-        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_RESOURCE_LIMITS)
-        self.addCleanup(
-            lambda: CustomerRole.OWNER.delete_permission(
-                PermissionEnum.UPDATE_RESOURCE_LIMITS
+        set_limit_change_requests(self.resource.offering)
+        # Approving applies the limits through an order, so the approver needs
+        # order creation rights alongside the limits permission.
+        for permission in (
+            PermissionEnum.UPDATE_RESOURCE_LIMITS,
+            PermissionEnum.CREATE_ORDER,
+        ):
+            CustomerRole.OWNER.add_permission(permission)
+            self.addCleanup(
+                lambda permission=permission: CustomerRole.OWNER.delete_permission(
+                    permission
+                )
             )
-        )
         self.request = factories.ResourceLimitChangeRequestFactory(
             resource=self.resource,
             created_by=self.fixture.manager,
@@ -198,6 +316,30 @@ class ResourceLimitChangeRequestApproveRejectTest(test.APITestCase):
         self.reject_url = factories.ResourceLimitChangeRequestFactory.get_url(
             self.request, action="reject"
         )
+
+    def test_approve_is_refused_once_offering_opts_out(self):
+        factories.OfferingComponentFactory(
+            offering=self.resource.offering,
+            type="storage",
+            billing_type=BillingTypes.LIMIT,
+        )
+        set_limit_change_requests(self.resource.offering, enabled=False)
+        orders = models.Order.objects.filter(resource=self.resource)
+        orders_before = orders.count()
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.post(self.approve_url, {"comment": "Approved"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.request.refresh_from_db()
+        self.assertEqual(self.request.state, ReviewStates.PENDING)
+        self.assertEqual(orders.count(), orders_before)
+
+    def test_reject_still_works_once_offering_opts_out(self):
+        set_limit_change_requests(self.resource.offering, enabled=False)
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.post(self.reject_url, {"comment": "Rejected"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.request.refresh_from_db()
+        self.assertEqual(self.request.state, ReviewStates.REJECTED)
 
     def test_owner_can_approve_request_and_order_is_created(self):
         """Organization owner can approve request and marketplace order is created."""
@@ -270,6 +412,55 @@ class ResourceLimitChangeRequestApproveRejectTest(test.APITestCase):
         self.request.refresh_from_db()
         self.assertEqual(self.request.state, ReviewStates.PENDING)
 
+    def approve_legacy_fractional_request(self, limit_amount):
+        """Approve a row whose fractional value predates the typed serializer.
+
+        The stored value is still a float, and validate_limit_amount compares it
+        against a quota sum taken from ComponentQuota.limit — a DecimalField.
+        Decimal + float raises TypeError, which surfaced as a bare 500.
+        """
+        component = factories.OfferingComponentFactory(
+            offering=self.resource.offering,
+            type="storage",
+            billing_type=BillingTypes.LIMIT,
+            limit_amount=limit_amount,
+            # Let the component accept the fraction, so the comparison against
+            # the Decimal quota sum is what this exercises.
+            limit_decimal_places=1,
+        )
+        models.ComponentQuota.objects.create(
+            resource=self.resource, component=component, limit=10
+        )
+        models.ResourceLimitChangeRequest.objects.filter(pk=self.request.pk).update(
+            requested_limits={"storage": 0.5}
+        )
+        self.client.force_authenticate(self.fixture.owner)
+        return self.client.post(self.approve_url, {"comment": "Approved"})
+
+    def test_fractional_limit_over_threshold_is_rejected_not_a_server_error(self):
+        response = self.approve_legacy_fractional_request(limit_amount=10)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_fractional_limit_under_threshold_is_approved(self):
+        response = self.approve_legacy_fractional_request(limit_amount=100)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    def test_fractional_limit_is_rejected_on_an_integer_only_component(self):
+        factories.OfferingComponentFactory(
+            offering=self.resource.offering,
+            type="storage",
+            billing_type=BillingTypes.LIMIT,
+        )
+        models.ResourceLimitChangeRequest.objects.filter(pk=self.request.pk).update(
+            requested_limits={"storage": 0.5}
+        )
+        self.client.force_authenticate(self.fixture.owner)
+
+        response = self.client.post(self.approve_url, {"comment": "Approved"})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("whole number", str(response.data))
+
     def test_cannot_approve_when_requested_limits_exceed_component_maximum(self):
         """Approval is rejected when a requested limit exceeds the component maximum."""
         factories.OfferingComponentFactory(
@@ -304,6 +495,15 @@ class ResourceLimitChangeRequestCancelTest(test.APITestCase):
         response = self.client.post(self.cancel_url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
+        self.request.refresh_from_db()
+        self.assertEqual(self.request.state, ReviewStates.CANCELED)
+
+    def test_creator_can_cancel_after_offering_opts_out(self):
+        """Opting out stops new requests, but a pending one can still be withdrawn."""
+        set_limit_change_requests(self.resource.offering, enabled=False)
+        self.client.force_authenticate(self.fixture.manager)
+        response = self.client.post(self.cancel_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.request.refresh_from_db()
         self.assertEqual(self.request.state, ReviewStates.CANCELED)
 
@@ -352,6 +552,7 @@ class ResourceLimitChangeRequestEventTest(test.APITestCase):
         self.resource = self.fixture.resource
         self.resource.state = models.Resource.States.OK
         self.resource.save()
+        set_limit_change_requests(self.resource.offering)
 
     def test_event_created_when_request_created(self):
         """Event is logged when request is created via API."""
@@ -384,6 +585,7 @@ class ResourceLimitChangeRequestNotificationTest(test.APITestCase):
         resource = fixture.resource
         resource.state = models.Resource.States.OK
         resource.save()
+        set_limit_change_requests(resource.offering)
         list_url = factories.ResourceLimitChangeRequestFactory.get_list_url()
         payload = {
             "resource": resource.uuid.hex,
@@ -408,17 +610,22 @@ class ResourceLimitChangeRequestNotificationTest(test.APITestCase):
         resource.save()
         resource.offering.shared = True
         resource.offering.save()
+        set_limit_change_requests(resource.offering)
         factories.OfferingComponentFactory(
             offering=resource.offering,
             type="storage",
             billing_type=BillingTypes.LIMIT,
         )
-        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_RESOURCE_LIMITS)
-        self.addCleanup(
-            lambda: CustomerRole.OWNER.delete_permission(
-                PermissionEnum.UPDATE_RESOURCE_LIMITS
+        for permission in (
+            PermissionEnum.UPDATE_RESOURCE_LIMITS,
+            PermissionEnum.CREATE_ORDER,
+        ):
+            CustomerRole.OWNER.add_permission(permission)
+            self.addCleanup(
+                lambda permission=permission: CustomerRole.OWNER.delete_permission(
+                    permission
+                )
             )
-        )
         request = factories.ResourceLimitChangeRequestFactory(
             resource=resource,
             created_by=fixture.manager,

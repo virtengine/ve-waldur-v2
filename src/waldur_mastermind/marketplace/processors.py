@@ -14,7 +14,10 @@ from waldur_mastermind.marketplace.callbacks import (
     resource_update_failed,
     resource_update_succeeded,
 )
-from waldur_mastermind.marketplace.utils import parse_date, validate_limits
+from waldur_mastermind.marketplace.utils import (
+    parse_date,
+    validate_limits,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +194,7 @@ class AbstractUpdateResourceProcessor(BaseOrderProcessor):
                 self.order.limits,
                 self.order.offering,
                 self.order.resource,
+                plan=self.order.plan,
             )
             return
 

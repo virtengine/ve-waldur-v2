@@ -1,5 +1,7 @@
+import contextlib
 import json
 import logging
+import tempfile
 from dataclasses import dataclass, field
 from io import StringIO
 from pathlib import Path
@@ -7,6 +9,12 @@ from pathlib import Path
 from django.core.management import call_command
 
 from waldur_mastermind.marketplace.billing import MarketplaceBillingService
+from waldur_mastermind.marketplace.demo_presets.credit_history import (
+    generate_credit_history,
+)
+from waldur_mastermind.marketplace.demo_presets.time_shift import (
+    rebase_to_current_month,
+)
 from waldur_mastermind.marketplace.enums import ResourceStates
 from waldur_mastermind.marketplace.models import Resource
 
@@ -175,22 +183,25 @@ class DemoPresetManager:
             if not dry_run and not skip_roles:
                 cls._ensure_system_roles_exist(output)
 
-            # Import the preset data
-            import_args = {
-                "input": str(file_path),
-                "skip_users": skip_users,
-                "skip_roles": skip_roles,
-                "skip_rabbitmq_messages": True,
-                "stdout": output,
-            }
-            if dry_run:
-                import_args["dry_run"] = True
+            # Import the preset data, with its billing history moved onto
+            # the current month -- see demo_presets/time_shift.py.
+            with cls._rebased_preset_file(file_path) as import_path:
+                import_args = {
+                    "input": str(import_path),
+                    "skip_users": skip_users,
+                    "skip_roles": skip_roles,
+                    "skip_rabbitmq_messages": True,
+                    "stdout": output,
+                }
+                if dry_run:
+                    import_args["dry_run"] = True
 
-            call_command("import_structure", **import_args)
+                call_command("import_structure", **import_args)
 
             # Generate invoices for imported resources (if not dry run)
             if not dry_run:
                 cls._generate_billing_for_resources(output)
+                cls._generate_credit_history(output, file_path)
 
             # Get users with passwords for the response
             users = cls.get_preset_users(name)
@@ -215,6 +226,21 @@ class DemoPresetManager:
                     "============================================================\n"
                 )
 
+            # import_structure reports per-entity failures as warnings and still
+            # exits 0, so a preset can lose whole collections while the load looks
+            # clean. Surface that here rather than letting it pass as success.
+            error_count = cls._count_import_errors(output.getvalue())
+            if error_count:
+                return {
+                    "success": False,
+                    "message": (
+                        f"Preset '{name}' loaded with {error_count} failed "
+                        f"entit{'y' if error_count == 1 else 'ies'} — see output"
+                    ),
+                    "output": output.getvalue(),
+                    "users": users,
+                }
+
             return {
                 "success": True,
                 "message": f"Preset '{name}' loaded successfully"
@@ -230,6 +256,45 @@ class DemoPresetManager:
                 "output": output.getvalue(),
                 "users": [],
             }
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _rebased_preset_file(file_path: Path):
+        """Yield a preset file whose billing history ends this month.
+
+        The committed file is never rewritten: a preset that needs no shift
+        is imported as it stands, and one that does is written to a
+        temporary copy for the duration of the import.
+        """
+        data = json.loads(file_path.read_text())
+        rebased = rebase_to_current_month(data)
+        if rebased is data:
+            yield file_path
+            return
+
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8"
+        ) as handle:
+            json.dump(rebased, handle)
+            temporary = Path(handle.name)
+        try:
+            yield temporary
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _count_import_errors(output: str) -> int:
+        """Count per-entity import failures reported by import_structure.
+
+        The command writes one "Failed to import <thing> <id>: <error>" line per
+        failed row and then exits 0, so the count has to be recovered from the
+        captured output.
+        """
+        return sum(
+            1
+            for line in output.splitlines()
+            if line.lstrip().startswith("Failed to import ")
+        )
 
     @classmethod
     def _generate_billing_for_resources(cls, output: StringIO):
@@ -259,6 +324,42 @@ class DemoPresetManager:
                 )
 
         output.write(f"\nGenerated billing for {invoice_count} resources\n")
+
+    @classmethod
+    def _generate_credit_history(cls, output: StringIO, file_path: Path = None):
+        """
+        Generate historical credit consumption for credited customers.
+
+        No-op for presets without credits. Past months are billed and then run
+        through the real compensation flow, so compensations, minimal-consumption
+        draws and credit balances match what production would produce.
+
+        A preset may shape individual projects through `_metadata.credit_history`;
+        see generate_credit_history.
+        """
+        patterns = {}
+        if file_path:
+            try:
+                with open(file_path) as preset_file:
+                    metadata = json.load(preset_file).get("_metadata") or {}
+                patterns = metadata.get("credit_history") or {}
+            except (OSError, ValueError) as e:
+                logger.warning(f"Failed to read credit history patterns: {e}")
+
+        try:
+            processed = generate_credit_history(stdout=output, patterns=patterns)
+        except Exception as e:
+            logger.warning(f"Failed to generate credit history: {e}")
+            output.write(f"Warning: Failed to generate credit history: {e}\n")
+            return
+
+        if not processed:
+            return
+
+        output.write("\n============================================================\n")
+        output.write("Generated Credit History\n")
+        output.write("============================================================\n")
+        output.write(f"Compensated {processed} customer-months\n")
 
     @classmethod
     def _get_permissions_file(cls) -> Path | None:

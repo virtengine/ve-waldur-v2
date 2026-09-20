@@ -12,19 +12,29 @@ from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_openstack import models
 from waldur_openstack.backend import OpenStackBackend
+from waldur_openstack.enums import Ipv6Modes
+from waldur_openstack.exceptions import OpenStackBackendError
 
 from . import factories, fixtures
 
 
-class BaseRouterTest(test.APITransactionTestCase):
+class BaseRouterTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = fixtures.OpenStackFixture()
         self.client.force_authenticate(user=self.fixture.owner)
-        self.mock = mock.patch("waldur_openstack.backend.OpenStackBackend.get_free_ip")
-        self.mock_get_free_ip = self.mock.start()
+        # Both patches used to be started and never stopped -- the second
+        # assignment even dropped the handle of the first -- so every test that
+        # ran later in the same process got a fake `get_free_ip` returning
+        # "1.1.1.1" and a `create_port` that does nothing. That is invisible
+        # until something actually exercises those methods (test_subnet_allocation_pools
+        # does), and then it fails for reasons that have nothing to do with it.
+        patcher = mock.patch("waldur_openstack.backend.OpenStackBackend.get_free_ip")
+        self.mock_get_free_ip = patcher.start()
+        self.addCleanup(patcher.stop)
         self.mock_get_free_ip.return_value = "1.1.1.1"
-        self.mock = mock.patch("waldur_openstack.backend.OpenStackBackend.create_port")
-        self.mock_create_port = self.mock.start()
+        patcher = mock.patch("waldur_openstack.backend.OpenStackBackend.create_port")
+        self.mock_create_port = patcher.start()
+        self.addCleanup(patcher.stop)
 
 
 class SetRoutesTest(BaseRouterTest):
@@ -51,6 +61,7 @@ class SetRoutesTest(BaseRouterTest):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
+@ddt
 class RouterInterfaceTest(BaseRouterTest):
     def setUp(self):
         super().setUp()
@@ -102,6 +113,99 @@ class RouterInterfaceTest(BaseRouterTest):
         mock_add.assert_called_once()
         mock_pull.assert_called_once()
 
+    def _make_ipv6_subnet(self, mode):
+        self.subnet.cidr = "2001:db8:1::/64"
+        self.subnet.ip_version = 6
+        self.subnet.ipv6_ra_mode = mode
+        self.subnet.ipv6_address_mode = mode
+        self.subnet.is_connected = False
+        self.subnet.save()
+
+    def _created_port_fixed_ips(self):
+        self.mock_create_port.assert_called_once()
+        return self.mock_create_port.call_args[0][0].fixed_ips
+
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.pull_tenant_routers")
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.add_router_interface")
+    def test_ipv4_subnet_gets_a_free_address(self, mock_add, mock_pull):
+        self.mock_get_free_ip.return_value = "192.168.1.10"
+
+        response = self.client.post(
+            self.url_add, {"subnet": factories.SubNetFactory.get_url(self.subnet)}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
+        self.assertEqual(
+            self._created_port_fixed_ips(),
+            [{"subnet_id": self.subnet.backend_id, "ip_address": "192.168.1.10"}],
+        )
+        mock_add.assert_called_once()
+
+    @data(Ipv6Modes.SLAAC, Ipv6Modes.DHCPV6_STATELESS)
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.pull_tenant_routers")
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.add_router_interface")
+    def test_address_from_prefix_subnet_lets_neutron_pick_the_address(
+        self, mode, mock_add, mock_pull
+    ):
+        self._make_ipv6_subnet(mode)
+
+        response = self.client.post(
+            self.url_add, {"subnet": factories.SubNetFactory.get_url(self.subnet)}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
+        self.mock_get_free_ip.assert_not_called()
+        self.assertEqual(
+            self._created_port_fixed_ips(), [{"subnet_id": self.subnet.backend_id}]
+        )
+        mock_add.assert_called_once()
+        self.subnet.refresh_from_db()
+        self.assertTrue(self.subnet.is_connected)
+
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.pull_tenant_routers")
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.add_router_interface")
+    def test_stateful_ipv6_subnet_gets_a_free_address(self, mock_add, mock_pull):
+        self._make_ipv6_subnet(Ipv6Modes.DHCPV6_STATEFUL)
+        self.mock_get_free_ip.return_value = "2001:db8:1::2"
+
+        response = self.client.post(
+            self.url_add, {"subnet": factories.SubNetFactory.get_url(self.subnet)}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
+        self.assertEqual(
+            self._created_port_fixed_ips(),
+            [{"subnet_id": self.subnet.backend_id, "ip_address": "2001:db8:1::2"}],
+        )
+        mock_add.assert_called_once()
+
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.add_router_interface")
+    def test_port_creation_failure_is_a_bad_request(self, mock_add):
+        self._make_ipv6_subnet(Ipv6Modes.SLAAC)
+        self.mock_create_port.side_effect = OpenStackBackendError(
+            "IPv6 address cannot be directly assigned to a port on subnet"
+        )
+
+        response = self.client.post(
+            self.url_add, {"subnet": factories.SubNetFactory.get_url(self.subnet)}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("cannot be directly assigned", str(response.data))
+        mock_add.assert_not_called()
+
+    def test_free_address_lookup_failure_is_a_bad_request(self):
+        self.mock_get_free_ip.side_effect = OpenStackBackendError(
+            "Subnet has an invalid allocation pool"
+        )
+
+        response = self.client.post(
+            self.url_add, {"subnet": factories.SubNetFactory.get_url(self.subnet)}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("invalid allocation pool", str(response.data))
+
     def test_add_router_interface_missing_params(self):
         response = self.client.post(self.url_add, {})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -124,27 +228,61 @@ class RouterInterfaceTest(BaseRouterTest):
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    # Both pulls have to be mocked. remove_router_interface_safely calls
+    # pull_tenant_ports as well, and leaving it real made it raise on a session
+    # with no auth_url -- harmlessly, because eager Celery swallowed it after
+    # the assertions below had already run against the pull that came first.
+    # That hid whether the second pull happened at all.
     @override_settings(task_always_eager=True)
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.pull_tenant_ports")
     @mock.patch("waldur_openstack.backend.OpenStackBackend.pull_tenant_routers")
     @mock.patch("waldur_openstack.backend.OpenStackBackend.remove_router_interface")
-    def test_remove_router_interface_with_subnet(self, mock_remove, mock_pull):
+    def test_remove_router_interface_with_subnet(
+        self, mock_remove, mock_pull_routers, mock_pull_ports
+    ):
         response = self.client.post(
             self.url_remove, {"subnet": factories.SubNetFactory.get_url(self.subnet)}
         )
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         mock_remove.assert_called_once()
-        mock_pull.assert_called_once()
+        mock_pull_ports.assert_called_once()
+        mock_pull_routers.assert_called_once()
 
     @override_settings(task_always_eager=True)
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.pull_tenant_ports")
     @mock.patch("waldur_openstack.backend.OpenStackBackend.pull_tenant_routers")
     @mock.patch("waldur_openstack.backend.OpenStackBackend.remove_router_interface")
-    def test_remove_router_interface_with_port(self, mock_remove, mock_pull):
+    def test_remove_router_interface_with_port(
+        self, mock_remove, mock_pull_routers, mock_pull_ports
+    ):
         response = self.client.post(
             self.url_remove, {"port": factories.PortFactory.get_url(self.port)}
         )
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         mock_remove.assert_called_once()
-        mock_pull.assert_called_once()
+        mock_pull_ports.assert_called_once()
+        mock_pull_routers.assert_called_once()
+
+    @override_settings(task_always_eager=True)
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.pull_tenant_ports")
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.pull_tenant_routers")
+    @mock.patch("waldur_openstack.backend.OpenStackBackend.remove_router_interface")
+    def test_removal_refreshes_ports_before_routers(
+        self, mock_remove, mock_pull_routers, mock_pull_ports
+    ):
+        """Order matters: pull_tenant_routers rebuilds the router's port set
+        from local Port rows, so it has to run after the sweep that drops the
+        port just removed -- otherwise the stale one stays attached."""
+        manager = mock.Mock()
+        manager.attach_mock(mock_pull_ports, "ports")
+        manager.attach_mock(mock_pull_routers, "routers")
+
+        response = self.client.post(
+            self.url_remove, {"port": factories.PortFactory.get_url(self.port)}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.assertEqual([call[0] for call in manager.mock_calls], ["ports", "routers"])
 
     def test_remove_router_interface_missing_params(self):
         response = self.client.post(self.url_remove, {})
@@ -583,7 +721,7 @@ class SetExternalGatewayRBACNetworkTest(BaseExternalGatewayTest):
 
 @ddt
 @mock.patch("waldur_openstack.executors.RouterSetExternalGatewayExecutor.execute")
-class ExternalGatewayTenantScopeTest(test.APITransactionTestCase):
+class ExternalGatewayTenantScopeTest(test.APITestCase):
     """Regression tests for WAL-9987: consumer-side users must not be able to
     attach a router to a provider-internal (non-shared) external network, even
     by calling the API directly and bypassing the homeport dropdown.

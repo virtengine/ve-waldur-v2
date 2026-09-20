@@ -10,12 +10,14 @@ from django import forms
 from django.conf import settings as django_settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import (
+    FieldDoesNotExist,
     ImproperlyConfigured,
     MultipleObjectsReturned,
     ObjectDoesNotExist,
 )
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.files.storage import default_storage
-from django.core.validators import RegexValidator, URLValidator
+from django.core.validators import MaxLengthValidator, RegexValidator, URLValidator
 from django.urls import Resolver404, reverse
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
@@ -23,15 +25,20 @@ from drf_spectacular.utils import extend_schema_field
 from modeltranslation.manager import get_translatable_fields_for_model
 from rest_framework import serializers
 from rest_framework import serializers as rf_serializers
-from rest_framework.fields import Field, ReadOnlyField
+from rest_framework.fields import Field, ReadOnlyField, lazy_format
 from rest_framework.serializers import ListSerializer
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core.clean_html import clean_html
 from waldur_core.core.models import PersonalAccessToken, UserDetailsMatchMixin
 from waldur_core.core.signals import pre_serializer_fields
+from waldur_core.core.validators import (
+    normalize_network_acl,
+    validate_access_email_patterns,
+)
 from waldur_core.permissions.enums import TYPE_KEY_BY_CT, TYPE_MAP, PermissionEnum
 from waldur_core.permissions.utils import get_scope_ancestors, has_any_permission
+from waldur_core.users.scim.server import matching as scim_matching
 from waldur_mastermind.common.serializers import StringListSerializer
 
 from . import fields as core_fields
@@ -246,6 +253,39 @@ class ObtainAuthTokenSerializer(serializers.Serializer):
 class CoreAuthTokenSerializer(serializers.Serializer):
     token = serializers.CharField(
         read_only=True, help_text="Authentication token for API access"
+    )
+
+
+class AuthTokenChallengeSerializer(serializers.Serializer):
+    """Body of a 401 from the password login endpoint.
+
+    A 401 here covers several cases — wrong credentials, a locked-out
+    username, a disabled account, and a correct password that still owes a
+    second factor. ``detail`` is always present; the passkey fields appear
+    only in the last case, which is why they are optional.
+
+    The second factor deliberately returns 401 rather than a 200 carrying a
+    handle. A 200 would have to make ``token`` optional in the shared response
+    schema, which changes the generated clients for every consumer including
+    the ones that never enable passkeys. A non-browser client cannot satisfy a
+    passkey anyway, so a loud error status is the honest answer for it, and
+    the browser can read the body to tell the two cases apart.
+    """
+
+    detail = serializers.CharField(
+        help_text="Human-readable reason the token was not issued."
+    )
+    passkey_required = serializers.BooleanField(
+        required=False,
+        help_text="True when the password was accepted but a passkey "
+        "assertion is still outstanding. Discriminates this case from a "
+        "rejected password, which is also a 401.",
+    )
+    pending_passkey_ceremony = serializers.UUIDField(
+        required=False,
+        help_text="Handle for the passkey challenge that must be satisfied "
+        "before a token is issued. Not a credential: it grants nothing on its "
+        "own and cannot be used for authentication.",
     )
 
 
@@ -628,6 +668,14 @@ color_hex_validator = RegexValidator(
 )
 
 
+ISSUE_KEY_PREFIX_RE = re.compile("^[A-Z]{3,5}$")
+issue_key_prefix_validator = RegexValidator(
+    ISSUE_KEY_PREFIX_RE,
+    _("Enter three to five capital latin letters, eg. WLD"),
+    "invalid",
+)
+
+
 class ConstanceSettingsSerializer(serializers.Serializer):
     def get_fields(self):
         fields = OrderedDict()
@@ -681,6 +729,8 @@ class ConstanceSettingsSerializer(serializers.Serializer):
                 "text_field",
                 "url_field",
                 "secret_field",
+                "non_empty_field",
+                "issue_key_prefix_field",
             ):
                 field_class = serializers.CharField
             if not field_class:
@@ -692,6 +742,13 @@ class ConstanceSettingsSerializer(serializers.Serializer):
                 kwargs["allow_null"] = True
             if config_type == "secret_field":
                 kwargs["allow_blank"] = True
+            if config_type == "issue_key_prefix_field":
+                kwargs["allow_blank"] = False
+                kwargs["validators"] = [issue_key_prefix_validator]
+            if config_type == "non_empty_field":
+                # The setting stays optional in the payload, but it cannot be
+                # blanked out once it is submitted.
+                kwargs["allow_blank"] = False
             if config_type == "color_field":
                 kwargs["validators"] = [color_hex_validator]
                 kwargs["allow_blank"] = True
@@ -709,6 +766,27 @@ class ConstanceSettingsSerializer(serializers.Serializer):
                 kwargs["allow_blank"] = True
             fields[name] = field_class(**kwargs)
         return fields
+
+    def validate_WALDUR_SUPPORT_ISSUE_KEY_PREFIX(self, value):
+        # The prefix is pasted into every ticket key, so a stray space or a
+        # lowercase letter would show up in mail subjects forever.
+        issue_key_prefix_validator(value)
+        return value
+
+    def validate_SCIM_USER_MATCH_WALDUR_ATTRIBUTE(self, value):
+        # Matching links SCIM identities to existing accounts, so only an
+        # enabled identifying attribute may be used.
+        try:
+            scim_matching.validate_waldur_attribute(value or "username")
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc))
+        return value
+
+    def validate_OIDC_ALLOWED_USER_EMAIL_PATTERNS(self, value):
+        # An unusable pattern never matches, so a silently accepted typo would
+        # lock users out instead of letting them in - reject it on write.
+        validate_access_email_patterns(value)
+        return value
 
     def save(self):
         for name in self.validated_data.keys():
@@ -849,7 +927,11 @@ class VersionSerializer(serializers.Serializer):
         help_text="Current installed version of the application"
     )
     latest_version = serializers.CharField(
-        help_text="Latest available version from GitHub, if available.", required=False
+        help_text=(
+            "Latest available version from GitHub. Only included for staff or "
+            "support users when update checks are enabled."
+        ),
+        required=False,
     )
 
 
@@ -1051,6 +1133,14 @@ class HTMLCleanField(serializers.CharField):
     This field ensures consistent HTML sanitization across the application by
     automatically cleaning any HTML content that is provided to it.
 
+    When no explicit ``max_length`` is given and the field is declared on a
+    ``ModelSerializer``, the limit is inferred from the backing model field.
+    Without this, redeclaring a bounded column (e.g. ``CharField(max_length=4096)``)
+    as an ``HTMLCleanField`` would silently drop the length validator that a plain
+    ``ModelSerializer`` would have generated, and an oversized value would reach
+    the database and blow up with a ``DataError`` (HTTP 500) instead of a clean 400.
+    Fields backed by an unbounded column (``TextField``) stay unbounded.
+
     Usage:
         class MySerializer(serializers.ModelSerializer):
             description = HTMLCleanField()
@@ -1061,19 +1151,64 @@ class HTMLCleanField(serializers.CharField):
                 fields = ('description', 'content')
     """
 
+    def bind(self, field_name, parent):
+        super().bind(field_name, parent)
+        if self.max_length is not None:
+            return
+        max_length = self._get_model_field_max_length()
+        if max_length is None:
+            return
+        self.max_length = max_length
+        self.validators.append(
+            MaxLengthValidator(
+                max_length,
+                message=lazy_format(
+                    self.error_messages["max_length"], max_length=max_length
+                ),
+            )
+        )
+
+    def _get_model_field_max_length(self):
+        """Return max_length of the model field backing this serializer field."""
+        model = getattr(getattr(self.parent, "Meta", None), "model", None)
+        if model is None:
+            return None
+        source = self.source
+        if not source or source == "*" or "." in source:
+            return None
+        try:
+            model_field = model._meta.get_field(source)
+        except (FieldDoesNotExist, AttributeError):
+            return None
+        return getattr(model_field, "max_length", None)
+
     def to_internal_value(self, data):
         # First, let the parent CharField handle basic validation
         value = super().to_internal_value(data)
         if not value:
             return value
         # Then clean the HTML content if it's not empty
-        value = clean_html(value.strip())
-        if self.max_length is not None and len(value) > self.max_length:
+        stripped = value.strip()
+        cleaned = clean_html(stripped)
+        if (
+            self.max_length is not None
+            and len(cleaned) > self.max_length
+            and len(stripped) <= self.max_length
+        ):
+            # The input itself fits, so it only overflowed because sanitisation
+            # expanded it: & -> &amp; and so on. Say so explicitly, otherwise a
+            # user staring at a 4004-character box is told it exceeds 4096.
             raise serializers.ValidationError(
-                _("Value is too long (maximum %(max_length)s characters).")
-                % {"max_length": self.max_length}
+                _(
+                    "Value is too long after HTML sanitisation: %(length)s characters, "
+                    "maximum is %(max_length)s. Characters such as &, < and > are "
+                    "escaped during sanitisation and count as several characters."
+                )
+                % {"length": len(cleaned), "max_length": self.max_length}
             )
-        return value
+        # An input that was already over the limit is reported by the regular
+        # max_length validator, which runs on the value returned from here.
+        return cleaned
 
 
 class ConnectionStatsSerializer(serializers.Serializer):
@@ -1307,6 +1442,26 @@ class VersionHistoryUserSerializer(serializers.Serializer):
     full_name = serializers.CharField(help_text="Full name of the user")
 
 
+# Field names stripped from version history payloads. A version holds the raw
+# serialized model, so returning it verbatim bypasses whatever that model's own
+# serializer withholds: User.password would hand out the password hash, and
+# Offering.secret_options is restricted by can_see_secret_options to holders of
+# the permission that edits integration settings - while the history endpoint is
+# open to support users too. Keep this in sync with any field a serializer
+# deliberately hides.
+REDACTED_VERSION_FIELDS = frozenset(
+    {
+        "password",
+        "secret_options",
+    }
+)
+
+# Values a JSON response can carry as-is. Model defaults are only substituted
+# below when they are one of these; anything richer (dates, files, Decimals)
+# is left absent rather than risking a render error on a read-only endpoint.
+JSON_NATIVE_TYPES = (str, int, float, bool, list, dict, type(None))
+
+
 class VersionHistorySerializer(serializers.Serializer):
     """
     Generic serializer for django-reversion Version objects.
@@ -1342,7 +1497,35 @@ class VersionHistorySerializer(serializers.Serializer):
         return None
 
     def get_serialized_data(self, obj) -> dict:
-        return json.loads(obj.serialized_data)[0]["fields"]
+        fields = json.loads(obj.serialized_data)[0]["fields"]
+        data = {
+            name: value
+            for name, value in fields.items()
+            if name not in REDACTED_VERSION_FIELDS
+        }
+        self._add_missing_fields(obj, data)
+        return data
+
+    def _add_missing_fields(self, obj, data) -> None:
+        """Fill in fields the model gained after this snapshot was taken.
+
+        A snapshot only carries the columns that existed when it was written.
+        Left absent, every field added since reads as a change when two versions
+        are compared, so a single rename can appear to have altered dozens of
+        fields - the older the snapshot, the worse it looks. Substituting the
+        model default keeps the comparison about what the user actually changed.
+        """
+        model = obj._model
+        if model is None:
+            return
+        for field in model._meta.concrete_fields:
+            if field.primary_key or field.name in data:
+                continue
+            if field.name in REDACTED_VERSION_FIELDS:
+                continue
+            default = field.get_default()
+            if isinstance(default, JSON_NATIVE_TYPES):
+                data[field.name] = default
 
 
 class TableGrowthStatsSerializer(serializers.Serializer):
@@ -1511,7 +1694,26 @@ def _serialize_allowed_scopes(stored):
     return out
 
 
-class PersonalAccessTokenCreateSerializer(serializers.Serializer):
+class NetworkAclValidationMixin:
+    """Validate + canonicalise ``allowed_networks`` and enforce the entry cap."""
+
+    def validate_allowed_networks(self, value):
+        try:
+            normalized = normalize_network_acl(value)
+        except DjangoValidationError as e:
+            raise serializers.ValidationError(e.messages)
+
+        max_entries = config.PAT_MAX_ACL_ENTRIES
+        if len(normalized) > max_entries:
+            raise serializers.ValidationError(
+                f"A token can have at most {max_entries} network ACL entries."
+            )
+        return normalized
+
+
+class PersonalAccessTokenCreateSerializer(
+    NetworkAclValidationMixin, serializers.Serializer
+):
     name = serializers.CharField(max_length=150)
     scopes = serializers.ListField(child=serializers.CharField())
     # Use ``Serializer(many=True)`` (a ListSerializer under the hood) rather
@@ -1525,6 +1727,16 @@ class PersonalAccessTokenCreateSerializer(serializers.Serializer):
         help_text=(
             "Optional list of entity bindings restricting where this token "
             "can act. Empty list = no entity restriction."
+        ),
+    )
+    allowed_networks = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        default=list,
+        help_text=(
+            "Optional list of CIDR networks the token may be used from. "
+            "Bare addresses are widened to /32 or /128. Empty list = no "
+            "network restriction."
         ),
     )
     expires_at = serializers.DateTimeField()
@@ -1658,6 +1870,7 @@ class PersonalAccessTokenCreateSerializer(serializers.Serializer):
             token_hash=token_hash,
             scopes=validated_data["scopes"],
             allowed_scopes=validated_data.get("allowed_scopes", []),
+            allowed_networks=validated_data.get("allowed_networks", []),
             expires_at=expires_at,
         )
         # Attach plaintext for one-time response
@@ -1673,6 +1886,7 @@ class PersonalAccessTokenCreatedSerializer(serializers.Serializer):
     token = serializers.CharField(help_text="Plaintext token — shown only once.")
     scopes = serializers.ListField(child=serializers.CharField())
     allowed_scopes = AllowedScopeOutputSerializer(many=True)
+    allowed_networks = serializers.ListField(child=serializers.CharField())
     expires_at = serializers.DateTimeField()
     created = serializers.DateTimeField()
 
@@ -1685,6 +1899,7 @@ class PersonalAccessTokenSerializer(serializers.Serializer):
     token_prefix = serializers.CharField()
     scopes = serializers.ListField(child=serializers.CharField())
     allowed_scopes = serializers.SerializerMethodField()
+    allowed_networks = serializers.ListField(child=serializers.CharField())
     expires_at = serializers.DateTimeField()
     is_active = serializers.BooleanField()
     last_used_at = serializers.DateTimeField()
@@ -1695,6 +1910,14 @@ class PersonalAccessTokenSerializer(serializers.Serializer):
     @extend_schema_field(AllowedScopeOutputSerializer(many=True))
     def get_allowed_scopes(self, obj):
         return _serialize_allowed_scopes(getattr(obj, "allowed_scopes", []) or [])
+
+
+class PersonalAccessTokenNetworkAclSerializer(
+    NetworkAclValidationMixin, serializers.Serializer
+):
+    allowed_networks = serializers.ListField(
+        child=serializers.CharField(), allow_empty=True
+    )
 
 
 class AvailableScopeSerializer(serializers.Serializer):
@@ -1715,3 +1938,48 @@ class DetailSerializer(serializers.Serializer):
 
 class StatusSerializer(serializers.Serializer):
     status = serializers.CharField()
+
+
+class AccessSubnetMixin:
+    """Shared mask and provenance rules for the access-subnet serializers.
+
+    Two rules, both of which need to know who is acting and therefore cannot
+    live on the model field:
+
+    * mask width — non-staff may only enter single hosts, staff any width but
+      ``/0`` (see ``core_utils.validate_access_subnet_for_user``);
+    * provenance — an entry staff created is flagged ``is_staff_managed`` and
+      becomes read-only for everyone else whatever its width, so a consumer
+      cannot quietly remove a range an operator pinned. Deletion is guarded
+      separately in the viewset, which the serializer never sees.
+
+    ``is_staff_managed`` is derived from the acting user on create and is never
+    writable through the API.
+    """
+
+    def validate_inet(self, value):
+        return core_utils.validate_access_subnet_for_user(
+            value, self.context["request"].user
+        )
+
+    def validate_staff_managed(self):
+        """Reject an update to an entry staff created when the caller is not staff."""
+        if self.instance is None or not self.instance.is_staff_managed:
+            return
+        if not self.context["request"].user.is_staff:
+            raise rf_serializers.ValidationError(
+                _("This entry is managed by staff and cannot be modified.")
+            )
+
+    def create(self, validated_data):
+        validated_data["is_staff_managed"] = self.context["request"].user.is_staff
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        # Staff may widen an entry a consumer originally created. Without this
+        # the entry would keep is_staff_managed=False, leaving the consumer able
+        # to delete a range only staff could have entered — so any staff write of
+        # `inet` takes ownership. Editing only a description does not.
+        if "inet" in validated_data and self.context["request"].user.is_staff:
+            validated_data["is_staff_managed"] = True
+        return super().update(instance, validated_data)

@@ -209,7 +209,7 @@ Both `format` and `uniqueness` are optional top-level keys.
 |--------|------|---------|-------------|
 | `auto_approve_remote_orders` | boolean | `false` | Skip provider approval for orders from external customers |
 | `auto_approve_in_service_provider_projects` | boolean | `false` | Skip consumer approval when ordering within the same organization |
-| `disable_autoapprove` | boolean | `false` | Force manual approval for all orders, overriding other auto-approve settings |
+| `disable_autoapprove` | boolean | `false` | Force manual consumer approval for all provisioning orders, overriding every other consumer-side auto-approve setting (including role-based and project-level auto-approval rules); termination orders, staff and provider approval are exempt |
 
 **Example:**
 
@@ -261,6 +261,12 @@ With this configuration:
 | `supports_downscaling` | boolean | `false` | Allow reducing resource limits |
 | `supports_pausing` | boolean | `false` | Allow pausing/resuming resources |
 | `restrict_deletion_with_active_resources` | boolean | `false` | Prevent offering deletion while it has non-terminated resources (applies to all users including staff) |
+| `enable_resource_end_date_change_requests` | boolean | `false` | Let users without the end date permission request an end date change; not available on prepaid offerings |
+| `enable_resource_limit_change_requests` | boolean | `false` | Let users who cannot change limits directly request a limit change; approval submits an update order |
+
+A child offering follows its parent's value for both request switches, and an
+offering imported from another Waldur keeps its local value when it is
+synchronized.
 
 **Example:**
 
@@ -347,13 +353,89 @@ The related `resource_slug_template` option (e.g. `{project_slug}-{counter}`) ge
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `service_provider_can_create_offering_user` | boolean | `false` | Allow provider to create offering-specific user accounts |
-| `username_generation_policy` | string | `"waldur_username"` | How usernames are generated: `waldur_username`, `anonymized`, `service_provider`, `full_name`, `freeipa`, `eduteams` |
+| `username_generation_policy` | string | `"service_provider"` | How usernames are generated: `waldur_username`, `anonymized`, `service_provider`, `full_name`, `freeipa`, `eduteams`. Inherits from the provider's `account_username_generation_policy` when unset |
 | `account_name_generation_policy` | string | none | Site-agent backend ID (e.g. SLURM account name) generation. Unset = use the resource slug as-is; `project_slug` = derive from the project slug with an incrementing counter. Do not combine with `resource_slug_template` (see [Resource Naming](#resource-naming)) |
 | `initial_uidnumber` | integer | `5000` | Starting UID for generated users |
 | `initial_primarygroup_number` | integer | `5000` | Starting GID for primary groups |
 | `initial_usergroup_number` | integer | `6000` | Starting GID for user groups |
-| `homedir_prefix` | string | `"/home/"` | Prefix for home directory paths |
-| `username_anonymized_prefix` | string | `"walduruser_"` | Prefix for anonymized usernames |
+| `homedir_prefix` | string | `"/home/"` | Prefix for home directory paths. Inherits from the provider's `account_homedir_prefix` when unset |
+| `login_shell` | string | `"/bin/bash"` | Login shell assigned to new accounts. Inherits from the provider's `account_login_shell` when unset |
+| `username_anonymized_prefix` | string | `"waldur_"` | Prefix for anonymized usernames; the name is the prefix followed by the account's POSIX UID (a per-offering counter when no UID resolves). Inherits from the provider's `account_username_anonymized_prefix` when unset |
+| `account_scope` | string | `"offering"` | `offering` keeps one account per offering; `provider` shares one account per user across the provider's offerings. Inherits from the provider's `account_scope` when unset |
+
+#### Inheriting account settings from the service provider
+
+The account settings `account_scope`, `username_generation_policy`,
+`username_anonymized_prefix`, `homedir_prefix` and `login_shell` can be set on
+an offering, in its plugin options, and on its service provider, in the
+provider's `account_options`. Both use the same keys and the same validation.
+They resolve most specific first:
+
+1. the offering's own plugin option, when set;
+2. otherwise the service provider's `account_options` value of the same key;
+3. otherwise the built-in default shown in the table above.
+
+Leave an option out of the offering's plugin options to inherit it. Saving an
+offering does not fill in the defaults, so a provider-level value applies to
+every offering that does not set its own.
+
+Both are updated key by key: omitting a key keeps its current value, and an
+empty string removes the setting so it is inherited again. For example, to
+set a login shell for all of a provider's offerings and clear its home
+directory prefix:
+
+```http
+PATCH /api/marketplace-service-providers/{uuid}/
+{"account_options": {"login_shell": "/bin/zsh", "homedir_prefix": ""}}
+```
+
+Changing the username generation policy or the anonymized prefix, on the
+offering or on the provider, regenerates the usernames of the offering users
+it affects. A provider change reaches only the offerings that inherit the
+setting. Accounts held at the provider (`account_scope: provider`) are not
+regenerated this way; their usernames belong to the provider account.
+
+Moving accounts into provider scope is refused while a person holds different
+usernames on the offerings that would share them. This applies to the
+provider's `account_scope` and to a single offering's `account_scope` alike.
+The provider's `username_conflicts` action lists the people concerned, and
+`adopt_provider_accounts` resolves them. A clean switch backs the existing
+accounts with provider accounts straight away.
+
+The provider-offering and public-offering APIs expose the effective values as
+the read-only `account_settings` field, and resources expose them for their
+offering as `offering_account_settings`:
+
+```json
+{
+  "account_scope": {
+    "value": "offering", "source": "default",
+    "inherited": {"value": "offering", "source": "default"}
+  },
+  "username_generation_policy": {
+    "value": "anonymized", "source": "provider",
+    "inherited": {"value": "anonymized", "source": "provider"}
+  },
+  "login_shell": {
+    "value": "/bin/sh", "source": "offering",
+    "inherited": {"value": "/bin/zsh", "source": "provider"}
+  }
+}
+```
+
+`source` is `offering`, `provider` or `default`. `inherited` is what the
+setting resolves to without the offering's own value: what removing the
+offering's override leads to.
+
+Offerings saved before this behaviour stored the defaults (`service_provider`,
+`waldur_`, `/home/`, `/bin/bash`) in their plugin options, which hides any
+provider value. A migration removes such a stored default when the offering's
+service provider sets that setting. Values that differ from a default are
+kept, and so is a stored username setting whose removal would rename existing
+accounts. The migration logs those offerings; send the key as an empty string
+to apply the provider setting and regenerate the usernames.
+
+The `anonymized` policy names an account `<prefix><posix uid>` -- for example `hpc_9001` for a prefix of `hpc_` and uid 9001. The uid is the one the account holds (or is allocated) from the POSIX ID pool that resolves for the offering, or the user's `uid_number` when `uid_source` is `user_attribute`. Because a pool allocates one uid per person across every offering that resolves to it, the same person gets the same username on every offering sharing that pool, and regenerating the name (`refresh_offering_usernames`, a policy change) is a no-op. When no uid resolves -- no pool covers the offering, or POSIX accounts are disabled -- the name falls back to a per-offering counter (`<prefix>00000`, `<prefix>00001`, ...) and a warning is logged. The prefix, like `username_generation_policy`, `homedir_prefix` and `login_shell`, is resolved most-specific-first: the offering's plugin option, else the provider's `account_*` field, else the default.
 
 ## Plugin-Specific Options
 
@@ -372,12 +454,15 @@ The related `resource_slug_template` option (e.g. `{project_slug}-{counter}`) ge
 
 | Option | Type | Description |
 |--------|------|-------------|
-| `heappe_url` | URL | HEAppE server endpoint |
-| `heappe_username` | string | Service account username |
-| `heappe_password` | string | Service account password |
-| `heappe_cluster_id` | integer | Target cluster ID |
+| `heappe_url` | URL | HEAppE server endpoint. Required |
+| `heappe_username` | string | Service account username. Required |
+| `heappe_cluster_id` | string | ID of the target cluster in HEAppE. Required |
+| `heappe_local_base_path` | string | Root directory on the cluster under which project directories are created. Required |
+| `heappe_identifier` | string | Human-readable identifier of the HEAppE instance this offering targets, e.g. `it4i-heappe-prod`; disambiguates between multiple HEAppE deployments a provider may run. Distinct from `heappe_cluster_id` |
 | `project_permanent_directory` | string | Persistent project directory path |
 | `scratch_project_directory` | string | Temporary scratch directory path |
+
+The service account password `heappe_password` (required) and `heappe_cluster_password` are secret options: they go in `secret_options`, not `plugin_options`, and are only returned to users who can manage the offering's integration.
 
 ### GLAuth (LDAP)
 
@@ -463,9 +548,19 @@ The `check_unique_backend_id` endpoint performs the same checks when `use_offeri
 
 ### Approval Flow
 
-The approval flow is determined by:
+Consumer and provider approval are decided separately, by two independent gates.
 
-1. If `disable_autoapprove` is `true`, manual approval is always required
-2. If ordering within same organization and `auto_approve_in_service_provider_projects` is `true`, consumer approval is skipped
-3. If `auto_approve_remote_orders` is `true`, provider approval is skipped for external customers
-4. Staff users bypass most approval requirements
+**Consumer approval** is decided by `order_should_not_be_reviewed_by_consumer()`, which applies these rules in order:
+
+1. If the offering sets `require_purchase_order_upload` and no purchase order is attached, manual approval is required — this applies to staff too. Termination orders are exempt
+2. Staff users skip consumer approval. This includes the system robot that drives scheduled sweeps and backend-triggered flows
+3. If `disable_autoapprove` is `true`, manual approval is required. It overrides every consumer-side mechanism below it: private-offering permissions, `auto_approve_in_service_provider_projects`, `auto_approve_for_roles`, project-level auto-approval rules, and the general `ORDER.APPROVE` permission that owners and managers hold by default. Termination orders are exempt: they reduce spend, so they follow the normal termination rules instead
+4. Otherwise the private-offering, same-organization (`auto_approve_in_service_provider_projects`), termination, role-based (`auto_approve_for_roles`) and `ORDER.APPROVE` rules apply, in that order
+
+**Provider approval** is decided by `order_should_not_be_reviewed_by_provider()` and is *not* affected by `disable_autoapprove`. It is governed by the offering type together with `auto_approve_remote_orders` (skips provider approval for orders from external customers) and `auto_approve_marketplace_script`.
+
+Both gates only decide whether an order needs *approval*. Flows that create an order already approved — as a record of a provisioning decision made elsewhere — do not consult them, so `disable_autoapprove` does not apply to:
+
+- **Proposal allocation.** The call review is itself the consumer-side decision: the project is created under the call manager's own organization. The offering's purchase-order requirement is still honoured
+- **Autoprovisioning and HPC onboarding rules**, which create the resource and its order at user signup. An order left pending would strand the resource in `Creating`
+- **Resource migration** (`waldur_openstack_replication`), which records the order once the migration has already succeeded or failed

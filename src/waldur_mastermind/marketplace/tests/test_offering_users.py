@@ -4,9 +4,13 @@ from unittest import mock
 
 from constance.test.unittest import override_config
 from ddt import data, ddt
+from django.contrib.contenttypes.models import ContentType
+from django.db import connection
+from django.test import utils as django_test
 from rest_framework import status, test
 from rest_framework.reverse import reverse
 
+from waldur_core.checklist import models as checklist_models
 from waldur_core.checklist.enums import QuestionTypes
 from waldur_core.checklist.tests.factories import ChecklistFactory, QuestionFactory
 from waldur_core.logging.models import Event
@@ -19,7 +23,7 @@ from waldur_core.permissions.fixtures import (
 )
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_core.structure.tests.factories import UserFactory
-from waldur_mastermind.marketplace import models, utils
+from waldur_mastermind.marketplace import models, serializers, utils
 from waldur_mastermind.marketplace.enums import (
     OfferingUserRuntimeStates,
     OfferingUserStates,
@@ -97,6 +101,22 @@ class ListOfferingUsersTest(test.APITestCase):
 
         self.assertEqual(1, len(response.data))
         self.assertEqual("user3", response.data[0]["username"])
+
+    @data("owner", "admin", "manager")
+    def test_other_users_can_not_view_offering_users_when_offering_user_creation_disabled(
+        self, user
+    ):
+        offering = factories.OfferingFactory(
+            shared=True, customer=self.fixture.customer
+        )
+        sample_user = UserFactory()
+        self.fixture.project.add_user(sample_user, ProjectRole.ADMIN)
+        OfferingUser.objects.create(
+            offering=offering, user=sample_user, username="remote-user"
+        )
+
+        response = self.list_permissions(user)
+        self.assertNotIn("remote-user", [row["username"] for row in response.data])
 
     def test_user_can_filter_offering_users(self):
         offering_user1 = OfferingUser.objects.get(username="user")
@@ -369,6 +389,22 @@ class OfferingUserPosixAttributesTest(test.APITestCase):
         self.assertEqual(
             self.offering_user.backend_metadata["homeDir"], "/home/hpc/alice2"
         )
+
+    def test_home_directory_is_derived_when_the_account_had_none(self):
+        # Under the service_provider username policy the account is materialised
+        # before a username exists, so it carries no homeDir at all. Assigning
+        # the username has to produce one, or the account never reaches GLAuth.
+        offering_user = OfferingUser.objects.create(
+            offering=self.offering,
+            user=UserFactory(),
+            backend_metadata={"uidnumber": 1001, "loginShell": "/bin/bash"},
+        )
+        self.client.force_authenticate(self.fixture.staff)
+        url = OfferingUserFactory.get_url(offering_user)
+        response = self.client.patch(url, {"username": "bob"})
+        self.assertEqual(status.HTTP_200_OK, response.status_code, response.data)
+        offering_user.refresh_from_db()
+        self.assertEqual(offering_user.backend_metadata["homeDir"], "/home/hpc/bob")
 
     def test_overridden_home_directory_is_preserved_on_username_change(self):
         self.offering_user.backend_metadata["homeDir"] = "/custom/alice"
@@ -996,6 +1032,41 @@ class OfferingUserStateTransitionTest(test.APITestCase):
         )
         self.assertEqual(
             self.offering_user.service_provider_comment_url,
+            "https://service.example.com/help",
+        )
+
+    def test_update_comments_emits_single_audit_event_with_changed_fields(self):
+        """update_comments emits one handler audit event for comment field changes."""
+        ServiceProviderRole.MANAGER.add_permission(PermissionEnum.UPDATE_OFFERING_USER)
+
+        service_provider_user = UserFactory()
+        self.offering.customer.add_user(
+            service_provider_user, ServiceProviderRole.MANAGER
+        )
+
+        self.client.force_authenticate(user=service_provider_user)
+        url = self.get_url(self.offering_user, "update_comments")
+        response = self.client.patch(
+            url,
+            {
+                "service_provider_comment": "Updated service comment",
+                "service_provider_comment_url": "https://service.example.com/help",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        events = Event.objects.filter(event_type="marketplace_offering_user_updated")
+        self.assertEqual(events.count(), 1)
+        event = events.get()
+        self.assertEqual(
+            event.context["changed_fields"],
+            ["service_provider_comment", "service_provider_comment_url"],
+        )
+        self.assertEqual(
+            event.context["new_service_provider_comment"], "Updated service comment"
+        )
+        self.assertEqual(
+            event.context["new_service_provider_comment_url"],
             "https://service.example.com/help",
         )
 
@@ -2138,6 +2209,69 @@ class ServiceProviderComplianceTest(test.APITestCase):
                 self.assertEqual(item["compliance_status"], "no_checklist")
                 self.assertIsNone(item["completion_percentage"])
 
+    @override_config(ENFORCE_USER_CONSENT_FOR_OFFERINGS=True)
+    def test_offering_users_hides_users_without_consent_when_tos_required(self):
+        """Compliance offering-users list must not reveal PII without ToS consent."""
+        models.OfferingTermsOfService.objects.create(
+            offering=self.offering_with_checklist,
+            terms_of_service="Compliance ToS",
+            version="1.0",
+            is_active=True,
+        )
+        models.UserOfferingConsent.objects.create(
+            user=self.user1,
+            offering=self.offering_with_checklist,
+            version="1.0",
+        )
+
+        self.client.force_authenticate(user=self.fixture.owner)
+        url = ServiceProviderFactory.get_compliance_url(
+            self.service_provider, "offering-users"
+        )
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        returned_uuids = {item["uuid"] for item in response.data}
+
+        # Consented user on ToS offering is visible
+        self.assertIn(str(self.offering_user1.uuid), returned_uuids)
+        # Non-consenting user on ToS offering is hidden
+        self.assertNotIn(str(self.offering_user2.uuid), returned_uuids)
+        # Offering without ToS is unaffected
+        self.assertIn(str(self.offering_user3.uuid), returned_uuids)
+
+    @override_config(ENFORCE_USER_CONSENT_FOR_OFFERINGS=True)
+    def test_offering_users_hides_user_after_consent_revoked(self):
+        """Revoking consent removes the user from the compliance offering-users list."""
+        models.OfferingTermsOfService.objects.create(
+            offering=self.offering_with_checklist,
+            terms_of_service="Compliance ToS",
+            version="1.0",
+            is_active=True,
+        )
+        consent = models.UserOfferingConsent.objects.create(
+            user=self.user1,
+            offering=self.offering_with_checklist,
+            version="1.0",
+        )
+
+        self.client.force_authenticate(user=self.fixture.owner)
+        url = ServiceProviderFactory.get_compliance_url(
+            self.service_provider, "offering-users"
+        )
+
+        response = self.client.get(url)
+        self.assertIn(
+            str(self.offering_user1.uuid), {item["uuid"] for item in response.data}
+        )
+
+        consent.revoke()
+
+        response = self.client.get(url)
+        self.assertNotIn(
+            str(self.offering_user1.uuid), {item["uuid"] for item in response.data}
+        )
+
     def test_offering_users_filter_by_offering_uuid(self):
         """Test filtering offering users by offering UUID."""
         self.client.force_authenticate(user=self.fixture.owner)
@@ -2902,6 +3036,65 @@ class OfferingUserComplianceFieldTest(test.APITestCase):
         self.assertIn("has_compliance_checklist", response.data[0])
         self.assertFalse(response.data[0]["has_compliance_checklist"])
 
+    def _make_offering_user(self, offering, username):
+        sample_user = UserFactory()
+        self.fixture.project.add_user(sample_user, ProjectRole.ADMIN)
+        offering_user = OfferingUser.objects.create(
+            offering=offering, user=sample_user, username=username
+        )
+        models.UserOfferingConsent.objects.create(
+            user=sample_user, offering=offering, version="1.0"
+        )
+        return offering_user
+
+    def test_annotation_matches_the_unannotated_fallback(self):
+        """The Exists() annotation must reproduce the per-row query exactly.
+
+        Covers all three shapes: an offering with a checklist and a
+        completion, one with a checklist but no completion, and one with no
+        checklist at all.
+        """
+        self._make_offering_user(self.offering_with_compliance, "with_completion")
+        without_completion = self._make_offering_user(
+            self.offering_with_compliance, "without_completion"
+        )
+        checklist_models.ChecklistCompletion.objects.filter(
+            scope_object_id=without_completion.id,
+            scope_content_type=ContentType.objects.get_for_model(OfferingUser),
+        ).delete()
+        self._make_offering_user(self.offering_without_compliance, "no_checklist")
+
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(OfferingUserFactory.get_list_url())
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        serializer = serializers.OfferingUserSerializer()
+        for payload in response.data:
+            # Re-fetch without the annotation so the serializer takes its
+            # fallback branch, and compare the two answers.
+            unannotated = OfferingUser.objects.get(uuid=payload["uuid"])
+            self.assertFalse(hasattr(unannotated, "_compliance_completion_exists"))
+            self.assertEqual(
+                payload["has_compliance_checklist"],
+                serializer.get_has_compliance_checklist(unannotated),
+                f"mismatch for {payload['username']}",
+            )
+
+    def test_query_count_does_not_grow_with_number_of_offering_users(self):
+        self._make_offering_user(self.offering_with_compliance, "user_0")
+        self.client.force_authenticate(self.fixture.staff)
+        url = OfferingUserFactory.get_list_url()
+        self.client.get(url)  # warm ContentType and permission caches
+
+        with django_test.CaptureQueriesContext(connection) as baseline:
+            self.client.get(url)
+
+        for index in range(1, 6):
+            self._make_offering_user(self.offering_with_compliance, f"user_{index}")
+
+        with self.assertNumQueries(len(baseline)):
+            self.client.get(url)
+
 
 @ddt
 class OfferingUserCommentUrlResetTest(test.APITestCase):
@@ -3603,17 +3796,40 @@ class OfferingUserUpdateRuntimeStateTest(test.APITestCase):
             response.status_code, status.HTTP_400_BAD_REQUEST, response.data
         )
 
-    def test_event_logged_on_runtime_state_update(self):
-        """An event is emitted when runtime state is updated."""
+    def test_update_runtime_state_emits_single_audit_event_with_changed_fields(self):
+        """update_runtime_state emits one handler audit event with all changed fields."""
         self.client.force_authenticate(user=self.fixture.owner)
-        self.client.post(
+        response = self.client.post(
             self.get_url(self.offering_user),
-            {"runtime_state": OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING},
+            {
+                "runtime_state": OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+                "service_provider_comment": "Please link your account",
+                "service_provider_comment_url": "https://help.example.com/link",
+            },
         )
-        self.assertTrue(
-            Event.objects.filter(
-                event_type="marketplace_offering_user_updated"
-            ).exists()
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        events = Event.objects.filter(event_type="marketplace_offering_user_updated")
+        self.assertEqual(events.count(), 1)
+        event = events.get()
+        self.assertEqual(
+            event.context["changed_fields"],
+            [
+                "runtime_state",
+                "service_provider_comment",
+                "service_provider_comment_url",
+            ],
+        )
+        self.assertEqual(
+            event.context["new_runtime_state"],
+            OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+        )
+        self.assertEqual(
+            event.context["new_service_provider_comment"], "Please link your account"
+        )
+        self.assertEqual(
+            event.context["new_service_provider_comment_url"],
+            "https://help.example.com/link",
         )
 
     def test_can_update_runtime_state_with_comments(self):
@@ -3750,6 +3966,60 @@ class OfferingUserRuntimeStateFilterTest(test.APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data), 2)
+
+
+class OfferingUserRuntimeMetadataAuditLogTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = structure_fixtures.ProjectFixture()
+        self.offering = OfferingFactory(customer=self.fixture.customer)
+        self.offering_user = OfferingUserFactory(
+            offering=self.offering,
+            user=self.fixture.user,
+            username="testuser",
+        )
+
+    def test_runtime_metadata_change_is_audited(self):
+        self.offering_user.runtime_state = (
+            OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING
+        )
+        self.offering_user.service_provider_comment = "Please link your account"
+        self.offering_user.service_provider_comment_url = (
+            "https://help.example.com/link"
+        )
+        self.offering_user.save(
+            update_fields=[
+                "runtime_state",
+                "service_provider_comment",
+                "service_provider_comment_url",
+            ]
+        )
+
+        event = (
+            Event.objects.filter(event_type="marketplace_offering_user_updated")
+            .order_by("-created")
+            .first()
+        )
+        self.assertIsNotNone(event)
+        self.assertEqual(
+            event.context["changed_fields"],
+            [
+                "runtime_state",
+                "service_provider_comment",
+                "service_provider_comment_url",
+            ],
+        )
+        self.assertEqual(
+            event.context["new_runtime_state"],
+            OfferingUserRuntimeStates.PENDING_ACCOUNT_LINKING,
+        )
+        self.assertEqual(
+            event.context["new_service_provider_comment"],
+            "Please link your account",
+        )
+        self.assertEqual(
+            event.context["new_service_provider_comment_url"],
+            "https://help.example.com/link",
+        )
 
 
 class OfferingUserRuntimeStateStompTest(test.APITestCase):

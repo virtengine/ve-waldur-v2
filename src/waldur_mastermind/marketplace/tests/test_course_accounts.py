@@ -1222,6 +1222,57 @@ class CourseAccountDateFieldsTest(test.APITestCase):
         self.assertIsNone(null_account["project_end_date"])
 
 
+class CourseAccountNullUserTest(test.APITestCase):
+    """Test for CourseAccount serializer when the linked user is None.
+
+    user is SET_NULL on delete, so a course account left over from a failed
+    or partial close (see test_delete_erred_course_account_without_user) can
+    have user=None while still being listed. user_uuid/username must come
+    back as null rather than being dropped from the payload entirely - a
+    dropped key crashes typed API clients (waldur-api-client) that expect it.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.course_project = structure_factories.ProjectFactory(
+            customer=self.fixture.project.customer,
+            kind=ProjectKind.COURSE,
+        )
+        self.account = factories.CourseAccountFactory(
+            project=self.course_project,
+            user=None,
+            email="orphaned@example.com",
+            state=CourseAccountState.CLOSED,
+        )
+        CustomerRole.OWNER.add_permission(PermissionEnum.MANAGE_COURSE_ACCOUNT)
+        self.fixture.project.customer.add_user(self.fixture.owner, CustomerRole.OWNER)
+
+    def test_retrieve_serializes_null_user_as_none(self):
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.CourseAccountFactory.get_url(self.account)
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("user_uuid", response.data)
+        self.assertIn("username", response.data)
+        self.assertIsNone(response.data["user_uuid"])
+        self.assertIsNone(response.data["username"])
+
+    def test_list_serializes_null_user_as_none(self):
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.CourseAccountFactory.get_list_url()
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        account_data = next(
+            a for a in response.data if a["email"] == "orphaned@example.com"
+        )
+        self.assertIn("user_uuid", account_data)
+        self.assertIn("username", account_data)
+        self.assertIsNone(account_data["user_uuid"])
+        self.assertIsNone(account_data["username"])
+
+
 @override_waldur_core_settings(
     COURSE_ACCOUNT_USE_API=False,  # Disable API calls for these tests
 )
@@ -1567,10 +1618,28 @@ class ExtractErrorDetailsFromHttpxErrorTest(test.APITestCase):
             f"Server error '{status_code}'", request=request, response=response
         )
 
-    def test_status_error_with_json_body_returns_parsed_json(self):
+    def test_status_error_with_json_body_returns_status_and_detail(self):
         exc = self._make_status_error(500, json_body={"detail": "DB connection failed"})
         result = utils.extract_error_details_from_httpx_error(exc)
-        self.assertEqual(result, {"detail": "DB connection failed"})
+        self.assertEqual(result, "Status code: 500, message: DB connection failed")
+
+    def test_status_error_with_json_body_without_detail_key_returns_whole_body(self):
+        exc = self._make_status_error(500, json_body={"code": "internal_error"})
+        result = utils.extract_error_details_from_httpx_error(exc)
+        self.assertEqual(
+            result, "Status code: 500, message: {'code': 'internal_error'}"
+        )
+
+    def test_status_error_with_non_json_body_returns_raw_text_instead_of_crashing(self):
+        # A bare 500 from an infra layer (gateway, k8s service) often isn't JSON at
+        # all - exc.response.json() must not be called unguarded here, or this
+        # blows up with a fresh, uncaught JSONDecodeError instead of recording
+        # any error message.
+        exc = self._make_status_error(500, text="<html>Internal Server Error</html>")
+        result = utils.extract_error_details_from_httpx_error(exc)
+        self.assertEqual(
+            result, "Status code: 500, message: <html>Internal Server Error</html>"
+        )
 
     def test_status_error_with_empty_body_returns_status_string(self):
         exc = self._make_status_error(500, text="")
@@ -1625,6 +1694,20 @@ class CreateCourseAccountTaskErrorHandlingTest(test.APITestCase):
         self._run_task()
         self.assertEqual(self.course_account.state, CourseAccountState.ERRED)
         self.assertIn("DB connection failed", self.course_account.error_message)
+
+    @patch("waldur_mastermind.marketplace.utils.create_course_account")
+    def test_http_500_with_non_json_body_stores_raw_text_instead_of_crashing(
+        self, mock_create
+    ):
+        mock_create.side_effect = self._make_status_error(
+            500, text="<html>Internal Server Error</html>"
+        )
+        self._run_task()
+        self.assertEqual(self.course_account.state, CourseAccountState.ERRED)
+        self.assertEqual(
+            self.course_account.error_message,
+            "Status code: 500, message: <html>Internal Server Error</html>",
+        )
 
     @patch("waldur_mastermind.marketplace.utils.create_course_account")
     def test_http_500_with_empty_body_stores_status_string(self, mock_create):

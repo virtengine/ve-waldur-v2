@@ -37,9 +37,6 @@ MEDIA_ROOT = "/media_root/"
 MEDIA_URL = "/media/"
 
 ALLOWED_HOSTS = []
-SITE_ID = 1
-DBTEMPLATES_USE_REVERSION = True
-DBTEMPLATES_USE_CODEMIRROR = True
 
 # Application definition
 INSTALLED_APPS = (
@@ -49,7 +46,6 @@ INSTALLED_APPS = (
     "django.contrib.messages",
     "django.contrib.humanize",
     "django.contrib.staticfiles",
-    "django.contrib.sites",
     "django.contrib.postgres",
     "waldur_core.landing",
     "waldur_core.core",
@@ -62,6 +58,7 @@ INSTALLED_APPS = (
     "waldur_core.logging",
     "waldur_core.checklist",
     "waldur_core.user_actions",
+    "waldur_core.passkeys",
     "rest_framework",
     "rest_framework.authtoken",
     "django_filters",
@@ -78,7 +75,6 @@ INSTALLED_APPS = (
     "health_check.contrib.migrations",
     # Note: We use waldur_core.core.health_checks.CeleryWorkersHealthCheck instead of
     # health_check.contrib.celery_ping for better performance (connection pooling + targeted pings)
-    "dbtemplates",
     "netfields",
     "constance",
     "constance.backends.database",
@@ -126,9 +122,25 @@ REST_FRAMEWORK = {
     ],
     "DEFAULT_THROTTLE_RATES": {
         "oauth": "10/s",
+        # api-auth/default/init/. The probe runs on every anonymous landing on
+        # the portal root and writes nothing, so it is budgeted for a lecture
+        # hall arriving behind one NAT at once; the navigation is a sign-in
+        # attempt and does write session state. Both are per client address.
+        "oauth_probe": "120/s",
+        "oauth_default": "60/s",
         "token_exchange": "60/min",
         "matrix_credentials": "1000/hour",
         "matrix_webhook": "10000/hour",
+        # Passkey ceremonies. Sign-in is anonymous and unauthenticated, so it
+        # is the tighter of the two. Deliberately not wired into django-axes:
+        # a counter shared with password login would let an attacker lock a
+        # user out of password auth simply by grinding assertions.
+        "passkey_signin": "30/min",
+        "passkey_registration": "20/min",
+        # Guards the staff-only mail diagnostics: the probe opens a socket to a
+        # third-party relay and the test send delivers a real message, so both
+        # are cheap to abuse and rare in legitimate use.
+        "email_diagnostics": "20/hour",
     },
     "DEFAULT_PAGINATION_CLASS": "waldur_core.core.pagination.LinkHeaderPagination",
     "DEFAULT_SCHEMA_CLASS": "waldur_core.core.openapi_inspector.WaldurOpenApiInspector",
@@ -182,7 +194,7 @@ TEMPLATES = [
         "OPTIONS": {
             "context_processors": CONTEXT_PROCESSORS,
             "loaders": (
-                "dbtemplates.loader.Loader",
+                "waldur_core.core.template_loaders.DatabaseTemplateLoader",
                 "django.template.loaders.filesystem.Loader",
                 "django.template.loaders.app_directories.Loader",
             ),
@@ -266,16 +278,7 @@ STORAGES = {
     },
 }
 
-# Disable excessive xmlschema logging
-import logging
-
 import structlog
-
-logging.getLogger("xmlschema").propagate = False
-
-# Disable excessive Celery task registration logging
-logging.getLogger("celery.utils.imports").setLevel(logging.WARNING)
-logging.getLogger("celery.app.autodiscover").setLevel(logging.WARNING)
 
 # Processors for stdlib loggers (foreign_pre_chain) - ExtraAdder merges record.extra
 _FOREIGN_PRE_CHAIN = [
@@ -314,6 +317,11 @@ LOGGING = {
         "console": {
             "class": "logging.StreamHandler",
             "formatter": "structlog_json" if _USE_JSON_LOGS else "structlog_console",
+            # Log to stdout, not logging's stderr default. Containers are
+            # collected from stdout, and this used to be set only in the
+            # image's logging.conf.py, so a compose stack and a helm pod
+            # disagreed about which stream carried the logs.
+            "stream": "ext://sys.stdout",
         },
         "database": {
             "class": "waldur_core.logging.log.DatabaseLogHandler",
@@ -359,6 +367,24 @@ LOGGING = {
         "neutronclient": {
             "level": "ERROR",
         },
+        # xmlschema logs every parsed element at INFO.
+        "xmlschema": {
+            "propagate": False,
+        },
+        # Celery's import and boot machinery is chatty at INFO. Keep the
+        # task-level loggers at INFO and quiet the layers underneath. These
+        # carry no "handlers"/"propagate" of their own on purpose: they
+        # inherit root's, so adding a root handler later reaches them too.
+        "celery": {"level": "INFO"},
+        "celery.app": {"level": "INFO"},
+        "celery.app.autodiscover": {"level": "WARNING"},
+        "celery.app.base": {"level": "WARNING"},
+        "celery.bootsteps": {"level": "WARNING"},
+        "celery.loaders": {"level": "WARNING"},
+        "celery.utils": {"level": "WARNING"},
+        "celery.utils.functional": {"level": "WARNING"},
+        "celery.utils.imports": {"level": "WARNING"},
+        "celery.worker": {"level": "INFO"},
     },
 }
 
@@ -398,9 +424,13 @@ LANGUAGES = (
     ("nb", "Norsk"),
     ("ar", "العربية"),
     ("cs", "Čeština"),
+    ("hr", "Hrvatski"),
     ("sl", "Slovenščina"),
     ("el", "Ελληνικά"),
     ("bg", "Български"),
+    ("km", "ខ្មែរ"),
+    ("mk", "Македонски"),
+    ("sq", "Shqip"),
 )
 
 # Disable SAML2 CSP warnings

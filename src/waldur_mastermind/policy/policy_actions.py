@@ -14,7 +14,6 @@ from waldur_core.logging.enums import EventType
 from waldur_core.structure.models import Customer, Project
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.enums import (
-    OPENSTACK_INSTANCE_OFFERING,
     OrderStates,
     OrderTypes,
     ResourceStates,
@@ -386,17 +385,12 @@ def terminate_resources(policy: models.Policy):
 
     for resource in resources:
         with transaction.atomic():
-            attributes = (
-                {"action": "force_destroy"}
-                if resource.offering.type == OPENSTACK_INSTANCE_OFFERING
-                else {}
-            )
             order = marketplace_models.Order.objects.create(
                 resource=resource,
                 offering=resource.offering,
                 type=OrderTypes.TERMINATE,
                 state=OrderStates.EXECUTING,
-                attributes=attributes,
+                attributes={},
                 project=resource.project,
                 created_by=user,
                 consumer_reviewed_by=user,
@@ -544,6 +538,19 @@ def _apply_generic_action(
     - Pre-computes policy scopes and system_robot once
     - Wraps all resource saves in a single transaction
     - Bulk-creates Event and Feed records after the loop
+
+    Row-locked via ``select_for_update()`` below: the CAS on ``has_fired``
+    only ever guarantees one *fire* runs per policy, and the periodic
+    ``check-polices`` sweep re-applies these same actions to already-fired
+    policies with no equivalent guard (see
+    ``policy/utils.py::_reconcile_idempotent_actions``). Without the lock,
+    two overlapping evaluations (a slow sweep colliding with the next tick,
+    two beat instances in a multi-replica deployment) can both read a
+    resource's field as unchanged before either commits, and both save +
+    emit an event for it -- the read-then-write is not itself atomic the way
+    the single ``UPDATE ... WHERE has_fired=False`` above is. The lock makes
+    the second transaction block until the first commits, then re-read the
+    now-current value and take the ``current_value == new_value`` skip below.
     """
     resources = _filter_resources_by_scope(queryset, policy)
     if resources is None:
@@ -564,7 +571,7 @@ def _apply_generic_action(
     pending_events = []
 
     with transaction.atomic():
-        for resource in resources:
+        for resource in resources.select_for_update():
             current_value = getattr(resource, field_name)
             if current_value == new_value:
                 continue

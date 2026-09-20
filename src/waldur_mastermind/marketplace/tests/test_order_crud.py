@@ -12,20 +12,21 @@ from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CustomerRole, OfferingRole, ProjectRole
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
-from waldur_mastermind.marketplace import models, plugins
+from waldur_mastermind.marketplace import models, permissions, plugins
 from waldur_mastermind.marketplace.enums import (
     BASIC_OFFERING,
     SUPPORT_OFFERING,
     BillingTypes,
     LimitPeriods,
     OfferingStates,
+    OrderTypes,
 )
 from waldur_mastermind.marketplace.tests import factories, fixtures
 from waldur_mastermind.marketplace.tests.factories import OFFERING_OPTIONS
 from waldur_mastermind.marketplace.tests.utils import TestCreateProcessor
 
 
-class BaseOrderCreateTest(test.APITransactionTestCase):
+class BaseOrderCreateTest(test.APITestCase):
     def setUp(self):
         self.fixture = structure_fixtures.ProjectFixture()
         self.project = self.fixture.project
@@ -756,6 +757,115 @@ class OrderNotificationCreateTest(BaseOrderCreateTest):
         else:
             mocked_task.assert_not_called()
 
+    def test_disable_autoapprove_overrides_owner_self_approval(self, mocked_task):
+        """Owners hold APPROVE_ORDER by default, which would otherwise let them
+        self-approve via the general permission fallback. disable_autoapprove must
+        override that too, not just auto_approve_in_service_provider_projects."""
+        offering = factories.OfferingFactory(
+            state=OfferingStates.ACTIVE,
+            shared=False,
+            billable=False,
+            customer=self.project.customer,
+            type="TEST_TYPE",
+            plugin_options={"disable_autoapprove": True},
+        )
+
+        response = self.create_order(self.fixture.owner, offering)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["state"], "pending-consumer")
+        mocked_task.assert_called()
+
+    def test_disable_autoapprove_overrides_owner_self_approval_on_shared_offering(
+        self, mocked_task
+    ):
+        """Same as above but for a shared/public offering with
+        auto_approve_in_service_provider_projects unset, so the owner's
+        self-approval would otherwise come from the general APPROVE_ORDER
+        permission fallback rather than the private-offering branch."""
+        consumer_fixture = provider_fixture = structure_fixtures.ProjectFixture()
+        public_offering = factories.OfferingFactory(
+            state=OfferingStates.ACTIVE,
+            shared=True,
+            billable=True,
+            customer=provider_fixture.customer,
+            type="TEST_TYPE",
+            plugin_options={"disable_autoapprove": True},
+        )
+
+        response = self.create_order(
+            consumer_fixture.owner,
+            public_offering,
+            add_payload={
+                "project": structure_factories.ProjectFactory.get_url(
+                    consumer_fixture.project
+                ),
+                "attributes": {"name": "test"},
+                "plan": factories.PlanFactory.get_public_url(
+                    factories.PlanFactory(offering=public_offering)
+                ),
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["state"], "pending-consumer")
+        mocked_task.assert_called()
+
+    def test_disable_autoapprove_does_not_block_termination(self, mocked_task):
+        """disable_autoapprove gates spend approval on provisioning orders; a
+        termination reduces spend, so it must keep following the normal
+        termination rules instead of being forced to pending-consumer -- else
+        a provider-initiated termination could get stuck with no consumer-side
+        actor able to clear it."""
+        offering = factories.OfferingFactory(
+            state=OfferingStates.ACTIVE,
+            shared=False,
+            billable=False,
+            customer=self.project.customer,
+            type="TEST_TYPE",
+            plugin_options={"disable_autoapprove": True},
+        )
+        resource = factories.ResourceFactory(offering=offering, project=self.project)
+        order = factories.OrderFactory(
+            offering=offering,
+            project=self.project,
+            created_by=self.fixture.owner,
+            type=OrderTypes.TERMINATE,
+            resource=resource,
+        )
+        self.assertTrue(permissions.order_should_not_be_reviewed_by_consumer(order))
+
+    def test_same_org_termination_auto_approves_despite_disable_autoapprove(
+        self, mocked_task
+    ):
+        """Deliberate consequence of exempting terminations, not an oversight.
+
+        The same-organization branch no longer carries its own disable_autoapprove
+        check, so with both options set a termination auto-approves there. A
+        project admin is the interesting actor: they are not an owner of the
+        offering's customer, so the termination branch below does not cover them,
+        and they hold no APPROVE_ORDER, so neither does the fallback. Before the
+        flag was hoisted above these branches such a termination required review.
+        """
+        offering = factories.OfferingFactory(
+            state=OfferingStates.ACTIVE,
+            shared=True,
+            billable=True,
+            customer=self.project.customer,
+            type="TEST_TYPE",
+            plugin_options={
+                "auto_approve_in_service_provider_projects": True,
+                "disable_autoapprove": True,
+            },
+        )
+        resource = factories.ResourceFactory(offering=offering, project=self.project)
+        order = factories.OrderFactory(
+            offering=offering,
+            project=self.project,
+            created_by=self.fixture.admin,
+            type=OrderTypes.TERMINATE,
+            resource=resource,
+        )
+        self.assertTrue(permissions.order_should_not_be_reviewed_by_consumer(order))
+
 
 @ddt
 class OrderLimitsCreateTest(BaseOrderCreateTest):
@@ -810,6 +920,81 @@ class OrderLimitsCreateTest(BaseOrderCreateTest):
 
         order = models.Order.objects.last()
         self.assertEqual(order.limits["cpu_count"], 5)
+
+    def build_limit_offering(self, **component_kwargs):
+        """An ACTIVE offering whose components all take user-set limits."""
+        offering = factories.OfferingFactory(
+            state=OfferingStates.ACTIVE, type=SUPPORT_OFFERING
+        )
+        plan = factories.PlanFactory(offering=offering)
+        for key in self.DEFAULT_LIMITS:
+            models.OfferingComponent.objects.create(
+                offering=offering,
+                type=key,
+                billing_type=BillingTypes.LIMIT,
+                **component_kwargs,
+            )
+        return offering, plan
+
+    def post_limits(self, offering, plan, limits):
+        return self.create_order(
+            self.fixture.staff,
+            offering,
+            add_payload={
+                "offering": factories.OfferingFactory.get_public_url(offering),
+                "plan": factories.PlanFactory.get_public_url(plan),
+                "limits": limits,
+                "attributes": {},
+            },
+        )
+
+    def test_whole_limits_are_returned_as_integers_not_floats(self):
+        """The shape every SDK consumer depends on.
+
+        The limit fields are FloatField-derived so that a fraction can pass, and
+        DRF would render a stored 5 as 5.0 unless the field narrows it back.
+        Asserting equality is not enough -- 5 == 5.0 == Decimal("5.00") -- so
+        this asserts the type.
+        """
+        offering, plan = self.build_limit_offering()
+
+        response = self.post_limits(offering, plan, self.DEFAULT_LIMITS)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        for key, value in response.data["limits"].items():
+            self.assertIsInstance(value, int, f"{key} came back as {type(value)}")
+
+    def test_a_fraction_is_refused_on_an_integer_only_component(self):
+        """Order create is the main door, and it was the one without a test."""
+        offering, plan = self.build_limit_offering()
+
+        response = self.post_limits(
+            offering, plan, {**self.DEFAULT_LIMITS, "cpu_count": 0.5}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_a_fraction_is_accepted_where_the_component_allows_it(self):
+        offering, plan = self.build_limit_offering(limit_decimal_places=1)
+
+        response = self.post_limits(
+            offering, plan, {**self.DEFAULT_LIMITS, "cpu_count": 0.5}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        order = models.Order.objects.last()
+        self.assertEqual(order.limits["cpu_count"], 0.5)
+        # The whole ones alongside it keep their shape.
+        self.assertIsInstance(order.limits["storage"], int)
+
+    def test_a_fraction_finer_than_the_component_allows_is_refused(self):
+        offering, plan = self.build_limit_offering(limit_decimal_places=1)
+
+        response = self.post_limits(
+            offering, plan, {**self.DEFAULT_LIMITS, "cpu_count": 0.55}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_user_can_not_create_order_with_invalid_limits(self):
         offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)

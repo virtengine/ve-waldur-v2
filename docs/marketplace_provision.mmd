@@ -15,6 +15,7 @@ classDiagram
         +string article_code
         +Offering offering [FK]
         +bool archived
+        +string billing_mode
         +int max_amount
         +OrganizationGroup organization_groups
     }
@@ -79,6 +80,7 @@ classDiagram
         +JSONField attributes
         +int type
         +Plan old_plan [FK]
+        +decimal old_cost
         +Project project [FK]
         +Resource resource [FK]
         +FSMIntegerField state
@@ -99,8 +101,10 @@ classDiagram
         +string provider_message
         +string provider_message_url
         +file provider_message_attachment
+        +datetime provider_message_updated_at
         +string consumer_message
         +file consumer_message_attachment
+        +datetime consumer_message_updated_at
         +string consumer_rejection_comment
         +string provider_rejection_comment
         +ProjectOrderAutoApproval auto_approved_by_rule [FK]

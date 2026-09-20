@@ -3,6 +3,7 @@ import logging
 from datetime import date, datetime
 
 from constance import config
+from django.conf import settings as django_settings
 from django.core.cache import cache
 from django.db import transaction
 from django.db.models import Avg, Count, Prefetch, Q
@@ -11,7 +12,8 @@ from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext
 from django.utils.translation import gettext_lazy as _
 from django_filters.rest_framework import DjangoFilterBackend
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import (
     decorators,
     generics,
@@ -36,6 +38,7 @@ from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import (
     permissions as structure_permissions,
 )
+from waldur_core.structure.managers import get_connected_customers
 from waldur_mastermind.notifications.models import BroadcastMessage
 
 # The Atlassian discovery service imports atlassian-python-api, which eagerly pulls
@@ -54,6 +57,34 @@ logger = logging.getLogger(__name__)
 
 class CheckExtensionMixin(core_views.ConstanceCheckExtensionMixin):
     extension_name = "WALDUR_SUPPORT"
+
+
+def get_provider_helpdesk_ids(user) -> set:
+    """Helpdesks the user speaks for: as service-provider owner, or as agent.
+
+    Empty for a user with no provider relationship, which is what callers use
+    to decide whether a non-staff user may see provider-scoped data at all.
+    """
+    owned = models.ProviderHelpdesk.objects.filter(
+        service_provider__customer__in=get_connected_customers(user, CustomerRole.OWNER)
+    ).values_list("id", flat=True)
+    agent_of = models.ProviderSupportUser.objects.filter(
+        user=user, is_active=True
+    ).values_list("provider_helpdesk_id", flat=True)
+    return set(owned) | set(agent_of)
+
+
+def validate_status_change_allowed(issue):
+    """Only Waldur's own, unrouted issues may have their status written here."""
+    if not backend.get_active_backend().update_is_available(issue):
+        raise ValidationError("Updating is not available.")
+    # A routed issue belongs to the provider's helpdesk: its status arrives over
+    # that provider's webhook, and writing it here would be silently overwritten
+    # by the next inbound sync.
+    if issue.provider_helpdesk_id:
+        raise ValidationError(
+            "Issue is routed to a provider helpdesk, which owns its status."
+        )
 
 
 class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
@@ -118,6 +149,51 @@ class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
     ]
     update_validators = partial_update_validators = [_update_is_available_validator]
 
+    def _set_status(self, issue, new_status):
+        """Apply a status change through the backend that owns the issue.
+
+        Raises ValidationError rather than letting SupportBackendError escape:
+        it does not derive from ServiceBackendError, so an illegal transition
+        would otherwise surface as a 500.
+        """
+        issue.status = new_status
+        try:
+            backend.get_active_backend().update_issue(issue)
+        except backend.SupportBackendError as e:
+            raise ValidationError(str(e))
+
+    @extend_schema(
+        summary="Move an issue to another status",
+        request=serializers.SetIssueStatusSerializer,
+        responses={200: serializers.IssueSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def set_status(self, request, uuid=None):
+        """Change the status of an issue Waldur itself owns.
+
+        `_update_is_available_validator` keeps this off the externally-backed
+        issues: Jira, Zammad and SMAX inherit `update_is_available` as False, so
+        their status stays whatever the remote service desk last told us.
+        """
+        issue = self.get_object()
+        serializer = self.get_serializer(
+            data=request.data, context={**self.get_serializer_context(), "issue": issue}
+        )
+        serializer.is_valid(raise_exception=True)
+
+        self._set_status(issue, serializer.validated_data["status"])
+
+        return response.Response(
+            serializers.IssueSerializer(
+                issue, context=self.get_serializer_context()
+            ).data,
+            status=status.HTTP_200_OK,
+        )
+
+    set_status_permissions = [structure_permissions.is_staff_or_support]
+    set_status_validators = [validate_status_change_allowed]
+    set_status_serializer_class = serializers.SetIssueStatusSerializer
+
     @transaction.atomic()
     def perform_destroy(self, issue):
         backend.get_active_backend().delete_issue(issue)
@@ -135,8 +211,14 @@ class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
         if user.is_staff or user.is_support or not obj:
             return
         issue = obj
-        # if it's a personal issue
-        if not issue.customer and not issue.project and issue.caller == user:
+        # The caller may reply on their own ticket. Scope is already settled by
+        # the time this runs: reaching here means the issue survived
+        # `IssueCallerOrRoleFilterBackend`, which on a ticket raised against a
+        # project or an organization admits only the roles held there. So this
+        # covers the caller who still has access but holds none of the roles
+        # below -- a plain project member on their own thread, refused with a
+        # 403 while the UI went on offering them the button.
+        if issue.caller == user:
             return
         if issue.customer and issue.customer.has_user(user, CustomerRole.OWNER):
             return
@@ -257,7 +339,29 @@ class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
             raise ValidationError("No issues found with the given UUIDs.")
 
         if "status" in data:
-            issues.update(status=data["status"])
+            # A raw queryset.update() here used to let a status be written for
+            # any backend, including the externally-backed ones whose status
+            # belongs to the remote service desk. It also skipped the field
+            # tracker, so no transition check, no resolution date, and none of
+            # the handlers that complete a support-offering order ever ran.
+            #
+            # Every issue is checked before any is written. Rejecting halfway
+            # through would leave the batch half-applied: DRF turns the
+            # ValidationError into a 400 response inside the atomic block, and
+            # its set_rollback() is a no-op unless the database is configured
+            # with ATOMIC_REQUESTS, which Waldur does not use. The operator
+            # would see a failure with some tickets already moved.
+            targets = list(issues)
+            active_backend = backend.get_active_backend()
+            for issue in targets:
+                validate_status_change_allowed(issue)
+                if data["status"] not in active_backend.get_available_statuses(issue):
+                    raise ValidationError(
+                        f"Issue {issue.key or issue.uuid.hex} cannot be moved from "
+                        f"'{issue.status}' to '{data['status']}'."
+                    )
+            for issue in targets:
+                self._set_status(issue, data["status"])
         if "priority" in data:
             issues.update(priority=data["priority"])
         if "assignee" in data:
@@ -636,17 +740,9 @@ class ProviderTicketViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
         if user.is_staff or user.is_support:
             return self.queryset
 
-        from waldur_core.structure.managers import get_connected_customers
-
-        provider_customers = get_connected_customers(user, CustomerRole.OWNER)
-        support_helpdesks = models.ProviderSupportUser.objects.filter(
-            user=user, is_active=True
-        ).values_list("provider_helpdesk_id", flat=True)
-
         return self.queryset.filter(
-            Q(provider_helpdesk__service_provider__customer__in=provider_customers)
-            | Q(provider_helpdesk__id__in=support_helpdesks)
-        ).distinct()
+            provider_helpdesk_id__in=get_provider_helpdesk_ids(user)
+        )
 
     @extend_schema(responses={status.HTTP_201_CREATED: None})
     @decorators.action(detail=True, methods=["post"])
@@ -805,14 +901,26 @@ class ProviderTicketViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
 
     @extend_schema(
         summary="Get statistics for provider tickets",
+        parameters=[
+            OpenApiParameter(
+                name="provider_helpdesk_uuid",
+                type=OpenApiTypes.UUID,
+                required=False,
+                location=OpenApiParameter.QUERY,
+                description="Count only the tickets routed to this helpdesk.",
+            ),
+        ],
         responses={200: serializers.ProviderStatsSerializer},
     )
     @decorators.action(detail=False, methods=["get"])
     def stats(self, request):
         from django.db.models import Avg, ExpressionWrapper, F, fields
 
-        qs = self.get_queryset()
-        open_qs = qs.filter(resolution_date__isnull=True)
+        qs = self.filter_queryset(self.get_queryset())
+        # Same open/closed definition as the support statistics and the is_open
+        # filter. resolved_qs below still keys off resolution_date, because it
+        # needs the timestamp to measure a duration.
+        open_qs = qs.open()
 
         resolved_qs = qs.filter(resolution_date__isnull=False).annotate(
             resolve_time=ExpressionWrapper(
@@ -822,8 +930,11 @@ class ProviderTicketViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
         )
         avg_resolve = resolved_qs.aggregate(avg=Avg("resolve_time"))["avg"]
 
+        # order_by() drops any ?o= ordering, which would otherwise join the
+        # GROUP BY and split one status across several rows.
         by_status = dict(
-            open_qs.values_list("status")
+            open_qs.order_by()
+            .values_list("status")
             .annotate(count=Count("id"))
             .values_list("status", "count")
         )
@@ -852,8 +963,6 @@ class ProviderHelpdeskViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
         user = self.request.user
         if user.is_staff or user.is_support:
             return self.queryset
-        from waldur_core.structure.managers import get_connected_customers
-
         provider_customers = get_connected_customers(user, CustomerRole.OWNER)
         return self.queryset.filter(service_provider__customer__in=provider_customers)
 
@@ -918,8 +1027,6 @@ class ProviderSupportUserViewSet(CheckExtensionMixin, core_views.ActionsViewSet)
         user = self.request.user
         if user.is_staff or user.is_support:
             return self.queryset
-        from waldur_core.structure.managers import get_connected_customers
-
         provider_customers = get_connected_customers(user, CustomerRole.OWNER)
         return self.queryset.filter(
             provider_helpdesk__service_provider__customer__in=provider_customers
@@ -976,8 +1083,6 @@ class ProviderCannedResponseViewSet(CheckExtensionMixin, core_views.ActionsViewS
         user = self.request.user
         if user.is_staff or user.is_support:
             return self.queryset
-        from waldur_core.structure.managers import get_connected_customers
-
         provider_customers = get_connected_customers(user, CustomerRole.OWNER)
         return self.queryset.filter(
             provider_helpdesk__service_provider__customer__in=provider_customers
@@ -1003,7 +1108,11 @@ class ProviderCannedResponseViewSet(CheckExtensionMixin, core_views.ActionsViewS
         _is_owner_or_staff
     ]
 
-    @extend_schema(responses={status.HTTP_200_OK: None})
+    @extend_schema(
+        summary="Render a canned response with context variables",
+        request=serializers.CannedResponseRenderSerializer,
+        responses={200: serializers.CannedResponseRenderResponseSerializer},
+    )
     @decorators.action(detail=True, methods=["post"])
     def render(self, request, uuid=None):
         canned_response = self.get_object()
@@ -1012,6 +1121,8 @@ class ProviderCannedResponseViewSet(CheckExtensionMixin, core_views.ActionsViewS
         canned_response.usage_count += 1
         canned_response.save(update_fields=["usage_count"])
         return response.Response({"rendered_text": rendered})
+
+    render_serializer_class = serializers.CannedResponseRenderSerializer
 
 
 class IssueTagViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
@@ -1090,7 +1201,7 @@ class CannedResponseViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
     @extend_schema(
         summary="Render a canned response with context variables",
         request=serializers.CannedResponseRenderSerializer,
-        responses={200: None},
+        responses={200: serializers.CannedResponseRenderResponseSerializer},
     )
     @decorators.action(detail=True, methods=["post"])
     def render(self, request, uuid=None):
@@ -1196,8 +1307,15 @@ class ProviderWebhookView(views.APIView):
         except models.Issue.DoesNotExist:
             return
 
+        # The provider owns this ticket's status, so the incoming value is
+        # written as-is — but the resolution date still has to follow it, or the
+        # SLA badge and the statistics never notice the ticket closing, and a
+        # ticket the provider reopens stays closed here for good.
         child_issue.status = new_status
-        child_issue.save(update_fields=["status"])
+        updated_fields = ["status"]
+        if child_issue.sync_resolution_date():
+            updated_fields.append("resolution_date")
+        child_issue.save(update_fields=updated_fields)
 
 
 class HelpdeskStatsViewSet(CheckExtensionMixin, generics.GenericAPIView):
@@ -1243,32 +1361,56 @@ class HelpdeskHealthViewSet(CheckExtensionMixin, generics.GenericAPIView):
 
 
 class SupportStatsViewSet(CheckExtensionMixin, generics.GenericAPIView):
+    """Ticket counts for the support dashboard.
+
+    Staff and support see the whole deployment. A provider sees only the
+    tickets routed to their own helpdesks, so these numbers never disclose one
+    provider's volume to another. Everyone else is refused: these are
+    operator-level figures, and until now any authenticated user could read
+    them.
+    """
+
     serializer_class = serializers.SupportStatsSerializer
     pagination_class = None
 
     def get(self, request, format=None):
         today = date.today()
-        current_month = today.month
-        open_issues_count = (
-            models.Issue.objects.exclude(
-                status__in=[
-                    models.IssueStatus.Types.RESOLVED,
-                    models.IssueStatus.Types.CANCELED,
-                    "Closed",
-                ]
+        user = request.user
+        issues = models.Issue.objects.all()
+        broadcasts_visible = True
+
+        if not (user.is_staff or user.is_support):
+            helpdesk_ids = (
+                get_provider_helpdesk_ids(user)
+                if config.WALDUR_SUPPORT_PROVIDER_ROUTING_ENABLED
+                else set()
             )
-            .filter(resolution_date__isnull=True)
+            if not helpdesk_ids:
+                raise rf_exceptions.PermissionDenied()
+            issues = issues.filter(provider_helpdesk_id__in=helpdesk_ids)
+            # Broadcasts are the operator talking to their users; a provider
+            # has no part in them.
+            broadcasts_visible = False
+
+        open_issues_count = issues.open().count()
+        closed_this_month_count = (
+            issues.closed()
+            .filter(
+                resolution_date__year=today.year,
+                resolution_date__month=today.month,
+            )
             .count()
         )
-        closed_this_month_count = models.Issue.objects.filter(
-            status__in=[models.IssueStatus.Types.RESOLVED, "Closed"],
-            resolution_date__month=current_month,
-        ).count()
 
-        recent_broadcasts = BroadcastMessage.objects.filter(
-            state=BroadcastMessage.States.SENT, created__month=current_month
+        recent_broadcasts_count = (
+            BroadcastMessage.objects.filter(
+                state=BroadcastMessage.States.SENT,
+                created__year=today.year,
+                created__month=today.month,
+            ).count()
+            if broadcasts_visible
+            else 0
         )
-        recent_broadcasts_count = recent_broadcasts.count()
 
         data = {
             "open_issues_count": open_issues_count,
@@ -1686,6 +1828,36 @@ class IssueStatusViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
     destroy_permissions = [core_permissions.IsStaff]
 
 
+# Constance settings holding each auth method's credentials, mapped to the
+# credentials serializer field that supplies them.
+ATLASSIAN_CREDENTIAL_SETTINGS = {
+    "api_token": {"ATLASSIAN_EMAIL": "email", "ATLASSIAN_TOKEN": "token"},
+    "personal_access_token": {
+        "ATLASSIAN_PERSONAL_ACCESS_TOKEN": "personal_access_token"
+    },
+    "basic": {"ATLASSIAN_USERNAME": "username", "ATLASSIAN_PASSWORD": "password"},
+    "oauth2_client_credentials": {
+        "ATLASSIAN_OAUTH2_CLIENT_ID": "client_id",
+        "ATLASSIAN_OAUTH2_CLIENT_SECRET": "client_secret",
+    },
+}
+ATLASSIAN_CREDENTIAL_KEYS = [
+    setting
+    for settings in ATLASSIAN_CREDENTIAL_SETTINGS.values()
+    for setting in settings
+] + ["ATLASSIAN_OAUTH2_ACCESS_TOKEN"]
+
+
+def _configured_setting(key):
+    """A setting's value, or an empty string while it holds its placeholder default.
+
+    Some Atlassian settings default to placeholders (https://example.com/,
+    USERNAME, PASSWORD) that must not be mistaken for configuration.
+    """
+    value = getattr(config, key)
+    return "" if value == django_settings.CONSTANCE_CONFIG[key][0] else value
+
+
 class AtlassianSettingsDiscoveryViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
     """
     ViewSet for Atlassian settings discovery and configuration.
@@ -1718,6 +1890,8 @@ class AtlassianSettingsDiscoveryViewSet(CheckExtensionMixin, core_views.ActionsV
             personal_access_token=credentials_data.get("personal_access_token"),
             username=credentials_data.get("username"),
             password=credentials_data.get("password"),
+            client_id=credentials_data.get("client_id"),
+            client_secret=credentials_data.get("client_secret"),
             verify_ssl=credentials_data.get("verify_ssl", True),
         )
         return AtlassianDiscoveryService(creds)
@@ -1907,7 +2081,7 @@ class AtlassianSettingsDiscoveryViewSet(CheckExtensionMixin, core_views.ActionsV
         # Build preview of settings
         data = serializer.validated_data
         preview = {
-            "ATLASSIAN_API_URL": data["api_url"],
+            "ATLASSIAN_API_URL": service.api_url,
             "ATLASSIAN_PROJECT_ID": data["project_id"],
             "ATLASSIAN_VERIFY_SSL": data.get("verify_ssl", True),
             "ATLASSIAN_USE_OLD_API": data.get("use_old_api", False),
@@ -1922,6 +2096,9 @@ class AtlassianSettingsDiscoveryViewSet(CheckExtensionMixin, core_views.ActionsV
             preview["ATLASSIAN_TOKEN"] = "***HIDDEN***"
         elif data["auth_method"] == "personal_access_token":
             preview["ATLASSIAN_PERSONAL_ACCESS_TOKEN"] = "***HIDDEN***"
+        elif data["auth_method"] == "oauth2_client_credentials":
+            preview["ATLASSIAN_OAUTH2_CLIENT_ID"] = data["client_id"]
+            preview["ATLASSIAN_OAUTH2_CLIENT_SECRET"] = "***HIDDEN***"
         else:
             preview["ATLASSIAN_USERNAME"] = data["username"]
             preview["ATLASSIAN_PASSWORD"] = "***HIDDEN***"
@@ -2000,36 +2177,18 @@ class AtlassianSettingsDiscoveryViewSet(CheckExtensionMixin, core_views.ActionsV
 
         # Save settings to constance
         try:
-            # URL and options
-            setattr(config, "ATLASSIAN_API_URL", data["api_url"])
+            # URL and options; a Cloud site URL is stored as its API gateway URL
+            # when the credentials need it.
+            setattr(config, "ATLASSIAN_API_URL", service.api_url)
             setattr(config, "ATLASSIAN_VERIFY_SSL", data.get("verify_ssl", True))
 
-            # Auth credentials based on method
-            if data["auth_method"] == "api_token":
-                setattr(config, "ATLASSIAN_EMAIL", data["email"])
-                setattr(config, "ATLASSIAN_TOKEN", data["token"])
-                # Clear other auth methods
-                setattr(config, "ATLASSIAN_PERSONAL_ACCESS_TOKEN", "")
-                setattr(config, "ATLASSIAN_USERNAME", "")
-                setattr(config, "ATLASSIAN_PASSWORD", "")
-            elif data["auth_method"] == "personal_access_token":
-                setattr(
-                    config,
-                    "ATLASSIAN_PERSONAL_ACCESS_TOKEN",
-                    data["personal_access_token"],
-                )
-                # Clear other auth methods
-                setattr(config, "ATLASSIAN_EMAIL", "")
-                setattr(config, "ATLASSIAN_TOKEN", "")
-                setattr(config, "ATLASSIAN_USERNAME", "")
-                setattr(config, "ATLASSIAN_PASSWORD", "")
-            else:
-                setattr(config, "ATLASSIAN_USERNAME", data["username"])
-                setattr(config, "ATLASSIAN_PASSWORD", data["password"])
-                # Clear other auth methods
-                setattr(config, "ATLASSIAN_EMAIL", "")
-                setattr(config, "ATLASSIAN_TOKEN", "")
-                setattr(config, "ATLASSIAN_PERSONAL_ACCESS_TOKEN", "")
+            # Store the chosen method's credentials and clear every other one.
+            # The backend picks the first method it finds configured (OAuth 2.0
+            # first), so a leftover credential would override the new one.
+            chosen = ATLASSIAN_CREDENTIAL_SETTINGS[data["auth_method"]]
+            for setting in ATLASSIAN_CREDENTIAL_KEYS:
+                field = chosen.get(setting)
+                setattr(config, setting, data[field] if field else "")
 
             # Project settings
             setattr(config, "ATLASSIAN_PROJECT_ID", data["project_id"])
@@ -2141,7 +2300,7 @@ class AtlassianSettingsDiscoveryViewSet(CheckExtensionMixin, core_views.ActionsV
         )
 
         settings_data = {
-            "ATLASSIAN_API_URL": config.ATLASSIAN_API_URL,
+            "ATLASSIAN_API_URL": _configured_setting("ATLASSIAN_API_URL"),
             "ATLASSIAN_PROJECT_ID": config.ATLASSIAN_PROJECT_ID,
             "ATLASSIAN_VERIFY_SSL": config.ATLASSIAN_VERIFY_SSL,
             "ATLASSIAN_USE_OLD_API": config.ATLASSIAN_USE_OLD_API,
@@ -2163,23 +2322,31 @@ class AtlassianSettingsDiscoveryViewSet(CheckExtensionMixin, core_views.ActionsV
             "ATLASSIAN_DEFAULT_OFFERING_ISSUE_TYPE": config.ATLASSIAN_DEFAULT_OFFERING_ISSUE_TYPE,
             # Credentials info for pre-filling (secrets are not returned)
             "ATLASSIAN_EMAIL": config.ATLASSIAN_EMAIL,
-            "ATLASSIAN_USERNAME": config.ATLASSIAN_USERNAME,
-            # Determine which auth method is configured
-            "auth_method": (
-                "api_token"
-                if config.ATLASSIAN_TOKEN
-                else (
-                    "personal_access_token"
-                    if config.ATLASSIAN_PERSONAL_ACCESS_TOKEN
-                    else ("basic" if config.ATLASSIAN_PASSWORD else None)
-                )
-            ),
-            "auth_configured": bool(
-                config.ATLASSIAN_TOKEN
-                or config.ATLASSIAN_PERSONAL_ACCESS_TOKEN
-                or config.ATLASSIAN_PASSWORD
-            ),
+            "ATLASSIAN_USERNAME": _configured_setting("ATLASSIAN_USERNAME"),
+            "ATLASSIAN_OAUTH2_CLIENT_ID": config.ATLASSIAN_OAUTH2_CLIENT_ID,
         }
+        # The configured auth method, in the backend's order of preference
+        settings_data["auth_method"] = next(
+            (
+                method
+                for method, configured in (
+                    (
+                        "oauth2_client_credentials",
+                        config.ATLASSIAN_OAUTH2_CLIENT_ID
+                        and config.ATLASSIAN_OAUTH2_CLIENT_SECRET,
+                    ),
+                    (
+                        "personal_access_token",
+                        config.ATLASSIAN_PERSONAL_ACCESS_TOKEN,
+                    ),
+                    ("api_token", config.ATLASSIAN_TOKEN),
+                    ("basic", _configured_setting("ATLASSIAN_PASSWORD")),
+                )
+                if configured
+            ),
+            None,
+        )
+        settings_data["auth_configured"] = settings_data["auth_method"] is not None
 
         return response.Response(settings_data, status=status.HTTP_200_OK)
 

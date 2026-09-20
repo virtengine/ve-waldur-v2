@@ -24,6 +24,26 @@ Allows to show permission reviews tab and popups for organisations.
 
 Enable display of project digest configuration in organization settings.
 
+## dashboard.spend_forecast
+
+Show credit burn-down with a projected exhaustion date on the project dashboard.
+
+## dashboard.usage_limit_horizon
+
+Show a saturation bar per offering component against a timeline, with the current date and the next limit reset marked.
+
+## dashboard.usage_per_offering_bars
+
+Show usage against the remaining cap as one stacked bar per offering.
+
+## dashboard.usage_period_over_period
+
+Show usage for the current period overlaid on the previous one, per offering component.
+
+## dashboard.usage_treemap
+
+Show usage as a treemap of offering, billing type and component.
+
 ## deployment.enable_cookie_notice
 
 Enable cookie notice in marketplace.
@@ -116,6 +136,10 @@ Allow to import resources from service provider to project.
 
 Enabled LEXIS link integrations for offerings.
 
+## marketplace.realtime_updates
+
+Enable push-driven UI updates over the event-consumer WebSocket (experimental). When disabled, the UI relies on polling and manual refresh as before. Requires RabbitMQ web-STOMP to be reachable at /rmqws-stomp on the API host.
+
 ## marketplace.show_call_management_functionality
 
 Enabled display of call management functionality.
@@ -131,6 +155,10 @@ Show the staff diagnostics page listing tenants with duplicate per-tenant OpenSt
 ## marketplace.show_posix_id_pools
 
 Render POSIX ID pool management UI for service providers.
+
+## marketplace.show_provider_accounts
+
+Render service provider account management UI: provider accounts, username conflicts, the shared GLAuth directory and provider account settings.
 
 ## marketplace.show_resource_end_date
 
@@ -215,6 +243,10 @@ Show affiliate program menus and pages. Backend enforcement is controlled separa
 ## reseller.arrow
 
 Enable Arrow integration menu in administration.
+
+## sram.integration
+
+Render the SRAM integration administration page and SRAM markers in team lists. Backend access is gated separately on the SRAM_INTEGRATION_ENABLED Constance setting.
 
 ## support.conceal_change_request
 

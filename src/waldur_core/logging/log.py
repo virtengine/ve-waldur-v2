@@ -99,13 +99,52 @@ class TCPEventHandler(logging.handlers.SocketHandler):
         return self.formatter.format(record).encode("utf-8") + b"\n"
 
 
-_SENSITIVE_RE = re.compile(
-    r"(?i)"
-    r"(password|passwd|pwd|token|secret|api_key|apikey|access_key|"
-    r"private_key|auth_token|authorization|credential|client_secret)"
-    r"(\s*[=:]\s*)"
-    r"(\S+)",
+_SENSITIVE_KEY_TERMS = (
+    "password",
+    "passwd",
+    "pwd",
+    "token",
+    "secret",
+    "api_key",
+    "apikey",
+    "access_key",
+    "private_key",
+    "auth_token",
+    "authorization",
+    "credential",
+    "client_secret",
+    "kubeconfig",
 )
+
+# Text scrubber for log lines: matches "<term> = value" / "<term>: value".
+_SENSITIVE_RE = re.compile(
+    r"(?i)(" + "|".join(_SENSITIVE_KEY_TERMS) + r")(\s*[=:]\s*)(\S+)",
+)
+
+_SCRUBBED = "***"
+
+
+def _is_sensitive_key(key) -> bool:
+    return isinstance(key, str) and any(
+        term in key.lower() for term in _SENSITIVE_KEY_TERMS
+    )
+
+
+def scrub_sensitive(value):
+    """Recursively mask values under sensitive keys in a JSON-like structure.
+
+    The text scrubber (_SENSITIVE_RE) only reaches log strings; this covers
+    structured data such as event contexts / webhook payloads that are sent to
+    external URLs, where a stray credential-named key would otherwise leak.
+    """
+    if isinstance(value, dict):
+        return {
+            key: (_SCRUBBED if _is_sensitive_key(key) else scrub_sensitive(val))
+            for key, val in value.items()
+        }
+    if isinstance(value, list | tuple):
+        return [scrub_sensitive(item) for item in value]
+    return value
 
 
 class DatabaseLogHandler(logging.Handler):
@@ -135,6 +174,7 @@ class DatabaseLogHandler(logging.Handler):
         self._enabled = True
         self._enabled_last_check = 0.0
         self._apps_ready = False
+        self._pid = os.getpid()
 
     @property
     def instance(self):
@@ -198,8 +238,30 @@ class DatabaseLogHandler(logging.Handler):
             cls._SystemLog = SystemLog
         return cls._SystemLog
 
+    def _discard_inherited_state(self):
+        """Drop buffer and lock inherited from a parent process after a fork.
+
+        A prefork pool child inherits the parent's buffer, so records still
+        unflushed at fork time would be written once per child — 11 copies at
+        Celery's default concurrency of 10, and again by the parent. The child
+        also inherits ``_buffer_lock``; unlike ``Handler.lock`` it is not
+        re-created by logging's own at-fork hook, so a lock held at the moment
+        of the fork would deadlock the child on its first record.
+
+        Called before taking the lock, and only ever from a child that has just
+        forked, which is single-threaded at that point.
+        """
+        pid = os.getpid()
+        if pid == self._pid:
+            return
+        self._pid = pid
+        self._buffer_lock = threading.Lock()
+        self._buffer = []
+
     def emit(self, record):
         """Buffer log record for later bulk insert."""
+        self._discard_inherited_state()
+
         if not self._check_apps_ready():
             return
 
@@ -276,6 +338,7 @@ class DatabaseLogHandler(logging.Handler):
 
     def close(self):
         """Flush remaining records on shutdown."""
+        self._discard_inherited_state()
         with self._buffer_lock:
             records = self._buffer[:]
             self._buffer.clear()

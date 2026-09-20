@@ -1,5 +1,8 @@
+from decimal import Decimal
 from unittest.mock import patch
 
+from django.test import SimpleTestCase
+from rest_framework import exceptions as rf_exceptions
 from rest_framework import status
 
 from waldur_core.logging import models as event_models
@@ -7,8 +10,10 @@ from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import (
     CustomerRole,
 )
-from waldur_mastermind.marketplace import models
+from waldur_mastermind.marketplace import models, utils
+from waldur_mastermind.marketplace import serializers as serializers_module
 from waldur_mastermind.marketplace.enums import (
+    OPENSTACK_TENANT_OFFERING,
     VMWARE_VM_OFFERING,
     BillingTypes,
     LimitPeriods,
@@ -45,6 +50,22 @@ class OfferingComponentRemoveTest(BaseOfferingUpdateTest):
         # Assert
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         cpu_component.refresh_from_db()
+
+    def test_a_plugin_created_builtin_component_cannot_be_removed(self):
+        # The OpenStack volume type sync creates components like this one: the
+        # plugin does not declare the type, only the stored flag marks it builtin.
+        self.offering.type = OPENSTACK_TENANT_OFFERING
+        self.offering.save()
+        component = factories.OfferingComponentFactory(
+            offering=self.offering, type="gigabytes_ssd", billed_per_plan=True
+        )
+
+        response = self.remove_offering_component(component, "owner")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue(
+            models.OfferingComponent.objects.filter(pk=component.pk).exists()
+        )
 
     def test_it_should_not_be_possible_to_remove_components_if_they_are_used(self):
         # Arrange
@@ -132,6 +153,129 @@ class OfferingComponentCreateTest(BaseOfferingUpdateTest):
         self.assertEqual(LimitPeriods.MONTH, component.limit_period)
 
 
+class OfferingComponentPrecisionTest(BaseOfferingUpdateTest):
+    """A provider may only allow fractional limits where the backend can hold one.
+
+    Plugins whose limits land on an integer quota declare
+    max_limit_decimal_places=0. Without the cap a provider could ask for 0.1 and
+    the plugin would truncate it at the far end, billing for a tenth and
+    granting nothing.
+    """
+
+    def setUp(self):
+        super().setUp()
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_COMPONENTS)
+        self.client.force_authenticate(self.fixture.owner)
+
+    def create_component(self, **extra):
+        url = factories.OfferingFactory.get_url(
+            self.offering, "create_offering_component"
+        )
+        payload = {
+            "type": "storage",
+            "name": "Storage",
+            "measured_unit": "TB",
+            "billing_type": BillingTypes.LIMIT,
+        }
+        payload.update(extra)
+        return self.client.post(url, payload)
+
+    def update_component(self, component, **extra):
+        url = factories.OfferingFactory.get_url(
+            self.offering, "update_offering_component"
+        )
+        payload = {
+            "uuid": component.uuid.hex,
+            "type": component.type,
+            "name": component.name,
+            "measured_unit": component.measured_unit,
+            "billing_type": component.billing_type,
+        }
+        payload.update(extra)
+        return self.client.post(url, payload)
+
+    def test_component_is_integer_only_by_default(self):
+        response = self.create_component()
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(self.offering.components.get().limit_decimal_places, 0)
+
+    def test_precision_can_be_set_on_an_uncapped_offering(self):
+        response = self.create_component(limit_decimal_places=1)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(self.offering.components.get().limit_decimal_places, 1)
+
+    def test_precision_beyond_the_storage_ceiling_is_rejected(self):
+        response = self.create_component(limit_decimal_places=3)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_precision_is_rejected_on_a_capped_offering_at_creation(self):
+        self.offering.type = VMWARE_VM_OFFERING
+        self.offering.save()
+
+        response = self.create_component(type="cpu", limit_decimal_places=1)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("limit_decimal_places", response.data)
+
+    def test_every_plugin_that_cannot_hold_a_fraction_refuses_one(self):
+        """All four caps, not just the two that happened to be covered.
+
+        A plugin declaring max_limit_decimal_places=0 does so because its
+        backend maps a limit onto an integer quota and would truncate a
+        fraction silently at the far end. Both openportal plugins declare it
+        and neither was asserted.
+        """
+        from waldur_mastermind.marketplace_openportal import (
+            PLUGIN_NAME as OPENPORTAL,
+        )
+        from waldur_mastermind.marketplace_openportal_remote import (
+            PLUGIN_NAME as OPENPORTAL_REMOTE,
+        )
+
+        for offering_type in (
+            VMWARE_VM_OFFERING,
+            OPENSTACK_TENANT_OFFERING,
+            OPENPORTAL,
+            OPENPORTAL_REMOTE,
+        ):
+            with self.subTest(offering_type=offering_type):
+                self.offering.type = offering_type
+                self.offering.save()
+                self.offering.components.all().delete()
+
+                response = self.create_component(limit_decimal_places=1)
+
+                self.assertEqual(
+                    response.status_code,
+                    status.HTTP_400_BAD_REQUEST,
+                    f"{offering_type} accepted a fractional component",
+                )
+
+    def test_a_cap_of_zero_still_allows_an_integer_only_component(self):
+        """The cap must refuse precision, not the component itself."""
+        self.offering.type = VMWARE_VM_OFFERING
+        self.offering.save()
+
+        response = self.create_component(type="custom_metric")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    def test_precision_is_rejected_on_a_capped_offering_at_update(self):
+        self.offering.type = OPENSTACK_TENANT_OFFERING
+        self.offering.save()
+        component = factories.OfferingComponentFactory(
+            offering=self.offering, type="storage", billing_type=BillingTypes.LIMIT
+        )
+
+        response = self.update_component(component, limit_decimal_places=1)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("limit_decimal_places", response.data)
+
+
 class OfferingComponentUpdateTest(BaseOfferingUpdateTest):
     def setUp(self):
         super().setUp()
@@ -169,6 +313,78 @@ class OfferingComponentUpdateTest(BaseOfferingUpdateTest):
         self.assertEqual("Cores", component.name)
         self.assertEqual("hours", component.measured_unit)
         self.assertEqual(BillingTypes.FIXED, component.billing_type)
+
+    def test_the_type_of_a_builtin_component_cannot_be_changed(self):
+        self.offering.type = VMWARE_VM_OFFERING
+        self.offering.save()
+        component = factories.OfferingComponentFactory(
+            offering=self.offering, type="cpu", billed_per_plan=True
+        )
+
+        response = self.update_offering_component(
+            {
+                "type": "vcpu",
+                "name": "CPU",
+                "measured_unit": "vCPU",
+                "billing_type": BillingTypes.LIMIT,
+                "uuid": component.uuid.hex,
+            },
+            "owner",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("type", response.data)
+        component.refresh_from_db()
+        self.assertEqual("cpu", component.type)
+
+    def test_a_custom_component_cannot_take_a_builtin_type(self):
+        self.offering.type = VMWARE_VM_OFFERING
+        self.offering.save()
+        component = factories.OfferingComponentFactory(
+            offering=self.offering, type="licence"
+        )
+
+        response = self.update_offering_component(
+            {
+                "type": "cpu",
+                "name": "Licence",
+                "measured_unit": "seats",
+                "billing_type": BillingTypes.FIXED,
+                "uuid": component.uuid.hex,
+            },
+            "owner",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        component.refresh_from_db()
+        self.assertEqual("licence", component.type)
+
+    def test_other_fields_of_a_builtin_component_can_still_be_edited(self):
+        self.offering.type = VMWARE_VM_OFFERING
+        self.offering.save()
+        component = factories.OfferingComponentFactory(
+            offering=self.offering,
+            type="cpu",
+            billed_per_plan=True,
+            billing_type=BillingTypes.LIMIT,
+        )
+
+        response = self.update_offering_component(
+            {
+                "type": "cpu",
+                "name": "Virtual CPU",
+                "measured_unit": "vCPU",
+                "billing_type": BillingTypes.LIMIT,
+                "article_code": "VCPU-1",
+                "uuid": component.uuid.hex,
+            },
+            "owner",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        component.refresh_from_db()
+        self.assertEqual("Virtual CPU", component.name)
+        self.assertEqual("VCPU-1", component.article_code)
 
     def test_update_without_limit_period_preserves_existing_value(self):
         component = factories.OfferingComponentFactory(
@@ -501,6 +717,237 @@ class OfferingComponentPrepaidValidationTest(BaseOfferingUpdateTest):
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("min_prepaid_duration", response.data)
+
+
+class LimitValueFieldShapeTest(SimpleTestCase):
+    """Whole numbers must survive a round trip as int, in both directions.
+
+    The field is a FloatField, and FloatField.to_representation renders a
+    stored 2 as 2.0. These fields are read as well as written — orders and
+    proposal resources both return their limits — so without narrowing on the
+    way out, every integer-only deployment's payloads would change shape.
+    """
+
+    def setUp(self):
+        self.field = serializers_module.LimitValueField()
+
+    def test_whole_numbers_stay_int_on_input(self):
+        for value in (2, 2.0, "2"):
+            self.assertIsInstance(self.field.to_internal_value(value), int)
+
+    def test_whole_numbers_stay_int_on_output(self):
+        for value in (2, 2.0):
+            self.assertIsInstance(self.field.to_representation(value), int)
+
+    def test_fractions_survive_both_directions(self):
+        self.assertEqual(self.field.to_internal_value("0.1"), 0.1)
+        self.assertEqual(self.field.to_representation(0.1), 0.1)
+
+
+class LimitArithmeticTest(SimpleTestCase):
+    """Reallocation adds and subtracts limits, and float addition is not exact.
+
+    0.1 + 0.2 as floats is 0.30000000000000004, which the precision validator
+    then rejects for a reallocation that balances exactly, and which would be
+    written into Order.limits as a limit nobody asked for.
+    """
+
+    def test_fractions_add_exactly(self):
+        self.assertEqual(utils.add_limit_values(0.1, 0.2), 0.3)
+        self.assertEqual(utils.add_limit_values(1.1, 0.3), 1.4)
+
+    def test_subtraction_reaches_a_clean_zero(self):
+        self.assertEqual(utils.add_limit_values(0.3, -0.3), 0)
+
+    def test_whole_numbers_stay_int(self):
+        self.assertIsInstance(utils.add_limit_values(2, 3), int)
+        self.assertIsInstance(utils.add_limit_values(0.5, 0.5), int)
+
+
+class LimitValueFieldRejectsNonFiniteTest(SimpleTestCase):
+    """FloatField accepts nan and inf where the old IntegerField did not.
+
+    MinValueValidator does not catch nan either, because every comparison
+    against it is False, and a nan reaching a jsonb column is a DataError.
+    """
+
+    def setUp(self):
+        self.field = serializers_module.LimitValueField(min_value=0)
+
+    def test_nan_is_rejected(self):
+        with self.assertRaises(rf_exceptions.ValidationError):
+            self.field.to_internal_value(float("nan"))
+
+    def test_infinity_is_rejected(self):
+        with self.assertRaises(rf_exceptions.ValidationError):
+            self.field.to_internal_value(float("inf"))
+
+
+class ComponentBoundPrecisionTest(BaseOfferingUpdateTest):
+    """A component that accepts a fractional limit must be able to describe one.
+
+    The bounds are Decimal columns rather than integers, so a minimum of 0.5 or
+    a default of 0.1 is expressible. They are still rendered as JSON numbers,
+    not DRF's decimal strings: homeport tests these for truthiness, and "0.00"
+    is truthy where 0 is not.
+    """
+
+    def setUp(self):
+        super().setUp()
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_OFFERING_COMPONENTS)
+        self.client.force_authenticate(self.fixture.owner)
+        self.url = factories.OfferingFactory.get_url(
+            self.offering, "create_offering_component"
+        )
+
+    def create(self, **extra):
+        payload = {
+            "type": "storage",
+            "name": "Storage",
+            "measured_unit": "TB",
+            "billing_type": BillingTypes.LIMIT,
+        }
+        payload.update(extra)
+        return self.client.post(self.url, payload)
+
+    def test_bounds_accept_fractional_values(self):
+        response = self.create(
+            limit_decimal_places=1, min_value=0.5, max_value=10.5, default_limit=0.1
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        component = self.offering.components.get()
+        self.assertEqual(component.min_value, Decimal("0.5"))
+        self.assertEqual(component.max_value, Decimal("10.5"))
+        self.assertEqual(component.default_limit, Decimal("0.1"))
+
+    def test_a_fractional_minimum_is_enforced(self):
+        self.create(limit_decimal_places=1, min_value=0.5)
+        self.offering.components.get()
+
+        with self.assertRaises(rf_exceptions.ValidationError):
+            utils.validate_limits({"storage": 0.2}, self.offering, is_creation=True)
+        utils.validate_limits({"storage": 0.5}, self.offering, is_creation=True)
+
+    def test_bounds_are_rendered_as_numbers_not_decimal_strings(self):
+        self.create(limit_decimal_places=1, min_value=0.5, max_value=4)
+        url = factories.OfferingFactory.get_url(self.offering)
+
+        component = self.client.get(url).data["components"][0]
+
+        self.assertEqual(component["min_value"], 0.5)
+        # A whole bound keeps rendering as 4, not 4.0 and not "4.00".
+        self.assertIsInstance(component["max_value"], int)
+
+
+class LegacyIntegerComponentTest(BaseOfferingUpdateTest):
+    """A component from before the Decimal migration must behave identically.
+
+    Every bound was an IntegerField and became DecimalField(20, 2). CI's upgrade
+    job proves the ALTER TABLE applies, but it runs against a database built by
+    migrate_fresh -- zero rows -- so nothing there exercises a component that
+    already carries values. These are those components: whole numbers in every
+    bound, precision left at its default.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.component = factories.OfferingComponentFactory(
+            offering=self.offering,
+            type="storage",
+            billing_type=BillingTypes.LIMIT,
+            min_value=2,
+            max_value=10,
+            max_available_limit=100,
+            default_limit=4,
+        )
+
+    def validate(self, value):
+        return utils.validate_limits(
+            {"storage": value}, self.offering, is_creation=True
+        )
+
+    def test_the_bounds_still_reject_and_accept_as_before(self):
+        with self.assertRaises(rf_exceptions.ValidationError):
+            self.validate(1)
+        with self.assertRaises(rf_exceptions.ValidationError):
+            self.validate(11)
+        self.validate(2)
+        self.validate(10)
+
+    def test_it_is_still_integer_only(self):
+        """The migration must not have quietly enabled fractions."""
+        self.assertEqual(self.component.limit_decimal_places, 0)
+        with self.assertRaises(rf_exceptions.ValidationError):
+            self.validate(5.5)
+
+    def test_the_bounds_are_stored_as_decimal_but_read_back_whole(self):
+        self.component.refresh_from_db()
+
+        self.assertEqual(self.component.min_value, Decimal("2"))
+        self.assertEqual(self.component.max_value, Decimal("10"))
+        self.assertEqual(self.component.default_limit, Decimal("4"))
+
+    def test_the_api_still_renders_whole_bounds_as_integers(self):
+        """What an existing SDK consumer sees must not change shape."""
+        self.client.force_authenticate(self.fixture.owner)
+
+        response = self.client.get(factories.OfferingFactory.get_url(self.offering))
+
+        component = next(
+            c for c in response.data["components"] if c["type"] == "storage"
+        )
+        for field in ("min_value", "max_value", "max_available_limit", "default_limit"):
+            self.assertIsInstance(
+                component[field], int, f"{field} is {type(component[field])}"
+            )
+
+
+class LimitPrecisionValidationTest(BaseOfferingUpdateTest):
+    """validate_limits is the one chokepoint every route into limits passes.
+
+    Rather than deciding precision in each of the eight serializers that carry a
+    limit, the component decides and validate_limits enforces — so ordering,
+    updating, renewing, reallocating, a limit change request and a proposal
+    resource template all agree without repeating the rule.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.component = factories.OfferingComponentFactory(
+            offering=self.offering,
+            type="storage",
+            billing_type=BillingTypes.LIMIT,
+        )
+
+    def validate(self, value):
+        return utils.validate_limits(
+            {"storage": value}, self.offering, is_creation=True
+        )
+
+    def set_precision(self, places):
+        self.component.limit_decimal_places = places
+        self.component.save(update_fields=["limit_decimal_places"])
+
+    def test_integer_component_accepts_a_whole_number(self):
+        self.validate(5)
+
+    def test_integer_component_rejects_a_fraction(self):
+        with self.assertRaises(rf_exceptions.ValidationError):
+            self.validate(0.5)
+
+    def test_component_accepts_a_fraction_within_its_precision(self):
+        self.set_precision(1)
+        self.validate(0.5)
+
+    def test_component_rejects_a_fraction_finer_than_its_precision(self):
+        self.set_precision(1)
+        with self.assertRaises(rf_exceptions.ValidationError):
+            self.validate(0.55)
+
+    def test_fractional_component_still_accepts_a_whole_number(self):
+        self.set_precision(2)
+        self.validate(7)
 
 
 class OfferingComponentMigrationTest(BaseOfferingUpdateTest):

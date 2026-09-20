@@ -17,7 +17,6 @@ from celery.app import shared_task
 from dateutil.relativedelta import relativedelta
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
-from django.db.models import Q
 from django.utils import dateparse, timezone
 from httpx import TransportError
 from rest_framework import exceptions as rf_exceptions
@@ -39,11 +38,14 @@ from waldur_core.structure import models as structure_models
 from waldur_core.structure.exceptions import ServiceBackendError
 from waldur_core.structure.tasks import BackgroundListPullTask, BackgroundPullTask
 from waldur_mastermind.marketplace import models
+from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.callbacks import sync_order_state
 from waldur_mastermind.marketplace.enums import (
     REMOTE_OFFERING,
     MaintenanceState,
+    MissingUsagePolicies,
     OfferingStates,
+    OfferingUserStates,
     OrderStates,
     OrderTypes,
     ResourceStates,
@@ -64,7 +66,9 @@ from waldur_mastermind.marketplace_remote.constants import (
 from waldur_mastermind.marketplace_remote.exceptions import RemoteWaldurError
 from waldur_mastermind.marketplace_remote.utils import (
     get_client_for_offering,
+    keep_local_plugin_options,
     pull_fields,
+    pull_offering_user_runtime_state_fields,
     sync_project_permission,
 )
 
@@ -113,7 +117,11 @@ class OfferingPullTask(BackgroundPullTask):
             remote_offering = marketplace_public_offerings_retrieve.sync(
                 client=client, uuid=local_offering.backend_id
             )
-            pull_fields(OFFERING_FIELDS, local_offering, remote_offering.to_dict())
+            pull_fields(
+                OFFERING_FIELDS,
+                local_offering,
+                keep_local_plugin_options(local_offering, remote_offering.to_dict()),
+            )
             utils.import_offering_thumbnail(local_offering, remote_offering.thumbnail)
             self.sync_offering_components(local_offering, remote_offering.components)
             self.sync_plans(local_offering, remote_offering.plans)
@@ -442,12 +450,23 @@ class OfferingUserPullTask(BackgroundPullTask):
         from waldur_api_client.api.marketplace_offering_users import (
             marketplace_offering_users_list,
         )
+        from waldur_api_client.models.offering_user_field_enum import (
+            OfferingUserFieldEnum,
+        )
 
         client = get_client_for_offering(local_offering)
         remote_offering_users = {
-            remote_offering_user.user_username: remote_offering_user.username
+            remote_offering_user.user_username: remote_offering_user
             for remote_offering_user in marketplace_offering_users_list.sync_all(
-                client=client, offering_uuid=[UUID(local_offering.backend_id)]
+                client=client,
+                offering_uuid=[UUID(local_offering.backend_id)],
+                field=[
+                    OfferingUserFieldEnum.USER_USERNAME,
+                    OfferingUserFieldEnum.USERNAME,
+                    OfferingUserFieldEnum.RUNTIME_STATE,
+                    OfferingUserFieldEnum.SERVICE_PROVIDER_COMMENT,
+                    OfferingUserFieldEnum.SERVICE_PROVIDER_COMMENT_URL,
+                ],
             )
         }
         # Build lookup dicts upfront to avoid N+1 queries
@@ -455,7 +474,7 @@ class OfferingUserPullTask(BackgroundPullTask):
             offering_user.user.username: offering_user
             for offering_user in models.OfferingUser.objects.filter(
                 offering=local_offering
-            ).select_related("user")
+            ).select_related("user", "offering__customer")
         }
         local_offering_users = {
             username: offering_user.username
@@ -477,11 +496,23 @@ class OfferingUserPullTask(BackgroundPullTask):
                 )
                 continue
             user = user_map[local_username]
-            models.OfferingUser.objects.create(
-                user=user,
-                offering=local_offering,
-                username=remote_offering_users[local_username],
+            remote_offering_user = remote_offering_users[local_username]
+            remote_username = remote_offering_user.username
+            # Through the shared creator so a provider-scoped offering gets a
+            # backed account; the remote's username only applies outside it.
+            # state is passed rather than left to the creator's own rule, which
+            # would open an account with a username as OK -- that is a change to
+            # what this sync means and does not belong in this branch.
+            offering_user, _ = marketplace_utils.create_offering_user(
+                user,
+                local_offering,
+                username=remote_username if isinstance(remote_username, str) else "",
+                state=OfferingUserStates.CREATION_REQUESTED,
             )
+            if offering_user.state != OfferingUserStates.DELETED:
+                pull_offering_user_runtime_state_fields(
+                    offering_user, remote_offering_user
+                )
 
         stale = set(local_offering_users.keys()) - set(remote_offering_users.keys())
         for local_username in stale:
@@ -507,20 +538,31 @@ class OfferingUserPullTask(BackgroundPullTask):
 
         common = set(local_offering_users.keys()) & set(remote_offering_users.keys())
         for local_username in common:
-            remote_username = remote_offering_users[local_username]
-            if local_offering_users[local_username] == remote_username:
-                continue
-            # O(1) lookup instead of database query
+            remote_offering_user = remote_offering_users[local_username]
+            remote_username = remote_offering_user.username
             offering_user = local_offering_user_objects[local_username]
-            offering_user.username = remote_username
-            offering_user.save(update_fields=["username"])
+            # A backed account's username is owned by its provider account, so
+            # the remote's name does not apply: under provider scope the two
+            # routinely differ, and writing here would raise every hour.
+            if (
+                isinstance(remote_username, str)
+                and not offering_user.is_provider_backed
+                and offering_user.username != remote_username
+            ):
+                offering_user.username = remote_username
+                offering_user.save(update_fields=["username"])
+            if offering_user.state != OfferingUserStates.DELETED:
+                pull_offering_user_runtime_state_fields(
+                    offering_user, remote_offering_user
+                )
 
 
 class OfferingUserListPullTask(BackgroundListPullTask):
     """Pull and synchronize remote marketplace offering users.
 
     This task synchronizes user associations with marketplace offerings from
-    remote Waldur instances, ensuring local user mappings are up to date.
+    remote Waldur instances, including usernames and runtime metadata
+    (runtime_state, service provider comments).
     Runs every 60 minutes via celery beat.
     """
 
@@ -528,11 +570,11 @@ class OfferingUserListPullTask(BackgroundListPullTask):
     pull_task = OfferingUserPullTask
 
     def get_pulled_objects(self):
+        # Accounts of a remote offering are managed by the remote Waldur, so
+        # they are pulled independently of plugin options, which are synced
+        # from the remote offering.
         return models.Offering.objects.filter(
             type=REMOTE_OFFERING, secret_options__has_keys=["api_url", "token"]
-        ).filter(
-            Q(plugin_options__service_provider_can_create_offering_user__isnull=True)
-            | Q(plugin_options__service_provider_can_create_offering_user=False)
         )
 
 
@@ -848,6 +890,28 @@ def pull_offering_orders(serialized_offering):
         OrderPullTask().delay(serialize_instance(order))
 
 
+def _resolve_missing_usage_policy(remote_usage) -> str:
+    """Read the missing-usage policy off a remote usage record.
+
+    A remote Waldur older than the one that introduced ``missing_usage_policy``
+    only returns the deprecated ``recurring`` boolean.
+
+    The generated client model is attrs-slotted with no ``__getattr__``, so
+    until the pinned SDK is regenerated the field never becomes an attribute —
+    it arrives in ``additional_properties``. Read both, so an upgraded remote
+    is honoured without waiting for the SDK bump.
+    """
+    policy = getattr(remote_usage, "missing_usage_policy", None)
+    if policy is None:
+        extra = getattr(remote_usage, "additional_properties", None) or {}
+        policy = extra.get("missing_usage_policy")
+    if isinstance(policy, str) and policy in dict(MissingUsagePolicies.CHOICES):
+        return policy
+    if getattr(remote_usage, "recurring", False) is True:
+        return MissingUsagePolicies.REUSE
+    return MissingUsagePolicies.NONE
+
+
 class UsagePullTask(BackgroundPullTask):
     def run(self, serialized_instance, **kwargs):
         instance = deserialize_instance(serialized_instance)
@@ -919,6 +983,20 @@ class UsagePullTask(BackgroundPullTask):
             )
         }
 
+        # Same for offering users, which _process_user_usages would otherwise
+        # look up once per user usage - that is once per usage per user.
+        # (offering, username) is not unique, only (offering, user) is, so
+        # order explicitly and keep the first match: the unordered .first()
+        # this replaces picked an arbitrary row among duplicates.
+        offering_users_by_username = {}
+        for offering_user in (
+            models.OfferingUser.objects.filter(offering=local_resource.offering)
+            .exclude(username="")
+            .exclude(username=None)
+            .order_by("id")
+        ):
+            offering_users_by_username.setdefault(offering_user.username, offering_user)
+
         processed_count = 0
         for remote_usage in remote_usages:
             offering_component = offering_components.get(remote_usage.type_)
@@ -937,7 +1015,9 @@ class UsagePullTask(BackgroundPullTask):
                 "description": remote_usage.description,
                 "created": remote_usage.created,
                 "date": usage_date,
-                "recurring": remote_usage.recurring,
+                # Older remote Waldur deployments only expose the deprecated
+                # `recurring` boolean; map it onto the policy in that case.
+                "missing_usage_policy": _resolve_missing_usage_policy(remote_usage),
                 "backend_id": remote_usage.uuid.hex,
             }
             plan_period = get_or_create_plan_period(local_resource, usage_date)
@@ -954,7 +1034,7 @@ class UsagePullTask(BackgroundPullTask):
             remote_user_usages = user_usages_by_key.get(key, [])
             if remote_user_usages:
                 self._process_user_usages(
-                    local_resource, component_usage, remote_user_usages
+                    component_usage, remote_user_usages, offering_users_by_username
                 )
 
             processed_count += 1
@@ -972,7 +1052,9 @@ class UsagePullTask(BackgroundPullTask):
             local_resource,
         )
 
-    def _process_user_usages(self, local_resource, component_usage, remote_user_usages):
+    def _process_user_usages(
+        self, component_usage, remote_user_usages, offering_users_by_username
+    ):
         """Process user usages for a component usage."""
         for remote_user_usage in remote_user_usages:
             if not remote_user_usage.username:
@@ -981,10 +1063,7 @@ class UsagePullTask(BackgroundPullTask):
                 usage = Decimal(0)
             else:
                 usage = Decimal(remote_user_usage.usage)
-            offering_user = models.OfferingUser.objects.filter(
-                offering=local_resource.offering,
-                username=remote_user_usage.username,
-            ).first()
+            offering_user = offering_users_by_username.get(remote_user_usage.username)
             models.ComponentUserUsage.objects.update_or_create(
                 component_usage=component_usage,
                 username=remote_user_usage.username,

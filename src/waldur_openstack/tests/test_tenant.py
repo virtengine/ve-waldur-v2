@@ -14,7 +14,7 @@ from waldur_core.permissions.fixtures import ProjectRole
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.common import utils as common_utils
 from waldur_mastermind.marketplace_openstack import views as marketplace_views
-from waldur_openstack import executors, models, tasks
+from waldur_openstack import executors, models, serializers, tasks
 from waldur_openstack.tests.helpers import override_openstack_settings
 
 from . import factories, fixtures
@@ -69,7 +69,7 @@ class TenantGetTest(BaseTenantActionsTest):
 
 
 @ddt
-class TenantCreateTest(test.APITransactionTestCase, BaseTenantActionsTest):
+class TenantCreateTest(BaseTenantActionsTest):
     def setUp(self):
         super().setUp()
         self.valid_data = {
@@ -342,6 +342,144 @@ class TenantCreateTest(test.APITransactionTestCase, BaseTenantActionsTest):
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def create_tenant_with_default_security_groups(self, **extra):
+        response = self.create_tenant_request(
+            self.fixture.staff, {**self.valid_data, **extra}
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        return models.Tenant.objects.get(name=self.valid_data["name"])
+
+    def create_external_subnet(self, cidr, ip_version, network=None):
+        if network is None:
+            network = factories.ExternalNetworkFactory(settings=self.fixture.settings)
+        return factories.ExternalSubnetFactory(
+            network=network, cidr=cidr, gateway_ip=None, ip_version=ip_version
+        )
+
+    def use_external_network(self, network):
+        self.fixture.settings.options["external_network_id"] = network.backend_id
+        self.fixture.settings.save()
+
+    def assert_default_security_groups_are_ipv4_only(self, tenant):
+        for name in ("ssh", "ping", "rdp", "web"):
+            rules = tenant.security_groups.get(name=name).rules.all()
+            self.assertTrue(rules.exists(), name)
+            self.assertEqual(
+                {(rule.ethertype, rule.cidr) for rule in rules},
+                {(models.SecurityGroupRule.IPv4, "0.0.0.0/0")},
+                name,
+            )
+
+    def test_default_security_groups_are_ipv4_only_in_ipv4_only_cloud(self):
+        self.create_external_subnet("203.0.113.0/24", 4)
+
+        tenant = self.create_tenant_with_default_security_groups()
+
+        self.assert_default_security_groups_are_ipv4_only(tenant)
+
+    def test_default_security_groups_are_ipv4_only_if_external_subnets_are_unknown(
+        self,
+    ):
+        tenant = self.create_tenant_with_default_security_groups()
+
+        self.assert_default_security_groups_are_ipv4_only(tenant)
+
+    def test_ipv6_on_another_external_network_does_not_open_ipv6(self):
+        used = self.create_external_subnet("203.0.113.0/24", 4).network
+        self.create_external_subnet("2001:db8::/64", 6)
+        self.use_external_network(used)
+
+        tenant = self.create_tenant_with_default_security_groups()
+
+        self.assert_default_security_groups_are_ipv4_only(tenant)
+
+    def test_default_security_groups_have_ipv6_twins_if_external_network_has_ipv6(
+        self,
+    ):
+        network = self.create_external_subnet("203.0.113.0/24", 4).network
+        self.create_external_subnet("2001:db8::/64", 6, network=network)
+        self.use_external_network(network)
+
+        tenant = self.create_tenant_with_default_security_groups()
+
+        self.assert_default_security_groups_have_ipv6_twins(tenant)
+
+    def test_default_security_groups_have_ipv6_twins_if_tenant_subnet_is_ipv6(self):
+        self.create_external_subnet("203.0.113.0/24", 4)
+
+        tenant = self.create_tenant_with_default_security_groups(
+            subnet_cidr="fd00:42::/64"
+        )
+
+        self.assert_default_security_groups_have_ipv6_twins(tenant)
+
+    def test_explicit_security_groups_are_created_as_requested_in_ipv4_only_cloud(
+        self,
+    ):
+        self.create_external_subnet("203.0.113.0/24", 4)
+        ssh = {"protocol": "tcp", "from_port": 22, "to_port": 22}
+
+        tenant = self.create_tenant_with_default_security_groups(
+            security_groups=[
+                {
+                    "name": "ssh",
+                    "rules": [
+                        {**ssh, "ethertype": "IPv4", "cidr": "0.0.0.0/0"},
+                        {**ssh, "ethertype": "IPv6", "cidr": "::/0"},
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(
+            {
+                (rule.ethertype, rule.cidr)
+                for rule in tenant.security_groups.get(name="ssh").rules.all()
+            },
+            {
+                (models.SecurityGroupRule.IPv4, "0.0.0.0/0"),
+                (models.SecurityGroupRule.IPv6, "::/0"),
+            },
+        )
+
+    def assert_default_security_groups_have_ipv6_twins(self, tenant):
+        # ICMPv6 is its own IP protocol; every other protocol is shared.
+        ipv6_protocol_for = {"icmp": "58"}
+        for name in ("ssh", "ping", "rdp", "web"):
+            rules = list(tenant.security_groups.get(name=name).rules.all())
+            ipv4 = {
+                (rule.protocol, rule.from_port, rule.to_port)
+                for rule in rules
+                if rule.ethertype == models.SecurityGroupRule.IPv4
+                and rule.cidr == "0.0.0.0/0"
+            }
+            ipv6 = {
+                (rule.protocol, rule.from_port, rule.to_port)
+                for rule in rules
+                if rule.ethertype == models.SecurityGroupRule.IPv6
+                and rule.cidr == "::/0"
+            }
+            self.assertTrue(ipv4, name)
+            self.assertEqual(len(ipv4) + len(ipv6), len(rules), name)
+            self.assertEqual(
+                {
+                    (ipv6_protocol_for.get(protocol, protocol), from_port, to_port)
+                    for protocol, from_port, to_port in ipv4
+                },
+                ipv6,
+                name,
+            )
+            for rule in rules:
+                serializers.validate_security_group_rule(
+                    {
+                        "ethertype": rule.ethertype,
+                        "protocol": rule.protocol,
+                        "from_port": rule.from_port,
+                        "to_port": rule.to_port,
+                        "cidr": rule.cidr,
+                    }
+                )
+
     def test_tenant_is_created_with_custom_security_groups(self):
         payload = self.valid_data.copy()
         payload["security_groups"] = [
@@ -419,6 +557,56 @@ class TenantCreateTest(test.APITransactionTestCase, BaseTenantActionsTest):
         tenant = models.Tenant.objects.get(name=self.valid_data["name"])
         subnet = models.SubNet.objects.get(tenant=tenant)
         self.assertFalse(subnet.allocation_pools)
+
+    def _set_default_nameservers(self, nameservers):
+        self.fixture.settings.options["dns_nameservers"] = nameservers
+        self.fixture.settings.save()
+
+    def test_an_ipv6_subnet_cidr_creates_an_ipv6_slaac_default_subnet(self):
+        self._set_default_nameservers(["8.8.8.8", "2001:4860:4860::8888"])
+        payload = {**self.valid_data, "subnet_cidr": "2001:db8:b1::/64"}
+
+        response = self.create_tenant_request(self.fixture.staff, payload)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        subnet = models.SubNet.objects.get(tenant__uuid=response.data["uuid"])
+        self.assertEqual(subnet.cidr, "2001:db8:b1::/64")
+        self.assertEqual(subnet.ip_version, 6)
+        self.assertEqual(subnet.ipv6_ra_mode, "slaac")
+        self.assertEqual(subnet.ipv6_address_mode, "slaac")
+        self.assertEqual(subnet.dns_nameservers, ["2001:4860:4860::8888"])
+
+    def test_the_default_ipv4_subnet_is_unchanged(self):
+        self._set_default_nameservers(["8.8.8.8", "2001:4860:4860::8888"])
+
+        response = self.create_tenant_request(self.fixture.staff, self.valid_data)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        subnet = models.SubNet.objects.get(tenant__uuid=response.data["uuid"])
+        self.assertEqual(subnet.cidr, "192.168.42.0/24")
+        self.assertEqual(subnet.ip_version, 4)
+        self.assertIsNone(subnet.ipv6_ra_mode)
+        self.assertIsNone(subnet.ipv6_address_mode)
+        self.assertEqual(subnet.dns_nameservers, ["8.8.8.8"])
+
+    @data(
+        "2001:db8:b1::/56",
+        "2001:db8:b1::/80",
+        "2001:db8:b1::",
+        "192.168.42.0",
+        "not-a-network",
+        "192.168.42.0/33",
+    )
+    def test_a_subnet_cidr_neutron_would_refuse_is_rejected(self, subnet_cidr):
+        payload = {**self.valid_data, "subnet_cidr": subnet_cidr}
+
+        response = self.create_tenant_request(self.fixture.staff, payload)
+
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
+        self.assertIn("subnet_cidr", response.data)
+        self.assertFalse(models.Tenant.objects.filter(name=payload["name"]).exists())
 
 
 @ddt
@@ -814,6 +1002,77 @@ class TenantCreateFloatingIPTest(BaseTenantActionsTest):
             self.url,
             {"router": factories.RouterFactory.get_url(router)},
         )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        mocked_task.assert_called_once()
+
+    def _use_imported_external_network(self, *ip_versions):
+        network = factories.ExternalNetworkFactory(settings=self.fixture.settings)
+        for ip_version in ip_versions:
+            if ip_version == 6:
+                factories.ExternalSubnetFactory(
+                    network=network,
+                    ip_version=6,
+                    cidr="2001:db8::/64",
+                    gateway_ip="2001:db8::1",
+                )
+            else:
+                factories.ExternalSubnetFactory(network=network, ip_version=4)
+        self.tenant.external_network_id = network.backend_id
+        self.tenant.external_network_ref = network
+        self.tenant.save()
+        return network
+
+    def test_floating_ip_is_refused_when_external_network_has_no_ipv4_subnet(
+        self, mocked_task
+    ):
+        self._use_imported_external_network(6)
+
+        response = self.client.post(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("IPv6", str(response.data))
+        self.assertEqual(self.tenant.floating_ips.count(), 0)
+        mocked_task.assert_not_called()
+
+    def test_floating_ip_is_allowed_when_external_network_has_ipv4_subnet(
+        self, mocked_task
+    ):
+        self._use_imported_external_network(4)
+
+        response = self.client.post(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        mocked_task.assert_called_once()
+
+    def test_floating_ip_is_allowed_when_external_network_is_dual_stack(
+        self, mocked_task
+    ):
+        self._use_imported_external_network(4, 6)
+
+        response = self.client.post(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        mocked_task.assert_called_once()
+
+    def test_floating_ip_is_allowed_when_external_network_subnets_are_unknown(
+        self, mocked_task
+    ):
+        self._use_imported_external_network()
+
+        response = self.client.post(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        mocked_task.assert_called_once()
+
+    def test_floating_ip_is_allowed_when_external_network_is_not_imported(
+        self, mocked_task
+    ):
+        self.tenant.external_network_id = "not-imported-external-network"
+        self.tenant.external_network_ref = None
+        self.tenant.save()
+
+        response = self.client.post(self.url)
+
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
         mocked_task.assert_called_once()
 

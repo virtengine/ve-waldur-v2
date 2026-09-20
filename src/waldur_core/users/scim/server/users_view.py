@@ -23,6 +23,7 @@ from waldur_auth_social.utils import (
     update_user_attributes_from_source,
 )
 from waldur_core.core.models import User
+from waldur_core.users.scim.server import matching
 from waldur_core.users.scim.server.auth import (
     IsScimStaff,
     ScimBearerAuthentication,
@@ -59,7 +60,7 @@ from waldur_core.users.scim.server.ssh_keys import (
 )
 
 
-class _UsersBaseView(APIView):
+class UsersBaseView(APIView):
     renderer_classes = [ScimJSONRenderer]
     parser_classes = [ScimJSONParser, ScimJSONParserPlain]
     authentication_classes = [ScimBearerAuthentication]
@@ -74,7 +75,7 @@ def _allowed_fields() -> set[str]:
     return set(config.SCIM_INBOUND_ALLOWED_ATTRIBUTES or [])
 
 
-def _source() -> str:
+def scim_source() -> str:
     return config.SCIM_INBOUND_SOURCE_NAME or "scim:default"
 
 
@@ -98,7 +99,10 @@ def _serialize(user: User, request) -> dict:
 
 
 def _find_user(body: dict) -> User | None:
-    """Lookup priority: externalId → userName → primary email.
+    """Lookup priority: externalId → configured match attribute → primary email.
+
+    The match attribute is ``userName`` → ``username`` unless configured
+    otherwise (see ``matching``).
 
     Uses ``all_objects`` — deactivated users must stay addressable so the IdM
     gets a 409 instead of a crash on re-create, and can reactivate them.
@@ -111,11 +115,9 @@ def _find_user(body: dict) -> User | None:
         if candidate:
             return candidate
 
-    user_name = body.get("userName")
-    if user_name:
-        candidate = User.all_objects.filter(username__iexact=user_name).first()
-        if candidate:
-            return candidate
+    candidate = matching.find_matching_user(body)
+    if candidate:
+        return candidate
 
     if getattr(config, "OIDC_MATCHMAKING_BY_EMAIL", False):
         primary_email = _primary_email(body.get("emails"))
@@ -138,27 +140,27 @@ def _primary_email(emails) -> str | None:
 
 
 def _normalize_username(raw: str) -> str:
-    """Waldur usernames must match [0-9a-z_.@+-]+. SCIM userNames may include
-    other characters and uppercase — we lowercase and strip incompatible
-    characters rather than rejecting, so common IdP values still flow through.
-    """
-    import re as _re
-
-    cleaned = "".join(_re.findall(r"[0-9a-z_.@+\-]+", raw.lower()))
-    if not cleaned:
-        raise ScimError(
-            400,
-            f"userName {raw!r} contains no characters valid for a Waldur username.",
-            scim_type="invalidValue",
-        )
-    return cleaned
+    return matching.normalize_username(raw)
 
 
 @transaction.atomic
-def _create_user(body: dict, request) -> User:
-    raw_username = body.get("userName")
-    if not raw_username:
-        raise ScimError(400, "userName is required.", scim_type="invalidValue")
+def create_user(body: dict, request) -> User:
+    match_field = matching.waldur_attribute()
+    match_value = matching.match_value(body)
+    if not match_value:
+        raise ScimError(
+            400,
+            f"{matching.scim_attribute()} is required.",
+            scim_type="invalidValue",
+        )
+    if match_field == matching.DEFAULT_WALDUR_ATTRIBUTE:
+        # The account is named after the matched value, so a later login that
+        # presents the same value finds it instead of creating a second one.
+        raw_username = match_value
+    else:
+        raw_username = body.get("userName")
+        if not raw_username:
+            raise ScimError(400, "userName is required.", scim_type="invalidValue")
     username = _normalize_username(raw_username)
 
     if User.all_objects.filter(username=username).exists():
@@ -176,15 +178,18 @@ def _create_user(body: dict, request) -> User:
         is_active=True if active is None else bool(active),
     )
     user.set_unusable_password()
+    if match_field != matching.DEFAULT_WALDUR_ATTRIBUTE:
+        setattr(user, match_field, match_value)
+        user.save(update_fields=[match_field])
 
     payload = scim_to_waldur_payload(body)
     update_user_attributes_from_source(
-        user, payload, source=_source(), allowed_fields=_allowed_fields()
+        user, payload, source=scim_source(), allowed_fields=_allowed_fields()
     )
 
     external_id = body.get("externalId")
     if external_id:
-        set_scim_external_id(user, str(external_id), source=_source())
+        set_scim_external_id(user, str(external_id), source=scim_source())
         user.save(update_fields=["attribute_sources"])
 
     if _ssh_keys_enabled():
@@ -196,44 +201,57 @@ def _create_user(body: dict, request) -> User:
     return user
 
 
-def _update_user(user: User, body: dict, *, full_replace: bool) -> User:
+def _check_username_unchanged(user: User, body: dict) -> None:
+    if matching.waldur_attribute() == matching.DEFAULT_WALDUR_ATTRIBUTE:
+        submitted = matching.match_value(body)
+        attribute = matching.scim_attribute()
+    else:
+        submitted = body.get("userName")
+        attribute = "userName"
+    if submitted is not None and _normalize_username(submitted) != user.username:
+        raise ScimError(
+            400,
+            f"Changing '{attribute}' after creation is not supported.",
+            scim_type="mutability",
+        )
+
+
+def update_user(
+    user: User, body: dict, *, full_replace: bool, check_username: bool = True
+) -> User:
     """Apply a PUT-style full replace to an existing user.
 
     Mutability rules:
     - ``userName`` is immutable post-creation; attempting to change it returns 400.
+      Callers that identify the account some other way (the SRAM profile links
+      it by ``externalId``) pass ``check_username=False``: the username then
+      stays what it was, even if the match settings changed since.
     - ``active=false`` triggers ``remove_user_from_isd``.
     """
-    submitted = body.get("userName")
-    if submitted is not None:
-        normalized = _normalize_username(submitted)
-        if normalized != user.username:
-            raise ScimError(
-                400,
-                "Changing 'userName' after creation is not supported.",
-                scim_type="mutability",
-            )
+    if check_username:
+        _check_username_unchanged(user, body)
 
     payload = scim_to_waldur_payload(body)
     update_user_attributes_from_source(
-        user, payload, source=_source(), allowed_fields=_allowed_fields()
+        user, payload, source=scim_source(), allowed_fields=_allowed_fields()
     )
 
     if "externalId" in body:
         external_id = body["externalId"]
         if external_id:
-            set_scim_external_id(user, str(external_id), source=_source())
+            set_scim_external_id(user, str(external_id), source=scim_source())
             user.save(update_fields=["attribute_sources"])
 
     active = body.get("active")
     if isinstance(active, str):
         active = active.lower() == "true"
     if active is False:
-        remove_user_from_isd(user, source=_source())
+        remove_user_from_isd(user, source=scim_source())
     elif active is True and not user.is_active:
         # Reactivation: clear deactivation reason and flip flag.
         user.is_active = True
         user.deactivation_reason = ""
-        user._change_source = _source()
+        user._change_source = scim_source()
         user.save(update_fields=["is_active", "deactivation_reason"])
 
     if _ssh_keys_enabled():
@@ -248,7 +266,7 @@ def _update_user(user: User, body: dict, *, full_replace: bool) -> User:
 
 
 @extend_schema(exclude=True)
-class UsersListView(_UsersBaseView):
+class UsersListView(UsersBaseView):
     """``/scim/v2/Users`` — list + create."""
 
     def get(self, request):
@@ -282,7 +300,7 @@ class UsersListView(_UsersBaseView):
                 f"User already exists (uuid={existing.uuid.hex}).",
                 scim_type="uniqueness",
             )
-        user = _create_user(body, request)
+        user = create_user(body, request)
         response = Response(_serialize(user, request), status=status.HTTP_201_CREATED)
         response["Location"] = _user_location(request, user)
         return response
@@ -298,7 +316,7 @@ def _get_user_or_404(uuid_hex: str) -> User:
 
 
 @extend_schema(exclude=True)
-class UserDetailView(_UsersBaseView):
+class UserDetailView(UsersBaseView):
     """``/scim/v2/Users/<uuid>`` — read / replace / patch / delete."""
 
     def get(self, request, uuid_hex):
@@ -311,7 +329,7 @@ class UserDetailView(_UsersBaseView):
         if not isinstance(body, dict):
             raise ScimError(400, "Request body must be a JSON object.")
         with transaction.atomic():
-            user = _update_user(user, body, full_replace=True)
+            user = update_user(user, body, full_replace=True)
         return Response(_serialize(user, request))
 
     def patch(self, request, uuid_hex):
@@ -323,13 +341,13 @@ class UserDetailView(_UsersBaseView):
                 update_user_attributes_from_source(
                     user,
                     patch_result.attributes,
-                    source=_source(),
+                    source=scim_source(),
                     allowed_fields=_allowed_fields(),
                 )
             if patch_result.set_external_id is not None:
                 if patch_result.set_external_id:
                     set_scim_external_id(
-                        user, patch_result.set_external_id, source=_source()
+                        user, patch_result.set_external_id, source=scim_source()
                     )
                 else:
                     sources = dict(user.attribute_sources or {})
@@ -338,12 +356,12 @@ class UserDetailView(_UsersBaseView):
                 user.save(update_fields=["attribute_sources"])
             if patch_result.set_active is not None:
                 if patch_result.set_active is False:
-                    remove_user_from_isd(user, source=_source())
+                    remove_user_from_isd(user, source=scim_source())
                 else:
                     if not user.is_active:
                         user.is_active = True
                         user.deactivation_reason = ""
-                        user._change_source = _source()
+                        user._change_source = scim_source()
                         user.save(update_fields=["is_active", "deactivation_reason"])
             if _ssh_keys_enabled():
                 if patch_result.replace_ssh_keys is not None:
@@ -368,5 +386,5 @@ class UserDetailView(_UsersBaseView):
         # Waldur uses soft-delete: route through remove_user_from_isd so the
         # deactivation policy applies and attribute provenance is preserved.
         with transaction.atomic():
-            remove_user_from_isd(user, source=_source())
+            remove_user_from_isd(user, source=scim_source())
         return Response(status=status.HTTP_204_NO_CONTENT)

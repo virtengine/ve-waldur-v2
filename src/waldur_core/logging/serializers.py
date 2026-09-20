@@ -7,13 +7,20 @@ from django.utils.translation import gettext_lazy as _
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
+from waldur_core.core import auth_utils
 from waldur_core.core.authentication import refresh_token
 from waldur_core.core.fields import NaturalChoiceField
 from waldur_core.core.serializers import (
     AllowedScopeInputSerializer,
     RestrictedSerializerMixin,
 )
-from waldur_core.logging import backend, enums, event_logger, models
+from waldur_core.logging import (
+    backend,
+    enums,
+    event_dispatch,
+    event_logger,
+    models,
+)
 from waldur_core.permissions.enums import TYPE_MAP
 from waldur_core.permissions.utils import holds_any_role_on_scope_or_ancestor
 
@@ -524,6 +531,17 @@ class RmqQueueStatsSerializer(serializers.Serializer):
         read_only=True,
         allow_null=True,
         help_text="Parsed object type from queue name (e.g., 'resource', 'order')",
+    )
+    consumer_uuid = serializers.CharField(
+        read_only=True,
+        allow_null=True,
+        help_text="Parsed EventConsumer UUID from a unified consumer queue name",
+    )
+    queue_kind = serializers.ChoiceField(
+        choices=enums.QueueKind.choices(),
+        read_only=True,
+        help_text="How Waldur uses the queue: a unified consumer queue, a legacy "
+        "subscription queue, or one whose name matches neither",
     )
     message_ttl = serializers.IntegerField(
         read_only=True,
@@ -1253,6 +1271,24 @@ class DeadLetterQueueSerializer(serializers.Serializer):
     )
 
 
+# Event-consumer bindings accept one scope type beyond the shared TYPE_MAP: a
+# self-referential "user" binding for a user's own identity events
+# (user_profile, user_ssh_key, user_lifecycle, user_role). Deliberately kept
+# OUT of TYPE_MAP — that map also validates Personal Access Token scopes,
+# invitation targets and role content types, none of which should accept users.
+EVENT_CONSUMER_TYPE_MAP = {**TYPE_MAP, "user": ("core", "user")}
+
+
+class EventConsumerScopeInputSerializer(AllowedScopeInputSerializer):
+    def validate_type(self, value):
+        if value not in EVENT_CONSUMER_TYPE_MAP:
+            raise serializers.ValidationError(
+                f"Unknown scope type '{value}'. Expected one of: "
+                f"{sorted(EVENT_CONSUMER_TYPE_MAP)}."
+            )
+        return value
+
+
 class EventConsumerRegistrationSerializer(serializers.Serializer):
     """Input for registering an event-consumer queue."""
 
@@ -1272,15 +1308,17 @@ class EventConsumerRegistrationSerializer(serializers.Serializer):
             "filter unchanged."
         ),
     )
-    scopes = AllowedScopeInputSerializer(
+    scopes = EventConsumerScopeInputSerializer(
         many=True,
         required=False,
         default=list,
         help_text=(
             "Entity bindings this consumer receives events for — e.g. "
-            "several projects, a customer, an offering. You may only bind to an "
-            "entity you hold a role on. AN EMPTY LIST MEANS GLOBAL (every "
-            "event, including all-user PII) and is staff/support only."
+            "several projects, a customer, an offering, or your own user "
+            "(type 'user', your own UUID) for identity events. You may only "
+            "bind to an entity you hold a role on, or to yourself. AN EMPTY "
+            "LIST MEANS GLOBAL (every event, including all-user PII) and is "
+            "staff/support only."
         ),
     )
 
@@ -1293,7 +1331,7 @@ class EventConsumerRegistrationSerializer(serializers.Serializer):
         for entry in value:
             type_key = entry["type"]
             uuid_value = entry["uuid"]
-            app_label, model_name = TYPE_MAP[type_key]
+            app_label, model_name = EVENT_CONSUMER_TYPE_MAP[type_key]
             try:
                 content_type = ContentType.objects.get_by_natural_key(
                     app_label, model_name
@@ -1313,6 +1351,21 @@ class EventConsumerRegistrationSerializer(serializers.Serializer):
                     f"may not subscribe to its events."
                 )
                 continue
+            # A ServiceProvider never appears in an event's scope-key chain --
+            # get_scope_ancestors walks offering -> customer, not the provider row
+            # -- so binding to one would be accepted and then match nothing, for
+            # ever, with no error to explain the silence. The operator's intent is
+            # unambiguous, so bind to the provider's customer instead: that is
+            # exactly the key every offering of that provider yields.
+            #
+            # Matched on the natural key rather than by importing the model, since
+            # this module is deliberately free of marketplace imports -- the same
+            # reason EventConsumerScope binds through a GenericForeignKey.
+            if (app_label, model_name) == ("marketplace", "serviceprovider"):
+                instance = instance.customer
+                content_type = ContentType.objects.get_by_natural_key(
+                    "structure", "customer"
+                )
             resolved.append(
                 {"content_type_id": content_type.id, "object_id": instance.id}
             )
@@ -1341,7 +1394,7 @@ class EventConsumerScopeOutputSerializer(serializers.Serializer):
 
     def get_type(self, scope) -> str | None:
         key = (scope.content_type.app_label, scope.content_type.model)
-        for type_key, natural_key in TYPE_MAP.items():
+        for type_key, natural_key in EVENT_CONSUMER_TYPE_MAP.items():
             if natural_key == key:
                 return type_key
         return scope.content_type.model
@@ -1351,9 +1404,42 @@ class EventConsumerScopeOutputSerializer(serializers.Serializer):
         return getattr(target, "uuid", None) and target.uuid.hex
 
 
+@extend_schema_field(serializers.ListField(child=serializers.CharField()))
+class ObjectTypesField(serializers.JSONField):
+    """A JSONField holding a list of object types, typed as such in the schema."""
+
+
 class EventConsumerSerializer(serializers.ModelSerializer):
     scopes = EventConsumerScopeOutputSerializer(many=True, read_only=True)
     is_global = serializers.BooleanField(read_only=True)
+    object_types = ObjectTypesField(read_only=True)
+    user_uuid = serializers.UUIDField(read_only=True, source="user.uuid")
+    user_username = serializers.ReadOnlyField(source="user.username")
+    user_full_name = serializers.ReadOnlyField(source="user.full_name")
+    user_is_staff = serializers.ReadOnlyField(source="user.is_staff")
+    # Declared rather than derived from the model field: ModelSerializer drops
+    # allow_blank on a read-only field, and the resulting SDK enum would then
+    # reject the empty string that rows predating the attribution hold.
+    auth_kind = serializers.ChoiceField(
+        choices=auth_utils.auth_method_choices(include_blank=True), read_only=True
+    )
+    authorized_via = serializers.ChoiceField(
+        choices=enums.ConsumerAuthorization.choices(include_blank=True), read_only=True
+    )
+    delivery_blocked_reason = serializers.SerializerMethodField()
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_delivery_blocked_reason(self, consumer) -> str | None:
+        # None (not "") means events are being delivered — the frontend shows a
+        # warning only for a non-null value.
+        #
+        # Costs a few queries per row: the viewset prefetches the bindings but
+        # not their ancestor chains, which scope_keys_for walks, plus one role
+        # query per consumer (staff/support rows short-circuit before either).
+        # Bounded by page size. Not batched because the role check is per-owner
+        # — one query over every owner and every binding on the page would match
+        # one owner's role against another's binding.
+        return event_dispatch.delivery_blocked_reason(consumer)
 
     class Meta:
         model = models.EventConsumer
@@ -1364,7 +1450,109 @@ class EventConsumerSerializer(serializers.ModelSerializer):
             "is_global",
             "rmq_username",
             "queue_created",
+            "user_uuid",
+            "user_username",
+            "user_full_name",
+            "user_is_staff",
+            "auth_kind",
+            "auth_token_prefix",
+            "auth_token_name",
+            "authorized_via",
+            "delivery_blocked_reason",
             "created",
             "modified",
         )
         read_only_fields = fields
+
+
+class EmailConfigSerializer(serializers.Serializer):
+    """Effective outgoing mail settings. The password is never exposed."""
+
+    backend = serializers.CharField(
+        read_only=True, help_text="EMAIL_BACKEND class path"
+    )
+    host = serializers.CharField(read_only=True, help_text="EMAIL_HOST")
+    port = serializers.IntegerField(
+        read_only=True, allow_null=True, help_text="EMAIL_PORT"
+    )
+    host_user = serializers.CharField(
+        read_only=True, allow_blank=True, help_text="EMAIL_HOST_USER"
+    )
+    has_password = serializers.BooleanField(
+        read_only=True, help_text="Whether EMAIL_HOST_PASSWORD is set"
+    )
+    use_tls = serializers.BooleanField(read_only=True, help_text="EMAIL_USE_TLS")
+    use_ssl = serializers.BooleanField(read_only=True, help_text="EMAIL_USE_SSL")
+    timeout = serializers.IntegerField(
+        read_only=True, allow_null=True, help_text="EMAIL_TIMEOUT in seconds"
+    )
+    default_from_email = serializers.CharField(
+        read_only=True, allow_blank=True, help_text="DEFAULT_FROM_EMAIL"
+    )
+    default_reply_to_email = serializers.CharField(
+        read_only=True, allow_blank=True, help_text="DEFAULT_REPLY_TO_EMAIL"
+    )
+    subject_prefix = serializers.CharField(
+        read_only=True, allow_blank=True, help_text="EMAIL_SUBJECT_PREFIX"
+    )
+
+
+class EmailFindingSerializer(serializers.Serializer):
+    """A single outcome of the mail configuration audit."""
+
+    level = serializers.CharField(read_only=True, help_text="OK, WARNING or ERROR")
+    code = serializers.CharField(read_only=True, help_text="Stable machine-readable id")
+    title = serializers.CharField(read_only=True, help_text="Short summary")
+    detail = serializers.CharField(
+        read_only=True, allow_blank=True, help_text="What was observed"
+    )
+    remediation = serializers.CharField(
+        read_only=True, allow_blank=True, help_text="How to fix it"
+    )
+
+
+class EmailDiagnosticsSerializer(serializers.Serializer):
+    """Outcome of the outgoing mail sanity check."""
+
+    status = serializers.CharField(
+        read_only=True, help_text="Worst finding level: OK, WARNING or ERROR"
+    )
+    config = EmailConfigSerializer(read_only=True)
+    findings = EmailFindingSerializer(many=True, read_only=True)
+    enabled_notification_count = serializers.IntegerField(read_only=True)
+    total_notification_count = serializers.IntegerField(read_only=True)
+    emails_sent_last_week = serializers.IntegerField(read_only=True)
+    last_email_sent_at = serializers.DateTimeField(read_only=True, allow_null=True)
+
+
+class EmailProbeSerializer(serializers.Serializer):
+    """Outcome of an SMTP connection attempt."""
+
+    success = serializers.BooleanField(read_only=True)
+    latency_ms = serializers.IntegerField(
+        read_only=True,
+        allow_null=True,
+        help_text="Time to open the connection, in milliseconds",
+    )
+    error = serializers.CharField(
+        read_only=True, allow_blank=True, help_text="Failure reason, empty on success"
+    )
+
+
+class EmailTestSendRequestSerializer(serializers.Serializer):
+    email = serializers.EmailField(
+        required=False,
+        help_text="Recipient of the test message. Defaults to the current user's own address.",
+    )
+
+
+class EmailTestSendResultSerializer(serializers.Serializer):
+    """Outcome of sending a test message."""
+
+    success = serializers.BooleanField(read_only=True)
+    email = serializers.EmailField(
+        read_only=True, help_text="Address the test was sent to"
+    )
+    error = serializers.CharField(
+        read_only=True, allow_blank=True, help_text="Failure reason, empty on success"
+    )

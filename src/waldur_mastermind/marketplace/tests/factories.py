@@ -786,6 +786,32 @@ class IntegrationStatusFactory(
         return url if action is None else url + action + "/"
 
 
+class ServiceProviderAccountFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.ServiceProviderAccount],
+):
+    service_provider = factory.SubFactory(ServiceProviderFactory)
+    user = factory.SubFactory(structure_factories.UserFactory)
+    username = factory.Sequence(lambda n: "provider-username-%s" % n)
+
+    class Meta:
+        model = models.ServiceProviderAccount
+
+    @classmethod
+    def get_list_url(cls):
+        return reverse("marketplace-service-provider-account-list")
+
+    @classmethod
+    def get_url(cls, account=None, action=None):
+        if account is None:
+            account = ServiceProviderAccountFactory()
+        base_name = "marketplace-service-provider-account"
+        url_name = f"{base_name}-{action}" if action else f"{base_name}-detail"
+        return "http://testserver" + reverse(
+            url_name, kwargs={"uuid": account.uuid.hex}
+        )
+
+
 class OfferingUserFactory(
     factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.OfferingUser]
 ):
@@ -1261,6 +1287,34 @@ class OfferingPartitionFactory(factory.django.DjangoModelFactory):
     def get_list_url(cls, action=None):
         url = "http://testserver" + reverse("marketplace-offering-partition-list")
         return url if action is None else url + action + "/"
+
+
+class SlurmOfferingQoSFactory(factory.django.DjangoModelFactory):
+    """Factory for OfferingQoS model."""
+
+    class Meta:
+        model = models.SlurmOfferingQoS
+
+    offering = factory.SubFactory(OfferingFactory)
+    name = factory.Sequence(lambda n: f"qos-{n}")
+    max_nodes = 64
+    max_time = 1440
+
+
+class SlurmPartitionQoSFactory(factory.django.DjangoModelFactory):
+    """Factory for PartitionQoS model."""
+
+    class Meta:
+        model = models.SlurmPartitionQoS
+
+    partition = factory.SubFactory(OfferingPartitionFactory)
+    # Default the QoS to the partition's offering so a factory-built link is
+    # valid by default (partition.offering == qos.offering). Tests that need a
+    # cross-offering mismatch pass ``qos`` explicitly.
+    qos = factory.LazyAttribute(
+        lambda o: SlurmOfferingQoSFactory(offering=o.partition.offering)
+    )
+    is_default = False
 
 
 class ResourceLimitChangeRequestFactory(

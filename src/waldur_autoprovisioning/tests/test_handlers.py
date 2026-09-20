@@ -5,10 +5,13 @@ from django.test import TestCase
 
 from waldur_autoprovisioning import handlers, models
 from waldur_autoprovisioning.tests import factories as autoprovisioning_factories
+from waldur_core.core import signals as core_signals
 from waldur_core.core.models import User
 from waldur_core.core.tests.helpers import override_waldur_core_settings
-from waldur_core.permissions.fixtures import ProjectRole
+from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
+from waldur_core.permissions.models import UserRole
 from waldur_core.structure import models as structure_models
+from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.enums import BASIC_OFFERING as MARKETPLACE_BASIC
 from waldur_mastermind.marketplace.enums import OPENSTACK_TENANT_OFFERING
@@ -143,6 +146,38 @@ class InvalidRegexPatternsTest(TestCase):
         )
         self.assertTrue(models.Rule._is_pattern_match("test.*", "test@example.com"))
 
+    def test_is_pattern_match_requires_the_whole_address(self):
+        # Matching only at the start let a lookalike domain through.
+        self.assertFalse(
+            models.Rule._is_pattern_match(
+                r".*@example\.com", "alice@example.com.attacker.net"
+            )
+        )
+        self.assertTrue(
+            models.Rule._is_pattern_match(r".*@example\.com", "alice@example.com")
+        )
+
+    def test_is_pattern_match_ignores_case(self):
+        self.assertTrue(
+            models.Rule._is_pattern_match(r".*@example\.com", "Alice@Example.COM")
+        )
+
+    def test_rule_does_not_provision_a_lookalike_domain(self):
+        rule = autoprovisioning_factories.RuleFactory(
+            plan=None, user_email_patterns=[r".*@example\.com"]
+        )
+
+        user = User.objects.create(
+            username="lookalike", email="alice@example.com.attacker.net"
+        )
+
+        self.assertFalse(models.Rule.evaluate_for_user(rule, user).matched)
+        self.assertFalse(
+            structure_models.Project.available_objects.filter(
+                customer=rule.customer
+            ).exists()
+        )
+
     @patch("waldur_autoprovisioning.handlers.process_order_on_commit")
     def test_get_rules_handles_invalid_regex_patterns(self, mock_process_order):
         rule = autoprovisioning_factories.RuleFactory()
@@ -170,12 +205,28 @@ class GetOrCreateProjectWithTemplateTest(TestCase):
 
     @patch("waldur_autoprovisioning.handlers.process_order_on_commit")
     def test_get_or_create_project_uses_template(self, mock_process_order):
-        project = handlers.get_or_create_project(self.rule, self.user)
+        project = handlers.get_or_create_project(
+            self.rule, self.user, self.rule.customer
+        )
 
         self.assertIsNotNone(project)
         self.assertEqual(project.name, "test_user_custom_workspace")
         self.assertEqual(project.customer, self.rule.customer)
+
+    @patch("waldur_autoprovisioning.handlers.process_order_on_commit")
+    def test_provisioning_grants_the_project_role(self, mock_process_order):
+        """The role is issued by reconciliation, not by project creation, so
+        that every rule-issued grant carries the rule's provenance."""
+        handlers.provision_for_user(self.user)
+
+        project = structure_models.Project.available_objects.get(
+            name="test_user_custom_workspace", customer=self.rule.customer
+        )
         self.assertTrue(project.has_user(self.user, ProjectRole.ADMIN))
+        grant = UserRole.objects.get(
+            user=self.user, role=ProjectRole.ADMIN, is_active=True
+        )
+        self.assertEqual(grant.source, self.rule.grant_source)
 
     @patch("waldur_autoprovisioning.handlers.process_order_on_commit")
     def test_get_or_create_project_without_template_uses_username(
@@ -184,20 +235,25 @@ class GetOrCreateProjectWithTemplateTest(TestCase):
         self.rule.project_name_template = ""
         self.rule.save()
 
-        project = handlers.get_or_create_project(self.rule, self.user)
+        project = handlers.get_or_create_project(
+            self.rule, self.user, self.rule.customer
+        )
 
         self.assertIsNotNone(project)
         self.assertEqual(project.name, "test_user")
         self.assertEqual(project.customer, self.rule.customer)
-        self.assertTrue(project.has_user(self.user, ProjectRole.ADMIN))
 
     @patch("waldur_autoprovisioning.handlers.process_order_on_commit")
     def test_get_or_create_project_returns_existing_project(self, mock_process_order):
         # Create project first time
-        project1 = handlers.get_or_create_project(self.rule, self.user)
+        project1 = handlers.get_or_create_project(
+            self.rule, self.user, self.rule.customer
+        )
 
         # Call again should return same project
-        project2 = handlers.get_or_create_project(self.rule, self.user)
+        project2 = handlers.get_or_create_project(
+            self.rule, self.user, self.rule.customer
+        )
 
         self.assertEqual(project1.id, project2.id)
         self.assertEqual(project1.name, "test_user_custom_workspace")
@@ -217,7 +273,9 @@ class GetOrCreateProjectWithTemplateTest(TestCase):
             last_name="Role",
         )
 
-        project = handlers.get_or_create_project(self.rule, new_user)
+        project = handlers.get_or_create_project(
+            self.rule, new_user, self.rule.customer
+        )
 
         self.assertIsNotNone(project)
         self.assertTrue(project.has_user(new_user, ProjectRole.MANAGER))
@@ -293,7 +351,7 @@ class GetOrCreateProjectPolicyTest(TestCase):
         rule = self._concealed_rule()
         user = self._make_user()
         # No project exists yet -> exercises the Project.DoesNotExist branch.
-        project = handlers.get_or_create_project(rule, user)
+        project = handlers.get_or_create_project(rule, user, rule.customer)
         self.assertIsNotNone(project)
         self.assertFalse(project.has_user(user, ProjectRole.ADMIN))
 
@@ -303,6 +361,141 @@ class GetOrCreateProjectPolicyTest(TestCase):
         project = structure_models.Project.available_objects.create(
             name=rule.resolve_project_name(user), customer=rule.customer
         )
-        result = handlers.get_or_create_project(rule, user)
+        result = handlers.get_or_create_project(rule, user, rule.customer)
         self.assertEqual(result.pk, project.pk)
         self.assertFalse(project.has_user(user, ProjectRole.ADMIN))
+
+    def test_concealed_role_skipped_by_reconciliation(self):
+        """The grant path that actually runs on login must also respect the
+        organization's concealment, and must not raise.
+
+        Unlike the other tests here the user *does* match the rule, so the
+        post_save handler provisions on creation — which is exactly the path
+        under test.
+        """
+        rule = self._concealed_rule()
+        user = User.objects.create(username="matching", email="matching@example.com")
+
+        project = structure_models.Project.available_objects.get(
+            name=rule.resolve_project_name(user), customer=rule.customer
+        )
+        self.assertFalse(project.has_user(user, ProjectRole.ADMIN))
+        self.assertFalse(UserRole.objects.filter(user=user, is_active=True).exists())
+
+
+@patch("waldur_autoprovisioning.handlers.process_order_on_commit")
+class ExistingUserProvisioningTest(TestCase):
+    """A rule created after an account exists provisions it on the next sync.
+
+    Projects used to be created only when an account was created, and
+    reconciliation only grants roles on projects that already exist. A user
+    who predated a project rule therefore got nothing at login, while the
+    dry-run said the rule would provision.
+    """
+
+    def setUp(self):
+        self.customer = structure_factories.CustomerFactory()
+        # Created before any rule exists, so account creation provisions nothing.
+        self.user = User.objects.create(
+            username="existing",
+            email="existing@example.org",
+            details={"schac_home_organization": "example.org"},
+        )
+
+    def _rule(self, **kwargs):
+        kwargs.setdefault("customer", self.customer)
+        kwargs.setdefault("plan", None)
+        kwargs.setdefault("project_role", ProjectRole.MANAGER)
+        kwargs.setdefault("user_claims", {"schac_home_organization": ["example.org"]})
+        return autoprovisioning_factories.RuleFactory(**kwargs)
+
+    def _sync(self):
+        core_signals.user_identity_synced.send(
+            sender=User, user=self.user, source="keycloak", created=False
+        )
+
+    def _projects(self):
+        return structure_models.Project.available_objects.filter(
+            customer=self.customer, name=self.user.username
+        )
+
+    def test_project_is_created_on_next_sync(self, _):
+        rule = self._rule()
+        self.assertFalse(self._projects().exists())
+
+        self._sync()
+
+        project = self._projects().get()
+        self.assertTrue(project.has_user(self.user, ProjectRole.MANAGER))
+        grant = UserRole.objects.get(user=self.user, is_active=True)
+        self.assertEqual(grant.source, rule.grant_source)
+
+    def test_repeated_sync_orders_the_resource_once(self, mock_process_order):
+        plan = marketplace_factories.PlanFactory()
+        plan.offering.type = MARKETPLACE_BASIC
+        plan.offering.save()
+        self._rule(plan=plan)
+
+        self._sync()
+        self._sync()
+
+        self.assertEqual(
+            marketplace_models.Order.objects.filter(created_by=self.user).count(), 1
+        )
+        self.assertEqual(mock_process_order.call_count, 1)
+
+    def test_deleted_project_is_not_recreated(self, _):
+        self._rule()
+        self._sync()
+        self._projects().get().delete()
+        self.assertFalse(UserRole.objects.filter(user=self.user, is_active=True))
+
+        self._sync()
+
+        self.assertFalse(self._projects().exists())
+        self.assertFalse(UserRole.objects.filter(user=self.user, is_active=True))
+
+    def test_project_from_before_provenance_is_not_recreated(self, _):
+        """Grants made before ``UserRole.source`` existed are empty. Such a user
+        must not get back a project they deleted."""
+        project = structure_models.Project.available_objects.create(
+            customer=self.customer, name=self.user.username
+        )
+        project.add_user(self.user, ProjectRole.MANAGER)
+        project.delete()
+
+        self._rule()
+        self._sync()
+
+        self.assertFalse(self._projects().exists())
+
+    def test_unrelated_soft_deleted_project_does_not_block_creation(self, _):
+        """A soft-deleted project with the same name that the user never
+        belonged to is not theirs, so it does not count as provisioned."""
+        structure_models.Project.available_objects.create(
+            customer=self.customer, name=self.user.username
+        ).delete()
+
+        self._rule()
+        self._sync()
+
+        project = self._projects().get()
+        self.assertTrue(project.has_user(self.user, ProjectRole.MANAGER))
+
+    def test_sync_revokes_once_no_rule_matches(self, _):
+        """Reconciliation must still run when nothing matches: that is when a
+        rule that stopped matching revokes its grant."""
+        self._rule(
+            create_project=False,
+            project_role=None,
+            customer_role=CustomerRole.OWNER,
+            revoke_when_unmatched=True,
+        )
+        self._sync()
+        self.assertTrue(self.customer.has_user(self.user, CustomerRole.OWNER))
+
+        self.user.details = {}
+        self.user.save()
+        self._sync()
+
+        self.assertFalse(self.customer.has_user(self.user, CustomerRole.OWNER))

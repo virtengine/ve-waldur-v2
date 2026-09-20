@@ -8,7 +8,6 @@ import yaml
 from constance import config
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
-from django.db.models import Q
 from django.http import FileResponse, Http404
 from django_filters.rest_framework import DjangoFilterBackend
 from django_fsm import TransitionNotAllowed
@@ -25,11 +24,19 @@ from waldur_core.permissions.fixtures import CustomerRole
 from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure.managers import (
     get_connected_customers,
-    get_connected_projects,
 )
-from waldur_core.structure.models import Customer, Project
+from waldur_core.structure.models import Project
 
-from . import filters, livekit_client, matrix_client, models, serializers, tasks
+from . import (
+    appservice_registration,
+    filters,
+    livekit_client,
+    matrix_client,
+    models,
+    serializers,
+    tasks,
+)
+from .managers import get_accessible_room_ids
 
 logger = logging.getLogger(__name__)
 
@@ -46,26 +53,6 @@ def _token_fingerprint(token):
     """Return a short SHA-256 fingerprint of a secret token for display."""
     digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
     return f"sha256:{digest[:12]}"
-
-
-def _get_accessible_room_ids(user):
-    """Get MatrixRoom IDs accessible to the user based on project/customer roles."""
-    project_ct = ContentType.objects.get_for_model(Project)
-    customer_ct = ContentType.objects.get_for_model(Customer)
-
-    connected_projects = get_connected_projects(user)
-    connected_customers = get_connected_customers(user)
-
-    # Include projects that belong to user's connected customers
-    projects_via_customer = Project.objects.filter(
-        customer__in=connected_customers
-    ).values_list("id", flat=True)
-
-    return models.MatrixRoom.objects.filter(
-        Q(content_type=project_ct, object_id__in=connected_projects)
-        | Q(content_type=project_ct, object_id__in=projects_via_customer)
-        | Q(content_type=customer_ct, object_id__in=connected_customers)
-    ).values_list("id", flat=True)
 
 
 class MatrixEnabledWriteGuardMixin:
@@ -103,7 +90,7 @@ class MatrixRoomViewSet(MatrixEnabledWriteGuardMixin, ActionsViewSet):
             return queryset.none()
         if user.is_staff or user.is_support:
             return queryset
-        return queryset.filter(id__in=_get_accessible_room_ids(user))
+        return queryset.filter(id__in=get_accessible_room_ids(user))
 
     @extend_schema(
         request=serializers.MatrixRoomCreateSerializer,
@@ -448,7 +435,7 @@ class MatrixHistoryExportViewSet(ActionsViewSet):
             return queryset.none()
         if user.is_staff or user.is_support:
             return queryset
-        return queryset.filter(room__id__in=_get_accessible_room_ids(user))
+        return queryset.filter(room__id__in=get_accessible_room_ids(user))
 
 
 class MatrixCredentialsView(views.APIView):
@@ -665,32 +652,13 @@ class MatrixAppserviceSetupView(views.APIView):
             else MATRIX_APPSERVICE_WEBHOOK_PATH
         )
 
-        homeserver_domain = effective["MATRIX_HOMESERVER_DOMAIN"]
-        registration = {
-            "id": "waldur",
-            "url": url,
-            "as_token": as_token,
-            "hs_token": hs_token,
-            "sender_localpart": sender_localpart,
-            "namespaces": {
-                "users": [
-                    # Claim the bot identity exclusively so it cannot be
-                    # registered through normal client signup on the local
-                    # homeserver. The bot always lives on
-                    # MATRIX_HOMESERVER_DOMAIN, so the regex is scoped.
-                    {
-                        "exclusive": True,
-                        "regex": f"@{sender_localpart}:{homeserver_domain}",
-                    },
-                    {
-                        "exclusive": False,
-                        "regex": f"@.*:{homeserver_domain}",
-                    },
-                ],
-                "rooms": [],
-                "aliases": [],
-            },
-        }
+        registration = appservice_registration.build_registration(
+            url=url,
+            as_token=as_token,
+            hs_token=hs_token,
+            sender_localpart=sender_localpart,
+            homeserver_domain=effective["MATRIX_HOMESERVER_DOMAIN"],
+        )
         registration_yaml = yaml.dump(registration, default_flow_style=False)
 
         # Best-effort bot provisioning, outside the DB transaction (this makes
@@ -1090,40 +1058,8 @@ class MatrixReprovisionView(views.APIView):
         # all rooms in a state that never resolves.
         if not matrix_client.is_enabled():
             raise ValidationError("Matrix chat is disabled.")
-        room_count = 0
-        with transaction.atomic():
-            # Lock the rows up front so concurrent disable/retry calls can't
-            # race the reprovisioning write-back. The active state filter is
-            # re-checked under the lock; rows that have transitioned out are
-            # silently skipped.
-            locked_rooms = list(
-                models.MatrixRoom.objects.select_for_update().filter(
-                    state=models.RoomStates.ACTIVE
-                )
-            )
-            for room in locked_rooms:
-                try:
-                    room.begin_reprovisioning()
-                except TransitionNotAllowed:
-                    continue
-                room.room_id = None
-                room.room_alias = ""
-                room.save(
-                    update_fields=["state", "error_message", "room_id", "room_alias"]
-                )
-                room_uuid = str(room.uuid)
-                transaction.on_commit(
-                    lambda uuid=room_uuid: tasks.create_room.delay(uuid)
-                )
-                room_count += 1
 
-            user_count = models.MatrixUserProfile.objects.filter(
-                provisioned=True
-            ).update(
-                provisioned=False,
-                access_token="",
-                provisioned_at=None,
-            )
+        room_count, user_count = tasks.reprovision_rooms()
 
         return Response(
             {
@@ -1168,7 +1104,7 @@ class MatrixHistoryExportDownloadView(views.APIView):
 
         user = request.user
         if not (user.is_staff or user.is_support):
-            if export.room.id not in _get_accessible_room_ids(user):
+            if export.room.id not in get_accessible_room_ids(user):
                 raise Http404
 
         file_field = export.export_file if kind == "export" else export.media_file

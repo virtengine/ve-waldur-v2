@@ -27,6 +27,7 @@ from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace.enums import BillingTypes, LimitPeriods
 
 from . import enums, structures
+from . import eta as policy_eta
 
 logger = logging.getLogger(__name__)
 
@@ -117,14 +118,23 @@ class EstimatedCostPolicyMixin(invoices_models.PeriodMixin):
 
     limit_cost = models.IntegerField()
 
+    #: Whether the evaluated cost is reduced by a customer's credit. False here
+    #: because an offering policy spans many customers, so no single credit
+    #: applies; the scoped policies below override it.
+    uses_credit_compensation = False
+
     def _is_triggered(self, invoice_items, compensation=0):
-        customers = structure_models.Customer.objects.filter(
-            blocked=False,
-            archived=False,
-        )
-        invoice_items = invoice_items.filter(
-            invoice__customer__in=customers,
-        ).exclude(invoice__state=invoices_models.Invoice.States.CANCELED)
+        return self._evaluated_cost(invoice_items, compensation) > self.limit_cost
+
+    def _evaluated_cost(self, invoice_items, compensation=0) -> decimal.Decimal:
+        """The cost this policy compares against ``limit_cost``.
+
+        Exposed as ``current_cost`` on the API so clients render the figure the
+        policy actually evaluates instead of re-deriving it. The derivation has
+        moved twice already, and each time a client copy silently fell out of
+        step.
+        """
+        invoice_items = self._eligible_items(invoice_items)
         month_start = core_utils.month_start(datetime.date.today())
         period = 0
 
@@ -147,7 +157,139 @@ class EstimatedCostPolicyMixin(invoices_models.PeriodMixin):
         invoice_items = invoice_items.filter(query)
 
         total = self._scoped_cost(invoice_items)
-        return total - compensation > self.limit_cost
+        return total - compensation
+
+    @classmethod
+    def _pending_compensation(cls, invoice_items, projected) -> decimal.Decimal:
+        """The part of `projected` that the cost sum does not already contain.
+
+        Credit compensations are ordinary invoice items with a negative
+        unit_price, and `_scoped_cost` sums every item in the queryset, so once
+        the monthly compensation has been written the cost total is already net
+        of it. MonthlyCompensation, however, always re-simulates the month from
+        the gross items — it has no notion of "already applied" — so deducting
+        its result wholesale subtracts the same credit a second time, and the
+        policy under-enforces by a month's credit draw.
+
+        Only credit that will still be drawn may come off the total: the
+        projection minus what is already written for the current month. The
+        written figure carries tax while the projection does not, so any
+        rounding difference resolves towards deducting less, never twice.
+        """
+        projected = decimal.Decimal(projected or 0)
+        if projected <= 0:
+            return decimal.Decimal(0)
+        month_start = core_utils.month_start(datetime.date.today())
+        written = invoice_items.filter(
+            invoice__year=month_start.year,
+            invoice__month=month_start.month,
+            credit__isnull=False,
+        )
+        applied = -cls._scoped_cost(written)
+        return max(decimal.Decimal(0), projected - applied)
+
+    @staticmethod
+    def _eligible_items(invoice_items):
+        """Items that count towards this policy, whatever is being measured.
+
+        Blocked and archived customers are out of scope, and a canceled invoice
+        is not a bill. Every figure the projection compares — the level, the
+        rate, and the uncompensated part of it — must be measured over the same
+        set, or a rate gets projected against a total that cannot move: a
+        blocked customer's `current_cost` collapses to zero while its gross
+        cost does not.
+        """
+        customers = structure_models.Customer.objects.filter(
+            blocked=False,
+            archived=False,
+        )
+        return invoice_items.filter(
+            invoice__customer__in=customers,
+        ).exclude(invoice__state=invoices_models.Invoice.States.CANCELED)
+
+    def _this_month(self, invoice_items):
+        month_start = core_utils.month_start(datetime.date.today())
+        return self._eligible_items(invoice_items).filter(
+            invoice__year=month_start.year,
+            invoice__month=month_start.month,
+        )
+
+    def _projection_credit(self):
+        """The credit that compensates this policy's scope, or None.
+
+        Overridden per scope: an offering policy spans many customers, so no
+        single credit applies to it.
+        """
+        return None
+
+    def _gross_cost_this_month(self, invoice_items) -> decimal.Decimal:
+        """This month's cost before any credit is applied.
+
+        Compensations are ordinary invoice items with a negative unit_price, so
+        they are excluded rather than added back — `credit__isnull=True` is the
+        same discriminator `_pending_compensation` uses from the other side.
+        """
+        return self._scoped_cost(
+            self._this_month(invoice_items).filter(credit__isnull=True)
+        )
+
+    def _uncompensated_cost_this_month(
+        self, invoice_items, deduction
+    ) -> decimal.Decimal:
+        """This month's cost the credit does not take off the policy.
+
+        Measured the way the policy measures everything else — `_scoped_cost`
+        over its own items, less the same pending draw `current_cost` is net of
+        — so it shares a basis with the level it is compared against.
+
+        Deriving it from the credit's own `creditable_cost_this_month` looked
+        simpler and was wrong three ways: that figure is pre-tax while
+        `_scoped_cost` carries tax, so on a VAT deployment a fully covered
+        project appeared to be accruing the tax and got a near-term date; it is
+        project-wide, so a resource-scoped policy compared a resource-sized cost
+        against it; and it exists only on ProjectCredit, so every
+        customer-scoped policy silently fell back to "the credit covers
+        everything".
+        """
+        net = self._scoped_cost(self._this_month(invoice_items)) - deduction
+        return max(decimal.Decimal(0), net)
+
+    def get_eta_days(self, compensation=None) -> int | None:
+        """Days until this policy crosses `limit_cost`; None when unprojectable.
+
+        The reasoning, and why a client cannot do this itself, is in eta.py.
+        """
+        invoice_items, deduction = self._cost_inputs(compensation)
+        today = datetime.date.today()
+        # Computed once: the credit's runway is measured against the same rate
+        # the projection uses after it runs out.
+        gross = self._gross_cost_this_month(invoice_items)
+        gross_per_day = gross / decimal.Decimal(today.day)
+        credit = self._projection_credit()
+        eta = policy_eta.project_eta_days(
+            limit_cost=self.limit_cost,
+            current_cost=self._evaluated_cost(invoice_items, deduction),
+            gross_this_month=gross,
+            uncompensated_this_month=self._uncompensated_cost_this_month(
+                invoice_items, deduction
+            ),
+            credit_days=policy_eta.credit_days_remaining(credit, gross_per_day),
+            credit_limit_days=policy_eta.credit_days_to_limit(
+                credit, self.limit_cost, gross_per_day
+            ),
+            period=self.period,
+            today=today,
+        )
+        if eta == 0 and not self.is_triggered():
+            # The limit is crossed, but `is_triggered` applies one more test the
+            # cost figures cannot see: a credit balance still larger than the
+            # limit holds the policy back. Reporting "already reached" while the
+            # policy itself reports False is precisely the kind of contradiction
+            # this field exists to stop a client inventing, so it is reported as
+            # no projection instead. Only reached in the crossed case, so the
+            # extra evaluation is not on the common path.
+            return None
+        return eta
 
     @staticmethod
     def _scoped_cost(invoice_items) -> decimal.Decimal:
@@ -244,20 +386,56 @@ class ProjectEstimatedCostPolicy(EstimatedCostPolicyMixin, ProjectPolicy):
     # existing policies.
     use_credit = models.BooleanField(default=True)
 
-    def is_triggered(self):
+    @property
+    def uses_credit_compensation(self) -> bool:
+        return self.use_credit
+
+    def _cost_inputs(self, compensation=None):
+        """The item queryset and credit deduction this policy is judged on.
+
+        `compensation` lets a caller serializing several policies for one
+        customer reuse a single MonthlyCompensation simulation.
+        """
         project = self.scope
         invoice_items = invoices_models.InvoiceItem.objects.filter(project=project)
         if self.resource_id:
             invoice_items = invoice_items.filter(resource_id=self.resource_id)
 
         if self.use_credit:
-            compensation = invoices_compensation.MonthlyCompensation(project.customer)
+            compensation = compensation or invoices_compensation.MonthlyCompensation(
+                project.customer
+            )
             if self.resource_id:
-                deduction = compensation.get_resource_compensation(self.resource)
+                projected = compensation.get_resource_compensation(self.resource)
             else:
-                deduction = compensation.get_project_compensation(project)
+                projected = compensation.get_project_compensation(project)
+            deduction = self._pending_compensation(invoice_items, projected)
         else:
             deduction = 0
+        return invoice_items, deduction
+
+    def _projection_credit(self):
+        """Mirrors the fallback `is_triggered` makes: the project allocation
+        when there is one, otherwise the organization balance funding it.
+
+        Reading only ProjectCredit reported "no credit" for every project funded
+        straight from the customer balance, and the projection then assumed
+        nothing was compensating a cost that is in fact fully compensated."""
+        if not self.use_credit:
+            return None
+        return (
+            invoices_models.ProjectCredit.objects.filter(project=self.scope).first()
+            or invoices_models.CustomerCredit.objects.filter(
+                customer=self.scope.customer
+            ).first()
+        )
+
+    def get_current_cost(self, compensation=None) -> decimal.Decimal:
+        return self._evaluated_cost(*self._cost_inputs(compensation))
+
+    def is_triggered(self):
+        project = self.scope
+        invoice_items, deduction = self._cost_inputs()
 
         if not self._is_triggered(invoice_items, deduction):
             return False
@@ -322,14 +500,34 @@ class CustomerPolicy(Policy):
 
 
 class CustomerEstimatedCostPolicy(EstimatedCostPolicyMixin, CustomerPolicy):
-    def is_triggered(self):
+    uses_credit_compensation = True
+
+    def _cost_inputs(self, compensation=None):
         customer = self.scope
         invoice_items = invoices_models.InvoiceItem.objects.filter(
             invoice__customer=customer
         )
-        compensation = invoices_compensation.MonthlyCompensation(customer)
+        compensation = compensation or invoices_compensation.MonthlyCompensation(
+            customer
+        )
+        deduction = self._pending_compensation(
+            invoice_items, compensation.total_compensation
+        )
+        return invoice_items, deduction
 
-        if not self._is_triggered(invoice_items, compensation.total_compensation):
+    def _projection_credit(self):
+        return invoices_models.CustomerCredit.objects.filter(
+            customer=self.scope
+        ).first()
+
+    def get_current_cost(self, compensation=None) -> decimal.Decimal:
+        return self._evaluated_cost(*self._cost_inputs(compensation))
+
+    def is_triggered(self):
+        customer = self.scope
+        invoice_items, deduction = self._cost_inputs()
+
+        if not self._is_triggered(invoice_items, deduction):
             return False
 
         try:
@@ -413,7 +611,10 @@ class OfferingPolicy(Policy):
 
 
 class OfferingEstimatedCostPolicy(EstimatedCostPolicyMixin, OfferingPolicy):
-    def is_triggered(self):
+    def _cost_inputs(self, compensation=None):
+        """An offering policy spans many customers, so no single customer's
+        credit applies: the deduction is always zero and `compensation` is
+        accepted only to match the other estimated-cost policies."""
         # Use optimized query based on apply_to_all setting
         if self.apply_to_all:
             # Direct filter on invoice items without customer IN clause
@@ -432,7 +633,13 @@ class OfferingEstimatedCostPolicy(EstimatedCostPolicyMixin, OfferingPolicy):
                 resource__offering=self.scope,
                 invoice__customer__in=customers,
             )
-        return self._is_triggered(items)
+        return items, 0
+
+    def get_current_cost(self, compensation=None) -> decimal.Decimal:
+        return self._evaluated_cost(*self._cost_inputs(compensation))
+
+    def is_triggered(self):
+        return self._is_triggered(*self._cost_inputs())
 
     class Meta:
         verbose_name_plural = "Offering estimated cost policies"
@@ -1369,9 +1576,11 @@ class SlurmPeriodicUsagePolicy(OfferingUsagePolicy):
                 return True
             else:
                 logger.warning(
-                    "No STOMP messages prepared for resource %s (offering %s). "
-                    "Ensure the site agent has periodic_limits.enabled=true "
-                    "and has registered a queue for object_type=resource_periodic_limits.",
+                    "No STOMP messages prepared for resource %s (offering %s): no "
+                    "queue registered for object_type=resource_periodic_limits. "
+                    "Such queues are registered only by a site agent running in "
+                    "event_process mode, with stomp_enabled=true and "
+                    "backend_settings.periodic_limits.enabled=true for this offering.",
                     resource.backend_id,
                     resource.offering.uuid,
                 )
@@ -1442,7 +1651,7 @@ class SlurmCommandHistory(core_models.UuidMixin, TimeStampedModel):
     )
 
     class Meta:
-        ordering = ["-executed_at"]
+        ordering = ["-executed_at", "id"]
         verbose_name = _("SLURM Command History")
         verbose_name_plural = _("SLURM Command History")
         indexes = [
@@ -1529,7 +1738,7 @@ class SlurmPolicyEvaluationLog(core_models.UuidMixin, TimeStampedModel):
     )
 
     class Meta:
-        ordering = ["-evaluated_at"]
+        ordering = ["-evaluated_at", "id"]
         verbose_name = _("SLURM Policy Evaluation Log")
         verbose_name_plural = _("SLURM Policy Evaluation Logs")
         indexes = [

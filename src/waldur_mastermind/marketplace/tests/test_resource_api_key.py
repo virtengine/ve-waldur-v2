@@ -1,12 +1,19 @@
+import datetime
 from unittest import mock
 
+from django.utils import timezone
 from django_fsm import TransitionNotAllowed
 from rest_framework import status, test
 from rest_framework.reverse import reverse
 
 from waldur_core.core import encryption
 from waldur_core.permissions.enums import PermissionEnum
-from waldur_core.permissions.fixtures import CustomerRole
+from waldur_core.permissions.fixtures import (
+    CustomerRole,
+    OfferingRole,
+    ServiceProviderRole,
+)
+from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.marketplace import models, serializers
 from waldur_mastermind.marketplace.tests import factories
 from waldur_mastermind.marketplace.tests.fixtures import MarketplaceFixture
@@ -54,22 +61,9 @@ class ResourceApiKeyModelTest(test.APITestCase):
         key.set_updating()
         self.assertEqual(key.state, States.UPDATING)
         key.set_ok()
-        key.set_terminating()
-        self.assertEqual(key.state, States.TERMINATING)
+        key.set_updating()
         key.set_erred()
         self.assertEqual(key.state, States.ERRED)
-
-    def test_fingerprint_masks_short_keys(self):
-        from waldur_mastermind.marketplace import utils
-
-        # A realistic agent key is long; head + tail leaves a masked middle.
-        long_key = "sk-" + "a" * 40
-        fp = utils.api_key_fingerprint(long_key)
-        self.assertTrue(fp.startswith("sk-aaaa"))
-        self.assertNotIn(long_key, fp)
-        # A short value must not be substantially exposed by the fingerprint.
-        short_fp = utils.api_key_fingerprint("sk-short")
-        self.assertEqual(short_fp, "sk-...")
 
     def test_updating_not_allowed_from_creating(self):
         key = models.ResourceApiKey.objects.create(
@@ -79,8 +73,8 @@ class ResourceApiKeyModelTest(test.APITestCase):
             key.set_updating()
 
     def test_erred_key_can_be_recovered(self):
-        # A failed apply must not strand the key: rotate/revoke and the agent's
-        # set_ok are all allowed from Erred so it can be retried from the portal.
+        # A failed apply must not strand the key: rotate and the agent's set_ok are
+        # both allowed from Erred so it can be retried from the portal.
         key = models.ResourceApiKey.objects.create(
             resource=factories.ResourceFactory(), client_id="cid-1"
         )
@@ -92,12 +86,6 @@ class ResourceApiKeyModelTest(test.APITestCase):
         key.set_ok()  # agent reports the new value
         self.assertEqual(key.state, States.OK)
 
-        key.set_terminating()  # portal revoke
-        key.set_erred()  # agent failed to remove the secret entry
-        self.assertEqual(key.state, States.ERRED)
-        key.set_terminating()  # portal revoke retry works from Erred too
-        self.assertEqual(key.state, States.TERMINATING)
-
 
 class ConsumerApiKeyTest(test.APITestCase):
     def setUp(self):
@@ -108,7 +96,6 @@ class ConsumerApiKeyTest(test.APITestCase):
             resource=self.resource,
             client_id="cid-1",
             key_ciphertext=encryption.encrypt_value("sk-secret-one"),
-            fingerprint="sk-secr...-one",
             state=States.OK,
         )
 
@@ -202,13 +189,12 @@ class ConsumerApiKeyTest(test.APITestCase):
         response = self.client.post(detail_url(self.key, "rotate"))
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_owner_can_revoke(self):
+    def test_revoke_is_not_offered(self):
+        # The key count is fixed at provisioning; rotation re-mints in place, so
+        # there is no consumer-facing way to remove a key.
         self.client.force_authenticate(self.fixture.owner)
-        with mock.patch(PREPARE, return_value=MESSAGES), mock.patch(PUBLISH):
-            response = self.client.post(detail_url(self.key, "revoke"))
-        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
-        self.key.refresh_from_db()
-        self.assertEqual(self.key.state, States.TERMINATING)
+        response = self.client.post(f"{detail_url(self.key)}revoke/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_rotate_rejected_when_resource_terminating(self):
         # A key command must not race the resource's termination cleanup.
@@ -363,24 +349,16 @@ class ProviderApiKeyTest(test.APITestCase):
         self.assertEqual(key.state, States.ERRED)
         self.assertEqual(key.error_message, "boom")
 
-    def test_agent_confirms_revoke_by_deleting(self):
-        key = models.ResourceApiKey.objects.create(
-            resource=self.resource, client_id="cid-1", state=States.TERMINATING
-        )
-        self.client.force_authenticate(self.fixture.offering_owner)
-        response = self.client.delete(detail_url(key))
-        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertFalse(models.ResourceApiKey.objects.filter(pk=key.pk).exists())
-
-    def test_destroy_requires_terminating(self):
-        # A stray/duplicate destroy must not remove an OK row while its key still
-        # serves at the gateway.
+    def test_destroy_is_not_offered(self):
+        # The key count is fixed at provisioning, so nothing needs a delete, and an
+        # ungated one could drop a row whose key still serves at the backend.
+        # Termination cleanup deletes rows directly.
         key = models.ResourceApiKey.objects.create(
             resource=self.resource, client_id="cid-1", state=States.OK
         )
         self.client.force_authenticate(self.fixture.offering_owner)
         response = self.client.delete(detail_url(key))
-        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
         self.assertTrue(models.ResourceApiKey.objects.filter(pk=key.pk).exists())
 
     def test_set_erred_rejected_from_ok(self):
@@ -395,19 +373,6 @@ class ProviderApiKeyTest(test.APITestCase):
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
         key.refresh_from_db()
         self.assertEqual(key.state, States.OK)
-
-    def test_set_key_rejected_from_terminating(self):
-        # A late value push must never resurrect a key that is being revoked, nor
-        # persist its ciphertext.
-        key = models.ResourceApiKey.objects.create(
-            resource=self.resource, client_id="cid-1", state=States.TERMINATING
-        )
-        self.client.force_authenticate(self.fixture.offering_owner)
-        response = self.client.post(detail_url(key, "set-key"), {"api_key": "sk-late"})
-        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
-        key.refresh_from_db()
-        self.assertEqual(key.state, States.TERMINATING)
-        self.assertFalse(key.key_ciphertext)
 
     def test_duplicate_report_created_upserts(self):
         # A retried or duplicated report must upsert on (resource, client_id), not
@@ -426,27 +391,6 @@ class ProviderApiKeyTest(test.APITestCase):
         self.assertEqual(self.resource.api_keys.count(), 1)
         key = self.resource.api_keys.get()
         self.assertEqual(encryption.decrypt_value(key.key_ciphertext), "sk-second")
-
-    def test_report_created_must_not_resurrect_a_terminating_key(self):
-        # A stale/duplicated report must not flip a key whose revoke is in flight
-        # back to OK — that would leave a revealable key the gateway no longer
-        # accepts once the revoke completes.
-        key = models.ResourceApiKey.objects.create(
-            resource=self.resource, client_id="cid-1", state=States.TERMINATING
-        )
-        self.client.force_authenticate(self.fixture.offering_owner)
-        response = self.client.post(
-            list_url("report-created"),
-            {
-                "resource": self.resource.uuid.hex,
-                "client_id": "cid-1",
-                "api_key": "sk-zombie",
-            },
-        )
-        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
-        key.refresh_from_db()
-        self.assertEqual(key.state, States.TERMINATING)
-        self.assertFalse(key.key_ciphertext)
 
     def test_report_created_rejected_for_dead_resource(self):
         # A late report against a terminating/terminated resource must not
@@ -468,6 +412,134 @@ class ProviderApiKeyTest(test.APITestCase):
             )
             self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
             self.assertFalse(self.resource.api_keys.exists())
+
+
+class ProviderApiKeyScopeTest(test.APITestCase):
+    """The provider actions must accept every scope the permission is granted at.
+
+    permissions.yaml gives RESOURCE.MANAGE_API_KEY to CUSTOMER.OWNER (customer
+    scope), CUSTOMER.MANAGER (service provider scope) and OFFERING.MANAGER
+    (offering scope) — and a site agent, the caller these actions exist for, runs
+    as the offering-scoped one.
+    """
+
+    def setUp(self):
+        self.fixture = MarketplaceFixture()
+        self.resource = self.fixture.resource
+        # Test-DB system roles are created bare (migration 0002 imports no
+        # permissions); grant exactly what production permissions.yaml gives each
+        # of the three roles that hold this one.
+        CustomerRole.OWNER.add_permission(PermissionEnum.MANAGE_RESOURCE_API_KEY)
+        ServiceProviderRole.MANAGER.add_permission(
+            PermissionEnum.MANAGE_RESOURCE_API_KEY
+        )
+        OfferingRole.MANAGER.add_permission(PermissionEnum.MANAGE_RESOURCE_API_KEY)
+        # The service-provider-scoped role is held on the ServiceProvider object,
+        # not on the Customer — that is precisely why a check against the customer
+        # alone does not see it.
+        self.provider_manager = structure_factories.UserFactory()
+        self.fixture.service_provider.add_user(
+            self.provider_manager, ServiceProviderRole.MANAGER
+        )
+
+    def provider_users(self):
+        return (
+            ("customer-owner", self.fixture.offering_owner),
+            ("service-provider-manager", self.provider_manager),
+            ("offering-manager", self.fixture.offering_manager),
+        )
+
+    def test_every_provider_role_can_report_a_created_key(self):
+        for label, user in self.provider_users():
+            with self.subTest(label):
+                self.client.force_authenticate(user)
+                response = self.client.post(
+                    list_url("report-created"),
+                    {
+                        "resource": self.resource.uuid.hex,
+                        "client_id": f"cid-{label}",
+                        "api_key": "sk-fresh",
+                    },
+                )
+                self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_every_provider_role_can_set_a_key(self):
+        for index, (label, user) in enumerate(self.provider_users()):
+            with self.subTest(label):
+                key = models.ResourceApiKey.objects.create(
+                    resource=self.resource,
+                    client_id=f"cid-{index}",
+                    state=States.UPDATING,
+                )
+                self.client.force_authenticate(user)
+                response = self.client.post(
+                    detail_url(key, "set-key"), {"api_key": "sk-rotated"}
+                )
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                key.refresh_from_db()
+                self.assertEqual(key.state, States.OK)
+
+    def test_every_provider_role_can_report_erred(self):
+        for index, (label, user) in enumerate(self.provider_users()):
+            with self.subTest(label):
+                key = models.ResourceApiKey.objects.create(
+                    resource=self.resource,
+                    client_id=f"cid-{index}",
+                    state=States.UPDATING,
+                )
+                self.client.force_authenticate(user)
+                response = self.client.post(
+                    detail_url(key, "set-erred"), {"error_message": "boom"}
+                )
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                key.refresh_from_db()
+                self.assertEqual(key.state, States.ERRED)
+
+    def test_offering_manager_reaches_the_key(self):
+        # The detail actions above are unreachable if the queryset hides the row:
+        # an offering-scoped role is neither a connected project nor a connected
+        # customer, so it used to 404 before any permission check ran.
+        key = models.ResourceApiKey.objects.create(
+            resource=self.resource, client_id="cid-1", state=States.OK
+        )
+        self.client.force_authenticate(self.fixture.offering_manager)
+        response = self.client.get(detail_url(key))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_no_provider_role_can_reveal(self):
+        # Admitting the provider org to the write actions must not let it read a
+        # consumer's live key: reveal stays consumer-side only.
+        key = models.ResourceApiKey.objects.create(
+            resource=self.resource,
+            client_id="cid-1",
+            key_ciphertext=encryption.encrypt_value("sk-secret-one"),
+            state=States.OK,
+        )
+        for label, user in self.provider_users():
+            with self.subTest(label):
+                self.client.force_authenticate(user)
+                response = self.client.get(detail_url(key, "reveal"))
+                self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_the_role_must_be_held_on_this_resource_offering(self):
+        outsider = MarketplaceFixture().offering_manager
+        key = models.ResourceApiKey.objects.create(
+            resource=self.resource, client_id="cid-1", state=States.UPDATING
+        )
+        self.client.force_authenticate(outsider)
+        response = self.client.post(
+            list_url("report-created"),
+            {
+                "resource": self.resource.uuid.hex,
+                "client_id": "cid-2",
+                "api_key": "sk-x",
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        response = self.client.post(
+            detail_url(key, "set-key"), {"api_key": "sk-rotated"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
 
 class ResourceHasApiKeysTest(test.APITestCase):
@@ -531,3 +603,61 @@ class ResourceHasApiKeysTest(test.APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         by_uuid = {row["uuid"]: row for row in response.data}
         self.assertTrue(by_uuid[self.resource.uuid.hex]["has_api_keys"])
+
+
+class ResourceApiKeyFilterTest(test.APITestCase):
+    """The agent's reconciliation pass finds stuck keys by listing, not by command."""
+
+    def setUp(self):
+        self.fixture = MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.stuck = models.ResourceApiKey.objects.create(
+            resource=self.resource, client_id="cid-1", state=States.UPDATING
+        )
+        self.settled = models.ResourceApiKey.objects.create(
+            resource=self.resource, client_id="cid-2", state=States.OK
+        )
+        self.client.force_authenticate(self.fixture.staff)
+
+    def test_filter_by_state(self):
+        response = self.client.get(list_url(), {"state": States.UPDATING})
+        self.assertEqual([key["uuid"] for key in response.data], [self.stuck.uuid.hex])
+
+    def test_filter_by_several_states(self):
+        response = self.client.get(list_url(), {"state": [States.UPDATING, States.OK]})
+        self.assertEqual(len(response.data), 2)
+
+    def test_filter_by_offering(self):
+        other = factories.ResourceFactory()
+        models.ResourceApiKey.objects.create(
+            resource=other, client_id="cid-3", state=States.UPDATING
+        )
+        response = self.client.get(
+            list_url(), {"offering_uuid": self.resource.offering.uuid.hex}
+        )
+        self.assertEqual(
+            {key["uuid"] for key in response.data},
+            {self.stuck.uuid.hex, self.settled.uuid.hex},
+        )
+
+    def test_filter_by_modification_time(self):
+        # The agent only wants keys stuck long enough to be a lost reply rather
+        # than one still in flight.
+        past = timezone.now() - datetime.timedelta(hours=1)
+        models.ResourceApiKey.objects.filter(pk=self.stuck.pk).update(modified=past)
+        cutoff = (timezone.now() - datetime.timedelta(minutes=30)).isoformat()
+
+        response = self.client.get(list_url(), {"modified_before": cutoff})
+
+        self.assertEqual([key["uuid"] for key in response.data], [self.stuck.uuid.hex])
+
+    def test_status_carries_the_resource_backend_id(self):
+        # A reconcile has no command carrying it, and rotate_resource_key needs it.
+        self.resource.backend_id = "res-backend-1"
+        self.resource.save()
+        response = self.client.get(
+            list_url(), {"resource_uuid": self.resource.uuid.hex}
+        )
+        self.assertEqual(
+            {key["resource_backend_id"] for key in response.data}, {"res-backend-1"}
+        )

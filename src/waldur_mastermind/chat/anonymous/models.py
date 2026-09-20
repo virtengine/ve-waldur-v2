@@ -212,6 +212,10 @@ class AnonymousChatInteraction(models.Model):
     input_tokens = models.PositiveIntegerField(null=True, blank=True, default=None)
     output_tokens = models.PositiveIntegerField(null=True, blank=True, default=None)
 
+    # Snapshot of config.AI_ASSISTANT_MODEL at generation time — see the matching
+    # field on chat.models.Message for the rationale.
+    model = models.CharField(max_length=150, blank=True, default="", db_index=True)
+
     # Scrypt(salt, ip) — irreversible pseudonym so admin UI shows a stable per-actor key without exposing raw IP.
     user_slug = models.CharField(max_length=128, db_index=True, blank=True, default="")
 
@@ -247,6 +251,7 @@ class AnonymousChatInteraction(models.Model):
     created = AutoCreatedField()
 
     class Meta:
+        ordering = ["-created", "id"]
         verbose_name = _("Anonymous Chat Interaction")
         verbose_name_plural = _("Anonymous Chat Interactions")
         indexes = [
@@ -331,6 +336,7 @@ class AnonymousChatFeedback(models.Model):
     modified_at = AutoLastModifiedField()
 
     class Meta:
+        ordering = ["-interaction_id"]
         verbose_name = _("Anonymous Chat Feedback")
         verbose_name_plural = _("Anonymous Chat Feedbacks")
         indexes = [

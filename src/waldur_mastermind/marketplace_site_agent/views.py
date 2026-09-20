@@ -3,6 +3,7 @@ from collections import defaultdict
 from datetime import timedelta
 
 from django.contrib.contenttypes.models import ContentType
+from django.core.cache import cache
 from django.db import transaction
 from django.db.models import Count, Q
 from django.utils import timezone
@@ -19,6 +20,7 @@ from waldur_core.core.permissions import IsStaff, IsSupport
 from waldur_core.core.views import ActionsViewSet
 from waldur_core.logging import backend as logging_backend
 from waldur_core.logging import enums as logging_enums
+from waldur_core.logging import event_dispatch
 from waldur_core.logging import models as logging_models
 from waldur_core.logging import serializers as logging_serializers
 from waldur_core.logging import utils as logging_utils
@@ -28,9 +30,15 @@ from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure.models import Project
 from waldur_mastermind.marketplace import enums as marketplace_enums
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace import serializers as marketplace_serializers
 from waldur_mastermind.marketplace_site_agent import filters, models, serializers
 from waldur_mastermind.marketplace_site_agent.enums import AgentServiceState
-from waldur_mastermind.marketplace_site_agent.utils import push_user_role_sync_message
+from waldur_mastermind.marketplace_site_agent.utils import (
+    can_manage_offering_agent,
+    push_resource_user_role_sync_message,
+    push_user_role_sync_message,
+    resolve_offering_agent_authorization,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,30 +64,20 @@ def _resolve_agent_rmq_password(request) -> str:
     return logging_utils.resolve_consumer_rmq_password(request)
 
 
-def _can_manage_offering_agent(request, offering, agent_identity=None):
-    """Check if user can manage agent identities/services for the given offering.
-
-    Allowed for:
-    1. Staff
-    2. Customer-level permission (owner, service provider manager)
-    3. Offering managers (offering-scoped role)
-    4. Identity managers with managed_isds — can create for non-archived/draft
-       offerings and manage only their own agent identities
-    """
-    user = request.user
-    if user.is_staff:
-        return True
-    if has_permission(request, PermissionEnum.CREATE_OFFERING, offering.customer):
-        return True
-    if has_permission(request, PermissionEnum.UPDATE_OFFERING, offering):
-        return True
-    if user.is_identity_manager and user.managed_isds:
-        if offering.state not in marketplace_enums.OfferingStates.ISD_ALLOWED_STATES:
-            return False
-        if agent_identity is not None:
-            return agent_identity.created_by == user
-        return True
-    return False
+# The EventConsumer-derived half of AgentConnectionInfoSerializer. Listed once
+# so the null (legacy-path) case cannot drift from the populated one.
+CONSUMER_INFO_FIELDS = (
+    "event_consumer_uuid",
+    "user_uuid",
+    "user_username",
+    "user_full_name",
+    "user_is_staff",
+    "auth_kind",
+    "auth_token_prefix",
+    "auth_token_name",
+    "authorized_via",
+    "delivery_blocked_reason",
+)
 
 
 class ProjectSyncUserRolesView(generics.GenericAPIView):
@@ -103,6 +101,71 @@ class ProjectSyncUserRolesView(generics.GenericAPIView):
         """
         project = self.get_object()
         push_user_role_sync_message(project)
+        return Response(status=status.HTTP_200_OK)
+
+
+class ResourceSyncUserRolesView(generics.GenericAPIView):
+    """Trigger user role synchronization for one resource.
+
+    Resource-scoped sibling of ProjectSyncUserRolesView: staff or a
+    provider-side user (UPDATE_OFFERING at offering or customer scope)
+    can ask the offering's agent to re-sync this resource's membership.
+    Requires the offering to opt in via enable_membership_sync_status —
+    the flag also gates the UI that exposes this action, so the button
+    and the badges it heals always appear together.
+    """
+
+    # Delivery rides the offering's event subscriptions; polling-only
+    # agents pick the state up on their next cycle regardless, so the
+    # trigger is best-effort by design.
+    THROTTLE_SECONDS = 30
+
+    queryset = marketplace_models.Resource.objects.all()
+    lookup_field = "uuid"
+    permission_classes = [rf_permissions.IsAuthenticated]
+
+    def check_object_permissions(self, request, obj):
+        super().check_object_permissions(request, obj)
+        if request.user.is_staff:
+            return
+        if has_permission(
+            request, PermissionEnum.UPDATE_OFFERING, obj.offering
+        ) or has_permission(
+            request, PermissionEnum.UPDATE_OFFERING, obj.offering.customer
+        ):
+            return
+        raise PermissionDenied()
+
+    @extend_schema(
+        description="Trigger user role sync for this resource. "
+        "Sends a notification to RabbitMQ that this resource needs user "
+        "role synchronization; agents without event subscriptions apply "
+        "the change on their next polling cycle.",
+        request=None,
+        responses={
+            200: None,
+            409: marketplace_serializers.DetailResponseSerializer,
+            429: marketplace_serializers.DetailResponseSerializer,
+        },
+    )
+    def post(self, request, *args, **kwargs):
+        """Trigger a user role sync message for this resource."""
+        resource = self.get_object()
+        if not (resource.offering.plugin_options or {}).get(
+            "enable_membership_sync_status"
+        ):
+            return Response(
+                {"detail": "Membership sync status is not enabled for this offering."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        throttle_key = f"resource-sync-user-roles-{resource.uuid.hex}"
+        if cache.get(throttle_key):
+            return Response(
+                {"detail": "Sync was already requested recently."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+        cache.set(throttle_key, True, self.THROTTLE_SECONDS)
+        push_resource_user_role_sync_message(resource)
         return Response(status=status.HTTP_200_OK)
 
 
@@ -167,7 +230,7 @@ class AgentIdentityViewSet(ActionsViewSet):
         offering = serializer.validated_data.get("offering")
         if not offering:
             raise PermissionDenied()
-        if not _can_manage_offering_agent(request, offering):
+        if not can_manage_offering_agent(request, offering):
             raise PermissionDenied()
 
     create_permissions = [check_create_permissions]
@@ -180,13 +243,22 @@ class AgentIdentityViewSet(ActionsViewSet):
             if not request.user.is_authenticated:
                 raise PermissionDenied("Authentication required")
             return
-        if not _can_manage_offering_agent(request, obj.offering, agent_identity=obj):
+        authorization = resolve_offering_agent_authorization(
+            request, obj.offering, agent_identity=obj
+        )
+        if authorization is None:
             raise PermissionDenied()
+        # Stash the branch that passed instead of discarding it. register_queue
+        # records it on the consumer; re-deriving it in the action would both
+        # repeat the role queries and open a window in which a concurrently
+        # revoked role turns an already-authorised registration into a blank
+        # attribution (and, for a PAT caller, a skipped audit event).
+        request.offering_agent_authorization = authorization
 
     # `update` (PUT) is included: without it, ActionsPermission finds no
     # `update_permissions`, falls back to an empty `unsafe_methods_permissions`,
     # and PUT is gated only by IsAuthenticated + get_queryset — weaker than the
-    # `_can_manage_offering_agent` check the sibling actions enforce. The
+    # `can_manage_offering_agent` check the sibling actions enforce. The
     # serializer additionally pins `offering` on update (see validate_offering).
     partial_update_permissions = update_permissions = destroy_permissions = (
         register_event_subscription_permissions
@@ -415,6 +487,14 @@ class AgentIdentityViewSet(ActionsViewSet):
             consumer.save(update_fields=["object_types"])
         effective_object_types = consumer.object_types or all_object_types
 
+        # Recorded on each successful exit below, never before: the attribution
+        # must describe a registration that actually completed, or a 400 from
+        # provisioning would leave the row claiming a credential the queue never
+        # got. The branch itself comes from the permission check that already
+        # ran (_check_agent_identity_permission stashes it), so it is the exact
+        # evaluation that authorised this request and costs no extra queries.
+        authorized_via = getattr(request, "offering_agent_authorization", None)
+
         queue_name = consumer.queue_name
 
         # Check if already registered and valid
@@ -432,6 +512,13 @@ class AgentIdentityViewSet(ActionsViewSet):
                         _resolve_agent_rmq_password(request),
                     )
                     if password_refreshed:
+                        # The RMQ password now matches the presented credential,
+                        # so the attribution can be recorded: a restart on a
+                        # different credential must refresh it even though the
+                        # queue itself needed no work.
+                        logging_utils.record_consumer_attribution(
+                            consumer, request, authorized_via
+                        )
                         response_data = {
                             "rmq_username": consumer.rmq_username,
                             "queue_name": queue_name,
@@ -473,6 +560,7 @@ class AgentIdentityViewSet(ActionsViewSet):
         result = logging_utils.provision_consumer_queue(
             consumer, _resolve_agent_rmq_password(request)
         )
+        logging_utils.record_consumer_attribution(consumer, request, authorized_via)
         response_data = {**result, "observable_object_types": effective_object_types}
         output_serializer = serializers.AgentQueueRegistrationResponseSerializer(
             data=response_data
@@ -606,7 +694,7 @@ class AgentServiceViewSet(ActionsViewSet):
             if not request.user.is_authenticated:
                 raise PermissionDenied("Authentication required")
             return
-        if not _can_manage_offering_agent(
+        if not can_manage_offering_agent(
             request, obj.identity.offering, agent_identity=obj.identity
         ):
             raise PermissionDenied()
@@ -763,7 +851,7 @@ class AgentProcessorViewSet(ActionsViewSet):
             if not request.user.is_authenticated:
                 raise PermissionDenied("Authentication required")
             return
-        if not _can_manage_offering_agent(
+        if not can_manage_offering_agent(
             request,
             obj.service.identity.offering,
             agent_identity=obj.service.identity,
@@ -973,6 +1061,7 @@ Requires support user permissions.""",
                                 "messages": queue.get("messages", 0),
                                 "consumers": queue.get("consumers", 0),
                                 "object_type": parsed.get("object_type"),
+                                "kind": logging_enums.QueueKind.LEGACY,
                             }
                         )
                     consumer_uuid = logging_utils.parse_consumer_queue_name(
@@ -984,6 +1073,7 @@ Requires support user permissions.""",
                             "messages": queue.get("messages", 0),
                             "consumers": queue.get("consumers", 0),
                             "object_type": None,
+                            "kind": logging_enums.QueueKind.CONSUMER,
                         }
         except Exception as e:
             logger.warning("Failed to get RMQ queues: %s", e)
@@ -1026,7 +1116,16 @@ Requires support user permissions.""",
 
         agent_identities = models.AgentIdentity.objects.select_related(
             "offering", "event_consumer__user"
-        ).prefetch_related("agentservice_set")
+        ).prefetch_related(
+            "agentservice_set",
+            # The bindings back delivery_blocked_reason below. This loads the
+            # bound entity, not its ancestor chain, so scope_keys_for still
+            # walks the parent FKs — the reason costs roughly two queries per
+            # agent. This endpoint is support-only and unpaginated; batching
+            # that walk across agents is the obvious next step if it grows.
+            "event_consumer__scopes__content_type",
+            "event_consumer__scopes__scope",
+        )
 
         for identity in agent_identities:
             # Get services for this identity
@@ -1095,9 +1194,6 @@ Requires support user permissions.""",
                     }
                 )
 
-            if agent_connected:
-                connected_count += 1
-
             # Get queues for this offering (legacy path)
             offering_uuid_hex = identity.offering.uuid.hex
             queues = list(queues_by_offering.get(offering_uuid_hex, []))
@@ -1106,10 +1202,39 @@ Requires support user permissions.""",
             if identity.event_consumer:
                 consumer_uuid_hex = identity.event_consumer.uuid.hex
                 if consumer_uuid_hex in agent_queues_by_consumer:
-                    queues.append(agent_queues_by_consumer[consumer_uuid_hex])
+                    consumer_queue = agent_queues_by_consumer[consumer_uuid_hex]
+                    queues.append(consumer_queue)
+                    # A migrated agent holds no legacy subscription, so the loop
+                    # above never sees it connected. Its consumer queue does:
+                    # draining it means a live STOMP consumer on the broker.
+                    if consumer_queue.get("consumers", 0) >= 1:
+                        agent_connected = True
+
+            if agent_connected:
+                connected_count += 1
 
             for queue in queues:
                 total_queued_messages += queue.get("messages", 0)
+
+            # Who the queue runs as and on what credential. All null for an
+            # agent still on the legacy path, which has no consumer at all.
+            consumer = identity.event_consumer
+            consumer_info = dict.fromkeys(CONSUMER_INFO_FIELDS)
+            if consumer:
+                consumer_info = {
+                    "event_consumer_uuid": consumer.uuid,
+                    "user_uuid": consumer.user.uuid,
+                    "user_username": consumer.user.username,
+                    "user_full_name": consumer.user.full_name,
+                    "user_is_staff": consumer.user.is_staff,
+                    "auth_kind": consumer.auth_kind,
+                    "auth_token_prefix": consumer.auth_token_prefix,
+                    "auth_token_name": consumer.auth_token_name,
+                    "authorized_via": consumer.authorized_via,
+                    "delivery_blocked_reason": event_dispatch.delivery_blocked_reason(
+                        consumer
+                    ),
+                }
 
             agents_data.append(
                 {
@@ -1119,6 +1244,7 @@ Requires support user permissions.""",
                     "offering_name": identity.offering.name,
                     "version": identity.version,
                     "last_restarted": identity.last_restarted,
+                    **consumer_info,
                     "services": services_data,
                     "event_subscriptions": event_subscriptions_data,
                     "queues": queues,
@@ -1154,12 +1280,7 @@ class SiteAgentLogViewSet(ActionsViewSet):
     def get_queryset(self):
         qs = super().get_queryset().select_related("agent_identity__offering")
         offerings = marketplace_models.Offering.objects.filter(
-            type__in=[
-                marketplace_enums.SITE_AGENT_OFFERING,
-                marketplace_enums.SCRIPT_OFFERING,
-                marketplace_enums.OPENSTACK_TENANT_OFFERING,
-                marketplace_enums.BASIC_OFFERING,
-            ]
+            type__in=marketplace_enums.SITE_AGENT_COMPATIBLE_OFFERING_TYPES
         ).filter_for_user(self.request.user)
         return qs.filter(agent_identity__offering__in=offerings)
 

@@ -15,6 +15,7 @@ from waldur_core.core.mixins import ScopeMixin
 from waldur_core.core.models import DescribableMixin, User, UuidMixin
 
 from . import signals
+from .enums import ROLE_DESCRIPTIONS
 
 
 class RoleManager(models.Manager):
@@ -26,7 +27,14 @@ class RoleManager(models.Manager):
             return self._cache[cache_key]
         role, _ = self.get_or_create(
             name=cache_key,
-            defaults={"is_system_role": True, "content_type": content_type},
+            defaults={
+                "is_system_role": True,
+                "content_type": content_type,
+                # Without this a role first created here (rather than by a
+                # seeding migration) has a blank description, and the UI falls
+                # back to showing the raw enum name.
+                "description": ROLE_DESCRIPTIONS.get(cache_key, ""),
+            },
         )
         self._cache[cache_key] = role
         return role
@@ -61,7 +69,7 @@ class Role(DescribableMixin, UuidMixin):
     )
 
     class Meta:
-        ordering = ["name"]
+        ordering = ["name", "id"]
 
     def save(self, *args, **kwargs):
         # Enforce name+content_type uniqueness for non-resource scopes.
@@ -170,6 +178,17 @@ class UserRole(TimeStampedModel, ScopeMixin, UuidMixin):
         related_name="+",
     )
     revoke_reason = models.CharField(max_length=255, blank=True, default="")
+    source = models.CharField(
+        max_length=150,
+        blank=True,
+        default="",
+        db_index=True,
+        help_text=(
+            "Provenance of a machine-issued grant, e.g. 'rule:<uuid>'. Empty for "
+            "grants made by a person. Only rows carrying a source are eligible "
+            "for automatic reconciliation."
+        ),
+    )
     expiration_time = models.DateTimeField(null=True, blank=True)
     is_active = models.BooleanField(null=True, default=True, db_index=True)
     tracker = cast(
@@ -239,7 +258,7 @@ class UserRole(TimeStampedModel, ScopeMixin, UuidMixin):
         )
 
     class Meta:
-        ordering = ["created"]
+        ordering = ["created", "id"]
 
     def __str__(self):
         return f"{self.user.username} ({self.role}, {self.expiration_time}, {self.is_active})"

@@ -17,8 +17,12 @@ from waldur_mastermind.invoices import signals as cost_signals
 from waldur_mastermind.invoices import utils as invoice_utils
 from waldur_mastermind.invoices.audit import credit_audit_skipped, skip_credit_audit
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.billing import MarketplaceBillingService
-from waldur_mastermind.marketplace.enums import ResourceStates
+from waldur_mastermind.marketplace.enums import (
+    MissingUsagePolicies,
+    ResourceStates,
+)
 
 from .models import CustomerCredit, Invoice, InvoiceItem, ProjectCredit
 
@@ -190,9 +194,17 @@ def projects_customer_has_been_changed(
         invoice.items.filter(project=project).update(invoice=new_invoice)
 
 
-def create_recurring_usage_if_invoice_has_been_created(
+def create_carried_over_usage_if_invoice_has_been_created(
     sender, instance: Invoice, created=False, **kwargs
 ):
+    """Materialize usage for the new billing period from the previous one.
+
+    Rows whose ``missing_usage_policy`` is REUSE repeat their last reported
+    value; rows set to ZERO get an explicit zero, so that a period the provider
+    stays silent about is recorded as "no usage" rather than left unreported.
+    The policy is copied onto the new row so the behaviour survives beyond a
+    single month.
+    """
     if not created:
         return
 
@@ -201,28 +213,53 @@ def create_recurring_usage_if_invoice_has_been_created(
     now = timezone.now()
     prev_month = (now.replace(day=1) - datetime.timedelta(days=1)).date()
     prev_month_start = prev_month.replace(day=1)
+    # Source rows come from the previous month only. Matching the current month
+    # too would make a row that is both a source and a target of this loop, so
+    # the value written would depend on unordered row iteration.
     usages = marketplace_models.ComponentUsage.objects.filter(
         resource__project__customer=invoice.customer,
-        recurring=True,
-        billing_period__gte=prev_month_start,
+        missing_usage_policy__in=MissingUsagePolicies.CARRIED_OVER,
+        billing_period=prev_month_start,
     ).exclude(resource__state=ResourceStates.TERMINATED)
 
     if not usages:
         return
 
+    billing_period = core_utils.month_start(now)
+
     for usage in usages:
-        marketplace_models.ComponentUsage.objects.update_or_create(
+        # Both policies only fill a gap. A row already present for the new
+        # period means the provider has since reported for it, and that report
+        # — its value, its own policy and the plan period it was measured
+        # against — is the more current statement of intent.
+        #
+        # A usage row is identified by (resource, component, billing_period);
+        # plan_period is a mutable attribute, not part of the identity. Keying
+        # the check on it too would miss a row reported under a newer plan
+        # period and create the (resource, component, billing_period)
+        # duplicates that migration 0212 had to clean up.
+        if marketplace_models.ComponentUsage.objects.filter(
             resource=usage.resource,
             component=usage.component,
-            plan_period=usage.plan_period,
-            billing_period=core_utils.month_start(now),
-            defaults={
-                "usage": usage.usage,
-                "date": now,
-                "description": usage.description,
-                "recurring": usage.recurring,
-                "modified_by": usage.modified_by,
-            },
+            billing_period=billing_period,
+        ).exists():
+            continue
+
+        marketplace_models.ComponentUsage.objects.create(
+            resource=usage.resource,
+            component=usage.component,
+            plan_period=marketplace_utils.get_plan_period_for_billing(
+                usage.resource, now
+            )
+            or usage.plan_period,
+            billing_period=billing_period,
+            usage=0
+            if usage.missing_usage_policy == MissingUsagePolicies.ZERO
+            else usage.usage,
+            date=now,
+            description=usage.description,
+            missing_usage_policy=usage.missing_usage_policy,
+            modified_by=usage.modified_by,
         )
 
 
@@ -262,6 +299,34 @@ def log_credit(sender, instance: CustomerCredit, created=False, **kwargs):
             },
             scopes=[credit.customer],
         )
+
+
+def delete_project_credits_with_customer_credit(
+    sender, instance: CustomerCredit, **kwargs
+):
+    """Remove the project credits funded by an organization credit with it.
+
+    A project credit is an allocation *out of* the organization credit — it is
+    created only when one exists (ProjectCredit.save validates that) and can
+    draw nothing without it. Leaving them behind produced orphans that no
+    longer meant anything and that every reader had to defend against.
+
+    Implemented as a signal rather than a foreign key because the two are
+    related through the project's customer, and a project can be moved between
+    customers; a FK would have to be rewritten on every move to stay true,
+    whereas resolving by customer at delete time is always correct.
+    """
+    project_credits = ProjectCredit.objects.filter(project__customer=instance.customer)
+    names = list(project_credits.values_list("project__name", flat=True))
+    if not names:
+        return
+    logger.info(
+        "Deleting %s project credit(s) with the organization credit of %s: %s",
+        len(names),
+        instance.customer,
+        ", ".join(names),
+    )
+    project_credits.delete()
 
 
 def log_project_credit(sender, instance: ProjectCredit, created=False, **kwargs):
@@ -433,15 +498,19 @@ def refund_project_credit_on_project_removal(sender, instance: Project, **kwargs
             )
 
 
-def record_credit_transaction(
-    sender, instance: CustomerCredit, created=False, **kwargs
-):
-    """Write a CreditTransaction ledger row for every CustomerCredit value
-    change. The semantic type comes from the innermost
-    ``ledger.credit_transaction_type`` block; untyped mutations (staff UI,
-    REST API, shell) are recorded as staff grants. Unlike the audit events,
-    ledger writes are never suppressed — the withdrawable balance is
-    derived from them.
+def record_credit_transaction(sender, instance, created=False, **kwargs):
+    """Write ledger rows for every credit value change, organization or project.
+
+    The semantic type comes from the innermost ``ledger.credit_transaction_type``
+    block; untyped mutations (staff UI, REST API, shell) are recorded as staff
+    grants. A writer that applies two different kinds of movement in one save —
+    compensation against usage, plus the top-up to the minimal-consumption floor
+    — declares the breakdown with ``ledger.credit_transaction_parts`` and gets
+    one row per part instead; a breakdown that does not add up to the delta is
+    refused, and the movement falls back to one row of the enclosing type.
+
+    Unlike the audit events, ledger writes are never suppressed: the
+    withdrawable balance and the drawdown history are derived from them.
     """
     update_fields = kwargs.get("update_fields")
     if update_fields and "value" not in update_fields:
@@ -458,13 +527,62 @@ def record_credit_transaction(
     if not delta:
         return
 
-    transaction_type, reference, comment = ledger.current_credit_transaction_type()
+    is_project_credit = isinstance(instance, models.ProjectCredit)
+    attribution = {}
+    if is_project_credit:
+        project = instance.project
+        attribution = {
+            "project_credit": instance,
+            "project_uuid": project.uuid.hex,
+            "project_name": project.name,
+        }
+    else:
+        attribution = {"credit": instance}
+
+    parts, parts_reference, parts_comment = ledger.current_credit_transaction_parts(
+        instance
+    )
+    if parts:
+        total = sum(part.amount for part in parts)
+        if total == delta:
+            for part in parts:
+                if not part.amount:
+                    continue
+                models.CreditTransaction.objects.create(
+                    amount=part.amount,
+                    transaction_type=part.transaction_type,
+                    reference=parts_reference,
+                    comment=parts_comment or "",
+                    billing_period=part.billing_period,
+                    **attribution,
+                )
+            return
+        # A breakdown that does not add up would misstate the balance it claims
+        # to explain, so fall through to a single row rather than trust it. The
+        # enclosing credit_transaction_type block then says what the movement
+        # was; a writer that declares parts should declare that too, or the
+        # refusal files the movement as an untyped staff grant.
+        logger.warning(
+            "Credit transaction parts for %s sum to %s but the value moved by %s; "
+            "recording the movement as one row instead.",
+            instance,
+            total,
+            delta,
+        )
+
+    (
+        transaction_type,
+        reference,
+        comment,
+        billing_period,
+    ) = ledger.current_credit_transaction_type()
     models.CreditTransaction.objects.create(
-        credit=instance,
         amount=delta,
         transaction_type=transaction_type or models.CreditTransaction.Types.STAFF_GRANT,
         reference=reference,
         comment=comment or "",
+        billing_period=billing_period,
+        **attribution,
     )
 
 

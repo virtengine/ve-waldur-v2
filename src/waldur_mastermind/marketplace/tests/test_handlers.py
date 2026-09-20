@@ -7,7 +7,9 @@ from django.db import transaction
 from rest_framework.test import APITestCase
 
 from waldur_core.core.tests.helpers import override_waldur_core_settings
+from waldur_core.logging import enums as logging_enums
 from waldur_core.logging.models import Event
+from waldur_core.logging.tests import factories as logging_factories
 from waldur_core.permissions.fixtures import ProjectRole
 from waldur_core.structure.models import Customer, Project
 from waldur_core.structure.tests import factories as structure_factories
@@ -456,6 +458,13 @@ class UpdateOfferingUserUsernameAfterUserChangeTest(APITestCase):
         self.offering_user.refresh_from_db()
         self.assertEqual(self.offering_user.username, "old_username")
 
+    def test_do_not_update_offering_user_username_if_details_is_not_dict(self):
+        self.user.details = ""
+        self.user.save(update_fields=["details"])
+
+        self.offering_user.refresh_from_db()
+        self.assertEqual(self.offering_user.username, "old_username")
+
     def test_do_not_update_offering_user_username_if_username_generation_policy_is_not_identity_claim(
         self,
     ):
@@ -475,6 +484,86 @@ class UpdateOfferingUserUsernameAfterUserChangeTest(APITestCase):
 
         offering_user.refresh_from_db()
         self.assertEqual(offering_user.username, "old_username")
+
+
+class UsernamePolicyResolutionTest(APITestCase):
+    """The identity-claim handler must see a policy set on the provider.
+
+    The handler used to filter on the offering's own plugin_options only, so an
+    offering inheriting the policy from its ServiceProvider was invisible to it
+    -- the same gap as the provider defaults, one layer along. It now selects a
+    superset in SQL and confirms per row with resolve_account_setting, so both
+    halves need covering: the inherited case is picked up, and an offering that
+    overrides its provider is left alone.
+    """
+
+    POLICY = utils.UsernameGenerationPolicy.IDENTITY_CLAIM.value
+
+    def build(self, offering_policy=None, provider_policy=None):
+        offering = factories.OfferingFactory(
+            type=BASIC_OFFERING,
+            plugin_options=(
+                {"username_generation_policy": offering_policy}
+                if offering_policy
+                else {}
+            ),
+        )
+        if provider_policy:
+            provider = factories.ServiceProviderFactory(customer=offering.customer)
+            provider.account_options["username_generation_policy"] = provider_policy
+            provider.save()
+        offering_user = factories.OfferingUserFactory(
+            offering=offering, username="old_username"
+        )
+        return offering_user
+
+    def rename(self, offering_user, name="new_site_username"):
+        user = offering_user.user
+        user.details = {"site_username": name}
+        user.save()
+        offering_user.refresh_from_db()
+        return offering_user
+
+    def test_a_policy_set_on_the_offering_is_honoured(self):
+        offering_user = self.build(offering_policy=self.POLICY)
+
+        self.assertEqual(self.rename(offering_user).username, "new_site_username")
+
+    def test_a_policy_inherited_from_the_provider_is_honoured(self):
+        offering_user = self.build(provider_policy=self.POLICY)
+
+        self.assertEqual(self.rename(offering_user).username, "new_site_username")
+
+    def test_an_offering_overriding_its_provider_is_left_alone(self):
+        offering_user = self.build(
+            offering_policy=utils.UsernameGenerationPolicy.FREEIPA.value,
+            provider_policy=self.POLICY,
+        )
+
+        self.assertEqual(self.rename(offering_user).username, "old_username")
+
+    def test_an_offering_with_no_policy_anywhere_is_left_alone(self):
+        offering_user = self.build()
+
+        self.assertEqual(self.rename(offering_user).username, "old_username")
+
+    def test_a_provider_backed_account_is_never_rewritten(self):
+        """Its username is owned by the provider account, so the handler skips it."""
+        offering_user = self.build(offering_policy=self.POLICY)
+        provider = factories.ServiceProviderFactory(
+            customer=offering_user.offering.customer
+        )
+        account = marketplace_models.ServiceProviderAccount.objects.create(
+            service_provider=provider,
+            user=offering_user.user,
+            username="owned_by_provider",
+        )
+        marketplace_models.OfferingUser.objects.filter(pk=offering_user.pk).update(
+            service_provider_account=account, username="owned_by_provider"
+        )
+        offering_user.refresh_from_db()
+
+        self.assertEqual(self.rename(offering_user).username, "owned_by_provider")
 
 
 class UpdateOfferingUserUsernameAfterOfferingSettingsChangeTest(APITestCase):
@@ -1052,10 +1141,13 @@ class OfferingUserRestorationOnProjectAccessGainedTest(APITestCase):
         offering_user.refresh_from_db()
         self.assertEqual(offering_user.state, OfferingUserStates.OK)
 
-    def test_offering_user_requests_new_account_when_deleted_and_user_regains_access(
-        self,
-    ):
-        """Test that offering user in DELETED requests new account creation when user regains access."""
+    def test_deleted_waldur_named_offering_user_comes_back_under_its_name(self):
+        """A Waldur-named account is restored from DELETED to OK with the same username.
+
+        The provider parks the directory entry on departure and re-enables it
+        when the account is presented live again, so asking for a new account
+        would strand the parked one.
+        """
         offering_user = marketplace_models.OfferingUser.objects.create(
             user=self.test_user,
             offering=self.fixture.offering,
@@ -1071,10 +1163,96 @@ class OfferingUserRestorationOnProjectAccessGainedTest(APITestCase):
         add_user_to_project(self.test_user, self.fixture.project)
 
         offering_user.refresh_from_db()
+        self.assertEqual(offering_user.state, OfferingUserStates.OK)
+        self.assertEqual(offering_user.username, "test_user")
+
+    def test_deleted_provider_named_offering_user_is_requested_again(self):
+        """Under the service_provider policy a DELETED account is gone for good."""
+        self.fixture.offering.plugin_options["username_generation_policy"] = (
+            "service_provider"
+        )
+        self.fixture.offering.save()
+        offering_user = marketplace_models.OfferingUser.objects.create(
+            user=self.test_user,
+            offering=self.fixture.offering,
+            state=OfferingUserStates.OK,
+            username="test_user",
+        )
+        offering_user.request_deletion()
+        offering_user.set_deleting()
+        offering_user.set_deleted()
+        offering_user.save()
+
+        add_user_to_project(self.test_user, self.fixture.project)
+
+        offering_user.refresh_from_db()
         self.assertEqual(offering_user.state, OfferingUserStates.CREATION_REQUESTED)
 
-    def test_offering_user_without_username_restored_to_creation_requested(self):
-        """Test that offering user without username is restored to CREATION_REQUESTED."""
+    def test_deleted_offering_user_is_restored_without_the_creation_flag(self):
+        """The flag gates minting accounts, not the return of an existing one."""
+        self.fixture.offering.plugin_options = {
+            "username_generation_policy": "waldur_username"
+        }
+        self.fixture.offering.save()
+        offering_user = marketplace_models.OfferingUser.objects.create(
+            user=self.test_user,
+            offering=self.fixture.offering,
+            state=OfferingUserStates.OK,
+            username="test_user",
+        )
+        offering_user.request_deletion()
+        offering_user.set_deleting()
+        offering_user.set_deleted()
+        offering_user.save()
+
+        add_user_to_project(self.test_user, self.fixture.project)
+
+        offering_user.refresh_from_db()
+        self.assertEqual(offering_user.state, OfferingUserStates.OK)
+        # ...while a member with no account here still gets none minted.
+        newcomer = structure_factories.UserFactory()
+        add_user_to_project(newcomer, self.fixture.project)
+        self.assertFalse(
+            marketplace_models.OfferingUser.objects.filter(
+                user=newcomer, offering=self.fixture.offering
+            ).exists()
+        )
+
+    @mock.patch("waldur_core.logging.tasks.publish_messages.delay")
+    def test_restore_publishes_an_offering_user_event(self, mocked_publish):
+        subscription = logging_factories.EventSubscriptionFactory(
+            user=self.fixture.offering_owner,
+            observable_objects=[
+                {"object_type": logging_enums.ObservableObjectType.OFFERING_USER.value}
+            ],
+        )
+        logging_factories.EventSubscriptionQueueFactory(
+            event_subscription=subscription,
+            offering_uuid=self.fixture.offering.uuid,
+            object_type=logging_enums.ObservableObjectType.OFFERING_USER.value,
+        )
+        offering_user = marketplace_models.OfferingUser.objects.create(
+            user=self.test_user,
+            offering=self.fixture.offering,
+            state=OfferingUserStates.OK,
+            username="test_user",
+        )
+        offering_user.request_deletion()
+        offering_user.set_deleting()
+        offering_user.set_deleted()
+        offering_user.save()
+        mocked_publish.reset_mock()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            add_user_to_project(self.test_user, self.fixture.project)
+
+        mocked_publish.assert_called()
+        payload = str(mocked_publish.call_args[0][0][0]["payload"])
+        self.assertIn(offering_user.uuid.hex, payload)
+        self.assertIn("OK", payload)
+
+    def test_offering_user_without_username_is_named_on_the_way_back(self):
+        """A Waldur-named account that never got a name gets one and goes live."""
         offering_user = marketplace_models.OfferingUser.objects.create(
             user=self.test_user,
             offering=self.fixture.offering,
@@ -1084,6 +1262,25 @@ class OfferingUserRestorationOnProjectAccessGainedTest(APITestCase):
         offering_user.save()
         self.assertEqual(offering_user.state, OfferingUserStates.DELETED)
         self.assertFalse(offering_user.username)
+
+        add_user_to_project(self.test_user, self.fixture.project)
+
+        offering_user.refresh_from_db()
+        self.assertEqual(offering_user.username, self.test_user.username)
+        self.assertEqual(offering_user.state, OfferingUserStates.OK)
+
+    def test_provider_named_offering_user_without_username_is_requested(self):
+        self.fixture.offering.plugin_options["username_generation_policy"] = (
+            "service_provider"
+        )
+        self.fixture.offering.save()
+        offering_user = marketplace_models.OfferingUser.objects.create(
+            user=self.test_user,
+            offering=self.fixture.offering,
+            state=OfferingUserStates.CREATION_REQUESTED,
+        )
+        offering_user.set_deleted()
+        offering_user.save()
 
         add_user_to_project(self.test_user, self.fixture.project)
 
@@ -1118,11 +1315,12 @@ class OfferingUserRestorationOnProjectAccessGainedTest(APITestCase):
         add_user_to_project(self.test_user, self.fixture.project)
 
         event = Event.objects.filter(
-            event_type="marketplace_offering_user_updated"
+            event_type="marketplace_offering_user_updated",
+            message__contains="has been restored",
         ).first()
         self.assertIsNotNone(event)
-        self.assertIn("has been restored from", event.message)
-        self.assertIn("to OK because user regained project access", event.message)
+        self.assertIn("was Requested deletion, now OK", event.message)
+        self.assertIn("because the user regained project access", event.message)
         self.assertIn(self.test_user.username, event.message)
         self.assertIn(self.fixture.offering.name, event.message)
 
@@ -1130,6 +1328,10 @@ class OfferingUserRestorationOnProjectAccessGainedTest(APITestCase):
         self,
     ):
         """Test that event is emitted when offering user without username is restored to CREATION_REQUESTED."""
+        self.fixture.offering.plugin_options["username_generation_policy"] = (
+            "service_provider"
+        )
+        self.fixture.offering.save()
         # Create in CREATING state (no username) so we can transition to DELETION_REQUESTED
         offering_user = marketplace_models.OfferingUser.objects.create(
             user=self.test_user,
@@ -1144,17 +1346,21 @@ class OfferingUserRestorationOnProjectAccessGainedTest(APITestCase):
         add_user_to_project(self.test_user, self.fixture.project)
 
         event = Event.objects.filter(
-            event_type="marketplace_offering_user_updated"
+            event_type="marketplace_offering_user_updated",
+            message__contains="requested again",
         ).first()
         self.assertIsNotNone(event)
-        self.assertIn("Account creation", event.message)
-        self.assertIn("has been requested", event.message)
-        self.assertIn("because user regained project access", event.message)
+        self.assertIn("was Requested deletion, now Requested", event.message)
+        self.assertIn("because the user regained project access", event.message)
         self.assertIn(self.test_user.username, event.message)
         self.assertIn(self.fixture.offering.name, event.message)
 
     def test_event_emitted_when_restoring_from_deleted_to_creation_requested(self):
         """Test that event is emitted when offering user in DELETED state requests new account creation."""
+        self.fixture.offering.plugin_options["username_generation_policy"] = (
+            "service_provider"
+        )
+        self.fixture.offering.save()
         offering_user = marketplace_models.OfferingUser.objects.create(
             user=self.test_user,
             offering=self.fixture.offering,
@@ -1169,13 +1375,12 @@ class OfferingUserRestorationOnProjectAccessGainedTest(APITestCase):
         add_user_to_project(self.test_user, self.fixture.project)
 
         event = Event.objects.filter(
-            event_type="marketplace_offering_user_updated"
+            event_type="marketplace_offering_user_updated",
+            message__contains="requested again",
         ).first()
         self.assertIsNotNone(event)
-        self.assertIn("New account creation", event.message)
-        self.assertIn("has been requested", event.message)
-        self.assertIn("after offering user was deleted", event.message)
-        self.assertIn("because user regained project access", event.message)
+        self.assertIn("was Deleted, now Requested", event.message)
+        self.assertIn("because the user regained project access", event.message)
         self.assertIn(self.test_user.username, event.message)
         self.assertIn(self.fixture.offering.name, event.message)
 
@@ -1414,10 +1619,11 @@ class UserOfferingsMappingRestorationTest(APITestCase):
         utils.user_offerings_mapping([self.fixture.offering])
 
         offering_user.refresh_from_db()
-        self.assertEqual(offering_user.state, OfferingUserStates.CREATION_REQUESTED)
+        self.assertEqual(offering_user.username, self.test_user.username)
+        self.assertEqual(offering_user.state, OfferingUserStates.OK)
 
-    def test_does_not_restore_deleting_user(self):
-        """Offering user in DELETING state is left untouched."""
+    def test_restores_deleting_user(self):
+        """Offering user in DELETING is brought back: the member still holds a resource."""
         offering_user = marketplace_models.OfferingUser.objects.create(
             user=self.test_user,
             offering=self.fixture.offering,
@@ -1432,10 +1638,10 @@ class UserOfferingsMappingRestorationTest(APITestCase):
         utils.user_offerings_mapping([self.fixture.offering])
 
         offering_user.refresh_from_db()
-        self.assertEqual(offering_user.state, OfferingUserStates.DELETING)
+        self.assertEqual(offering_user.state, OfferingUserStates.OK)
 
-    def test_does_not_restore_deleted_user(self):
-        """Offering user in DELETED state is left untouched."""
+    def test_restores_deleted_unnamed_user_as_a_creation_request(self):
+        """A DELETED account that never had a name is requested again."""
         offering_user = marketplace_models.OfferingUser.objects.create(
             user=self.test_user,
             offering=self.fixture.offering,
@@ -1448,7 +1654,10 @@ class UserOfferingsMappingRestorationTest(APITestCase):
         utils.user_offerings_mapping([self.fixture.offering])
 
         offering_user.refresh_from_db()
-        self.assertEqual(offering_user.state, OfferingUserStates.DELETED)
+        # waldur_username policy: the name is derived on the way back, so the
+        # account is live again rather than waiting on the provider.
+        self.assertEqual(offering_user.username, self.test_user.username)
+        self.assertEqual(offering_user.state, OfferingUserStates.OK)
 
 
 class OfferingUserCreationHandlerWhenOrderIsValidTest(APITestCase):

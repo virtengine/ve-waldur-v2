@@ -1,7 +1,9 @@
+import copy
 import hashlib
 import json
 import logging
 import traceback
+from io import StringIO
 from uuid import uuid4
 
 from celery import Task as CeleryTask
@@ -12,11 +14,13 @@ from celery.result import AsyncResult
 from celery.worker.request import Request
 from constance import config
 from django.core.cache import cache
+from django.core.management import call_command
 from django.db import IntegrityError, OperationalError, close_old_connections
 from django.db import models as django_models
 from django.db.models import ObjectDoesNotExist
 from django.utils import timezone
-from django_fsm import TransitionNotAllowed
+from django_fsm import FSMFieldMixin, TransitionNotAllowed
+from model_utils.fields import AutoLastModifiedField
 
 from waldur_core.core import models, utils
 from waldur_core.core.enums import CoreStates
@@ -27,6 +31,44 @@ logger = logging.getLogger(__name__)
 
 class StateChangeError(RuntimeError):
     pass
+
+
+def _field_values(instance):
+    """Values of the concrete fields loaded on `instance`.
+
+    Dicts and lists are copied, so a transition that mutates one in place still
+    shows up as a change.
+    """
+    deferred = instance.get_deferred_fields()
+    values = {}
+    for field in instance._meta.concrete_fields:
+        if field.primary_key or field.attname in deferred:
+            continue
+        value = getattr(instance, field.attname)
+        values[field.attname] = (
+            copy.deepcopy(value) if isinstance(value, dict | list) else value
+        )
+    return values
+
+
+def _transition_update_fields(instance, before):
+    """Fields a state transition has to write.
+
+    The state field always, so a transition into the state the row is already in
+    still saves and signals as before; timestamps maintained on save; and every
+    other field the transition method or the task changed.
+    """
+    fields = set()
+    for field in instance._meta.concrete_fields:
+        if field.attname not in before:
+            continue
+        if (
+            isinstance(field, FSMFieldMixin | AutoLastModifiedField)
+            or getattr(field, "auto_now", False)
+            or getattr(instance, field.attname) != before[field.attname]
+        ):
+            fields.add(field.name)
+    return fields
 
 
 class TaskType(type):
@@ -166,12 +208,16 @@ class StateTransitionTask(Task):
         )
         old_state = instance.get_state_display()
         try:
+            before = _field_values(instance)
             getattr(instance, transition_method)()
             if action is not None:
                 instance.action = action
             if action_details is not None:
                 instance.action_details = action_details
-            instance.save()
+            # Only what the transition changed: the instance was loaded when the
+            # task started, and a full save would write every other column back
+            # as it was then, reverting whatever a request committed meanwhile.
+            instance.save(update_fields=_transition_update_fields(instance, before))
         except IntegrityError:
             message = f"Could not change state of {instance_description}, using method `{transition_method}` due to concurrent update"
             raise StateChangeError(message)
@@ -430,6 +476,7 @@ class BackgroundTask(CeleryTask, metaclass=TaskType):
         # 2. Check Lock (Atomic ADD)
         # We store the task_id inside the lock for debugging purposes
         task_id = options.get("task_id") or str(uuid4())
+        options["task_id"] = task_id
 
         # cache.add returns True if key was set, False if key already existed.
         # celery-beat is long-lived and has no HTTP request boundary, so Django
@@ -920,3 +967,52 @@ def check_table_growth_alerts():
             )
     else:
         logger.info("No table growth alerts triggered")
+
+
+@shared_task(name="waldur_core.delete_stale_user_revisions")
+def delete_stale_user_revisions():
+    """Prune reversion history for users.
+
+    Every audited change to a user opens a revision, and federated deployments
+    sync users on every login, so core.User is the fastest-growing versioned
+    table. USER_REVISION_KEEP_MINIMUM guarantees each user keeps a usable trail
+    however old it is: without it, a quiet account would eventually lose its
+    history entirely.
+
+    Note that a revision is deleted whole, taking every version it holds with
+    it. Revisions written by the per-user signal handler hold exactly one user,
+    but an admin bulk action writes one revision covering all users it touched -
+    those are pruned together, which is fine as they share an age.
+    """
+    retention_days = config.USER_REVISION_RETENTION_DAYS
+    if not retention_days:
+        logger.debug(
+            "USER_REVISION_RETENTION_DAYS is 0, skipping user revision cleanup"
+        )
+        return
+
+    keep = config.USER_REVISION_KEEP_MINIMUM
+    if keep < 1:
+        logger.warning(
+            "USER_REVISION_KEEP_MINIMUM is %s, which would allow a user's whole "
+            "history to be deleted. Skipping user revision cleanup.",
+            keep,
+        )
+        return
+
+    output = StringIO()
+    call_command(
+        "deleterevisions",
+        "core.User",
+        days=retention_days,
+        keep=keep,
+        verbosity=1,
+        stdout=output,
+    )
+    logger.info(
+        "Pruned user revisions older than %s days, keeping the %s most recent "
+        "per user. %s",
+        retention_days,
+        keep,
+        output.getvalue().strip().replace("\n", " "),
+    )

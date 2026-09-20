@@ -1,20 +1,21 @@
 import django_filters
-from dbtemplates.models import Template
 from django import forms
 from django.conf import settings as django_settings
 from django.contrib.contenttypes.models import ContentType
 from django.core import exceptions
-from django.db.models import OuterRef, Q, Subquery
+from django.db.models import Exists, OuterRef, Q, Subquery
 from django.db.models.functions import Concat, Length
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django_filters.widgets import BooleanWidget
 from drf_spectacular.plumbing import build_parameter_type
 from drf_spectacular.utils import OpenApiParameter
+from rest_framework import filters as rf_filters
 from rest_framework.filters import BaseFilterBackend
 
 from waldur_core.core import filters as core_filters
 from waldur_core.core import models as core_models
+from waldur_core.core import template_utils
 from waldur_core.core.enums import CoreStates
 from waldur_core.core.filters import (
     ExternalFilterBackend,
@@ -37,6 +38,7 @@ from waldur_core.structure.managers import (
     get_customer_users,
     get_nested_customer_users,
     get_project_users,
+    get_service_provider_manager_customer_ids_qs,
     get_visible_users,
 )
 from waldur_core.structure.registry import SupportedServices
@@ -194,6 +196,32 @@ class GenericRoleFilter(BaseFilterBackend):
             return queryset.none()
 
 
+def _with_service_provider_organizations(queryset, visible, user):
+    managed_customer_ids = get_service_provider_manager_customer_ids_qs(user)
+    if managed_customer_ids is None:
+        return visible
+    return queryset.filter(
+        Q(id__in=visible.values("id")) | Q(id__in=managed_customer_ids)
+    )
+
+
+class CustomerRoleFilter(GenericRoleFilter):
+    """GenericRoleFilter plus the organizations of service providers the user
+    has a role on.
+
+    Wired only to CustomerViewSet, whose serializer narrows those rows to
+    public identity fields. Other Customer-queryset views (e.g.
+    financial-reports) keep using GenericRoleFilter and must not see them.
+    """
+
+    def filter_queryset(self, request, queryset, view):
+        visible = super().filter_queryset(request, queryset, view)
+        user = request.user
+        if not user.is_authenticated or user.is_staff or user.is_support:
+            return visible
+        return _with_service_provider_organizations(queryset, visible, user)
+
+
 class GenericUserFilter(BaseFilterBackend):
     def filter_queryset(self, request, queryset, view):
         user_uuid = request.query_params.get("user_uuid")
@@ -208,6 +236,9 @@ class GenericUserFilter(BaseFilterBackend):
         except core_models.User.DoesNotExist:
             return queryset.none()
 
+        return self.filter_for_user(queryset, user)
+
+    def filter_for_user(self, queryset, user):
         return filter_queryset_for_user(queryset, user)
 
     def get_schema_operation_parameters(self, view):
@@ -1382,7 +1413,12 @@ class NotificationTemplateFilter(NameFilterSet):
         ]
 
     def filter_is_overridden(self, queryset, name, value):
-        return queryset.filter(path__in=Template.objects.values_list("name"))
+        overridden_uuids = [
+            obj.uuid for obj in queryset if template_utils.is_template_overridden(obj)
+        ]
+        if value:
+            return queryset.filter(uuid__in=overridden_uuids)
+        return queryset.exclude(uuid__in=overridden_uuids)
 
 
 class NotificationFilter(NameFilterSet):
@@ -1404,11 +1440,14 @@ class NotificationFilter(NameFilterSet):
         return query
 
     def filter_is_overridden(self, queryset, name, value):
-        template_names = Template.objects.values_list("name", flat=True)
         overridden_notifications = [
             notification.uuid
             for notification in queryset
-            if notification.templates.filter(path__in=template_names).exists() == value
+            if any(
+                template_utils.is_template_overridden(t)
+                for t in notification.templates.all()
+            )
+            == value
         ]
         return queryset.filter(uuid__in=overridden_notifications)
 
@@ -1426,6 +1465,29 @@ class AccessSubnetFilter(django_filters.FilterSet):
     description = django_filters.CharFilter(
         lookup_expr="icontains", label="Description"
     )
+    applies_to_portal = django_filters.BooleanFilter(label="Applies to portal")
+    is_staff_managed = django_filters.BooleanFilter(label="Is staff managed")
+    offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        method="filter_offering",
+        label="Offering UUID",
+    )
+
+    def filter_offering(self, queryset, name, value):
+        """Entries scoped to the given offering.
+
+        The scope table lives in the marketplace, and AccessSubnet deliberately
+        exposes no reverse accessor to it, so this resolves through an explicit
+        subquery behind a function-local import — the same way the rest of
+        structure reaches marketplace.
+        """
+        from waldur_mastermind.marketplace.models import AccessSubnetOfferingScope
+
+        return queryset.filter(
+            id__in=AccessSubnetOfferingScope.objects.filter(
+                offering__uuid=value
+            ).values("access_subnet_id")
+        )
 
     class Meta:
         model = models.AccessSubnet
@@ -1434,7 +1496,70 @@ class AccessSubnetFilter(django_filters.FilterSet):
             "customer_uuid",
             "inet",
             "description",
+            "applies_to_portal",
+            "is_staff_managed",
+            "offering_uuid",
         ]
+
+
+class AccessSubnetOrderingFilter(rf_filters.OrderingFilter):
+    """Ordering that also understands the per-offering columns.
+
+    Most columns map to a field and sort natively. An offering column does not:
+    "sorted by whether this entry applies to offering X" carries the offering
+    identity in the sort key itself, which ``ordering_fields`` cannot express
+    because the set of offerings is data, not a fixed list.
+
+    Such a term is spelled ``o=offering:<uuid>`` and is resolved into an
+    annotated ``Exists`` for that offering. Anything else is validated against
+    the view's ``ordering_fields`` exactly as the parent would, so this does not
+    become a way to order by arbitrary columns.
+    """
+
+    OFFERING_PREFIX = "offering:"
+
+    def filter_queryset(self, request, queryset, view):
+        from waldur_mastermind.marketplace.models import AccessSubnetOfferingScope
+
+        terms = [
+            term.strip()
+            for value in request.query_params.getlist(self.ordering_param)
+            for term in value.split(",")
+            if term.strip()
+        ]
+        offering_terms = [
+            term for term in terms if term.lstrip("-").startswith(self.OFFERING_PREFIX)
+        ]
+        if not offering_terms:
+            return super().filter_queryset(request, queryset, view)
+
+        allowed = set(getattr(view, "ordering_fields", ()) or ())
+        annotations = {}
+        ordering = []
+        for term in terms:
+            descending = term.startswith("-")
+            key = term[1:] if descending else term
+            if not key.startswith(self.OFFERING_PREFIX):
+                # Same validation the parent applies: an unknown field is
+                # dropped rather than passed through to order_by.
+                if key in allowed:
+                    ordering.append(term)
+                continue
+            offering_uuid = key[len(self.OFFERING_PREFIX) :]
+            if not is_uuid_like(offering_uuid):
+                continue
+            alias = f"scope_{offering_uuid.replace('-', '')}"
+            annotations[alias] = Exists(
+                AccessSubnetOfferingScope.objects.filter(
+                    access_subnet=OuterRef("pk"),
+                    offering__uuid=offering_uuid,
+                )
+            )
+            ordering.append(f"-{alias}" if descending else alias)
+
+        if not ordering:
+            return queryset
+        return queryset.annotate(**annotations).order_by(*ordering)
 
 
 class ExternalLinkFilter(django_filters.FilterSet):
@@ -1454,3 +1579,11 @@ class ExternalLinkFilter(django_filters.FilterSet):
                 | Q(description__icontains=value)
             ).distinct()
         return queryset
+
+
+class CustomerUserFilter(GenericUserFilter):
+    """``user_uuid`` filter kept in step with CustomerRoleFilter."""
+
+    def filter_for_user(self, queryset, user):
+        visible = super().filter_for_user(queryset, user)
+        return _with_service_provider_organizations(queryset, visible, user)

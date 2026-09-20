@@ -192,9 +192,12 @@ def synchronize_directly_connected_ips(
 
 def synchronize_ports(sender, instance: Port, created=False, **kwargs):
     port = instance
+    # backend_id is watched too: a port requested with a fixed IP already
+    # carries that address, so Neutron echoes it back and fixed_ips never changes.
     if not created and not set(port.tracker.changed()) & {
         "fixed_ips",
         "instance_id",
+        "backend_id",
     }:
         return
 
@@ -286,6 +289,14 @@ def create_resource_of_volume_if_instance_created(
 ):
     resource = instance
 
+    scope_just_set = (
+        created
+        or resource.tracker.has_changed("content_type_id")
+        or resource.tracker.has_changed("object_id")
+    )
+    if not scope_just_set:
+        return
+
     if not resource.scope or not getattr(resource.offering, "scope", None):
         return
 
@@ -326,8 +337,24 @@ def create_marketplace_resource_for_imported_resources(
 def import_resource_metadata_when_resource_is_created(
     sender, instance: marketplace_models.Resource, created=False, **kwargs
 ):
-    """Import OpenStack resource metadata when marketplace resource is created."""
-    if not created:
+    """Import OpenStack resource metadata when marketplace resource is created
+    or linked to its OpenStack scope.
+
+    Order processing creates the resource first and links the instance later,
+    so importing only on creation left internal_ips empty for ports whose
+    requested fixed IP never changes afterwards.
+    """
+    update_fields = kwargs.get("update_fields")
+    scope_fields = {"content_type", "content_type_id", "object_id"}
+    # The metadata import saves the resource again with update_fields that
+    # never include the scope, which keeps this handler from recursing.
+    scope_just_set = (
+        update_fields is None or bool(scope_fields & set(update_fields))
+    ) and (
+        instance.tracker.has_changed("content_type_id")
+        or instance.tracker.has_changed("object_id")
+    )
+    if not created and not scope_just_set:
         return
 
     #  If the resource has just been created and the save_base method has not yet completed,
@@ -412,18 +439,29 @@ def create_offering_component_for_volume_type(
 
     content_type = ContentType.objects.get_for_model(volume_type)
 
-    # It is assumed that article code and product code are filled manually via UI
+    # Fields that mirror the volume type, refreshed on every sync.
+    synced = dict(
+        offering=offering,
+        name="Storage (%s)" % volume_type.name,
+        # It is expected that internal name of offering component related to volume type
+        # matches storage quota name generated in OpenStack
+        type=volume_type_name_to_quota_name(volume_type.name),
+        description=volume_type.description,
+        # Created by the volume type sync, not by the provider, so it
+        # follows the plan like the other builtin components.
+        billed_per_plan=True,
+    )
+    # It is assumed that article code and product code are filled manually via UI.
+    # Accounting is the provider's to change as well, so it is set only when the
+    # component is created: every sync re-saves each volume type, and writing it
+    # here on update would revert whatever the provider chose.
     marketplace_models.OfferingComponent.objects.update_or_create(
         object_id=volume_type.id,
         content_type=content_type,
-        defaults=dict(
-            offering=offering,
-            name="Storage (%s)" % volume_type.name,
-            # It is expected that internal name of offering component related to volume type
-            # matches storage quota name generated in OpenStack
-            type=volume_type_name_to_quota_name(volume_type.name),
+        defaults=synced,
+        create_defaults=dict(
+            synced,
             measured_unit="GB",
-            description=volume_type.description,
             billing_type=BillingTypes.LIMIT,
             limit_period=LimitPeriods.MONTH,
         ),

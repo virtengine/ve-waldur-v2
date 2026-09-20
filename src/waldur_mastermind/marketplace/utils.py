@@ -27,8 +27,19 @@ from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage as storage
 from django.db import models as models_module
 from django.db import transaction
-from django.db.models import F, Q, Sum
+from django.db.models import (
+    Count,
+    Exists,
+    F,
+    OuterRef,
+    Prefetch,
+    Q,
+    QuerySet,
+    Subquery,
+    Sum,
+)
 from django.db.models.fields import FloatField
+from django.db.models.functions import Coalesce
 from django.db.models.functions.math import Ceil
 from django.urls import get_resolver
 from django.utils import timezone
@@ -72,7 +83,7 @@ from waldur_mastermind.common.utils import create_request, mb_to_gb
 from waldur_mastermind.invoices import models as invoice_models
 from waldur_mastermind.invoices.structures import InvoiceResourceLimitPeriodDict
 from waldur_mastermind.invoices.utils import get_full_days
-from waldur_mastermind.marketplace import attribute_types
+from waldur_mastermind.marketplace import attribute_types, billing_mode
 from waldur_mastermind.marketplace.billing import MarketplaceBillingService
 from waldur_mastermind.marketplace.enums import (
     OPENSTACK_TENANT_OFFERING,
@@ -99,6 +110,10 @@ from .enums import OrderTypes
 logger = logging.getLogger(__name__)
 USERNAME_ANONYMIZED_POSTFIX_LENGTH = 5
 
+# One default for the anonymized prefix, shared by the plugin-options serializer
+# and the generator, so an offering saved through the API and one that never
+# set the key produce the same names.
+DEFAULT_ANONYMIZED_PREFIX = "waldur_"
 
 USERNAME_POSTFIX_LENGTH = 2
 
@@ -107,8 +122,10 @@ class UsernameGenerationPolicy(Enum):
     SERVICE_PROVIDER = (
         "service_provider"  # SP should manually submit username for the offering users
     )
-    ANONYMIZED = "anonymized"  # Usernames are generated with <prefix>_<number>, e.g. "anonym_00001".
-    # The prefix must be specified in offering.plugin_options as "username_anonymized_prefix"
+    # Usernames are <prefix><posix uid>, e.g. "anonym_9001", or a per-offering
+    # counter ("anonym_00001") when no POSIX UID resolves. The prefix comes from
+    # the "username_anonymized_prefix" account setting (offering, else provider).
+    ANONYMIZED = "anonymized"
     FULL_NAME = "full_name"  # Usernames are constructed using first and last name of users with numerical suffix, e.g. "john_doe_01"
     WALDUR_USERNAME = "waldur_username"  # Using username field of User model
     FREEIPA = "freeipa"  # Using username field of waldur_freeipa.Profile model
@@ -152,15 +169,7 @@ def process_order(order: models.Order, user):
         order.error_message = str(e)
         order.error_traceback = traceback.format_exc()
         order.set_state_erred()
-
-        if (
-            order.attributes.get("action") == "force_destroy"
-            and order.type == OrderTypes.TERMINATE
-            and user.is_staff
-        ):
-            order.resource.set_state_terminated()
-        else:
-            order.resource.set_state_erred()
+        order.resource.set_state_erred()
 
         # exc_info=True emits the full traceback to the log stream (Loki); the
         # DB only keeps order.error_traceback, which operators cannot see while
@@ -309,6 +318,13 @@ def validate_limit_amount(value, component):
     if not component.limit_amount:
         return
 
+    # `current` is summed from ComponentQuota.limit and limit_amount is a
+    # Decimal column, but the requested value comes out of a JSONField as int
+    # or float. Adding a float to a Decimal raises TypeError, which surfaced as
+    # a bare HTTP 500. Coerce via str() so 0.1 becomes Decimal("0.1") rather
+    # than its binary expansion.
+    value = decimal.Decimal(str(value))
+
     if component.limit_period == LimitPeriods.MONTH:
         current = (
             (
@@ -392,12 +408,22 @@ def validate_maximum_available_limit(value, component, resource=None):
     if resource:
         all_offering_resources = all_offering_resources.exclude(id=resource.id)
 
+    # max_available_limit is a Decimal column while the limits it is compared
+    # against come out of a JSONField as int or float. Comparing the two is
+    # fine, but subtracting is a TypeError, so the running total is carried as
+    # Decimal from the start.
     current_total_limits = sum(
-        resource["limits"].get(component.type, 0)
-        for resource in all_offering_resources.values("limits")
+        (
+            decimal.Decimal(str(resource["limits"].get(component.type, 0)))
+            for resource in all_offering_resources.values("limits")
+        ),
+        decimal.Decimal(0),
     )
 
-    if current_total_limits + value >= component.max_available_limit:
+    if (
+        current_total_limits + decimal.Decimal(str(value))
+        >= component.max_available_limit
+    ):
         error_message = "Requested %s cannot be provisioned due to offering safety limit. You can allocate up to %s of %s."
         if component.type == "cores":
             value = component.max_available_limit - current_total_limits - 1
@@ -417,36 +443,124 @@ def validate_maximum_available_limit(value, component, resource=None):
 
 
 def validate_min_max_limit(value, component):
+    # min_value is nullable, so None is "unset" and 0 is a real bound: a
+    # truthiness test made min_value=0 no bound at all, which left a negative
+    # limit orderable. max_value deliberately keeps the truthiness test —
+    # existing rows hold 0 meaning "no maximum", and the frontend agrees
+    # (offerings/store/limits.ts), so tightening it here would 400 orders the
+    # UI still offers. Changing that is a data-migration question of its own.
     if component.max_value and value > component.max_value:
         raise serializers.ValidationError(
             _("The limit %s value cannot be more than %s.")
             % (value, component.max_value)
         )
-    if component.min_value and value < component.min_value:
+    if component.min_value is not None and value < component.min_value:
         raise serializers.ValidationError(
             _("The limit %s value cannot be less than %s.")
             % (value, component.min_value)
         )
 
 
-def get_components_map(limits, offering: models.Offering):
-    valid_component_types = set(
-        offering.components.filter(
-            Q(billing_type=BillingTypes.LIMIT)
-            | Q(billing_type=BillingTypes.ONE_TIME, is_prepaid=True)
-        ).values_list("type", flat=True)
-    )
+def narrow_limit_value(value):
+    """Render a limit or bound as the JSON-native number it should be.
 
-    invalid_types = set(limits.keys()) - valid_component_types
-    if invalid_types:
+    Limits live in JSONFields and bounds are Decimal columns, but both are
+    exchanged as JSON numbers. Whole values stay int so that a limit of 5 is
+    still 5 rather than 5.0 or "5.00", which keeps payloads for integer-only
+    deployments byte-identical.
+    """
+    number = float(value)
+    return int(number) if number.is_integer() else number
+
+
+def add_limit_values(*values):
+    """Add limit values exactly, returning a JSON-native result.
+
+    Limits live in JSONFields, so they arrive as int or float, and adding
+    floats directly leaves binary-expansion noise: 1.1 + 0.3 is
+    1.4000000000000001, which validate_limit_precision then rejects for a
+    request that is arithmetically valid, and which reallocation would store as
+    a limit nobody asked for. Sum in Decimal and narrow back the way
+    LimitValueField does, so whole numbers stay int.
+    """
+    total = sum((decimal.Decimal(str(value)) for value in values), decimal.Decimal(0))
+    return narrow_limit_value(total)
+
+
+def validate_component_precision_is_supported(offering_type, limit_decimal_places):
+    """Refuse a fractional component on a backend that cannot express one.
+
+    Without this a provider could set a precision the plugin then truncates at
+    the far end — the customer is billed for 0.1 and given 0. Plugins that map a
+    limit onto an integer quota declare ``max_limit_decimal_places=0``; a plugin
+    that declares nothing is uncapped, because for a backend Waldur cannot
+    introspect the operator owns the decision.
+    """
+    if not limit_decimal_places:
+        return
+    cap = plugins.manager.get_max_limit_decimal_places(offering_type)
+    if cap is not None and limit_decimal_places > cap:
         raise serializers.ValidationError(
-            {"limits": _("Invalid types: %s") % ", ".join(invalid_types)}
+            {
+                "limit_decimal_places": _(
+                    "Offerings of type %(type)s accept at most %(cap)s decimal "
+                    "places on a component limit."
+                )
+                % {"type": offering_type, "cap": cap}
+            }
         )
 
-    components_map = {
-        component.type: component
-        for component in offering.components.filter(type__in=valid_component_types)
-    }
+
+def validate_limit_precision(value, component):
+    """Reject a limit finer than the component was configured to accept.
+
+    The serializers parse a limit as a number without deciding whether one is
+    allowed, because that answer belongs to the component: most backends map a
+    limit onto an integer quota and would truncate a fraction silently at the
+    far end. Enforcing it here covers every route into `limits` at once —
+    ordering, updating, renewing, reallocating, a limit change request and a
+    proposal resource template.
+    """
+    places = component.limit_decimal_places or 0
+    exponent = decimal.Decimal(1).scaleb(-places)
+    amount = decimal.Decimal(str(value))
+    try:
+        truncated = amount.quantize(exponent, rounding=decimal.ROUND_DOWN)
+    except decimal.InvalidOperation:
+        # More digits than the decimal context can hold. Nothing legitimate
+        # reaches this, and letting it through would be an uncaught 500.
+        raise serializers.ValidationError(
+            _("The limit %s value is out of range.") % value
+        )
+    if amount != truncated:
+        if places == 0:
+            message = _("The limit %s value must be a whole number.") % value
+        else:
+            message = _(
+                "The limit %(value)s value cannot have more than "
+                "%(places)s decimal places."
+            ) % {"value": value, "places": places}
+        raise serializers.ValidationError(message)
+
+
+def get_components_map(limits, offering: models.Offering, plan=None):
+    """Pair each limit key with the component it belongs to.
+
+    Only components whose quantity is a user-requested limit under ``plan``
+    (or under the stored component types when no plan is given) are valid
+    keys; anything else is rejected.
+    """
+    components_map = (
+        billing_mode.resolve_plan(plan).limit_components
+        if plan is not None
+        else billing_mode.resolve_offering(offering).limit_components
+    )
+
+    invalid_types = set(limits.keys()) - set(components_map)
+    if invalid_types:
+        raise serializers.ValidationError(
+            {"limits": _("Invalid types: %s") % ", ".join(sorted(invalid_types))}
+        )
 
     result = []
     for key, value in limits.items():
@@ -456,23 +570,29 @@ def get_components_map(limits, offering: models.Offering):
     return result
 
 
-def validate_limits(limits, offering, resource=None, is_creation=False):
+def validate_limits(limits, offering, resource=None, is_creation=False, plan=None):
     """
     @param limits Maximum/Minimum limit-based components values and maximum available limit
     @param offering The offering being created
     @param resource Passing the resource if the limits of the resource are being updated.
     @param is_creation If True, skip the can_update_limits check (it only applies to updates).
+    @param plan The plan the limits are requested under; decides which components take limits.
     """
     if not is_creation and not plugins.manager.can_update_limits(offering.type):
         raise serializers.ValidationError(
             {"limits": _("Limits update is not supported for this resource.")}
         )
 
+    if plan is None and resource is not None:
+        plan = resource.plan
+
     limits_validator = plugins.manager.get_limits_validator(offering.type)
     if limits_validator:
         limits_validator(limits)
 
-    for component, value in get_components_map(limits, offering):
+    for component, value in get_components_map(limits, offering, plan):
+        validate_limit_precision(value, component)
+
         validate_min_max_limit(value, component)
 
         validate_limit_amount(value, component)
@@ -531,11 +651,16 @@ def create_offering_components(offering, custom_components=None):
         models.OfferingComponent.objects.create(
             offering=offering,
             parent=category_components.get(component_data.type, None),
+            # A component the plugin provides is billed the way the plan says.
+            billed_per_plan=True,
             **component_data._asdict(),
         )
 
     if custom_components:
         for component_data in custom_components:
+            validate_component_precision_is_supported(
+                offering.type, component_data.get("limit_decimal_places")
+            )
             models.OfferingComponent.objects.create(offering=offering, **component_data)
 
 
@@ -595,6 +720,28 @@ def get_marketplace_category_name(serializer, scope) -> str | None:
         return
 
 
+def annotate_scope_resource(queryset):
+    """Annotate offerings with the marketplace resource sharing their scope.
+
+    An offering may be scoped to an object which is itself backed by a
+    marketplace resource: for example, per-tenant offerings for creation of
+    instances and volumes are scoped to an OpenStack tenant, and the tenant is
+    the scope of a marketplace resource too. Both models keep the scope in the
+    same (content_type, object_id) pair, so the resource is resolved with a
+    subquery instead of a per-object generic foreign key lookup.
+
+    Offerings without a scope have content_type set to NULL, which never
+    matches a scopeless resource, since NULL is not equal to NULL in SQL.
+    """
+    scope_resources = models.Resource.objects.filter(
+        content_type=OuterRef("content_type"), object_id=OuterRef("object_id")
+    )
+    return queryset.annotate(
+        scope_resource_uuid=Subquery(scope_resources.values("uuid")[:1]),
+        scope_resource_name=Subquery(scope_resources.values("name")[:1]),
+    )
+
+
 def get_marketplace_resource_uuid(serializer, scope) -> str | None:
     try:
         return models.Resource.objects.get(scope=scope).uuid.hex
@@ -620,14 +767,14 @@ def get_marketplace_resource_state(serializer, scope) -> str | None:
 
 def get_is_usage_based(serializer, scope) -> bool | None:
     try:
-        return models.Resource.objects.get(scope=scope).offering.is_usage_based
+        return models.Resource.objects.get(scope=scope).is_usage_based
     except ObjectDoesNotExist:
         return
 
 
 def get_is_limit_based(serializer, scope) -> bool | None:
     try:
-        return models.Resource.objects.get(scope=scope).offering.is_limit_based
+        return models.Resource.objects.get(scope=scope).is_limit_based
     except ObjectDoesNotExist:
         return
 
@@ -829,15 +976,20 @@ def get_invoice_item_for_component_usage(component_usage: models.ComponentUsage)
 
 
 def serialize_resource_limit_period(
-    start: datetime.datetime, end: datetime.datetime, quantity: int
+    start: datetime.datetime, end: datetime.datetime, quantity: float
 ) -> InvoiceResourceLimitPeriodDict:
     billing_periods = get_full_days(start, end)
+    # quantity stays as passed in — it goes back into a JSONField, where a
+    # Decimal is not encodable. The total is only ever read back as a string,
+    # so compute it in Decimal to keep a fractional quantity out of its binary
+    # expansion: 0.1 * 3 must render as 0.3, not 0.30000000000000004.
+    total = decimal.Decimal(str(quantity)) * billing_periods
     return {
         "start": start.isoformat(),
         "end": end.isoformat(),
         "quantity": quantity,
         "billing_periods": billing_periods,
-        "total": str(quantity * billing_periods),
+        "total": str(total),
     }
 
 
@@ -853,19 +1005,6 @@ def _force_approve_pending_terminate_order(pending_order):
     level would be circular, so both stay function-local, confined to this
     one helper.
     """
-    if (
-        pending_order.offering.plugin_options.get("require_purchase_order_upload")
-        and not pending_order.attachment
-    ):
-        # Mirror the manual-approval guard in ConsumerResourceViewSet.terminate:
-        # a missing required purchase-order attachment still blocks approval
-        # even for an automatic, end-date-triggered termination.
-        logger.info(
-            "Skipping forced approval of order %s: purchase order attachment is required.",
-            pending_order.uuid,
-        )
-        return
-
     from waldur_mastermind.marketplace import order_approval
 
     order_approval.confirm_pending_terminate_order(
@@ -1025,7 +1164,7 @@ def get_service_provider_user_ids(user, service_provider, customer=None):
     )
     if user.is_authenticated and not user.is_staff and not user.is_support:
         qs = qs.filter(user__is_active=True)
-    return qs.values_list("user_id", flat=True).distinct()
+    return qs.order_by().values_list("user_id", flat=True).distinct()
 
 
 def get_plan_period(resource, date):
@@ -1121,18 +1260,99 @@ def get_or_create_plan_period(resource: models.Resource, date):
     return plan_period
 
 
+def get_or_create_plan_period_for_historical_backfill(resource: models.Resource, date):
+    """Resolve or create the plan period for a historical billing month.
+
+    Mirrors ``get_plan_period_for_billing``'s overlap resolution, but —
+    unlike that function — will also create a missing
+    :class:`ResourcePlanPeriod` for a PAST billing month, not just the
+    current one.
+
+    This is intentionally a separate function, not a relaxed version of
+    ``get_plan_period_for_billing``: ordinary live usage-reporting API calls
+    must keep refusing to retroactively fabricate billing history for a past
+    month. Only an explicit, staff-triggered backfill
+    (the ``rebill_historical_usage`` management command) should ever call
+    this.
+    """
+    plan_period = get_plan_period(resource, date)
+    if plan_period is not None:
+        return plan_period
+
+    month_start = core_utils.month_start(date)
+    month_end = core_utils.month_end(date)
+    plan_period = (
+        models.ResourcePlanPeriod.objects.filter(resource=resource)
+        .filter(Q(start__lte=month_end) | Q(start__isnull=True))
+        .filter(Q(end__gte=month_start) | Q(end__isnull=True))
+        .order_by("start")
+        .last()
+    )
+    if plan_period is not None:
+        return plan_period
+
+    if resource.plan and resource.state in [
+        ResourceStates.OK,
+        ResourceStates.UPDATING,
+    ]:
+        # Bound the fabricated period so it can never overlap an existing
+        # one: cap its end at the next later period's start (if any), and
+        # its start at the previous earlier period's end (if any). Without
+        # this, an open-ended (`end=None`) period created here for a gap
+        # that has OTHER periods on either side would overlap them,
+        # corrupting get_plan_period's point-in-time resolution for dates
+        # outside this historical month too.
+        following_start = (
+            models.ResourcePlanPeriod.objects.filter(
+                resource=resource, start__gte=month_end
+            )
+            .order_by("start")
+            .values_list("start", flat=True)
+            .first()
+        )
+        preceding_end = (
+            models.ResourcePlanPeriod.objects.filter(
+                resource=resource, end__lte=month_start
+            )
+            .order_by("-end")
+            .values_list("end", flat=True)
+            .first()
+        )
+        start = (
+            max(resource.created, preceding_end) if preceding_end else resource.created
+        )
+        logger.warning(
+            "Creating missing historical Resource Plan Period for resource %s "
+            "(UUID: %s) covering %s using its CURRENT plan (%s) -- the plan "
+            "actually active during that historical month could not be "
+            "determined from existing ResourcePlanPeriod records and may "
+            "differ.",
+            resource.name,
+            resource.uuid.hex,
+            month_start,
+            resource.plan,
+        )
+        plan_period = models.ResourcePlanPeriod.objects.create(
+            resource=resource,
+            plan=resource.plan,
+            start=start,
+            end=following_start,
+        )
+
+    return plan_period
+
+
 def import_current_usages(resource, usages=None, hourly_accumulation=False):
     now = timezone.now()
     date = now.date()
     if usages is None:
         usages = resource.current_usages
 
+    resolved = billing_mode.resolve_for_resource(resource)
+
     for component_type, component_usage in usages.items():
-        try:
-            offering_component = models.OfferingComponent.objects.get(
-                offering=resource.offering, type=component_type
-            )
-        except models.OfferingComponent.DoesNotExist:
+        effective = resolved.get(component_type)
+        if effective is None:
             logger.warning(
                 "Skipping current usage synchronization because related "
                 "OfferingComponent does not exist."
@@ -1140,13 +1360,16 @@ def import_current_usages(resource, usages=None, hourly_accumulation=False):
                 resource.id,
             )
             continue
+        offering_component = effective.component
 
-        plan_period = get_plan_period_for_billing(resource, date)
+        # Resolve with the datetime: plan periods open and close at the
+        # switch instant, so on the day of a plan switch a date-based
+        # lookup would still land on the previous period.
+        plan_period = get_plan_period_for_billing(resource, now)
         billing_period = core_utils.month_start(date)
 
         use_accumulation = (
-            hourly_accumulation
-            and offering_component.billing_type == BillingTypes.USAGE
+            hourly_accumulation and effective.billing_type == BillingTypes.USAGE
         )
 
         if use_accumulation:
@@ -1170,20 +1393,49 @@ def import_current_usages(resource, usages=None, hourly_accumulation=False):
             )
 
 
-def _update_high_watermark_usage(
-    resource, offering_component, component_usage, plan_period, billing_period, date
-):
-    """Original high-watermark logic: usage = max(new, existing)."""
-    # Look up by (resource, component, billing_period) only —
-    # plan_period is mutable and should not be part of the identity.
-    existing_qs = models.ComponentUsage.objects.filter(
+def _get_current_usage_row(resource, offering_component, billing_period, plan_period):
+    """The ComponentUsage row that the current report must update.
+
+    Rows are identified by plan period as well as month: after a plan switch
+    the pre-switch row stays attached to the old period (and is invoiced at
+    that plan's prices) while a fresh row accumulates under the new one.
+    Consecutive periods of the same plan within a month share one row, which
+    the caller re-points to the current period. A legacy row without a plan
+    period is adopted rather than duplicated, and deleted when it duplicates
+    the current period's row. Rows of another plan are never touched.
+
+    A report that resolves to no plan period (a date before any period of
+    the resource) cannot be attributed to a plan, so the month keeps a
+    single row: legacy duplicates are folded into it.
+    """
+    rows = models.ComponentUsage.objects.filter(
         resource=resource,
         component=offering_component,
         billing_period=billing_period,
     )
-    existing = existing_qs.first()
+    if plan_period is None:
+        existing = rows.filter(plan_period__isnull=True).first() or rows.first()
+        if existing is not None:
+            rows.exclude(pk=existing.pk).delete()
+        return existing
+    existing = rows.filter(plan_period=plan_period).first()
+    if existing is not None:
+        rows.filter(plan_period__isnull=True).delete()
+        return existing
+    existing = rows.filter(plan_period__plan=plan_period.plan).first()
+    if existing is not None:
+        return existing
+    return rows.filter(plan_period__isnull=True).first()
+
+
+def _update_high_watermark_usage(
+    resource, offering_component, component_usage, plan_period, billing_period, date
+):
+    """Original high-watermark logic: usage = max(new, existing)."""
+    existing = _get_current_usage_row(
+        resource, offering_component, billing_period, plan_period
+    )
     if existing:
-        existing_qs.exclude(pk=existing.pk).delete()
         existing.plan_period = plan_period
         existing.usage = max(component_usage, existing.usage)
         existing.save()
@@ -1225,14 +1477,10 @@ def _accumulate_hourly_usage(
         str(elapsed_hours)
     )
 
-    existing_qs = models.ComponentUsage.objects.filter(
-        resource=resource,
-        component=offering_component,
-        billing_period=billing_period,
+    existing = _get_current_usage_row(
+        resource, offering_component, billing_period, plan_period
     )
-    existing = existing_qs.first()
     if existing:
-        existing_qs.exclude(pk=existing.pk).delete()
         existing.plan_period = plan_period
         new_total = existing.usage + increment
         existing.usage = new_total
@@ -1284,8 +1532,9 @@ def get_current_period_usage(resource, limit_period=None):
     """
     result = {}
 
-    for component in resource.offering.components.all():
-        effective_period = limit_period or component.limit_period
+    for effective in billing_mode.resolve_for_resource(resource).components.values():
+        component = effective.component
+        effective_period = limit_period or effective.limit_period
 
         usages = models.ComponentUsage.objects.filter(
             resource=resource, component=component
@@ -1305,9 +1554,31 @@ def get_current_period_usage(resource, limit_period=None):
         elif effective_period == LimitPeriods.TOTAL:
             pass  # Sum all usages
 
-        result[component.type] = float(
-            usages.aggregate(total=Sum("usage"))["total"] or 0
-        )
+        # After a switch between a usage plan and a limit plan the month holds
+        # rows of both semantics (accumulated core-hours next to a peak core
+        # count). Only rows billed the same way as the current plan count.
+        rows = [
+            row
+            for row in usages.select_related("plan_period__plan")
+            if billing_mode.resolve_component(
+                component, row.plan_period.plan if row.plan_period else resource.plan
+            ).billing_type
+            == effective.billing_type
+        ]
+        if effective.billing_type == BillingTypes.USAGE:
+            # Accumulated usage: every row adds up, including the rows of
+            # two plan periods that share one month after a plan switch.
+            total = sum(row.usage for row in rows)
+        else:
+            # High-water mark: one peak per month, then summed over months.
+            peaks = {}
+            for row in rows:
+                peaks[row.billing_period] = max(
+                    peaks.get(row.billing_period, 0), row.usage
+                )
+            total = sum(peaks.values())
+
+        result[component.type] = float(total)
 
     return result
 
@@ -1337,9 +1608,12 @@ def is_usage_over_component_limit(resource):
     annual / total).
     """
     period_usage = get_current_period_usage(resource)
-    for component in resource.offering.components.all():
-        if component.billing_type != BillingTypes.LIMIT:
+    for effective in billing_mode.resolve_for_resource(resource).components.values():
+        # Only components the resource's plan bills as limits are enforced:
+        # under a usage plan the accumulated core-hours are not a quota.
+        if effective.billing_type != BillingTypes.LIMIT:
             continue
+        component = effective.component
         limit = get_effective_component_limit(resource, component)
         if limit and period_usage.get(component.type, 0) >= limit:
             return True
@@ -1939,6 +2213,38 @@ def format_limits_list(components_map, limits):
     return ", ".join(f"{format_label(key)}: {value}" for key, value in limits.items())
 
 
+def format_order_attributes(order) -> list[tuple[str, str]]:
+    """
+    Label/value pairs of the order attributes, labelled as in the offering form.
+
+    Attributes declared secret by the plugin are left out.
+    """
+    options = (order.offering.options or {}).get("options") or {}
+    result = []
+    for key, value in order.safe_attributes.items():
+        option = options.get(key) or {}
+        result.append((option.get("label") or key, value))
+    return result
+
+
+def format_order_limits(order) -> list[tuple[str, str]]:
+    """Label/value pairs of the order limits, with the measured unit appended."""
+    components_map = order.offering.get_limit_components(order.plan)
+    result = []
+    for key, value in (order.limits or {}).items():
+        component = components_map.get(key)
+        if component is None:
+            result.append((key, str(value)))
+            continue
+        result.append(
+            (
+                component.name or component.type,
+                f"{value} {component.measured_unit}".strip(),
+            )
+        )
+    return result
+
+
 def get_resource_users(resource):
     project_user_ids = get_project_users(resource.project_id)
     customer_user_ids = get_customer_users(resource.project.customer_id)
@@ -2099,12 +2405,34 @@ def setup_linux_related_data(
 
     login_shell = instance.backend_metadata.get("loginShell")
     if not login_shell:
-        instance.backend_metadata["loginShell"] = offering.plugin_options.get(
+        instance.backend_metadata["loginShell"] = offering.resolve_account_setting(
             "login_shell", "/bin/bash"
         )
 
-    homedir_prefix = offering.plugin_options.get("homedir_prefix", "/home/")
-    instance.backend_metadata["homeDir"] = f"{homedir_prefix}{instance.username}"
+    if instance.username:
+        # Derived from the username, so it is only meaningful once one exists —
+        # an account materialised before its username is known keeps no homeDir
+        # rather than a "/home/None" placeholder.
+        homedir_prefix = offering.resolve_account_setting("homedir_prefix", "/home/")
+        instance.backend_metadata["homeDir"] = f"{homedir_prefix}{instance.username}"
+
+
+def offering_owns_pricing(offering: models.Offering) -> bool:
+    """Whether plans and prices belong to this offering rather than to its parent.
+
+    A child offering is an implementation detail of its parent — the OpenStack
+    per-tenant Instance and Volume offerings are the case in point: they carry no
+    components of their own, and both ordering and the API resolve the parent's
+    plans anyway. Plans, prices, quotas and discounts have nothing to act on
+    there, so the surfaces that manage them are refused rather than silently
+    ignored.
+
+    Being non-billable is a separate matter and deliberately not covered here: a
+    top-level offering that is not invoiced still needs a plan of its own, since
+    activation requires one (see offering_has_plans) and there is no parent to
+    inherit it from.
+    """
+    return offering.parent_id is None
 
 
 def get_plans_available_for_user(
@@ -2130,7 +2458,39 @@ def get_plans_available_for_user(
             | Q(organization_groups__in=get_organization_groups(user))
         )
 
-    return qs
+    return _with_plan_serialization_hints(qs)
+
+
+def _with_plan_serialization_hints(qs):
+    """Preload what BasePlanSerializer reads for every plan.
+
+    Six of its method fields iterate ``plan.components.all()`` and dereference
+    ``component``, and ``get_resources_count`` counts resources per plan, so
+    without this the cost grows with plans x components.
+
+    This belongs on the plan queryset rather than on the offering queryset:
+    callers reach plans through this helper, which applies its own
+    ``.filter()`` for organization groups, and a filter discards any prefetch
+    cache built further up.
+    """
+    resources_count = (
+        models.Resource.objects.filter(plan=OuterRef("pk"))
+        .order_by()
+        .values("plan")
+        .annotate(total=Count("*"))
+        .values("total")
+    )
+    return qs.prefetch_related(
+        Prefetch(
+            "components",
+            queryset=models.PlanComponent.objects.select_related("component"),
+        ),
+        "organization_groups",
+    ).annotate(
+        # Subquery yields NULL when a plan has no resources; the .count() this
+        # replaces yielded 0.
+        resources_count=Coalesce(Subquery(resources_count), 0),
+    )
 
 
 def generate_glauth_records_for_offering_users(
@@ -2696,16 +3056,20 @@ def get_offering_user_posix_groups(offering_user, viewer=None):
     )
 
     # Map each group to the pool its GID was allocated from (if any), so the row
-    # can show pool provenance like the per-user UID/GID table does.
+    # can show pool provenance like the per-user UID/GID table does. Scoped to
+    # the offering's currently resolved pool: a group may legally hold an active
+    # identity in more than one pool (the active-consumer constraint is per
+    # pool), and an unscoped lookup would keep whichever row came last.
     group_ct = ContentType.objects.get_for_model(models.OfferingUserGroup)
-    group_pools = {
-        identity.object_id: identity.pool
-        for identity in models.PosixIdentity.objects.filter(
-            content_type=group_ct,
-            object_id__in=[group.id for group in groups],
-            released_at__isnull=True,
-        ).select_related("pool")
-    }
+    resolved_pool = models.PosixIdPool.resolve(offering)
+    group_identities = models.PosixIdentity.objects.filter(
+        content_type=group_ct,
+        object_id__in=[group.id for group in groups],
+        released_at__isnull=True,
+    ).select_related("pool")
+    if resolved_pool is not None:
+        group_identities = group_identities.filter(pool=resolved_pool)
+    group_pools = {identity.object_id: identity.pool for identity in group_identities}
 
     rows = []
     for group in groups:
@@ -2734,10 +3098,16 @@ def get_offering_user_posix_groups(offering_user, viewer=None):
                 "customer_uuid": customer.uuid.hex if customer else None,
                 "project_accessible": accessible,
                 "pool_uuid": pool.uuid.hex if pool else None,
+                "pool_scope": pool.scope if pool else None,
             }
         )
     rows.sort(key=lambda r: r["gid"])
     return rows
+
+
+# Distinguishes "the caller did not resolve a pool" from "the caller resolved
+# this offering to no pool at all".
+_UNSET = object()
 
 
 def _posix_pool_scope_name(pool) -> str | None:
@@ -2750,12 +3120,50 @@ def _posix_pool_scope_name(pool) -> str | None:
     return None
 
 
-def get_offering_user_posix_allocations(offering_user):
+def get_offerings_sharing_pool(user, pool, exclude_offering_id=None):
+    """Offerings of ``user`` whose accounts resolve to ``pool``.
+
+    A user identity is shared, so this is the set of accounts that carry the same
+    UID and primary GID. Ordered by name for a stable report.
+
+    Accounts soft-deleted into ``OfferingUserStates.DELETED`` are included on
+    purpose: release is tied to actual row deletion, so such an account is
+    exactly why the value is still reserved, and hiding it would leave the
+    reservation unexplained.
+    """
+    if user is None or pool is None:
+        return []
+    offerings = []
+    for offering_user in models.OfferingUser.objects.filter(user=user).select_related(
+        "offering"
+    ):
+        offering = offering_user.offering
+        if offering.id == exclude_offering_id:
+            continue
+        if not posix_ids.pool_sourced_namespaces(offering):
+            continue
+        resolved = models.PosixIdPool.resolve(offering)
+        if resolved is not None and resolved.pk == pool.pk:
+            offerings.append({"uuid": offering.uuid.hex, "name": offering.name})
+    offerings.sort(key=lambda item: item["name"])
+    return offerings
+
+
+def get_offering_user_posix_allocations(
+    offering_user, resolved_pool=_UNSET, shared_offerings=None
+):
     """Return the offering user's POSIX identifiers and their originating pool.
 
     One row per identifier (UID, primary GID) present in ``backend_metadata``.
-    The row carries the pool that tracks the value and its scope; ``pool_uuid``
-    is ``None`` when the value is not tracked by a pool (e.g. seeded manually).
+    The row carries the pool that tracks the value and its scope, plus the other
+    offerings of the same user that share it — the value belongs to the user
+    within the pool, not to this single account. ``pool_uuid`` is ``None`` when
+    the value is not tracked by a pool (e.g. seeded manually).
+
+    ``resolved_pool`` and ``shared_offerings`` let a caller that already walked
+    the user's accounts pass what it knows, instead of making this function walk
+    them again per account. ``resolved_pool=None`` is a real answer — "this
+    offering resolves to no pool" — and is honoured; omitting it resolves here.
     """
     metadata = offering_user.backend_metadata or {}
     identifiers = [
@@ -2763,17 +3171,33 @@ def get_offering_user_posix_allocations(offering_user):
         (posix_ids.GID, metadata.get("primarygroup")),
     ]
 
-    ct = ContentType.objects.get_for_model(models.OfferingUser)
-    identity = (
-        models.PosixIdentity.objects.filter(
-            content_type=ct,
-            object_id=offering_user.pk,
-            released_at__isnull=True,
-        )
-        .select_related("pool__offering", "pool__service_provider__customer")
-        .first()
+    pool = (
+        models.PosixIdPool.resolve(offering_user.offering)
+        if resolved_pool is _UNSET
+        else resolved_pool
     )
+    identity = None
+    if pool is not None:
+        identity = (
+            models.PosixIdentity.objects.filter(
+                pool=pool,
+                released_at__isnull=True,
+                **posix_ids.principal_filter(offering_user),
+            )
+            .select_related("pool__offering", "pool__service_provider__customer")
+            .first()
+        )
     pool = identity.pool if identity else None
+    if shared_offerings is not None:
+        shared_with = [
+            offering
+            for offering in shared_offerings
+            if offering["uuid"] != offering_user.offering.uuid.hex
+        ]
+    else:
+        shared_with = get_offerings_sharing_pool(
+            offering_user.user, pool, exclude_offering_id=offering_user.offering_id
+        )
 
     rows = []
     for namespace, value in identifiers:
@@ -2787,48 +3211,122 @@ def get_offering_user_posix_allocations(offering_user):
                 "pool_uuid": pool.uuid.hex if (tracked and pool) else None,
                 "scope": pool.scope if (tracked and pool) else None,
                 "scope_name": _posix_pool_scope_name(pool) if tracked else None,
+                "shared_with_offerings": shared_with if tracked else [],
             }
         )
     return rows
 
 
 def get_user_posix_identities(offering_users, viewer=None):
-    """Flatten a user's POSIX identities across all their offering accounts.
+    """Consolidate a user's POSIX identities across all their offering accounts.
 
-    One row per identifier — personal UID / primary GID and each project group
-    GID — tagged with the owning offering and the pool it came from, so a
-    consolidated cross-offering view can be rendered. The same project may
-    appear under several offerings with different GIDs (each offering runs its
-    own directory and pool).
+    One row per ``(pool, namespace, value)`` — personal UID / primary GID and
+    each project group GID — carrying the offerings that use it. A user's UID is
+    allocated once per pool, so the accounts on every offering of a provider that
+    has no override pool collapse into a single row. An offering with its own
+    pool resolves elsewhere and therefore appears as a separate row.
+
+    Values not tracked by any pool cannot be proven to be the same allocation, so
+    they are never merged across offerings.
     """
-    rows = []
+    offering_users = list(offering_users)
+    # Resolve each offering's pool once, then derive the sharing sets from that
+    # single pass: resolving per identifier per account would make the endpoint
+    # quadratic in the number of the user's accounts.
+    pool_by_offering = {}
     for offering_user in offering_users:
         offering = offering_user.offering
-        base = {
-            "offering_name": offering.name,
-            "offering_uuid": offering.uuid.hex,
-        }
-        for allocation in get_offering_user_posix_allocations(offering_user):
-            rows.append(
-                {
-                    **base,
-                    "namespace": allocation["namespace"],
-                    "value": allocation["value"],
-                    "context": None,
-                    "pool_uuid": allocation["pool_uuid"],
-                }
+        if offering.id in pool_by_offering:
+            continue
+        pool_by_offering[offering.id] = (
+            models.PosixIdPool.resolve(offering)
+            if posix_ids.pool_sourced_namespaces(offering)
+            else None
+        )
+    sharing = defaultdict(list)
+    for offering_user in offering_users:
+        offering = offering_user.offering
+        pool = pool_by_offering[offering.id]
+        if pool is None:
+            continue
+        entry = {"uuid": offering.uuid.hex, "name": offering.name}
+        if entry not in sharing[pool.pk]:
+            sharing[pool.pk].append(entry)
+    for entries in sharing.values():
+        entries.sort(key=lambda item: item["name"])
+
+    rows = {}
+    order = []
+
+    def add(key, namespace, value, context, pool_uuid, scope, offering):
+        row = rows.get(key)
+        if row is None:
+            row = {
+                "namespace": namespace,
+                "value": value,
+                "context": context,
+                "pool_uuid": pool_uuid,
+                "pool_scope": scope,
+                "offerings": [],
+            }
+            rows[key] = row
+            order.append(key)
+        if all(item["uuid"] != offering.uuid.hex for item in row["offerings"]):
+            row["offerings"].append({"uuid": offering.uuid.hex, "name": offering.name})
+
+    for offering_user in offering_users:
+        offering = offering_user.offering
+        pool = pool_by_offering[offering.id]
+        allocations = get_offering_user_posix_allocations(
+            offering_user,
+            resolved_pool=pool,
+            shared_offerings=sharing[pool.pk] if pool is not None else [],
+        )
+        for allocation in allocations:
+            pool_uuid = allocation["pool_uuid"]
+            key = (
+                pool_uuid or f"untracked:{offering.uuid.hex}",
+                allocation["namespace"],
+                allocation["value"],
+                None,
+            )
+            add(
+                key,
+                allocation["namespace"],
+                allocation["value"],
+                None,
+                pool_uuid,
+                allocation["scope"],
+                offering,
             )
         for group in get_offering_user_posix_groups(offering_user, viewer=viewer):
-            rows.append(
-                {
-                    **base,
-                    "namespace": posix_ids.GID,
-                    "value": group["gid"],
-                    "context": group["project_name"],
-                    "pool_uuid": group["pool_uuid"],
-                }
+            pool_uuid = group["pool_uuid"]
+            key = (
+                pool_uuid or f"untracked:{offering.uuid.hex}",
+                posix_ids.GID,
+                group["gid"],
+                group["project_uuid"],
             )
-    return rows
+            add(
+                key,
+                posix_ids.GID,
+                group["gid"],
+                group["project_name"],
+                pool_uuid,
+                group["pool_scope"],
+                offering,
+            )
+
+    for row in rows.values():
+        row["offerings"].sort(key=lambda item: item["name"])
+        # Deprecated compatibility projection: the endpoint used to return one
+        # row per offering. Keeping the singular fields populated from the first
+        # sharing offering makes the SDK bump additive, so a client that has not
+        # migrated to `offerings` yet keeps rendering a name instead of a blank.
+        first = row["offerings"][0] if row["offerings"] else None
+        row["offering_name"] = first["name"] if first else None
+        row["offering_uuid"] = first["uuid"] if first else None
+    return [rows[key] for key in order]
 
 
 def build_glauth_tree(offering, *, resource_filter=None):
@@ -2844,12 +3342,17 @@ def build_glauth_tree(offering, *, resource_filter=None):
     # Offering users: queryset same as the existing endpoints. Exclude
     # accounts without a username — both "" and NULL, since the field is
     # nullable and ``.exclude(username="")`` alone does not drop NULL.
+    # When ToS enforcement is on, also drop users without active consent so
+    # LDAP export does not disclose PII after revoke / without consent.
     offering_users_qs = (
         models.OfferingUser.objects.filter(offering=offering)
         .exclude(username="")
         .exclude(username__isnull=True)
         .select_related("user")
         .prefetch_related("user__sshpublickey_set")
+    )
+    offering_users_qs = filter_offering_users_queryset_by_consent(
+        offering_users_qs, offering=offering
     )
     if resource_filter is not None:
         # Mirror Resource.glauth_users_config which scopes to project users.
@@ -3066,8 +3569,36 @@ def sanitize_name(name):
     return name
 
 
-def create_anonymized_username(offering):
-    prefix = offering.plugin_options.get("username_anonymized_prefix", "walduruser_")
+def resolve_posix_uid(user, offering, account=None) -> int | None:
+    """The POSIX UID ``user`` holds (or is now given) on ``offering``, if any.
+
+    Mirrors the UID half of :func:`setup_linux_related_data`: a value already
+    recorded on ``account`` (including an operator's override) wins, then the
+    user attribute when the offering sources UIDs from it, else the pool.
+    ``posix_ids.allocate`` is idempotent and keyed on the Waldur user, so calling
+    this before the account row exists hands out the same number the row later
+    receives. Returns ``None`` when nothing resolves: POSIX accounts are off,
+    no pool covers the offering, or the user carries no ``uid_number``.
+    """
+    if account is not None and (account.backend_metadata or {}).get("uidnumber"):
+        return account.backend_metadata["uidnumber"]
+    plugin_options = offering.plugin_options or {}
+    if not plugin_options.get("enable_posix_account", True):
+        return None
+    if plugin_options.get("uid_source", "pool") == "user_attribute":
+        return user.uid_number
+    # The allocator only needs the principal behind the consumer, which for a
+    # user account is the Waldur user -- so an unsaved row is enough to ask with.
+    consumer = (
+        account
+        if account is not None
+        else models.OfferingUser(offering=offering, user=user)
+    )
+    return posix_ids.allocate(offering, posix_ids.UID, consumer)
+
+
+def _next_counter_username(offering, prefix):
+    """Historical per-offering counter: the highest ``<prefix>NNNNN`` plus one."""
     previous_users = models.OfferingUser.objects.filter(
         offering=offering, username__istartswith=prefix
     ).order_by("username")
@@ -3080,6 +3611,33 @@ def create_anonymized_username(offering):
         number = "0".zfill(USERNAME_ANONYMIZED_POSTFIX_LENGTH)
 
     return f"{prefix}{number}"
+
+
+def create_anonymized_username(user, offering, account=None):
+    """``<prefix><uid>``: the name is a pure function of the user's POSIX identity.
+
+    A counter scoped to one offering and a UID scoped to the provider disagree as
+    soon as two offerings share a directory -- the same person gets two names for
+    one UID, and two people can get one name. Deriving the name from the UID makes
+    it unique wherever the UID is, stable for the person, and identical on every
+    offering that draws from the same pool, so regenerating it is a no-op.
+
+    Without a resolvable UID the per-offering counter is kept as a fallback, and
+    the gap is logged rather than hidden.
+    """
+    prefix = offering.resolve_account_setting(
+        "username_anonymized_prefix", DEFAULT_ANONYMIZED_PREFIX
+    )
+    uid = resolve_posix_uid(user, offering, account)
+    if uid is not None:
+        return f"{prefix}{uid}"
+    logger.warning(
+        "No POSIX UID resolves for user %s on offering %s; falling back to the "
+        "per-offering counter for the anonymized username.",
+        user,
+        offering,
+    )
+    return _next_counter_username(offering, prefix)
 
 
 def create_username_from_full_name(user, offering):
@@ -3110,8 +3668,14 @@ def create_username_from_freeipa_profile(user):
         return profiles.first().username
 
 
-def generate_username(user, offering):
-    username_generation_policy = offering.plugin_options.get(
+def generate_username(user, offering, account=None):
+    """The username ``user`` gets on ``offering`` under its generation policy.
+
+    ``account`` is the row being named (an OfferingUser or the
+    ServiceProviderAccount backing it) when one exists; the anonymized policy
+    reads the POSIX identity already recorded on it.
+    """
+    username_generation_policy = offering.resolve_account_setting(
         "username_generation_policy", UsernameGenerationPolicy.SERVICE_PROVIDER.value
     )
 
@@ -3119,7 +3683,7 @@ def generate_username(user, offering):
         return ""
 
     if username_generation_policy == UsernameGenerationPolicy.ANONYMIZED.value:
-        return create_anonymized_username(offering)
+        return create_anonymized_username(user, offering, account)
 
     if username_generation_policy == UsernameGenerationPolicy.FULL_NAME.value:
         return create_username_from_full_name(user, offering)
@@ -3134,6 +3698,474 @@ def generate_username(user, offering):
         return user.details.get("site_username", "")
 
     return ""
+
+
+def get_or_create_provider_account(user, offering):
+    """The provider-level account backing this user's access to ``offering``.
+
+    Returns ``None`` when the offering is not in provider scope, or its customer
+    has no ServiceProvider row — the caller then keeps the historical
+    per-offering behaviour.
+
+    The account is named and given its POSIX identity once; a second offering of
+    the same provider finds the existing row, which is the whole point. Because
+    ``posix_ids.principal_filter`` keys on the Waldur user, the UID and primary
+    GID here are the same ones the user's offering accounts already hold.
+    """
+    if not offering.uses_provider_accounts:
+        return None
+    provider = offering.service_provider
+    if provider is None:
+        logger.warning(
+            "Offering %s asks for provider-level accounts but its customer is not "
+            "a service provider; falling back to a per-offering account.",
+            offering,
+        )
+        return None
+
+    account, created = models.ServiceProviderAccount.objects.get_or_create(
+        service_provider=provider, user=user
+    )
+    if not account.username:
+        username = generate_username(user, offering, account)
+        if username:
+            account.username = username
+            account.state = OfferingUserStates.OK
+
+    # Only mint the POSIX identity while the account is still missing it.
+    # setup_linux_related_data rewrites homeDir unconditionally from the
+    # offering's own homedir_prefix, so running it for every offering would let
+    # the second one move a shared account's home -- and would silently discard
+    # an operator's override, which the offering-user API is careful to keep.
+    needs_posix_identity = created or not (account.backend_metadata or {}).get(
+        "uidnumber"
+    )
+    if needs_posix_identity:
+        setup_linux_related_data(account, offering)
+    account.save()
+    if created:
+        logger.info("The provider account %s has been created", account)
+    return account
+
+
+def create_offering_user(user, offering, username=None, state=None):
+    """Create this user's account on ``offering``, backed when the provider owns it.
+
+    Under provider scope the account belongs to the ServiceProvider and the row
+    created here is only the association that reads through it: username, UID,
+    primary GID and home directory are decided once, on the provider account.
+    Outside provider scope the historical per-offering behaviour is kept.
+
+    ``username`` and ``state`` are what the caller would have used on its own --
+    a remote sync knows the remote's name, the Rancher handler uses the Waldur
+    username. Both are ignored under provider scope, where the provider account
+    is the only thing entitled to decide them.
+
+    Every creator has to go through here rather than calling
+    ``OfferingUser.objects.create``: a row created unbacked on a provider-scoped
+    offering stays unbacked until someone runs an adoption, which is the whole
+    divergence provider scope exists to remove.
+
+    Returns ``(offering_user, created)``.
+    """
+    provider_account = get_or_create_provider_account(user, offering)
+    if provider_account is not None:
+        offering_user, created = models.OfferingUser.objects.get_or_create(
+            offering=offering,
+            user=user,
+            defaults={"service_provider_account": provider_account},
+        )
+        if created:
+            logger.info(
+                "The offering user %s has been created, backed by %s",
+                offering_user,
+                provider_account,
+            )
+        elif not offering_user.is_provider_backed:
+            # defaults apply only on insert, so a row that predates provider
+            # scope would stay unbacked for ever and the same person would hold
+            # a backed and an unbacked account at the same provider.
+            offering_user.service_provider_account = provider_account
+            offering_user.pull_from_provider_account()
+            offering_user.save(
+                update_fields=[
+                    "service_provider_account",
+                    "username",
+                    "backend_metadata",
+                ]
+            )
+            logger.info(
+                "The offering user %s has been adopted by %s",
+                offering_user,
+                provider_account,
+            )
+        return offering_user, created
+
+    if username is None:
+        # The row does not exist yet; the generator only needs the principal
+        # behind it, and a UID it allocates now is the one the saved row reads
+        # back in setup_linux_related_data.
+        username = generate_username(
+            user, offering, models.OfferingUser(offering=offering, user=user)
+        )
+    if state is None:
+        state = (
+            OfferingUserStates.OK if username else OfferingUserStates.CREATION_REQUESTED
+        )
+    offering_user, created = models.OfferingUser.objects.get_or_create(
+        offering=offering,
+        user=user,
+        defaults={"username": username, "state": state},
+    )
+    if created:
+        setup_linux_related_data(offering_user, offering)
+        offering_user.save(update_fields=["backend_metadata"])
+        logger.info("The offering user %s has been created", offering_user)
+    return offering_user, created
+
+
+def restore_provider_account(account) -> bool:
+    """Bring a provider account that was on its way out back to OK.
+
+    Returns whether anything changed. The username and POSIX identity are kept:
+    a provider that parks departing entries re-enables them by name and uid, so
+    minting new ones here would leave it a stranger to re-enable.
+    """
+    if account.state not in OfferingUserStates.DELETION_FLOW_STATES:
+        return False
+    old_state = account.get_state_display()
+    account.restore()
+    account.save(update_fields=["state"])
+    logger.info(
+        "The provider account %s has been restored from %s because the user "
+        "regained access to one of the provider's offerings.",
+        account,
+        old_state,
+    )
+    return True
+
+
+def restore_offering_user(offering_user) -> bool:
+    """Bring a departed member's account back when they regain access.
+
+    Returns whether anything changed; an account that is not in the deletion
+    flow is left alone.
+
+    The account comes back under the name it already has. Waldur-named policies
+    (anonymized, waldur_username, ...) go straight to OK -- the name is a stable
+    function of the person, and a provider that parked the directory entry on
+    departure re-enables it when it sees the account live again. The same holds
+    for an account whose deletion was only requested or begun under the
+    service_provider policy. Only a service_provider-named account that was
+    fully deleted, or one that never got a name, goes back to the provider as a
+    creation request, since nothing is left to re-enable.
+
+    A provider-backed row reads through its ServiceProviderAccount, so that is
+    restored first and the row re-pulls its identity from it.
+    """
+    if offering_user.state not in OfferingUserStates.DELETION_FLOW_STATES:
+        return False
+    old_state = offering_user.get_state_display()
+    offering = offering_user.offering
+
+    if offering_user.is_provider_backed:
+        restore_provider_account(offering_user.service_provider_account)
+        offering_user.pull_from_provider_account()
+
+    policy = offering.resolve_account_setting(
+        "username_generation_policy", UsernameGenerationPolicy.SERVICE_PROVIDER.value
+    )
+    waldur_named = policy != UsernameGenerationPolicy.SERVICE_PROVIDER.value
+    if waldur_named and not offering_user.username:
+        offering_user.username = generate_username(
+            offering_user.user, offering, offering_user
+        )
+
+    if offering_user.username and (
+        waldur_named or offering_user.state != OfferingUserStates.DELETED
+    ):
+        offering_user.restore()
+        what = "restored"
+    else:
+        offering_user.state = OfferingUserStates.CREATION_REQUESTED
+        what = "requested again"
+    # No update_fields: a username filled in above has to land too, and a full
+    # save is what fires the state-change event the directory writers act on.
+    offering_user.save()
+    event_logger.emit(
+        f"Account for user {offering_user.user.username} in offering "
+        f"{offering.name} has been {what} (was {old_state}, now "
+        f"{offering_user.get_state_display()}) because the user regained project access.",
+        event_type=EventType.MARKETPLACE_OFFERING_USER_UPDATED,
+        event_context={"offering_user": offering_user},
+        scopes=[offering, offering.customer],
+    )
+    return True
+
+
+def provider_username_conflicts(service_provider, offerings=None) -> list[dict]:
+    """Users whose offering accounts at this provider disagree about the username.
+
+    Adopting provider-level accounts collapses each user's offering accounts onto
+    one username. Where they already agree that is silent; where they differ, one
+    of the names has to lose, and renaming a live POSIX account orphans every file
+    it owns -- so the choice belongs to an operator, not to a tie-break rule here.
+
+    Each candidate is reported with the evidence needed to choose: how many of the
+    provider's offerings use it, whether any of those accounts belongs to a user
+    with a live resource, and the home directory recorded for it.
+
+    ``offerings`` narrows the check to those offerings of the provider, such as
+    the ones sharing accounts once a single offering joins them.
+    """
+    offering_users = (
+        models.OfferingUser.objects.filter(
+            offering__customer_id=service_provider.customer_id
+        )
+        .exclude(username="")
+        .exclude(username__isnull=True)
+        .select_related("user", "offering")
+    )
+    if offerings is not None:
+        offering_users = offering_users.filter(offering__in=offerings)
+
+    by_user: dict[int, list] = defaultdict(list)
+    for offering_user in offering_users:
+        by_user[offering_user.user_id].append(offering_user)
+
+    conflicts = []
+    for accounts in by_user.values():
+        usernames = {account.username for account in accounts}
+        if len(usernames) < 2:
+            continue
+
+        # Resolved per offering, because "has a live resource" is a fact about the
+        # offering the account belongs to, not about the provider as a whole.
+        active_by_offering = {}
+        for account in accounts:
+            if account.offering_id not in active_by_offering:
+                active_by_offering[account.offering_id] = _users_with_active_resources(
+                    account.offering, [account]
+                )
+
+        candidates = []
+        for username in sorted(usernames):
+            matching = [a for a in accounts if a.username == username]
+            candidates.append(
+                {
+                    "username": username,
+                    "offering_count": len(matching),
+                    "offering_uuids": sorted(a.offering.uuid.hex for a in matching),
+                    "has_active_resources": any(
+                        a.user_id in active_by_offering[a.offering_id] for a in matching
+                    ),
+                    "home_directories": sorted(
+                        {
+                            (a.backend_metadata or {}).get("homeDir")
+                            for a in matching
+                            if (a.backend_metadata or {}).get("homeDir")
+                        }
+                    ),
+                }
+            )
+
+        user = accounts[0].user
+        conflicts.append(
+            {
+                "user_uuid": user.uuid.hex,
+                "user_username": user.username,
+                "user_full_name": user.full_name,
+                "candidates": candidates,
+            }
+        )
+
+    return sorted(conflicts, key=lambda c: c["user_username"] or "")
+
+
+def adopt_provider_accounts(
+    service_provider, resolutions: dict | None = None, offerings=None
+) -> dict:
+    """Back every offering account at this provider with a provider-level account.
+
+    ``resolutions`` maps a user uuid hex to the username an operator chose for a
+    conflicted user. Users whose accounts already agree need no entry and are
+    adopted without input.
+
+    Refuses outright while any conflict is unresolved: adopting half a provider
+    would leave the rest silently on the old per-offering behaviour, which is
+    worse than not starting.
+
+    ``offerings`` narrows the adoption to those offerings of the provider, as
+    when a single offering joins the ones already sharing accounts.
+    """
+    resolutions = resolutions or {}
+    with transaction.atomic():
+        # Lock the provider row so a concurrent adoption (or a username edit that
+        # would create a fresh conflict) serialises behind this one: checking
+        # conflicts outside the transaction that resolves them is a TOCTOU.
+        service_provider = models.ServiceProvider.objects.select_for_update().get(
+            pk=service_provider.pk
+        )
+        return _adopt_provider_accounts_locked(service_provider, resolutions, offerings)
+
+
+def _validate_adoption(service_provider, by_user, resolutions, offerings) -> None:
+    """Refuse an adoption whose surviving usernames are not valid choices.
+
+    A resolution must be one of the usernames reported for that user, and no
+    two people may end up with one name at the provider -- neither two adopted
+    now nor one of them and an existing provider account. Checked before
+    anything is written, so a bad choice is a 400 that changes nothing instead
+    of a unique-constraint failure half way through.
+    """
+    candidates = {
+        conflict["user_uuid"]: {c["username"] for c in conflict["candidates"]}
+        for conflict in provider_username_conflicts(service_provider, offerings)
+    }
+    invalid = {
+        user_uuid: [
+            _("%(username)s is not one of this user's usernames at the provider.")
+            % {"username": username}
+        ]
+        for user_uuid, username in resolutions.items()
+        if user_uuid in candidates and username not in candidates[user_uuid]
+    }
+    if invalid:
+        raise serializers.ValidationError({"resolutions": invalid})
+
+    planned = defaultdict(set)
+    for accounts in by_user.values():
+        user = accounts[0].user
+        chosen = resolutions.get(user.uuid.hex) or next(
+            (a.username for a in accounts if a.username), ""
+        )
+        if chosen:
+            planned[chosen.lower()].add(user.id)
+    clashes = {name for name, user_ids in planned.items() if len(user_ids) > 1}
+    for name, user_ids in planned.items():
+        if (
+            models.ServiceProviderAccount.objects.filter(
+                service_provider=service_provider, username__iexact=name
+            )
+            .exclude(user_id__in=user_ids)
+            .exists()
+        ):
+            clashes.add(name)
+    if clashes:
+        raise serializers.ValidationError(
+            {
+                "usernames": sorted(clashes),
+                "detail": _(
+                    "Adopting would give these usernames to more than one person "
+                    "at this provider. Rename one of the accounts first."
+                ),
+            }
+        )
+
+
+def _adopt_provider_accounts_locked(
+    service_provider, resolutions: dict, offerings=None
+) -> dict:
+    """The body of :func:`adopt_provider_accounts`, run under the provider lock."""
+    unresolved = [
+        conflict
+        for conflict in provider_username_conflicts(service_provider, offerings)
+        if conflict["user_uuid"] not in resolutions
+    ]
+    if unresolved:
+        # DRF's, not Django's: this surfaces straight to the operator as the
+        # response body, and the conflict report is the useful half of it.
+        raise serializers.ValidationError(
+            {
+                "conflicts": unresolved,
+                "detail": _(
+                    "Some users hold different usernames on different offerings of "
+                    "this provider. Choose the surviving username for each before "
+                    "adopting provider-level accounts."
+                ),
+            }
+        )
+
+    adopted = 0
+    backed = 0
+    offering_users = models.OfferingUser.objects.filter(
+        offering__customer_id=service_provider.customer_id,
+        service_provider_account__isnull=True,
+    ).select_related("user")
+    if offerings is not None:
+        offering_users = offering_users.filter(offering__in=offerings)
+
+    by_user: dict[int, list] = defaultdict(list)
+    for offering_user in offering_users:
+        by_user[offering_user.user_id].append(offering_user)
+
+    _validate_adoption(service_provider, by_user, resolutions, offerings)
+
+    for accounts in by_user.values():
+        user = accounts[0].user
+        chosen = resolutions.get(user.uuid.hex)
+        if chosen is None:
+            # No conflict, so any of them is the same answer.
+            chosen = next((a.username for a in accounts if a.username), "")
+
+        account, created = models.ServiceProviderAccount.objects.get_or_create(
+            service_provider=service_provider,
+            user=user,
+            defaults={"username": chosen},
+        )
+        if created:
+            adopted += 1
+        source = next((a for a in accounts if a.username == chosen), accounts[0])
+        if not account.backend_metadata:
+            account.backend_metadata = dict(source.backend_metadata or {})
+        if account.username != chosen:
+            account.username = chosen
+        account.state = source.state
+        account.save()
+
+        for offering_user in accounts:
+            offering_user.service_provider_account = account
+            offering_user.pull_from_provider_account()
+            offering_user.save(
+                update_fields=[
+                    "service_provider_account",
+                    "username",
+                    "backend_metadata",
+                ]
+            )
+            backed += 1
+
+    logger.info(
+        "Adopted %d provider account(s) at %s, backing %d offering account(s)",
+        adopted,
+        service_provider,
+        backed,
+    )
+    return {"adopted": adopted, "backed": backed}
+
+
+def propagate_provider_account(account) -> int:
+    """Push a provider account's values down onto every offering user backing it.
+
+    The columns on OfferingUser are a cache of the parent, not a second source of
+    truth: ``OfferingUserFilter`` searches ``backend_metadata__uidnumber`` and the
+    model orders by ``username``, so both have to follow. Returns how many rows
+    actually changed.
+    """
+    updated = 0
+    for offering_user in account.offering_users.all():
+        if offering_user.pull_from_provider_account():
+            offering_user.save(
+                update_fields=["username", "backend_metadata", "modified"]
+            )
+            updated += 1
+    if updated:
+        logger.info(
+            "Propagated provider account %s to %d offering user(s)",
+            account.uuid.hex,
+            updated,
+        )
+    return updated
 
 
 def user_offerings_mapping(offerings):
@@ -3174,30 +4206,14 @@ def user_offerings_mapping(offerings):
             user=user, offering=offering
         ).first()
         if offering_user is None:
-            username = generate_username(user, offering)
-            # Set state to OK when username is known at creation time
-            state = (
-                OfferingUserStates.OK
-                if username
-                else OfferingUserStates.CREATION_REQUESTED
-            )
-            offering_user = models.OfferingUser.objects.create(
-                user=user, offering=offering, username=username, state=state
-            )
-            logger.info("Offering user %s has been created.", offering_user)
-        elif offering_user.state == OfferingUserStates.DELETION_REQUESTED:
-            # Only restore from DELETION_REQUESTED — no backend action taken yet.
-            # DELETING/ERROR_DELETING/DELETED are left untouched since
-            # the service provider/site agent may have already started backend actions.
-            if offering_user.username:
-                offering_user.set_ok()
-            else:
-                offering_user.state = OfferingUserStates.CREATION_REQUESTED
-            offering_user.save(update_fields=["state"])
-            logger.info(
-                "Offering user %s has been restored from deletion request.",
-                offering_user,
-            )
+            # create_offering_user generates the username and sets the state
+            # to OK when one is known at creation time.
+            offering_user, _ = create_offering_user(user, offering)
+        else:
+            # The member still holds a live resource here, so an account on its
+            # way out -- however far along -- is brought back rather than left to
+            # finish deleting.
+            restore_offering_user(offering_user)
 
 
 def order_should_not_be_reviewed_by_provider(order: models.Order):
@@ -3286,6 +4302,67 @@ def get_provider_approvers(order):
     return approvers
 
 
+def _as_string_list(value, option_name: str) -> list[str]:
+    """The string members of a list-valued option, or an empty list.
+
+    The serializer guarantees a list of strings, but secret_options is also
+    editable as raw JSON in the Django admin, which bypasses it. A bare string
+    there would iterate per character, and a mixed list would reach sorted() as
+    a TypeError, so anything that is not a string is dropped.
+    """
+    if not isinstance(value, list):
+        if value:
+            logger.warning(
+                "Expected a list in %s, got %s: %s", option_name, type(value), value
+            )
+        return []
+    members = [member for member in value if isinstance(member, str)]
+    if len(members) != len(value):
+        logger.warning("Ignoring non-string members of %s: %s", option_name, value)
+    return members
+
+
+def _get_users_holding_roles(scope, role_names) -> QuerySet:
+    user_ids = UserRole.objects.filter(
+        is_active=True, scope=scope, role__name__in=role_names
+    ).values_list("user_id", flat=True)
+    return User.objects.filter(id__in=user_ids)
+
+
+def get_new_order_notification_recipients(order) -> list[str]:
+    """Addresses configured on the offering to be notified about a new order.
+
+    Explicit addresses are taken as configured: there is no user behind them, so
+    they cannot be filtered by notifications_enabled. Role names are resolved on
+    the provider organization and on the offering itself, and the users behind
+    them are filtered like in get_provider_approvers.
+    """
+    secret_options = order.offering.secret_options or {}
+    emails = set(
+        _as_string_list(
+            secret_options.get("order_notification_emails"),
+            "order_notification_emails",
+        )
+    )
+    role_names = _as_string_list(
+        secret_options.get("order_notification_roles"), "order_notification_roles"
+    )
+
+    if role_names:
+        users = _get_users_holding_roles(
+            order.offering.customer, role_names
+        ) | _get_users_holding_roles(order.offering, role_names)
+
+        emails.update(
+            users.distinct()
+            .exclude(email="")
+            .exclude(notifications_enabled=False)
+            .values_list("email", flat=True)
+        )
+
+    return sorted(emails)
+
+
 def check_pending_order_exists(resource):
     return models.Order.objects.filter(
         resource=resource,
@@ -3310,6 +4387,34 @@ def get_pending_consumer_terminate_order(resource):
     )
 
 
+def can_update_offering_in_any_scope(request, offering) -> bool:
+    """True if the caller holds UPDATE_OFFERING on the offering, its customer,
+    or that customer's service provider.
+
+    ``has_permission`` matches ``UserRole.scope`` exactly and never walks
+    ancestors, so all three scopes have to be named: OFFERING.MANAGER holds the
+    permission on the offering, CUSTOMER.OWNER on the customer, and
+    SERVICE_PROVIDER.MANAGER on the service provider. This is the same set
+    ``permission_factory(UPDATE_OFFERING, ["*", "customer",
+    "customer.serviceprovider"])`` accepts on ProviderOfferingViewSet.
+
+    Use this where a bool is wanted; ``views.can_update_offering`` is the
+    permission_factory-style callable that raises and additionally applies the
+    ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT config and a draft-state rule.
+    """
+    return any(
+        has_permission(request, PermissionEnum.UPDATE_OFFERING, scope)
+        for scope in (
+            offering,
+            offering.customer,
+            # Not every customer has a service provider record, and a bare
+            # attribute access would raise. `has_permission` treats a None scope
+            # as False.
+            getattr(offering.customer, "serviceprovider", None),
+        )
+    )
+
+
 def refresh_integration_agent_status(request, agent_type):
     user_agent = core_utils.get_user_agent(request)
     if "waldur-site-agent" not in user_agent:
@@ -3329,7 +4434,7 @@ def refresh_integration_agent_status(request, agent_type):
         )
         return
 
-    if not has_permission(request, PermissionEnum.UPDATE_OFFERING, offering.customer):
+    if not can_update_offering_in_any_scope(request, offering):
         logger.warning(
             "User %s lacks UPDATE_OFFERING permission on offering %s (%s); "
             "skipping %s integration status update",
@@ -3365,9 +4470,18 @@ def validate_end_date(
     offering: models.Offering,
     created_date: datetime.date,
     end_date: datetime.date | None = None,
+    *,
+    start_date: datetime.date | None = None,
+    project_end_date: datetime.date | None = None,
 ) -> None | datetime.date:
     """
     Validate or compute the resource end date based on plugin options.
+
+    Offset base is order ``start_date`` when it is later than ``created_date``
+    (delayed provisioning), otherwise ``created_date``. Max and default
+    dates are also capped by ``latest_date_for_resource_termination`` and
+    ``project_end_date`` when set.
+
     Raises ValidationError if constraints are violated or configuration is invalid.
     """
 
@@ -3378,19 +4492,37 @@ def validate_end_date(
     default_offset = options.get("default_resource_termination_offset_in_days")
 
     latest_date = parse_date(options.get("latest_date_for_resource_termination"))
+    today = timezone.now().date()
+    offset_base = (
+        start_date if start_date and start_date > created_date else created_date
+    )
 
     if end_date:
-        if end_date and end_date < timezone.datetime.today().date():
+        if end_date < today:
             raise serializers.ValidationError(
                 {"end_date": _("Cannot be earlier than the current date.")}
+            )
+
+        if start_date and end_date < start_date:
+            raise serializers.ValidationError(
+                {"end_date": _("End date cannot be earlier than the start date.")}
             )
 
         if latest_date and end_date > latest_date:
             raise serializers.ValidationError(
                 {"end_date": _("End date exceeds global termination limit.")}
             )
+        if project_end_date and end_date > project_end_date:
+            raise serializers.ValidationError(
+                {
+                    "end_date": _(
+                        "End date cannot be later than the project end date (%(project_end_date)s)."
+                    )
+                    % {"project_end_date": project_end_date}
+                }
+            )
         if isinstance(max_offset, int):
-            if end_date > created_date + datetime.timedelta(days=max_offset):
+            if end_date > offset_base + datetime.timedelta(days=max_offset):
                 raise serializers.ValidationError(
                     {"end_date": _("End date exceeds maximum allowed offset.")}
                 )
@@ -3404,11 +4536,74 @@ def validate_end_date(
             {"end_date": _("Missing default termination offset configuration.")}
         )
 
-    termination_date = created_date + datetime.timedelta(days=default_offset)
-    if latest_date:
-        return min(termination_date, latest_date)
-    else:
-        return termination_date
+    termination_date = offset_base + datetime.timedelta(days=default_offset)
+    caps = [d for d in (latest_date, project_end_date) if d]
+    return min([termination_date, *caps]) if caps else termination_date
+
+
+def offering_allows_end_date_change_requests(offering: models.Offering) -> bool:
+    """Whether this offering accepts end date change requests.
+
+    When enabled, users who may not set the date themselves can ask for it, and
+    whoever holds the permission — or an external approval system acting on
+    their behalf — decides.
+
+    Prepaid offerings are excluded whatever the option says: they extend through
+    the renewal action, which enforces duration bounds and charges upfront, and
+    an arbitrary-date path would bypass both.
+    """
+    if offering.components.filter(is_prepaid=True).exists():
+        return False
+    return bool(
+        _displayed_plugin_options(offering).get(
+            "enable_resource_end_date_change_requests"
+        )
+    )
+
+
+def _displayed_plugin_options(offering: models.Offering) -> dict:
+    """The plugin options the API shows for this offering.
+
+    A child offering is rendered with its parent's plugin options (see
+    ``ProviderOfferingDetailsSerializer.get_fields``), so a consumer-facing
+    switch read from the child's own options would disagree with what the UI
+    shows and would not be editable where the UI edits it.
+    """
+    source = offering.parent if offering.parent_id else offering
+    return source.plugin_options or {}
+
+
+def offering_allows_limit_change_requests(offering: models.Offering) -> bool:
+    """Whether this offering accepts resource limit change requests.
+
+    Off unless the offering opts in. When enabled, users who may not change the
+    limits themselves can ask for new ones, and holders of the limits
+    permission decide; approval submits an update order.
+    """
+    return bool(
+        _displayed_plugin_options(offering).get("enable_resource_limit_change_requests")
+    )
+
+
+def validate_end_date_for_resource(resource: models.Resource, end_date):
+    """Validate a requested end date against the resource and its offering.
+
+    Wraps validate_end_date with the arguments derived from the resource, so the
+    request path and the approval path apply identical rules. Termination
+    offsets are measured from the creation order's start date when provisioning
+    was delayed, same as at order creation time.
+    """
+    if not end_date:
+        raise serializers.ValidationError({"end_date": _("End date is required.")})
+
+    creation_order = resource.creation_order
+    return validate_end_date(
+        offering=resource.offering,
+        created_date=resource.created.date(),
+        end_date=end_date,
+        start_date=creation_order.start_date if creation_order else None,
+        project_end_date=resource.project.end_date if resource.project else None,
+    )
 
 
 def sync_component_user_usage(allocation_user_usage, plugin_name):
@@ -3470,7 +4665,7 @@ def sync_component_user_usage(allocation_user_usage, plugin_name):
 def update_component_quota(allocation, plugin_name):
     """Shared handler for syncing allocation component quotas to marketplace resources.
 
-    Used by marketplace_slurm, marketplace_openportal, and marketplace_openportal_remote
+    Used by marketplace_openportal and marketplace_openportal_remote
     plugins to update ComponentQuota, ComponentUsage, and Resource.limits when an
     allocation's usage or limit fields change.
     """
@@ -3929,6 +5124,19 @@ def rotate_service_account_api_key(service_account: models.ScopedServiceAccount)
         raise
 
 
+def get_scope_offering_identifiers(resource_queryset) -> list[str]:
+    """Return each resource's offering backend_id, falling back to slug if not yet set.
+
+    backend_id is only populated once a processing agent has provisioned the
+    resource, so a project/customer with not-yet-provisioned resources still
+    needs the slug fallback.
+    """
+    offering_ids = set(
+        resource_queryset.values_list("offering__backend_id", "offering__slug")
+    )
+    return list({backend_id or slug for backend_id, slug in offering_ids})
+
+
 def post_service_account_to_url(
     url: str, service_account: dict, owner_username: str = "", scope_type: str = ""
 ):
@@ -3939,25 +5147,20 @@ def post_service_account_to_url(
             customer = project.customer
             scope_name = project.name
             scope_slug = project.slug
-            scope_offering_slugs = []
-            offering_slugs = set(
-                project.resource_set.exclude(
-                    state=ResourceStates.TERMINATED
-                ).values_list("offering__slug", flat=True)
+            scope_offering_slugs = get_scope_offering_identifiers(
+                project.resource_set.exclude(state=ResourceStates.TERMINATED)
             )
         elif scope_type == "customer":
             customer: structure_models.Customer = service_account["customer"]
             scope_name = customer.name
             scope_slug = customer.slug
-            offering_slugs = set(
-                models.Resource.objects.exclude(state=ResourceStates.TERMINATED)
-                .filter(project__customer=customer)
-                .values_list("offering__slug", flat=True)
+            scope_offering_slugs = get_scope_offering_identifiers(
+                models.Resource.objects.exclude(state=ResourceStates.TERMINATED).filter(
+                    project__customer=customer
+                )
             )
         else:
             raise ValueError(f"Unsupported service account type: {scope_type}")
-
-        scope_offering_slugs = list(offering_slugs)
 
         payload = {
             "ownerUsername": owner_username,
@@ -3980,13 +5183,34 @@ def post_service_account_to_url(
         raise
 
 
-def extract_error_details_from_httpx_error(exc: httpx.HTTPError):
-    """Extract error details from an HTTPx error depending on the error type."""
-    if isinstance(exc, httpx.HTTPStatusError):
-        if exc.response.text:
-            return exc.response.json()
-        return f"Status code: {exc.response.status_code}, empty body"
-    return str(exc)
+def extract_error_details_from_httpx_error(exc: httpx.HTTPError) -> str:
+    """Extract error details from an HTTPx error depending on the error type.
+
+    Always includes the HTTP status code so a stored error_message is
+    identifiable even when the backend's body is empty, unparseable, or
+    just an opaque wrapper - without this, `str(exc)` on a raw
+    HTTPStatusError only shows the generic "Server error '500 ...'"
+    request-line text, discarding whatever detail the backend actually
+    returned (or forcing a crash here if that detail isn't valid JSON).
+    """
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return str(exc)
+
+    response = exc.response
+    status_code = response.status_code
+    if not response.text:
+        return f"Status code: {status_code}, empty body"
+
+    try:
+        body = response.json()
+    except ValueError:
+        return f"Status code: {status_code}, message: {response.text}"
+
+    message = body
+    if isinstance(body, dict):
+        message = body.get("detail") or body.get("message") or body
+
+    return f"Status code: {status_code}, message: {message}"
 
 
 def create_service_account(service_account: dict, owner_username: str, scope_type: str):
@@ -4402,6 +5626,7 @@ _CONSUMER_RESOURCE_EVENTS = {
     ObservableObjectType.RESOURCE,
     ObservableObjectType.RESOURCE_PERIODIC_LIMITS,
     ObservableObjectType.RESOURCE_API_KEY_ROTATION,
+    ObservableObjectType.RESOURCE_END_DATE_CHANGE_REQUEST,
 }
 # Scoped via project_uuid in payload
 _CONSUMER_PROJECT_SCOPED_EVENTS = {
@@ -4486,6 +5711,40 @@ def _resolve_event_consumer_customer(
     if project:
         return project.customer
     return None
+
+
+def prepare_provider_account_messages(
+    account,
+    message_payload: dict,
+) -> list[dict[str, str]]:
+    """Build ``service_provider_account`` messages for one provider account.
+
+    The sibling of :func:`prepare_messages` for events that have no offering.
+    A provider account belongs to the provider, not to any one of its offerings,
+    so the event is anchored on the provider's **customer** -- which is the key
+    ``get_scope_ancestors`` already yields for every offering of that provider,
+    so a consumer bound there receives both this and the per-offering events.
+
+    The legacy per-offering subscription path does not apply: its queue name is
+    built from an offering uuid, and this event has none.
+    """
+    customer = account.service_provider.customer
+    scope_keys = permission_utils.scope_keys_for(customer)
+
+    def _build_payload():
+        payload = dict(message_payload)
+        payload["service_provider_uuid"] = account.service_provider.uuid.hex
+        payload["customer_uuid"] = customer.uuid.hex
+        payload["object_type"] = ObservableObjectType.SERVICE_PROVIDER_ACCOUNT.value
+        return payload
+
+    dispatch_result = event_dispatch.build_messages(
+        scope_keys,
+        _build_payload,
+        ObservableObjectType.SERVICE_PROVIDER_ACCOUNT,
+        include_global=True,
+    )
+    return dispatch_result.messages
 
 
 def prepare_messages(
@@ -4685,51 +5944,43 @@ def publish_offering_resources_sync_request(offering: models.Offering, user) -> 
     return True
 
 
-def api_key_fingerprint(plaintext: str) -> str:
-    """A display fingerprint that recognizes a key without revealing it."""
-    # For a short value, head[:7] + tail[-4:] would overlap and expose most of the
-    # key, so only show head+tail when a masked middle remains between them.
-    if len(plaintext) < 15:
-        return f"{plaintext[:3]}..."
-    return f"{plaintext[:7]}...{plaintext[-4:]}"
-
-
-def _log_api_key_action(
-    resource: models.Resource, action: str, extra: str = ""
-) -> None:
-    """Log an API key action with the identifiers useful for support triage."""
+def _log_api_key_rotation(api_key: models.ResourceApiKey) -> None:
+    """Log a rotation command with the identifiers useful for support triage."""
+    resource = api_key.resource
     project = resource.project
     customer = project.customer
     logger.info(
-        "API key %s requested for resource %s (%s), project %s (%s), "
-        "organization %s (%s)%s",
-        action,
+        "API key rotation requested for key %s of resource %s (%s), "
+        "project %s (%s), organization %s (%s)",
+        api_key.uuid.hex,
         resource.name,
         resource.uuid.hex,
         project.name,
         project.uuid.hex,
         customer.name,
         customer.uuid.hex,
-        extra,
     )
 
 
-def publish_api_key_event(api_key: models.ResourceApiKey, action: str) -> bool:
-    """Ask connected site agents to reconcile a resource API key.
+def publish_api_key_event(api_key: models.ResourceApiKey) -> bool:
+    """Ask connected site agents to rotate a resource API key.
 
     The agent owns key generation: this only sends a slim command (no key
-    material). ``action`` is one of ``rotate`` / ``revoke`` / ``add``. The agent
-    performs the backend change and reports back via the provider endpoints.
-    Returns True if at least one agent subscription received the command.
+    material). Rotation is the only command — the key count is fixed at
+    provisioning and a rotation replaces a value in place — so the action is not
+    a parameter. The agent performs the backend change and reports back via the
+    provider endpoints. Returns True if at least one agent subscription received
+    the command.
     """
     resource = api_key.resource
-    _log_api_key_action(resource, action, extra=f", key {api_key.uuid.hex}")
+    _log_api_key_rotation(api_key)
     payload = {
         "resource_uuid": resource.uuid.hex,
         "resource_backend_id": resource.backend_id,
         "api_key_uuid": api_key.uuid.hex,
         "client_id": api_key.client_id,
-        "action": action,
+        # Still on the wire: the agent dispatches on it and rejects anything else.
+        "action": "rotate",
     }
     messages = prepare_messages(
         resource.offering,
@@ -4770,12 +6021,8 @@ def post_course_account_to_url(
         if api_access_token is None:
             api_access_token = get_course_account_api_token()
         project: structure_models.Project = course_account["project"]
-        offering_slugs = list(
-            set(
-                project.resource_set.exclude(
-                    state=ResourceStates.TERMINATED
-                ).values_list("offering__slug", flat=True)
-            )
+        offering_slugs = get_scope_offering_identifiers(
+            project.resource_set.exclude(state=ResourceStates.TERMINATED)
         )
 
         payload = {
@@ -5193,6 +6440,19 @@ def validate_target_allocation(
             name=target_resource.name,
         )
 
+    # Each target gets its own order, so order creation must be authorized per
+    # target as well. Targets come from the request body rather than the
+    # action's object, so the view's permission check does not cover them.
+    if not has_permission(
+        user, PermissionEnum.CREATE_ORDER, target_resource.project
+    ) and not has_permission(
+        user, PermissionEnum.CREATE_ORDER, target_resource.project.customer
+    ):
+        error_validation(
+            "User does not have permission to create orders for target resource %(name)s.",
+            name=target_resource.name,
+        )
+
     target_limits = target_resource.limits or {}
     validate_limits(target_limits, target_resource.offering, target_resource)
 
@@ -5211,7 +6471,9 @@ def validate_target_allocation(
             )
 
         new_target_limits = target_limits.copy()
-        new_target_limits[component] = target_limits.get(component, 0) + allocated_value
+        new_target_limits[component] = add_limit_values(
+            target_limits.get(component, 0), allocated_value
+        )
 
         try:
             validate_limits(
@@ -5225,7 +6487,9 @@ def validate_target_allocation(
                 error=str(e),
             )
 
-        total_allocated[component] += allocated_value
+        total_allocated[component] = add_limit_values(
+            total_allocated[component], allocated_value
+        )
 
 
 def calculate_new_limits(current_limits, allocated_limits, subtract=False):
@@ -5237,9 +6501,11 @@ def calculate_new_limits(current_limits, allocated_limits, subtract=False):
     for component, allocated_value in allocated_limits.items():
         current_value = new_limits.get(component, 0)
         if subtract:
-            new_limits[component] = max(0, current_value - allocated_value)
+            new_limits[component] = max(
+                0, add_limit_values(current_value, -allocated_value)
+            )
         else:
-            new_limits[component] = current_value + allocated_value
+            new_limits[component] = add_limit_values(current_value, allocated_value)
 
     return new_limits
 
@@ -5509,6 +6775,28 @@ def _is_field_empty_q(user_field_name):
         return Q(**{f"{prefix}__isnull": True})
 
 
+def user_can_see_resource_order_workflow(user, resource) -> bool:
+    """Return whether ``user`` may see ``order_in_progress`` / ``creation_order``.
+
+    Visible to consumer project/customer members and to service providers with
+    access to the resource's offering. Hidden from users whose only connection
+    is a direct Resource or ResourceProject role.
+    """
+    if not user or not user.is_authenticated:
+        return False
+    if user.is_staff or user.is_support:
+        return True
+    if resource.project_id in get_connected_projects(user):
+        return True
+    if resource.project.customer_id in get_connected_customers(user):
+        return True
+    return (
+        models.Resource.objects.filter(pk=resource.pk)
+        .filter_for_service_provider(user)
+        .exists()
+    )
+
+
 def is_resource_project_only_viewer(user, resource) -> bool:
     """True when ``user`` can only see ``resource`` via a ResourceProject role.
 
@@ -5572,6 +6860,36 @@ def filter_users_with_active_offering_consent(users, offering):
     ).distinct()
 
 
+def filter_offering_users_queryset_by_consent(queryset, offering=None):
+    """Exclude OfferingUsers without active consent when ToS enforcement is on.
+
+    Mirrors the predicate used by ``get_allowed_offering_users_for_user`` /
+    ``list_customer_users``: keep rows for offerings without an active ToS, or
+    where the linked user has an unrevoked consent for that offering.
+
+    When ``offering`` is passed (single-offering callers such as glauth), skip
+    the filter entirely if that offering has no active ToS.
+    """
+    if not config.ENFORCE_USER_CONSENT_FOR_OFFERINGS:
+        return queryset
+
+    if offering is not None:
+        if not offering.has_terms_of_service():
+            return queryset
+        return queryset.filter(
+            user__offering_consents__offering=offering,
+            user__offering_consents__revocation_date__isnull=True,
+        ).distinct()
+
+    return queryset.filter(
+        ~Q(offering__terms_of_service_configs__is_active=True)
+        | Q(
+            user__offering_consents__offering=F("offering"),
+            user__offering_consents__revocation_date__isnull=True,
+        )
+    ).distinct()
+
+
 def should_filter_provider_resource_team_by_consent(user, offering) -> bool:
     if user.is_staff or user.is_support:
         return False
@@ -5614,3 +6932,87 @@ def build_resource_team_response(resource, request, users):
         ).data,
         status=status.HTTP_200_OK,
     )
+
+
+def _live_resource_exists():
+    """Scopes whose organization still runs something on the offering.
+
+    A scope survives the termination of the last resource so that
+    re-provisioning restores protection without reconfiguration. It must not
+    keep reaching the exported allow-list though: an external firewall would go
+    on trusting those addresses for a service the organization has stopped
+    using.
+    """
+    return Q(
+        Exists(
+            models.Resource.objects.filter(
+                project__customer_id=OuterRef("access_subnet__customer_id"),
+                offering_id=OuterRef("offering_id"),
+            ).exclude(state=models.Resource.States.TERMINATED)
+        )
+    )
+
+
+def aggregate_access_subnets(offering_uuids=None, include_organization_subnets=False):
+    """Collect the access-subnet allow-list for the given offerings.
+
+    ``offering_uuids=None`` means all offerings. Returns a dict with the
+    consumer (customer x offering) subnets, the provider-default offering
+    subnets, the organization-level subnets of customers owning non-terminated
+    resources of the offerings (empty unless ``include_organization_subnets``),
+    and ``packed`` — all of the above collapsed into the minimal CIDR list.
+
+    Consumer entries are reported per (customer, offering) pair rather than per
+    resource: the list is defined at that grain, so expanding it across every
+    resource would multiply the payload without adding information.
+    """
+    consumer_subnets = (
+        models.AccessSubnetOfferingScope.objects.exclude(
+            access_subnet__inet__isnull=True
+        )
+        .filter(_live_resource_exists())
+        .select_related("access_subnet", "access_subnet__customer", "offering")
+        .order_by("access_subnet__inet")
+    )
+    offering_defaults = (
+        models.OfferingAccessSubnet.objects.exclude(inet__isnull=True)
+        .select_related("offering")
+        .order_by("inet")
+    )
+    if offering_uuids is not None:
+        consumer_subnets = consumer_subnets.filter(offering__uuid__in=offering_uuids)
+        offering_defaults = offering_defaults.filter(offering__uuid__in=offering_uuids)
+
+    if include_organization_subnets:
+        resources = models.Resource.objects.exclude(
+            state=models.Resource.States.TERMINATED
+        )
+        if offering_uuids is not None:
+            resources = resources.filter(offering__uuid__in=offering_uuids)
+        customer_ids = resources.values_list(
+            "project__customer_id", flat=True
+        ).distinct()
+        organization_subnets = (
+            structure_models.AccessSubnet.objects.exclude(inet__isnull=True)
+            # Portal-scoped only, preserving what this flag meant before the
+            # two lists merged: "also trust the addresses this organization
+            # signs in from". Offering scopes arrive through consumer_subnets.
+            .filter(customer_id__in=customer_ids, applies_to_portal=True)
+            .select_related("customer")
+            .order_by("inet")
+        )
+    else:
+        organization_subnets = structure_models.AccessSubnet.objects.none()
+
+    inets = (
+        [scope.access_subnet.inet for scope in consumer_subnets]
+        + [subnet.inet for subnet in offering_defaults]
+        + [subnet.inet for subnet in organization_subnets]
+    )
+    packed = [str(network) for network in core_utils.merge_access_subnets(inets)]
+    return {
+        "consumer_subnets": consumer_subnets,
+        "offering_defaults": offering_defaults,
+        "organization_subnets": organization_subnets,
+        "packed": packed,
+    }

@@ -145,6 +145,8 @@ Waldur supports a two-level credit system: **CustomerCredit** (organization-wide
 
 **ProjectCredit** is a sub-allocation of the customer credit. The sum of all project credit values cannot exceed the customer credit value.
 
+Every change to either balance is recorded in the [credit ledger](../credit-ledger.md), which is what makes the drawdown below observable after the fact: the minimal-consumption tail writes no invoice item, so the ledger is the only place it is visible.
+
 #### Invoice Finalization Flow
 
 During invoice finalization, credits are processed via `process_invoice_credits()`:
@@ -205,6 +207,11 @@ sequenceDiagram
         end
     end
 ```
+
+Both deductions against a balance — what usage consumed and what the floor took
+— land in a single `value` write. The flow declares the breakdown so that the
+ledger can record them as separate `compensation` and `minimal_draw` rows; see
+[Credit ledger](../credit-ledger.md).
 
 #### Minimal Consumption
 
@@ -279,6 +286,33 @@ When a grace period is used, the effective date for zeroing credits is always th
 | `roll_back_customer_credit` | Compensation cleared |
 | `roll_back_project_credit` | Compensation cleared |
 
+#### Cost Policies and Compensation
+
+`waldur_mastermind.policy`'s `ProjectEstimatedCostPolicy` and `CustomerEstimatedCostPolicy` (`src/waldur_mastermind/policy/models.py`) net cost against credit in two independent steps inside `is_triggered()`, not one combined comparison:
+
+```mermaid
+graph TD
+    A[New invoice item / credit change] --> B{Gate 1:<br>cost this window<br>net of compensation<br>>= limit_cost?}
+    B -->|No| Z[Policy stays clear]
+    B -->|Yes| C{use_credit configured?}
+    C -->|No| F[Policy fires]
+    C -->|Yes| D{Gate 2:<br>credit.value<br><= limit_cost?}
+    D -->|No, balance healthy| Z
+    D -->|Yes, balance depleted| F
+```
+
+**Gate 1** sums every `InvoiceItem` for the project/customer across the policy's rolling window (1/3/12 months) via `EstimatedCostPolicyMixin._is_triggered` -- cost items and compensation items together, unfiltered by type, since a compensation item is just a negative-priced row on the same invoice. For a month whose invoice has already been finalized -- including one `rebill_historical_usage` has just corrected -- this sum is entirely real, persisted data. There's no simulation involved in reading it.
+
+On top of that sum, `is_triggered()` additionally subtracts a live `MonthlyCompensation.get_resource_compensation()` / `get_project_compensation()` / `total_compensation` call -- but this only ever represents the customer's *current, still-mutable* invoice (`MonthlyCompensation(customer)`, called with no explicit `invoice=` argument, auto-selects it), re-run fresh in memory on every evaluation without ever calling `.save()`. It has no bearing on any past month already reflected in the sum above.
+
+**Gate 2** re-queries `CustomerCredit`/`ProjectCredit` directly, and is only consulted once gate 1 is already open (`use_credit=False` policies skip it and compare gross cost instead).
+
+The two gates read genuinely different facts -- gate 1 is a net invoiced position over a window, gate 2 is the current remaining reserve -- so they can disagree for ordinary reasons. This window's net cost can be high because credit only partially covered it, correctly, if the pool was scarce at finalization time; or because a later correction's compensation update didn't fully rebalance against a sibling sharing the same credit, since `rebill_historical_usage`'s own correction is a simplified 1:1 update to the one resource being fixed, not a full cheapest-first re-run across every resource sharing that credit (see its `sibling_compensations` warning). Either way, the real balance behind it can still have plenty of untouched headroom for other resources or future spend. Gate 2 doesn't re-derive gate 1's number; it checks the one fact that's never in question -- the balance, right now. The policy fires only when both independently say the account is over budget.
+
+Verified example, from `scripts/simulate_rebill_historical_usage.py`'s scenario B: a resource billed 500 node-hours (1,425), fully compensated at finalization time from a 3,000 project credit (1,575 left over). A correction raises the reported usage to 3,000 node-hours (8,550) -- the credit correction aborts (7,125 needed, only 1,575 available), so the compensation item stays at its old value. Gate 1 for that project: 8,550 − 1,425 = 7,125, against a `limit_cost` of 3,000 -- opens. Gate 2: the real project credit balance, 1,575, is also below 3,000 -- opens too. Both gates reflect real, persisted numbers throughout; no simulation was involved in either.
+
+See `EstimatedCostPolicyMixin._is_triggered` and `ProjectEstimatedCostPolicy.is_triggered` / `CustomerEstimatedCostPolicy.is_triggered` in `src/waldur_mastermind/policy/models.py` for the exact implementation.
+
 ### Configuration
 
 The grace period is configured in `WALDUR_INVOICES` settings:
@@ -352,3 +386,4 @@ For TOTAL period components, the system:
 | `src/waldur_mastermind/invoices/tasks.py` | `finalize_previous_invoices` | Deferred invoice finalization (grace period) |
 | `src/waldur_mastermind/invoices/compensations.py` | `MonthlyCompensation` | Credit-based compensation logic |
 | `src/waldur_mastermind/marketplace/enums.py` | `BillingTypes`, `LimitPeriods` | Billing type and period enums |
+| `src/waldur_mastermind/policy/models.py` | `ProjectEstimatedCostPolicy`, `CustomerEstimatedCostPolicy` | Cost Policy gate logic, consumes `MonthlyCompensation` as a projection |

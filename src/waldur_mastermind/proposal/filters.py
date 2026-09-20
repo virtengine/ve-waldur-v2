@@ -71,6 +71,11 @@ class CallFilter(django_filters.FilterSet):
     offering_uuid = core_filters.RelatedUUIDFilter(
         view_name="marketplace-provider-offering-detail", method="filter_offering_uuid"
     )
+    open_for_offering_uuid = core_filters.RelatedUUIDFilter(
+        view_name="marketplace-provider-offering-detail",
+        method="filter_open_for_offering_uuid",
+        label="Calls the offering can be requested through right now",
+    )
     state = django_filters.MultipleChoiceFilter(choices=CallStates.CHOICES)
     o = django_filters.OrderingFilter(
         fields=("manager__customer__name", "created", "name")
@@ -101,6 +106,16 @@ class CallFilter(django_filters.FilterSet):
 
     def filter_offering_uuid(self, queryset, name, value):
         return queryset.filter(offerings__uuid=value).distinct()
+
+    def filter_open_for_offering_uuid(self, queryset, name, value):
+        """Calls a proposal for this offering can be submitted to right now.
+
+        Narrower than ``offering_uuid``, which matches every call the offering was
+        ever added to. Shares the predicate behind ``open_for_proposals``.
+        """
+        return queryset.filter(
+            id__in=models.RequestedOffering.objects.call_ids_open_for_offering(value)
+        )
 
 
 class ProposalFilter(django_filters.FilterSet):
@@ -221,13 +236,16 @@ class RequestedOfferingFilter(django_filters.FilterSet):
 
 
 class RequestedResourceFilter(django_filters.FilterSet):
+    # RequestedResource reaches the offering through RequestedOffering; it has no
+    # offering FK of its own, so the shorter path raises FieldError at query time.
     offering = core_filters.URLFilter(
         view_name="marketplace-provider-offering-detail",
-        field_name="offering__uuid",
+        field_name="requested_offering__offering__uuid",
         label="Offering",
     )
     offering_uuid = core_filters.RelatedUUIDFilter(
-        view_name="marketplace-provider-offering-detail", field_name="offering__uuid"
+        view_name="marketplace-provider-offering-detail",
+        field_name="requested_offering__offering__uuid",
     )
     resource = core_filters.URLFilter(
         view_name="marketplace-resource-detail",
@@ -245,18 +263,57 @@ class RequestedResourceFilter(django_filters.FilterSet):
     proposal_uuid = core_filters.RelatedUUIDFilter(
         view_name="proposal-proposal-detail", field_name="proposal__uuid"
     )
+    proposal_state = django_filters.MultipleChoiceFilter(
+        field_name="proposal__state",
+        choices=ProposalStates.CHOICES,
+        label="Proposal state",
+    )
+    query = django_filters.CharFilter(
+        method="filter_query",
+        label="Search by offering, proposal, call or resource name",
+    )
     o = django_filters.OrderingFilter(
         fields=(
-            "created",
-            "offering__name",
-            "resource__name",
-            "proposal__name",
+            ("created", "created"),
+            ("requested_offering__offering__name", "offering__name"),
+            ("resource__name", "resource__name"),
+            ("resource__state", "resource__state"),
+            ("proposal__name", "proposal__name"),
+            ("proposal__state", "proposal__state"),
+            ("proposal__round__call__name", "call__name"),
         )
     )
+
+    def filter_query(self, queryset, name, value):
+        # The four names a row actually shows, so the box matches what is read.
+        return queryset.filter(
+            Q(requested_offering__offering__name__icontains=value)
+            | Q(proposal__name__icontains=value)
+            | Q(proposal__round__call__name__icontains=value)
+            | Q(resource__name__icontains=value)
+        )
 
     class Meta:
         model = models.RequestedResource
         fields = ["created"]
+
+
+class CallWorkflowStepNotificationRuleFilter(django_filters.FilterSet):
+    call_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-public-call-detail",
+        field_name="workflow_step__call__uuid",
+    )
+    workflow_step_uuid = core_filters.RelatedUUIDFilter(
+        view_name="proposal-call-workflow_step-detail",
+        field_name="workflow_step__uuid",
+    )
+    step = django_filters.CharFilter(field_name="workflow_step__step")
+    trigger = django_filters.CharFilter()
+    is_enabled = django_filters.BooleanFilter()
+
+    class Meta:
+        model = models.CallWorkflowStepNotificationRule
+        fields = []
 
 
 class ProposalProjectRoleMappingFilter(django_filters.FilterSet):
@@ -373,11 +430,7 @@ class ConflictOfInterestFilter(django_filters.FilterSet):
         fields = []
 
     def filter_reviewer_name(self, queryset, name, value):
-        return queryset.filter(
-            Q(reviewer__user__first_name__icontains=value)
-            | Q(reviewer__user__last_name__icontains=value)
-            | Q(reviewer__user__full_name__icontains=value)
-        )
+        return core_filters.filter_by_full_name(queryset, value, "reviewer__user")
 
 
 class COIDisclosureFormFilter(django_filters.FilterSet):

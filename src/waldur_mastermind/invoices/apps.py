@@ -61,9 +61,9 @@ class InvoiceConfig(AppConfig):
         )
 
         signals.post_save.connect(
-            handlers.create_recurring_usage_if_invoice_has_been_created,
+            handlers.create_carried_over_usage_if_invoice_has_been_created,
             sender=models.Invoice,
-            dispatch_uid="waldur_mastermind.invoices.create_recurring_usage_if_invoice_has_been_created",
+            dispatch_uid="waldur_mastermind.invoices.create_carried_over_usage_if_invoice_has_been_created",
         )
 
         signals.post_save.connect(
@@ -79,6 +79,12 @@ class InvoiceConfig(AppConfig):
         )
 
         signals.post_save.connect(
+            handlers.record_credit_transaction,
+            sender=models.ProjectCredit,
+            dispatch_uid="waldur_mastermind.invoices.record_project_credit_transaction",
+        )
+
+        signals.post_save.connect(
             handlers.log_affiliate,
             sender=models.CustomerAffiliate,
             dispatch_uid="waldur_mastermind.invoices.log_affiliate",
@@ -90,6 +96,12 @@ class InvoiceConfig(AppConfig):
             handlers.process_affiliate_fees,
             sender=models.Invoice,
             dispatch_uid="waldur_mastermind.invoices.process_affiliate_fees",
+        )
+
+        signals.pre_delete.connect(
+            handlers.delete_project_credits_with_customer_credit,
+            sender=models.CustomerCredit,
+            dispatch_uid="waldur_mastermind.invoices.delete_project_credits_with_customer_credit",
         )
 
         signals.post_save.connect(

@@ -12,6 +12,7 @@ from waldur_core.core.tests.helpers import override_waldur_core_settings
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
 from waldur_core.permissions.models import Role, UserRole
+from waldur_core.permissions.serializers import clone_role_for_customer
 from waldur_core.permissions.utils import add_user, has_user
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.tests import factories as structure_factories
@@ -1059,6 +1060,26 @@ class RequestApproveTest(BaseInvitationTest):
         self.permission_request.refresh_from_db()
         self.assertEqual(self.permission_request.state, ReviewStates.PENDING)
 
+    def test_approve_grants_clone_when_user_holds_template(self):
+        # The "already has the role" skip in approve is identity-strict:
+        # approving a clone request for a template holder must grant the
+        # clone, not silently no-op.
+        clone = clone_role_for_customer(
+            CustomerRole.OWNER, self.customer, conceal_template=False
+        )
+        invitation = factories.CustomerGroupInvitationFactory(
+            scope=self.customer, role=clone
+        )
+        requester = structure_factories.UserFactory()
+        add_user(self.customer, requester, CustomerRole.OWNER)
+        permission_request = factories.PermissionRequestFactory(
+            invitation=invitation, created_by=requester
+        )
+
+        permission_request.approve(self.staff)
+
+        self.assertTrue(has_user(self.customer, requester, clone, match_clones=False))
+
     def test_customer_owner_can_approve_project_scoped_request(self):
         project_invitation = factories.ProjectGroupInvitationFactory(scope=self.project)
         permission_request = factories.PermissionRequestFactory(
@@ -1116,6 +1137,19 @@ class RequestApproveTest(BaseInvitationTest):
         self.permission_request.refresh_from_db()
         # State already moved to APPROVED by super().approve(); the rollback
         # comes from @transaction.atomic on PermissionRequest.approve.
+        self.assertEqual(self.permission_request.state, ReviewStates.PENDING)
+
+    @override_config(INVITATION_DISABLE_MULTIPLE_ROLES=True)
+    def test_approve_rejects_second_role_when_multiple_roles_disabled(self):
+        add_user(self.customer, self.created_by, CustomerRole.SUPPORT)
+        self.client.force_authenticate(user=self.staff)
+
+        response = self.client.post(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("User already has role within this scope.", str(response.data))
+        self.assertFalse(has_user(self.customer, self.created_by, CustomerRole.OWNER))
+        self.permission_request.refresh_from_db()
         self.assertEqual(self.permission_request.state, ReviewStates.PENDING)
 
 
@@ -1561,6 +1595,40 @@ class GroupInvitationAutoApprovalTest(BaseGroupInvitationTest):
             has_user(self.customer, user, self.auto_approve_invitation.role)
         )
 
+    def test_submit_request_response_reports_customer_scope_type(self):
+        """Customer-scoped invitations report scope_type=customer in the response."""
+        user = structure_factories.UserFactory(email="user@example.com")
+        self.client.force_authenticate(user=user)
+
+        response = self.client.post(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["scope_type"], "customer")
+
+    def test_submit_request_response_reports_project_scope_type(self):
+        """Project-scoped invitations report scope_type=project in the response.
+
+        Without auto_create_project, project_uuid stays null while scope_uuid
+        is a *project* UUID — the frontend can only route to the right
+        dashboard when scope_type identifies the scope model.
+        """
+        project_scoped_invitation = factories.ProjectGroupInvitationFactory(
+            scope=self.project,
+            auto_approve=True,
+            user_email_patterns=[".*@example.com"],
+        )
+        url = factories.ProjectGroupInvitationFactory.get_url(
+            project_scoped_invitation, "submit_request"
+        )
+        user = structure_factories.UserFactory(email="user@example.com")
+        self.client.force_authenticate(user=user)
+
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["auto_approved"])
+        self.assertEqual(response.data["scope_type"], "project")
+        self.assertEqual(response.data["scope_uuid"], self.project.uuid.hex)
+        self.assertIsNone(response.data.get("project_uuid"))
+
     def test_auto_approval_disabled_requires_manual_approval(self):
         """Test that when auto_approve is False, requests require manual approval."""
         manual_approval_invitation = factories.CustomerGroupInvitationFactory(
@@ -1590,6 +1658,50 @@ class GroupInvitationAutoApprovalTest(BaseGroupInvitationTest):
 
         # Check that user has NOT been granted the role yet
         self.assertFalse(has_user(self.customer, user, manual_approval_invitation.role))
+
+    @mock.patch(
+        "waldur_core.users.handlers.tasks."
+        "send_mail_notification_about_permission_request_has_been_submitted.delay"
+    )
+    def test_auto_approved_request_does_not_notify_owners(self, mock_tasks: mock.Mock):
+        """Auto-approved requests grant access immediately, so owners should not
+        get a 'please approve' email for them."""
+        user = structure_factories.UserFactory(email="user@example.com")
+        self.client.force_authenticate(user=user)
+
+        response = self.client.post(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["auto_approved"])
+
+        mock_tasks.assert_not_called()
+
+    @mock.patch(
+        "waldur_core.users.handlers.tasks."
+        "send_mail_notification_about_permission_request_has_been_submitted.delay"
+    )
+    def test_manual_approval_request_notifies_owners(self, mock_tasks: mock.Mock):
+        """Requests that actually need review should still notify owners."""
+        manual_approval_invitation = factories.CustomerGroupInvitationFactory(
+            scope=self.customer,
+            auto_approve=False,
+            user_email_patterns=[".*@example.com"],
+            user_affiliations=["staff"],
+        )
+        url = factories.CustomerGroupInvitationFactory.get_url(
+            manual_approval_invitation, "submit_request"
+        )
+
+        user = structure_factories.UserFactory(email="user@example.com")
+        self.client.force_authenticate(user=user)
+
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["auto_approved"])
+
+        permission_request = models.PermissionRequest.objects.get(
+            invitation=manual_approval_invitation, created_by=user
+        )
+        mock_tasks.assert_called_once_with(permission_request.id)
 
     def test_auto_approval_with_project_creation(self):
         """Test auto-approval works with auto_create_project enabled."""

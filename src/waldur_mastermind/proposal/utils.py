@@ -7,13 +7,17 @@ from constance import config
 from dateutil.relativedelta import relativedelta
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
+from django.utils import timezone
 from rest_framework import serializers
 
+from waldur_core.core import utils as core_utils
 from waldur_core.core.fields import StringUUID
 from waldur_core.core.utils import get_system_robot
 from waldur_core.permissions.utils import get_users
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
+from waldur_mastermind.marketplace import utils as marketplace_utils
+from waldur_mastermind.marketplace.enums import OrderStates
 from waldur_mastermind.proposal import models as proposal_models
 from waldur_mastermind.proposal.enums import (
     AllocationTimes,
@@ -23,6 +27,282 @@ from waldur_mastermind.proposal.enums import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _requested_months(
+    requested_resource: proposal_models.RequestedResource,
+) -> int | None:
+    """How many whole months the request asks for, or None when it names none.
+
+    The length is the contract. ``attributes.end_date`` is the older form of the
+    same answer, kept for requests written before the form asked for months, and
+    measured from the day that request was created because that is the day its
+    date was computed from.
+    """
+    attributes = requested_resource.attributes or {}
+
+    stored_length = attributes.get("prepaid_duration_months")
+    if stored_length is not None:
+        try:
+            months = int(stored_length)
+        except (TypeError, ValueError):
+            months = 0
+        if months > 0:
+            return months
+        logger.warning(
+            "Requested resource %s carries an unusable subscription length %r; "
+            "falling back to its end date.",
+            requested_resource.uuid,
+            stored_length,
+        )
+
+    if not attributes.get("end_date"):
+        return None
+
+    try:
+        requested_end = marketplace_utils.parse_date(attributes["end_date"])
+    except serializers.ValidationError:
+        logger.warning(
+            "Requested resource %s carries an unparseable end date %r; the "
+            "allocated resource is left without one.",
+            requested_resource.uuid,
+            attributes["end_date"],
+        )
+        return None
+    if requested_end is None:
+        return None
+
+    return core_utils.calculate_duration_months(
+        requested_resource.created.date(), requested_end
+    )
+
+
+def _is_prepaid(requested_resource: proposal_models.RequestedResource) -> bool:
+    """Whether this request buys a subscription at all.
+
+    The stored length means nothing on an offering with no prepaid component —
+    only such an offering is bought by the month.
+    """
+    return requested_resource.requested_offering.offering.components.filter(
+        is_prepaid=True
+    ).exists()
+
+
+def get_proposal_duration_months(proposal: proposal_models.Proposal) -> int | None:
+    """The longest subscription the proposal asks for, in whole months.
+
+    The project cannot end before its longest subscription does. Returns None
+    when the proposal asks for no subscription at all — a call may accept
+    prepaid and non-prepaid offerings side by side, and a proposal that requested
+    only the latter has no length to derive anything from.
+    """
+    lengths = [
+        months
+        for requested_resource in proposal.requestedresource_set.filter(
+            requested_offering__state=RequestedOfferingStates.ACCEPTED
+        ).select_related("requested_offering__offering")
+        if _is_prepaid(requested_resource)
+        and (months := _requested_months(requested_resource)) is not None
+    ]
+    return max(lengths) if lengths else None
+
+
+def allocation_start_date(
+    proposal_round: proposal_models.Round,
+) -> datetime.date | None:
+    """The day allocation is scheduled for, where the call dates it forward.
+
+    None for a call that allocates on decision: the project then starts the
+    day it is created. ``Project.start_date`` is a DateField and the round's
+    ``allocation_date`` a DateTimeField, hence the coercion.
+    """
+    # Allocation timing is a call-level policy on the allocation_decision step;
+    # the concrete date stays per-round.
+    allocation_step = proposal_models.CallWorkflowStep.objects.filter(
+        call=proposal_round.call, step="allocation_decision"
+    ).first()
+    allocation_time = (
+        allocation_step.allocation_time
+        if allocation_step
+        else AllocationTimes.ON_DECISION
+    )
+    if allocation_time == AllocationTimes.FIXED_DATE and proposal_round.allocation_date:
+        return proposal_round.allocation_date.date()
+    return None
+
+
+def max_prepaid_duration_months(
+    call: proposal_models.Call, anchor: datetime.date
+) -> int | None:
+    """The longest subscription, in whole months, the call's fixed duration admits.
+
+    A call's fixed duration is the length of every project it awards, so a
+    subscription requested under it may not outlast it. Months and days are
+    only comparable once resolved against a date, so the answer depends on the
+    anchor: the largest N with ``anchor + N months <= anchor + fixed days``.
+    None when the call fixes nothing.
+    """
+    fixed_days = call.fixed_duration_in_days
+    if not fixed_days:
+        return None
+
+    project_end = anchor + datetime.timedelta(days=fixed_days)
+    months = 0
+    while anchor + relativedelta(months=months + 1) <= project_end:
+        months += 1
+    return months
+
+
+def project_end_date(
+    proposal: proposal_models.Proposal, start_date: datetime.date
+) -> datetime.date | None:
+    """When the allocated project should end, measured from its own start.
+
+    The call's fixed duration is the length of every project it awards, so it
+    decides whenever it is set — the subscriptions requested under it are
+    bounded by it (see :func:`max_prepaid_duration_months`) and clamped to the
+    project by :func:`_requested_end_date`. The longest subscription sets the
+    length only for a call that fixes none. The two units are never converted
+    into each other — a length in months and a length in days are only
+    comparable once each has been resolved against a date, because a day count
+    is true only relative to the anchor it was measured from.
+    """
+    fixed_days = proposal.round.call.fixed_duration_in_days
+    if fixed_days:
+        return start_date + datetime.timedelta(days=fixed_days)
+
+    months = get_proposal_duration_months(proposal)
+    if months is not None:
+        return start_date + relativedelta(months=months)
+
+    return None
+
+
+def requested_duration_label(proposal: proposal_models.Proposal) -> str | None:
+    """The project length as the applicant can be told it, unit included.
+
+    In order of truthfulness: what was granted (once allocated), the call's
+    fixed length, and the subscription the proposal asks for. Months
+    and days are never converted into each other (see :func:`project_end_date`),
+    so the unit travels with the number. None when nothing is known — the
+    template drops the line rather than printing "None".
+    """
+    granted_days = granted_duration_in_days(proposal)
+    if granted_days:
+        return f"{granted_days} days"
+
+    fixed_days = proposal.round.call.fixed_duration_in_days
+    if fixed_days:
+        return f"{fixed_days} days"
+
+    months = get_proposal_duration_months(proposal)
+    if months:
+        return "1 month" if months == 1 else f"{months} months"
+
+    return None
+
+
+def granted_duration_in_days(
+    proposal: proposal_models.Proposal,
+) -> int | None:
+    """How long the granted project runs, in whole days.
+
+    The counterpart of :func:`project_end_date`: that decides when the project
+    ends, this reads the decision back so the applicant can be told.
+
+    Deliberately what was *granted*, not what was asked for: the applicant is
+    not asked for a length at all any more (the retired
+    ``Proposal.duration_in_days`` recorded one), and the request's own length —
+    a subscription in months — is resolved against a date at allocation.
+
+    Returns None when there is nothing truthful to say — no project yet, or a
+    project with no end date, which is a grant that does not expire. The
+    template drops the line rather than printing a blank.
+    """
+    project = proposal.project
+    if project is None or project.end_date is None:
+        return None
+
+    # The anchor allocation itself measured from: the project's own start where
+    # it has one, otherwise the day it was created (allocate_proposal passes
+    # `start_date or today` to project_end_date and stores start_date as-is).
+    start_date = project.start_date or timezone.localdate(project.created)
+    days = (project.end_date - start_date).days
+    return days if days > 0 else None
+
+
+def _requested_end_date(
+    requested_resource: proposal_models.RequestedResource,
+    project: structure_models.Project,
+    today: datetime.date,
+) -> datetime.date | None:
+    """The end date for the allocated resource, anchored on its project's start.
+
+    A resource request names a length, not a date: the day the resource is
+    granted is unknown while the proposal is being written and reviewed. Running
+    the grant for that many months from the day allocation is scheduled for
+    keeps both the period the applicant chose and the cost the reviewer priced,
+    where an absolute date would quietly deliver a shorter grant and invoice less
+    than the approved figure — and, once review outlasts the period, would have
+    passed altogether, which ``validate_end_date`` rejects outright.
+
+    Returns None when no period was requested, or when the anchored date breaks
+    the offering's own termination rules — allocation must not fail over a date,
+    so the resource is left open and the operator gets a warning.
+    """
+    months = _requested_months(requested_resource)
+    if months is None:
+        return None
+
+    # Measured from the day allocation is scheduled for, not from the day the
+    # decision happened to be taken. A call that dates allocation forward would
+    # otherwise spend the whole interval before the project even opens: a grant
+    # approved in August and allocated in December expired in the following
+    # August rather than the following December. What happens after that date —
+    # the provider approving the order, the backend taking its time — eats into
+    # the usable period without moving it.
+    anchor = project.start_date or today
+    end_date = anchor + relativedelta(months=months)
+
+    # Clamped, not left to be rejected. ``validate_end_date`` raises when a
+    # resource outlasts its project, and the handler below turns any rejection
+    # into "no end date at all" — which bills a prepaid resource for a single
+    # month. A resource that would outrun its project should be shortened to it,
+    # not silently un-dated.
+    if project.end_date and end_date > project.end_date:
+        logger.info(
+            "End date %s for requested resource %s is capped at the project's "
+            "own end date %s.",
+            end_date,
+            requested_resource.uuid,
+            project.end_date,
+        )
+        end_date = project.end_date
+
+    offering = requested_resource.requested_offering.offering
+    try:
+        return marketplace_utils.validate_end_date(
+            offering,
+            today,
+            end_date,
+            # The offering's own termination offset is measured from the same
+            # anchor the period is, or a date only N months from the project's
+            # start reads as N months plus the wait before it. The marketplace's
+            # own path says the same thing in validate_end_date_for_resource.
+            start_date=project.start_date,
+            project_end_date=project.end_date,
+        )
+    except serializers.ValidationError as exc:
+        logger.warning(
+            "End date %s for requested resource %s was rejected by offering %s "
+            "(%s); the allocated resource is left without one, so prepaid "
+            "components are charged for a single month.",
+            end_date,
+            requested_resource.uuid,
+            offering.uuid,
+            exc.detail,
+        )
+        return None
 
 
 def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
@@ -46,33 +326,38 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
         [call_prefix, proposal_round.start_time.strftime("%Y-%m-%d"), name]
     )[: structure_models.PROJECT_NAME_LENGTH]
 
-    # Allocation timing is a call-level policy on the allocation_decision step;
-    # the concrete date stays per-round.
-    allocation_step = proposal_models.CallWorkflowStep.objects.filter(
-        call=proposal_round.call, step="allocation_decision"
-    ).first()
-    allocation_time = (
-        allocation_step.allocation_time
-        if allocation_step
-        else AllocationTimes.ON_DECISION
-    )
-    if allocation_time == AllocationTimes.FIXED_DATE and proposal_round.allocation_date:
-        # Project.start_date is a DateField; the round's allocation_date is a
-        # DateTimeField. Coerce to a date so downstream date comparisons (e.g.
-        # the order-created notification handler) don't hit a datetime-vs-date
-        # TypeError.
-        start_date = proposal_round.allocation_date.date()
+    start_date = allocation_start_date(proposal_round)
+
+    # The project runs for the call's fixed duration, or, for a call that fixes
+    # none, for as long as the longest subscription it holds. Measured from the
+    # project's own start so that a call which
+    # dates allocation forward does not spend the period before it opens.
+    # One reading of the clock for the whole allocation: the project and every
+    # resource in it must be measured from the same day, or a run that crosses
+    # midnight leaves a resource outlasting its own project.
+    today = datetime.date.today()
+    end_date = project_end_date(proposal, start_date or today)
 
     project = structure_models.Project.objects.create(
         customer=proposal_round.call.manager.customer,
         name=project_name,
         start_date=start_date,
+        end_date=end_date,
     )
     project = cast(structure_models.Project, project)
 
     if start_date:
         logger.info(
             f"Field start_date of {project} has been changed to {proposal.round.allocation_date}."
+        )
+    if end_date:
+        logger.info(
+            "Project %s ends on %s, derived from %s.",
+            project,
+            end_date,
+            "the longest requested subscription"
+            if get_proposal_duration_months(proposal) is not None
+            else "the call's fixed duration",
         )
 
     proposal.project = project
@@ -105,19 +390,58 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
                 **attrs,
                 name=project.name,
             )
+            # Before init_cost: the prepaid multiplier in Plan.get_estimate and
+            # in the invoice item builder both read this field, so setting it
+            # afterwards would price and bill a six-month grant as one month.
+            # The marketplace order path sets it in the same order and says so.
+            resource.end_date = _requested_end_date(requested_resource, project, today)
             resource.init_cost()
             resource.save()
 
+            robot = get_system_robot()
             order = marketplace_models.Order(
                 **attrs,
                 resource=resource,
-                created_by=get_system_robot(),
+                created_by=robot,
             )
+            # Hand the purchase order to the order, so the approval gate in
+            # marketplace.permissions is already satisfied. Without this the
+            # applicant supplies it during the proposal and is asked again the
+            # moment the allocation lands.
+            if requested_resource.attachment:
+                # Point at the stored file rather than assigning the FieldFile:
+                # the document is already committed, so this records the same
+                # path without re-uploading a copy.
+                order.attachment.name = requested_resource.attachment.name
+            if requested_resource.purchase_order_reference:
+                order.request_comment = requested_resource.purchase_order_reference
             order.init_cost()
             order.save()
 
             requested_resource.resource = resource
             requested_resource.save()
+
+            # No consumer approval here: order.save() above has already fired
+            # notify_approvers_when_order_is_created, and that handler owns it.
+            # The robot is staff, so the marketplace gate clears the consumer
+            # step and routes the order to provider review, PENDING_PROJECT or
+            # EXECUTING. The call review already authorised the spend, so that
+            # is the intended outcome. Approving a second time here raised
+            # TransitionNotAllowed on orders the handler had taken to
+            # EXECUTING, and queued a duplicate provider notification for the
+            # rest.
+            #
+            # The gate still leaves the order PENDING_CONSUMER when the
+            # offering requires a purchase order document and none was copied
+            # above. The call snapshots that flag when the offering is added,
+            # so a requirement introduced later reaches existing calls
+            # uncollected, and the provider's control must still hold.
+            logger.info(
+                "Order %s allocated from proposal %s is %s.",
+                order.uuid,
+                proposal.uuid,
+                dict(OrderStates.CHOICES).get(order.state, order.state),
+            )
 
 
 def process_closed_round(call_round: proposal_models.Round):
@@ -172,6 +496,7 @@ DUPLICATE_CALL_SECTION_DEFAULTS: dict[str, bool] = {
     "copy_resource_templates": True,
     "copy_role_mappings": True,
     "copy_applicant_visibility_config": True,
+    "copy_proposal_field_config": True,
     "copy_coi_configuration": True,
     "copy_matching_configuration": True,
     "copy_assignment_configuration": True,
@@ -278,6 +603,21 @@ def duplicate_call(
             _prepare_clone(src_mapping)
             src_mapping.call = new_call
             src_mapping.save()
+
+    # Not part of the loop below: the new call already has a field config, seeded
+    # by the post_save handler, so cloning the source row would collide on the
+    # one-to-one constraint. Overwrite the seeded columns instead.
+    if opts["copy_proposal_field_config"]:
+        source_states = proposal_models.CallProposalFieldConfig.get_states_for_call(
+            source
+        )
+        proposal_models.CallProposalFieldConfig.objects.update_or_create(
+            call=new_call,
+            defaults={
+                proposal_models.CallProposalFieldConfig.column_for(field_name): state
+                for field_name, state in source_states.items()
+            },
+        )
 
     onetoone_targets = (
         ("copy_applicant_visibility_config", "applicant_visibility_config"),

@@ -8,10 +8,7 @@ from rest_framework import serializers
 from rest_framework.reverse import reverse
 
 from waldur_core.core import utils as core_utils
-from waldur_core.core.enums import CoreStates
-from waldur_core.core.exceptions import IncorrectStateException
-from waldur_mastermind.marketplace import models, processors, signals
-from waldur_mastermind.marketplace.enums import BillingTypes
+from waldur_mastermind.marketplace import billing_mode, models, processors, signals
 from waldur_mastermind.marketplace.processors import (
     copy_attributes,
     get_order_post_data,
@@ -63,12 +60,12 @@ class TenantCreateProcessor(processors.BaseCreateResourceProcessor):
             quotas = utils.map_limits_to_quotas(order.limits, order.offering)
             return dict(quotas=quotas, **payload)
 
-        # Usage-based offerings don't require limits — tenants are created
-        # with default quotas and billed by actual consumption.
-        has_usage_billing = order.offering.components.filter(
-            billing_type=BillingTypes.USAGE,
-        ).exists()
-        if has_usage_billing:
+        # A plan that bills the builtin components by usage does not require
+        # limits: the tenant is created with backend default quotas and
+        # billed by actual consumption. Under a limit plan quotas are the
+        # billed quantity, so they are mandatory.
+        resolved = billing_mode.resolve_for_order(order)
+        if resolved.is_usage_based and not resolved.limit_types:
             return payload
 
         raise serializers.ValidationError(
@@ -144,6 +141,7 @@ class InstanceCreateProcessor(TenantMixin, processors.BaseCreateResourceProcesso
         "connect_directly_to_external_network",
         "config_drive",
         "data_volumes",
+        "metadata",
     )
 
     def validate_order(self, request):
@@ -215,43 +213,9 @@ class InstanceCreateProcessor(TenantMixin, processors.BaseCreateResourceProcesso
 
 class InstanceDeleteProcessor(processors.AbstractDeleteResourceProcessor):
     def validate_order(self, request):
-        instance = cast(openstack_models.Instance, self.order.resource.scope)
-        if not instance:
-            return
-        delete_attributes = self.order.attributes
-        action = delete_attributes.get("action", "destroy")
-        validators = {
-            "destroy": [
-                self._can_destroy_instance,
-                openstack_views.InstanceViewSet._has_backups,
-                openstack_views.InstanceViewSet._has_snapshots,
-            ],
-            "force_destroy": openstack_views.MarketplaceInstanceViewSet.force_destroy_validators,
-        }
-        if action not in validators:
-            action = "destroy"
-        for validator in validators[action]:
-            validator(instance)
-
-    def _can_destroy_instance(self, instance: openstack_models.Instance):
-        if instance.state == CoreStates.ERRED:
-            return
-        if (
-            instance.state == CoreStates.OK
-            and instance.runtime_state
-            == openstack_models.Instance.RuntimeStates.SHUTOFF
-        ):
-            return
-        if (
-            instance.state == CoreStates.OK
-            and instance.runtime_state == openstack_models.Instance.RuntimeStates.ACTIVE
-        ):
-            raise IncorrectStateException(
-                _("Please stop the instance before its removal.")
-            )
-        raise IncorrectStateException(
-            _("Instance should be shutoff and OK or erred. Please contact support.")
-        )
+        # Instance deletion preparation (stop, backups, snapshots) is handled
+        # asynchronously by InstanceDeleteExecutor.
+        pass
 
     def send_request(self, user, resource: models.Resource):
         if not resource.scope:

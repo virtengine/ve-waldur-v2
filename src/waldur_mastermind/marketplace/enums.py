@@ -25,6 +25,58 @@ class BillingTypes:
     )
 
 
+class BillingModes:
+    """How a plan bills the offering's builtin components.
+
+    Custom components always keep their own ``OfferingComponent.billing_type``;
+    the plan mode overrides only the components the plugin registers
+    (for OpenStack: cores, ram, storage and the per-volume-type quotas).
+    """
+
+    INHERIT = "inherit"
+    LIMIT = "limit"
+    USAGE = "usage"
+
+    CHOICES = (
+        # builtin components keep the billing type stored on the offering component
+        (INHERIT, "Inherit from components"),
+        # builtin components are billed monthly on the requested limits
+        (LIMIT, "Limit-based"),
+        # builtin components are billed on accumulated usage (component-hours)
+        (USAGE, "Usage-based"),
+    )
+    # Prepaid is deliberately absent. It is not a third way of counting a
+    # component -- it is limit-based billing paid upfront for a fixed term --
+    # and it stays where it already lives, on OfferingComponent.is_prepaid,
+    # which providers set per component through the component API and the
+    # offering-level switch.
+
+
+class SwitchBillingModes:
+    """Offering-level switch of the builtin components' billing type."""
+
+    MONTHLY = "monthly"
+    PREPAID = "prepaid"
+    USAGE = "usage"
+
+    CHOICES = (
+        (MONTHLY, "Monthly (Limit-based)"),
+        (PREPAID, "Prepaid (One-time)"),
+        (USAGE, "Usage-based"),
+    )
+
+
+# The offering-level switch says the same thing as a plan mode, in the older
+# vocabulary, and applies it to the offering's plans. Prepaid has no plan mode,
+# so the plans are set to inherit and the components govern, which is what
+# prepaid has always meant.
+PLAN_MODE_BY_SWITCH_MODE = {
+    SwitchBillingModes.MONTHLY: BillingModes.LIMIT,
+    SwitchBillingModes.PREPAID: BillingModes.INHERIT,
+    SwitchBillingModes.USAGE: BillingModes.USAGE,
+}
+
+
 class LimitPeriods:
     MONTH = "month"
     QUARTERLY = "quarterly"
@@ -53,6 +105,31 @@ class LimitPeriods:
             "amount over the whole active state of resource.",
         ),
     )
+
+
+class MissingUsagePolicies:
+    """What to record for a component when a period passes with no usage report.
+
+    Stored on ``ComponentUsage`` and carried onto the row created for the next
+    billing period by
+    ``invoices.handlers.create_carried_over_usage_if_invoice_has_been_created``.
+    """
+
+    NONE = "none"
+    REUSE = "reuse"
+    ZERO = "zero"
+
+    CHOICES = (
+        # nothing is recorded — the period stays unreported
+        (NONE, "Leave the period unreported."),
+        # the last reported value is repeated until the provider reports a new one
+        (REUSE, "Reuse the reported value every month until changed."),
+        # silence is treated as an explicit zero
+        (ZERO, "Record zero when no usage is reported."),
+    )
+
+    # Policies that materialize a row for the following billing period.
+    CARRIED_OVER = (REUSE, ZERO)
 
 
 class UsageLimitAction:
@@ -139,6 +216,39 @@ class RobotAccountStates:
     VALUES = [val for (_, val) in CHOICES]
 
 
+class AccountScopes:
+    """Where a user's login/POSIX account is held.
+
+    ``OFFERING`` is the historical behaviour: one account row, and one set of
+    values, per offering. ``PROVIDER`` holds one account per user per service
+    provider, which is what a directory shared across several offerings needs.
+    """
+
+    OFFERING = "offering"
+    PROVIDER = "provider"
+
+    CHOICES = (
+        (OFFERING, "Per offering"),
+        (PROVIDER, "Per service provider"),
+    )
+
+    VALUES = (OFFERING, PROVIDER)
+
+
+class AccountSettingSources:
+    """Where an offering's effective account setting comes from."""
+
+    OFFERING = "offering"
+    PROVIDER = "provider"
+    DEFAULT = "default"
+
+    CHOICES = (
+        (OFFERING, "Set on the offering"),
+        (PROVIDER, "Inherited from the service provider"),
+        (DEFAULT, "Built-in default"),
+    )
+
+
 class OfferingUserStates:
     # creation flow
     CREATION_REQUESTED = 1
@@ -168,6 +278,19 @@ class OfferingUserStates:
     )
 
     VALUES = [val for (_, val) in CHOICES]
+
+    # States in which the account is (or is about to be) present at the provider.
+    LIVE_STATES = (
+        CREATION_REQUESTED,
+        CREATING,
+        PENDING_ACCOUNT_LINKING,
+        PENDING_ADDITIONAL_VALIDATION,
+        OK,
+        ERROR_CREATING,
+    )
+    # States an account passes through on its way out; a returning member is
+    # restored from any of them.
+    DELETION_FLOW_STATES = (DELETION_REQUESTED, DELETING, ERROR_DELETING, DELETED)
 
 
 OfferingUserStatesType = Literal[
@@ -408,19 +531,19 @@ class ServiceAccountState:
 
 class ResourceApiKeyStates:
     # Reuses the resource state vocabulary so the portal renders keys with the
-    # standard StateIndicator: Creating/Updating/Terminating show a spinner,
-    # OK is green, Erred is red.
+    # standard StateIndicator: Creating/Updating show a spinner, OK is green,
+    # Erred is red. There is no Terminating: the key count is fixed at
+    # provisioning and rotation replaces a value in place, so no consumer action
+    # removes a key.
     CREATING = "Creating"
     OK = "OK"
     UPDATING = "Updating"
-    TERMINATING = "Terminating"
     ERRED = "Erred"
 
     CHOICES = (
         (CREATING, CREATING),
         (OK, OK),
         (UPDATING, UPDATING),
-        (TERMINATING, TERMINATING),
         (ERRED, ERRED),
     )
 
@@ -441,6 +564,14 @@ class CourseAccountState(models.IntegerChoices):
     PENDING = 4, _("Pending")
 
 
+# Ceiling on OfferingComponent.limit_decimal_places. ComponentQuota and
+# ResourceComponentUsageSummary store limits as DecimalField(decimal_places=2),
+# so a finer limit would be rounded there while InvoiceItem.quantity, which has
+# ten places, kept it — the reported allocation and the invoice would disagree.
+# Raising this means migrating those columns first.
+MAX_LIMIT_DECIMAL_PLACES = 2
+
+
 SUPPORT_OFFERING = "Support.OfferingTemplate"
 BOOKING_OFFERING = "Marketplace.Booking"
 BASIC_OFFERING = "Marketplace.Basic"
@@ -459,6 +590,18 @@ SITE_AGENT_OFFERING = "Marketplace.Slurm"
 # processors and only no-op the send paths (delegating to the external
 # waldur-site-agent), so the persisted data shape is interchangeable.
 SWAPPABLE_OFFERING_TYPES = frozenset({BASIC_OFFERING, SITE_AGENT_OFFERING})
+
+# Offering types a site agent may be attached to: it registers an identity and
+# ships logs against one of these. Keep this list in one place.
+SITE_AGENT_COMPATIBLE_OFFERING_TYPES = frozenset(
+    {
+        SITE_AGENT_OFFERING,
+        SCRIPT_OFFERING,
+        OPENSTACK_TENANT_OFFERING,
+        BASIC_OFFERING,
+        SUPPORT_OFFERING,
+    }
+)
 
 
 class ResourceAction:

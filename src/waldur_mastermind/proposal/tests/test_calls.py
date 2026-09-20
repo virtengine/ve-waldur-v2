@@ -1,14 +1,22 @@
 import uuid
+from datetime import timedelta
 
 from ddt import data, ddt
+from django.utils import timezone
 from rest_framework import status, test
 
 from waldur_core.checklist.enums import ChecklistTypes
 from waldur_core.checklist.tests import factories as checklist_factories
+from waldur_core.core.models import DESCRIPTION_LENGTH
+from waldur_core.core.tests.helpers import EXPANDING_DESCRIPTION
 from waldur_core.media.utils import dummy_image
-from waldur_core.permissions.fixtures import CallRole
+from waldur_core.permissions import enums as permissions_enums
+from waldur_core.permissions import utils as permissions_utils
+from waldur_core.permissions.fixtures import CallRole, CustomerRole
+from waldur_core.permissions.models import UserRole
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
+from waldur_mastermind.proposal import enums as proposal_enums
 from waldur_mastermind.proposal import models
 from waldur_mastermind.proposal.enums import CallStates, RequestedOfferingStates
 from waldur_mastermind.proposal.tests import fixtures
@@ -43,6 +51,84 @@ class PublicCallGetTest(test.APITestCase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.json()), 1)
+
+
+class PublicCallOpenForOfferingFilterTest(test.APITestCase):
+    """``open_for_offering_uuid`` must agree with the offering's open_for_proposals.
+
+    ``offering_uuid`` stays deliberately loose: the offering page lists past and
+    archived calls under it too.
+    """
+
+    def setUp(self):
+        self.offering = marketplace_factories.OfferingFactory()
+        self.url = factories.CallFactory.get_public_list_url()
+
+    def add_offering_to_call(self, with_round=True, **kwargs):
+        kwargs.setdefault("call__state", CallStates.ACTIVE)
+        requested_offering = factories.RequestedOfferingFactory(
+            offering=self.offering, **kwargs
+        )
+        if with_round:
+            factories.RoundFactory(call=requested_offering.call, opened=True)
+        return requested_offering.call
+
+    def get_calls(self, param):
+        response = self.client.get(self.url, {param: self.offering.uuid.hex})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return [call["uuid"] for call in response.json()]
+
+    def test_call_accepting_proposals_is_returned_by_both_filters(self):
+        call = self.add_offering_to_call()
+
+        self.assertEqual(self.get_calls("offering_uuid"), [call.uuid.hex])
+        self.assertEqual(self.get_calls("open_for_offering_uuid"), [call.uuid.hex])
+
+    def test_call_without_a_live_round_is_returned_by_offering_uuid_only(self):
+        call = self.add_offering_to_call(with_round=False)
+
+        self.assertEqual(self.get_calls("offering_uuid"), [call.uuid.hex])
+        self.assertEqual(self.get_calls("open_for_offering_uuid"), [])
+
+    def test_archived_call_is_returned_by_offering_uuid_only(self):
+        call = self.add_offering_to_call(call__state=CallStates.ARCHIVED)
+
+        self.assertEqual(self.get_calls("offering_uuid"), [call.uuid.hex])
+        self.assertEqual(self.get_calls("open_for_offering_uuid"), [])
+
+    def test_unaccepted_request_is_returned_by_offering_uuid_only(self):
+        call = self.add_offering_to_call(state=RequestedOfferingStates.REQUESTED)
+
+        self.assertEqual(self.get_calls("offering_uuid"), [call.uuid.hex])
+        self.assertEqual(self.get_calls("open_for_offering_uuid"), [])
+
+    def test_call_open_for_another_offering_is_not_returned(self):
+        factories.RoundFactory(
+            call=factories.RequestedOfferingFactory(call__state=CallStates.ACTIVE).call,
+            opened=True,
+        )
+
+        self.assertEqual(self.get_calls("open_for_offering_uuid"), [])
+
+    def test_call_whose_templates_skip_the_offering_is_not_returned(self):
+        """Such a call strands the applicant on a proposal it cannot be added to."""
+        call = self.add_offering_to_call()
+        # A template on the same call, but for a different requested offering.
+        factories.CallResourceTemplateFactory(call=call, requested_offering__call=call)
+
+        self.assertEqual(self.get_calls("offering_uuid"), [call.uuid.hex])
+        self.assertEqual(self.get_calls("open_for_offering_uuid"), [])
+
+    def test_call_whose_template_covers_the_offering_is_returned(self):
+        call = self.add_offering_to_call()
+        factories.CallResourceTemplateFactory(
+            call=call,
+            requested_offering=models.RequestedOffering.objects.get(
+                call=call, offering=self.offering
+            ),
+        )
+
+        self.assertEqual(self.get_calls("open_for_offering_uuid"), [call.uuid.hex])
 
 
 @ddt
@@ -130,7 +216,7 @@ class CallCreateTest(test.APITestCase):
 
 
 @ddt
-class CallUpdateTest(test.APITransactionTestCase):
+class CallUpdateTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
         self.call = self.fixture.call
@@ -154,11 +240,30 @@ class CallUpdateTest(test.APITransactionTestCase):
         response = self.update_call(user)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
+    @data(
+        "reviewer_1",
+        "panel_member",
+    )
+    def test_call_team_member_can_not_update_call(self, user):
+        # A call role grants visibility, not authorship: reviewers and panel
+        # members reach the call through the queryset but hold no UPDATE_CALL.
+        response = self.update_call(user)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertNotEqual(self.call.description, "new description")
+
+    def test_call_organizer_can_update_call(self):
+        # The organizer's role is bound to the CallManagingOrganisation rather
+        # than to the call, so the gate has to reach it through "manager".
+        response = self.update_call(self.fixture.call_organizer_user)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(self.call.description, "new description")
+
     def update_call(self, user, payload=None, **kwargs):
         if not payload:
             payload = {"description": "new description"}
 
-        user = getattr(self.fixture, user)
+        if isinstance(user, str):
+            user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
         url = factories.CallFactory.get_protected_url(self.call)
         response = self.client.patch(url, payload, **kwargs)
@@ -169,10 +274,14 @@ class CallUpdateTest(test.APITransactionTestCase):
         url = factories.CallFactory.get_protected_url(
             self.call, action="attach_documents"
         )
+        # attach_documents reads request.data.getlist("documents"), so the
+        # files go in as a flat list. Wrapping each one in a dict cannot
+        # survive multipart encoding -- Django stringifies the dict and the
+        # repr lands in CallDocument.file instead of the upload.
         payload = {
             "documents": [
-                {"file": dummy_image()},
-                {"file": dummy_image()},
+                dummy_image(),
+                dummy_image(),
             ],
         }
         return self.client.post(url, payload, format="multipart")
@@ -187,7 +296,49 @@ class CallUpdateTest(test.APITransactionTestCase):
         response = self._upload_call_document()
         call = models.Call.objects.get(uuid=self.call.uuid)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(call.calldocument_set.all()), 2)
+        documents = call.calldocument_set.all()
+        self.assertEqual(len(documents), 2)
+        # Assert the upload actually landed in storage. A row count alone
+        # passes even when the stored value is junk.
+        for document in documents:
+            self.assertTrue(
+                document.file.name.startswith("call_documents/"),
+                f"unexpected stored path: {document.file.name}",
+            )
+            self.assertTrue(document.file.storage.exists(document.file.name))
+            self.assertGreater(document.file.size, 0)
+
+    def test_attaching_a_string_instead_of_a_file_is_rejected(self):
+        """The endpoint used to write request.data straight into a FileField.
+
+        A caller could therefore store an arbitrary storage path rather than an
+        upload, and the media rule would then hand out that file's URL.
+        """
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.CallFactory.get_protected_url(
+            self.call, action="attach_documents"
+        )
+
+        response = self.client.post(
+            url,
+            {"documents": ["marketplace_order_attachments/someone-elses.pdf"]},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(models.CallDocument.objects.filter(call=self.call).exists())
+
+    def test_detaching_an_unknown_document_returns_404(self):
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.CallFactory.get_protected_url(
+            self.call, action="detach_documents"
+        )
+
+        response = self.client.post(
+            url, {"documents": [uuid.uuid4().hex]}, format="multipart"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     @data(
         "staff",
@@ -208,6 +359,78 @@ class CallUpdateTest(test.APITransactionTestCase):
         call = models.Call.objects.get(uuid=self.call.uuid)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(call.documents.all()), 1)
+
+
+@ddt
+class CallTeamManagementPermissionTest(test.APITestCase):
+    """Managing the call team is gated on CALL.CREATE_PERMISSION /
+    DELETE_PERMISSION (checked in UserRoleMutateSerializer against the call or
+    its customer), not on UPDATE_CALL. The shipped CUSTOMER.OWNER role carries
+    the former and not the latter, so the viewset's blanket UPDATE_CALL gate on
+    unsafe methods must not reach these inherited actions."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProposalFixture()
+        self.call = self.fixture.call
+        for perm in (
+            permissions_enums.PermissionEnum.CREATE_CALL_PERMISSION,
+            permissions_enums.PermissionEnum.DELETE_CALL_PERMISSION,
+            permissions_enums.PermissionEnum.LIST_CALLS,
+        ):
+            CustomerRole.OWNER.add_permission(perm)
+
+    def add_user(self, user, target):
+        self.client.force_authenticate(user)
+        return self.client.post(
+            factories.CallFactory.get_protected_url(self.call, action="add_user"),
+            {"user": target.uuid.hex, "role": "CALL.REVIEWER"},
+        )
+
+    def test_owner_without_update_call_can_still_add_team_member(self):
+        target = structure_factories.UserFactory()
+        response = self.add_user(self.fixture.owner, target)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertTrue(self.call.has_user(target, CallRole.REVIEWER))
+
+    @data("reviewer_1", "panel_member")
+    def test_call_team_member_can_not_add_team_member(self, user):
+        target = structure_factories.UserFactory()
+        response = self.add_user(getattr(self.fixture, user), target)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(self.call.has_user(target, CallRole.REVIEWER))
+
+
+class CallDescriptionLengthTest(test.APITestCase):
+    """Oversized call descriptions must be rejected with 400, not blow up in the database."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProposalFixture()
+        self.call = self.fixture.call
+        self.client.force_authenticate(self.fixture.staff)
+        self.url = factories.CallFactory.get_protected_url(self.call)
+
+    def test_description_over_limit_is_rejected(self):
+        response = self.client.patch(
+            self.url, {"description": "a" * (DESCRIPTION_LENGTH + 904)}
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("description", response.data)
+
+    def test_description_expanded_by_html_clean_is_rejected(self):
+        self.assertLess(len(EXPANDING_DESCRIPTION), DESCRIPTION_LENGTH)
+
+        response = self.client.patch(self.url, {"description": EXPANDING_DESCRIPTION})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("description", response.data)
+        self.assertIn("sanitisation", str(response.data["description"]))
+
+    def test_description_within_limit_is_accepted(self):
+        response = self.client.patch(
+            self.url, {"description": "a" * DESCRIPTION_LENGTH}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.call.refresh_from_db()
+        self.assertEqual(len(self.call.description), DESCRIPTION_LENGTH)
 
 
 @ddt
@@ -254,6 +477,15 @@ class CallDeleteTest(test.APITestCase):
             models.Call.objects.filter(uuid=self.draft_call.uuid.hex).exists()
         )
 
+    @data("REVIEWER", "PANEL_MEMBER")
+    def test_call_team_member_can_not_delete_call(self, role):
+        self.draft_call.add_user(self.fixture.user, getattr(CallRole, role))
+        response = self.delete_call("user", self.draft_call)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(
+            models.Call.objects.filter(uuid=self.draft_call.uuid.hex).exists()
+        )
+
     def delete_call(self, user, call):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
@@ -292,6 +524,37 @@ class CallActivateTest(test.APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertEqual(self.draft_call.state, CallStates.ACTIVE)
 
+    def test_user_can_not_activate_call_whose_offering_has_no_plan(self):
+        """Such a call activates fine and then cannot be applied to.
+
+        The applicant's resource-request form lists only offerings carrying a
+        plan, so the picker would be empty with no indication why. A plan can
+        only be set while the offering is still requested, so activation is the
+        last point it is still fixable.
+        """
+        factories.RoundFactory(call=self.draft_call)
+        self.draft_call.requestedoffering_set.update(plan=None)
+
+        response = self.activate_call("staff", self.draft_call)
+
+        self.assertEqual(
+            response.status_code, status.HTTP_400_BAD_REQUEST, response.data
+        )
+        self.draft_call.refresh_from_db()
+        self.assertEqual(self.draft_call.state, CallStates.DRAFT)
+
+    def test_a_planless_offering_that_was_never_accepted_does_not_block(self):
+        factories.RoundFactory(call=self.draft_call)
+        factories.RequestedOfferingFactory(
+            call=self.draft_call,
+            state=RequestedOfferingStates.REQUESTED,
+            plan=None,
+        )
+
+        response = self.activate_call("staff", self.draft_call)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
     @data("staff")
     def test_user_can_not_activate_call_without_round(self, user):
         response = self.activate_call(user, self.draft_call)
@@ -328,6 +591,14 @@ class CallActivateTest(test.APITestCase):
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND, response.data)
         self.assertEqual(self.active_call.state, CallStates.ACTIVE)
 
+    @data("REVIEWER", "PANEL_MEMBER")
+    def test_call_team_member_can_not_activate_call(self, role):
+        factories.RoundFactory(call=self.draft_call)
+        self.draft_call.add_user(self.fixture.user, getattr(CallRole, role))
+        response = self.activate_call("user", self.draft_call)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.draft_call.state, CallStates.DRAFT)
+
     def activate_call(self, user, call):
         user = getattr(self.fixture, user)
         self.client.force_authenticate(user)
@@ -361,6 +632,13 @@ class CallArchiveTest(test.APITestCase):
     def test_user_can_not_archive_call(self, user):
         response = self.archive_call(user, self.draft_call)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND, response.data)
+        self.assertEqual(self.draft_call.state, CallStates.DRAFT)
+
+    @data("REVIEWER", "PANEL_MEMBER")
+    def test_call_team_member_can_not_archive_call(self, role):
+        self.draft_call.add_user(self.fixture.user, getattr(CallRole, role))
+        response = self.archive_call("user", self.draft_call)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
         self.assertEqual(self.draft_call.state, CallStates.DRAFT)
 
     def archive_call(self, user, call):
@@ -972,3 +1250,269 @@ class CallProposalSlugTemplateSerializerTest(test.APITestCase):
         self.assertEqual(
             response.data["proposal_slug_template"], "{org_slug}-{counter_padded}"
         )
+
+
+class CallPanelChairTest(test.APITestCase):
+    """``Call.panel_chair`` is one flagged panel member, cleared on revocation."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProposalFixture()
+        self.call = self.fixture.call
+        self.manager = self.fixture.call_manager
+        self.chair = self.fixture.panel_member
+        self.url = factories.CallFactory.get_protected_url(self.call)
+
+    def _set_chair(self, user, value):
+        self.client.force_authenticate(user)
+        return self.client.patch(self.url, {"panel_chair": value})
+
+    def test_manager_sets_panel_member_as_chair(self):
+        response = self._set_chair(self.manager, self.chair.uuid.hex)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["panel_chair_uuid"], self.chair.uuid.hex)
+        self.assertEqual(response.data["panel_chair_name"], self.chair.full_name)
+        self.call.refresh_from_db()
+        self.assertEqual(self.call.panel_chair, self.chair)
+
+    def test_chair_must_be_panel_member(self):
+        response = self._set_chair(self.manager, self.fixture.reviewer_1.uuid.hex)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("panel_chair", response.data)
+
+    def test_chair_can_be_unset(self):
+        self.call.panel_chair = self.chair
+        self.call.save()
+        response = self._set_chair(self.manager, None)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.call.refresh_from_db()
+        self.assertIsNone(self.call.panel_chair)
+
+    def test_panel_member_cannot_set_chair(self):
+        response = self._set_chair(self.chair, self.chair.uuid.hex)
+        self.assertIn(
+            response.status_code,
+            (status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND),
+        )
+
+    def test_revoking_panel_role_clears_chair(self):
+        self.call.panel_chair = self.chair
+        self.call.save()
+        # The Team tab's remove action, admin revocation and the expiry sweep
+        # all funnel through UserRole.revoke(), which delete_user wraps.
+        permissions_utils.delete_user(
+            self.call, self.chair, CallRole.PANEL_MEMBER, self.manager
+        )
+        self.call.refresh_from_db()
+        self.assertIsNone(self.call.panel_chair)
+
+    def test_expired_panel_role_clears_chair(self):
+        from waldur_core.permissions import tasks as permission_tasks
+
+        self.call.panel_chair = self.chair
+        self.call.save()
+        UserRole.objects.filter(
+            user=self.chair, role__name=CallRole.PANEL_MEMBER.name
+        ).update(expiration_time=timezone.now() - timedelta(days=1))
+        permission_tasks.check_expired_permissions()
+        self.call.refresh_from_db()
+        self.assertIsNone(self.call.panel_chair)
+
+    def test_chair_cannot_be_set_on_create(self):
+        self.client.force_authenticate(self.fixture.call_organizer_user)
+        response = self.client.post(
+            factories.CallFactory.get_protected_list_url(),
+            {
+                "name": "Chaired call",
+                "manager": factories.CallManagingOrganisationFactory.get_url(
+                    self.fixture.manager
+                ),
+                "panel_chair": self.chair.uuid.hex,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("panel_chair", response.data)
+
+    def test_public_call_does_not_expose_chair(self):
+        self.call.panel_chair = self.chair
+        self.call.save()
+        self.client.force_authenticate(self.fixture.reviewer_1)
+        response = self.client.get(factories.CallFactory.get_public_url(self.call))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertNotIn("panel_chair", response.data)
+
+
+class CallSupportTicketCallerTest(test.APITestCase):
+    """Configuring who a call's support tickets are raised on behalf of (#449)."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProposalFixture()
+        self.call = self.fixture.call
+        self.url = factories.CallFactory.get_protected_url(self.call)
+        self.client.force_authenticate(self.fixture.staff)
+
+    def patch(self, payload):
+        response = self.client.patch(self.url, payload)
+        self.call.refresh_from_db()
+        return response
+
+    def eligible_user(self, **kwargs):
+        """Someone the call may name as its contact -- here, one of its own
+        managers. The choice is restricted to people already attached to the
+        call, so a bare UserFactory is not selectable."""
+        user = structure_factories.UserFactory(**kwargs)
+        self.call.add_user(user, CallRole.MANAGER)
+        return user
+
+    def test_default_is_the_applicant(self):
+        self.assertEqual(
+            self.call.support_ticket_caller,
+            proposal_enums.SupportTicketCallers.APPLICANT,
+        )
+
+    def test_a_role_can_be_chosen(self):
+        response = self.patch({"support_ticket_caller": "project_manager"})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(self.call.support_ticket_caller, "project_manager")
+
+    def test_specific_user_can_be_selected_before_the_contact_is_named(self):
+        # The settings page edits one field per request, so the mode has to be
+        # selectable on its own. Until the contact is named the resolver falls
+        # back to the project's roles.
+        response = self.patch({"support_ticket_caller": "specific_user"})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(self.call.support_ticket_caller, "specific_user")
+        self.assertIsNone(self.call.support_ticket_caller_user)
+
+    def test_named_contact_must_be_reachable(self):
+        unreachable = self.eligible_user(email="")
+
+        response = self.patch(
+            {
+                "support_ticket_caller": "specific_user",
+                "support_ticket_caller_user": unreachable.uuid.hex,
+            }
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("support_ticket_caller_user", response.data)
+
+    def test_named_contact_is_accepted(self):
+        grants_office = self.eligible_user()
+
+        response = self.patch(
+            {
+                "support_ticket_caller": "specific_user",
+                "support_ticket_caller_user": grants_office.uuid.hex,
+            }
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(self.call.support_ticket_caller_user, grants_office)
+
+    def test_contact_can_be_set_on_a_call_already_using_specific_user(self):
+        # The two halves are writable independently, so validation has to read
+        # the stored choice when only the contact is sent.
+        grants_office = self.eligible_user()
+        self.call.support_ticket_caller = (
+            proposal_enums.SupportTicketCallers.SPECIFIC_USER
+        )
+        self.call.support_ticket_caller_user = self.eligible_user()
+        self.call.save()
+
+        response = self.patch({"support_ticket_caller_user": grants_office.uuid.hex})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(self.call.support_ticket_caller_user, grants_office)
+
+    def test_contact_fields_are_null_not_absent_when_unset(self):
+        # A dotted source over a nullable FK drops the key from the payload
+        # unless allow_null is set, while the generated SDK still types it as
+        # required. Most calls have no named contact, so that is the norm.
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        for field in (
+            "support_ticket_caller_user",
+            "support_ticket_caller_user_uuid",
+            "support_ticket_caller_user_name",
+        ):
+            self.assertIn(field, response.data)
+            self.assertIsNone(response.data[field])
+
+    def test_inactive_contact_is_refused(self):
+        # The candidate queryset is built from User.objects, the active-only
+        # manager, so this never reaches the email check below.
+        inactive = self.eligible_user(is_active=False)
+
+        response = self.patch(
+            {
+                "support_ticket_caller": "specific_user",
+                "support_ticket_caller_user": inactive.uuid.hex,
+            }
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("support_ticket_caller_user", response.data)
+
+    def test_the_contact_can_be_cleared(self):
+        self.call.support_ticket_caller = (
+            proposal_enums.SupportTicketCallers.SPECIFIC_USER
+        )
+        self.call.support_ticket_caller_user = self.eligible_user()
+        self.call.save()
+
+        response = self.patch({"support_ticket_caller_user": None})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertIsNone(self.call.support_ticket_caller_user)
+
+    def test_an_unrelated_user_cannot_be_named(self):
+        # Whoever is named starts receiving the call's ticket mail and gets a
+        # helpdesk account created for them, so anyone with UPDATE_CALL must not
+        # be able to point that at an arbitrary account in the deployment.
+        stranger = structure_factories.UserFactory()
+
+        response = self.patch(
+            {
+                "support_ticket_caller": "specific_user",
+                "support_ticket_caller_user": stranger.uuid.hex,
+            }
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("support_ticket_caller_user", response.data)
+        self.assertIsNone(self.call.support_ticket_caller_user)
+
+    def test_an_unrelated_user_is_refused_like_a_missing_one(self):
+        # The same message either way: the field must not report whether a uuid
+        # belongs to a real account.
+        stranger = structure_factories.UserFactory()
+        missing = uuid.uuid4().hex
+
+        unrelated = self.patch({"support_ticket_caller_user": stranger.uuid.hex})
+        nonexistent = self.patch({"support_ticket_caller_user": missing})
+
+        self.assertEqual(unrelated.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(nonexistent.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            str(unrelated.data["support_ticket_caller_user"][0]),
+            str(nonexistent.data["support_ticket_caller_user"][0]),
+        )
+
+    def test_a_member_of_the_managing_organisation_can_be_named(self):
+        # A grants office sitting on the call's organisation rather than on the
+        # call itself is still a legitimate contact.
+        grants_office = structure_factories.UserFactory()
+        self.fixture.customer.add_user(grants_office, CustomerRole.OWNER)
+
+        response = self.patch(
+            {
+                "support_ticket_caller": "specific_user",
+                "support_ticket_caller_user": grants_office.uuid.hex,
+            }
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(self.call.support_ticket_caller_user, grants_office)

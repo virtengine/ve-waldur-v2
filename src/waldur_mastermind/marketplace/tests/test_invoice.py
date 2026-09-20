@@ -5,9 +5,11 @@ from decimal import Decimal
 from ddt import data, ddt
 from django.utils import timezone
 from freezegun import freeze_time
-from rest_framework import test
+from rest_framework import status, test
 from rest_framework.reverse import reverse
 
+from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.permissions.fixtures import ServiceProviderRole
 from waldur_mastermind.invoices import models as invoices_models
 from waldur_mastermind.invoices.tasks import create_monthly_invoices
 from waldur_mastermind.marketplace import models as marketplace_models
@@ -138,6 +140,35 @@ class TotalLimitTest(test.APITestCase):
         self.assertEqual(items.count(), 2)
         self.assertTrue(items.last().unit_price < 0)
         self.assertEqual(items.last().quantity, 5)
+
+    def test_fractional_limit_change_with_billing_history_is_billed(self):
+        # set_limits stores the JSON payload as-is, so a fractional value
+        # arrives as a float; the already-billed total is a Decimal summed
+        # from InvoiceItem.quantity. Mixing the two used to raise TypeError
+        # (HTTP 500) exactly when the resource had billing history.
+        self.resource.limits[self.component.type] = 0.5
+        self.resource.save()
+
+        items = self.get_invoice_items()
+        self.assertEqual(items.count(), 2)
+        self.assertTrue(items.last().unit_price < 0)
+        self.assertEqual(items.last().quantity, Decimal("9.5"))
+
+    def test_fractional_limit_change_via_set_limits_returns_200(self):
+        ServiceProviderRole.MANAGER.add_permission(PermissionEnum.SET_RESOURCE_STATE)
+        url = ResourceFactory.get_provider_resource_url(self.resource, "set_limits")
+        self.client.force_authenticate(self.fixture.staff)
+
+        response = self.client.post(
+            url, {"limits": {self.component.type: 0.1}}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.limits[self.component.type], 0.1)
+        items = self.get_invoice_items()
+        self.assertEqual(items.count(), 2)
+        self.assertEqual(items.last().quantity, Decimal("9.9"))
 
     def test_total_billing_works_without_create_orders(self):
         """Test TOTAL billing behavior when CREATE orders are missing (simulating deleted orders scenario)."""
@@ -1823,6 +1854,234 @@ class LimitBillingDuplicateInvoiceTest(test.APITestCase):
         self.assertGreater(total_quantity, 100, "Total quantity should be updated")
 
 
+@freeze_time("2024-10-15")
+class FractionalLimitBillingBase(test.APITestCase):
+    """Setup shared by the fractional billing cases: one LIMIT component on a
+    resource billed for the whole of October, and helpers to change its limit
+    and read the resulting invoice item back.
+
+    Deliberately carries no tests of its own -- each period and plan unit takes
+    a different branch and asserts something different.
+    """
+
+    #: Plan unit under test. PER_DAY and everything else take different
+    #: branches in both _update_invoice_item and quantity_from_limit_periods.
+    PLAN_UNIT = marketplace_models.Plan.Units.PER_DAY
+    #: Limit period under test.
+    LIMIT_PERIOD = LimitPeriods.MONTH
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.component = marketplace_factories.OfferingComponentFactory(
+            offering=self.fixture.offering,
+            type="storage_tb",
+            name="Storage",
+            billing_type=BillingTypes.LIMIT,
+            limit_period=self.LIMIT_PERIOD,
+            measured_unit="TB",
+        )
+        self.plan = marketplace_factories.PlanFactory(
+            offering=self.fixture.offering,
+            unit_price=0,
+            unit=self.PLAN_UNIT,
+        )
+        self.plan_component = marketplace_factories.PlanComponentFactory(
+            plan=self.plan,
+            component=self.component,
+            price=10,
+        )
+        self.invoice, _ = invoices_models.Invoice.objects.get_or_create(
+            customer=self.fixture.project.customer, year=2024, month=10
+        )
+        self.resource = self.bill_resource(0.1)
+
+    def bill_resource(self, limit):
+        """A resource billed for the whole of October at `limit`."""
+        # Provision in CREATING and promote with a queryset update, so the
+        # billing handlers do not open an item before this method does.
+        resource = marketplace_factories.ResourceFactory(
+            project=self.fixture.project,
+            offering=self.fixture.offering,
+            plan=self.plan,
+            limits={self.component.type: limit},
+            state=marketplace_models.ResourceStates.CREATING,
+        )
+        marketplace_models.Resource.objects.filter(pk=resource.pk).update(
+            state=marketplace_models.ResourceStates.OK,
+        )
+        resource.refresh_from_db()
+        LimitPeriodProcessor._create_invoice_item(
+            source=resource,
+            plan_component=self.plan_component,
+            invoice=self.invoice,
+            start=timezone.datetime(2024, 10, 1, tzinfo=UTC),
+            end=timezone.datetime(2024, 10, 31, 23, 59, 59, tzinfo=UTC),
+        )
+        return resource
+
+    def get_item(self, resource=None):
+        return invoices_models.InvoiceItem.objects.get(
+            resource=resource or self.resource,
+            details__offering_component_type=self.component.type,
+            invoice=self.invoice,
+            unit_price__gte=0,
+        )
+
+    def change_limit_to(self, new_quantity, resource=None):
+        LimitPeriodProcessor._update_invoice_item(
+            resource=resource or self.resource,
+            component_type=self.component.type,
+            invoice=self.invoice,
+            new_quantity=new_quantity,
+        )
+
+
+@freeze_time("2024-10-15")
+class MonthlyLimitFractionalQuantityTest(FractionalLimitBillingBase):
+    """The monthly counterpart of TotalLimitTest's fractional case.
+
+    A limit change splits the billing period in two, and _update_invoice_item
+    re-serialises the sub-period the old limit covered. Truncating that
+    quantity to an integer dropped the sub-period's prorated share from the
+    invoice silently: the request succeeded and the customer was undercharged.
+    """
+
+    def test_old_period_keeps_its_fractional_quantity(self):
+        self.change_limit_to(0.5)
+
+        periods = self.get_item().details["resource_limit_periods"]
+        self.assertEqual(len(periods), 2)
+        self.assertEqual(periods[0]["quantity"], 0.1)
+        self.assertEqual(periods[1]["quantity"], 0.5)
+
+    def test_billed_quantity_covers_both_sub_periods(self):
+        self.change_limit_to(0.5)
+
+        item = self.get_item()
+        periods = item.details["resource_limit_periods"]
+        expected = sum(
+            Decimal(str(period["quantity"])) * period["billing_periods"]
+            for period in periods
+        )
+        self.assertEqual(item.quantity, expected)
+        # The old sub-period contributed something; truncation made it zero.
+        self.assertGreater(
+            Decimal(str(periods[0]["quantity"])) * periods[0]["billing_periods"],
+            0,
+        )
+
+    def test_period_total_is_free_of_binary_expansion(self):
+        self.change_limit_to(0.5)
+
+        periods = self.get_item().details["resource_limit_periods"]
+        for period in periods:
+            self.assertEqual(
+                period["total"],
+                str(Decimal(str(period["quantity"])) * period["billing_periods"]),
+            )
+            self.assertNotIn("000000000", period["total"])
+
+    def test_terminating_an_item_with_a_fractional_period_does_not_raise(self):
+        # InvoiceItem.terminate() rewrites the final period's total and
+        # quantity_from_limit_periods() sums them back. Both used int(), which
+        # truncates a fractional quantity to zero and raises outright on a
+        # total like "1.4".
+        self.change_limit_to(0.5)
+        item = self.get_item()
+
+        item.terminate(end=timezone.datetime(2024, 10, 20, tzinfo=UTC))
+
+        item.refresh_from_db()
+        periods = item.details["resource_limit_periods"]
+        self.assertEqual(periods[-1]["quantity"], 0.5)
+        self.assertEqual(
+            item.quantity,
+            sum(
+                Decimal(str(period["quantity"])) * period["billing_periods"]
+                for period in periods
+            ),
+        )
+
+    def test_whole_number_quantity_is_still_stored_as_int(self):
+        # Integer-only deployments must see byte-identical payloads.
+        resource = self.bill_resource(4)
+        self.change_limit_to(6, resource=resource)
+
+        periods = self.get_item(resource).details["resource_limit_periods"]
+        self.assertEqual(len(periods), 2)
+        for period in periods:
+            self.assertIsInstance(period["quantity"], int)
+
+
+@freeze_time("2024-10-15")
+class NonDailyFractionalQuantityTest(FractionalLimitBillingBase):
+    """The same fractional limit change, billed per month rather than per day.
+
+    _update_invoice_item takes a different branch for non-PER_DAY units: rather
+    than summing quantity x days, it weights each sub-period by its share of
+    the billing period. quantity_from_limit_periods reads the same periods back
+    the same way. Neither had any fractional coverage, and the day-weighted
+    branch is where a truncated quantity would be hardest to notice, because
+    the result is plausible rather than zero.
+    """
+
+    PLAN_UNIT = marketplace_models.Plan.Units.PER_MONTH
+
+    def test_the_day_weighted_average_keeps_the_fraction(self):
+        self.change_limit_to(0.5)
+
+        item = self.get_item()
+        periods = item.details["resource_limit_periods"]
+        total_days = sum(p["billing_periods"] for p in periods)
+        expected = (
+            sum(Decimal(str(p["quantity"])) * p["billing_periods"] for p in periods)
+            / total_days
+        )
+        self.assertAlmostEqual(Decimal(item.quantity), expected, places=6)
+        # Strictly between the two limits: neither sub-period was dropped.
+        self.assertGreater(Decimal(item.quantity), Decimal("0.1"))
+        self.assertLess(Decimal(item.quantity), Decimal("0.5"))
+
+    def test_quantity_from_limit_periods_agrees_after_termination(self):
+        self.change_limit_to(0.5)
+        item = self.get_item()
+
+        item.terminate(end=timezone.datetime(2024, 10, 20, tzinfo=UTC))
+
+        item.refresh_from_db()
+        self.assertGreater(Decimal(item.quantity), 0)
+        self.assertEqual(item.quantity, item.quantity_from_limit_periods())
+
+
+@freeze_time("2024-10-15")
+class QuarterlyFractionalQuantityTest(FractionalLimitBillingBase):
+    """QUARTERLY dispatches through the same _update_invoice_item branch as
+    MONTH but with a different period window, and had no fractional test."""
+
+    LIMIT_PERIOD = LimitPeriods.QUARTERLY
+
+    def test_the_old_period_keeps_its_fractional_quantity(self):
+        self.change_limit_to(0.5)
+
+        periods = self.get_item().details["resource_limit_periods"]
+        self.assertEqual(periods[0]["quantity"], 0.1)
+        self.assertEqual(periods[-1]["quantity"], 0.5)
+
+
+@freeze_time("2024-10-15")
+class AnnualFractionalQuantityTest(FractionalLimitBillingBase):
+    """ANNUAL, likewise."""
+
+    LIMIT_PERIOD = LimitPeriods.ANNUAL
+
+    def test_the_old_period_keeps_its_fractional_quantity(self):
+        self.change_limit_to(0.5)
+
+        periods = self.get_item().details["resource_limit_periods"]
+        self.assertEqual(periods[0]["quantity"], 0.1)
+        self.assertEqual(periods[-1]["quantity"], 0.5)
+
+
 @freeze_time("2020-11-01")
 class NonBillableOfferingTest(test.APITestCase):
     """
@@ -2081,4 +2340,81 @@ class GetOrCreateInvoiceWithDateInputTest(test.APITestCase):
                 details__offering_component_type=self.component.type,
             ).count(),
             1,
+        )
+
+
+class OneTimeQuantityTest(test.APITestCase):
+    """A one-time fee is invoiced at the quantity its plan names.
+
+    The estimate has always read ``PlanComponent.amount``; the invoice used to
+    charge one of each whatever the plan said, so the two disagreed in
+    whichever direction the amount fell.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.MarketplaceFixture()
+        self.resource = self.fixture.resource
+        self.plan = self.resource.plan
+
+    def _one_time_component(self, amount, price, billing_type=BillingTypes.ONE_TIME):
+        component = marketplace_factories.OfferingComponentFactory(
+            offering=self.resource.offering,
+            type="setup",
+            name="Setup fee",
+            billing_type=billing_type,
+            is_prepaid=False,
+        )
+        return marketplace_factories.PlanComponentFactory(
+            plan=self.plan,
+            component=component,
+            price=Decimal(price),
+            amount=amount,
+        )
+
+    def _activate(self):
+        now = timezone.now()
+        self.resource.set_state_ok()
+        self.resource.save()
+        return invoices_models.Invoice.objects.get(
+            customer=self.resource.project.customer,
+            year=now.year,
+            month=now.month,
+        )
+
+    def test_a_quantified_fee_is_billed_for_its_quantity(self):
+        # 40 units at 15 is 600, which is what the plan quotes. Billing one of
+        # them charged 15 for something sold as 600.
+        self._one_time_component(amount=40, price="15")
+
+        invoice = self._activate()
+
+        item = invoice.items.get(
+            resource_id=self.resource.id, name__contains="Setup fee"
+        )
+        self.assertEqual(item.quantity, 40)
+        self.assertEqual(item.quantity * item.unit_price, Decimal("600"))
+
+    def test_a_fee_of_one_is_unchanged(self):
+        self._one_time_component(amount=1, price="250")
+
+        invoice = self._activate()
+
+        item = invoice.items.get(
+            resource_id=self.resource.id, name__contains="Setup fee"
+        )
+        self.assertEqual(item.quantity, 1)
+
+    def test_the_invoice_agrees_with_the_estimate(self):
+        # The two figures the customer sees: what they were quoted, and what
+        # they are billed.
+        self._one_time_component(amount=3, price="100")
+
+        invoice = self._activate()
+
+        item = invoice.items.get(
+            resource_id=self.resource.id, name__contains="Setup fee"
+        )
+        self.assertEqual(
+            item.quantity * item.unit_price,
+            Decimal(str(self.plan.non_prepaid_init_price)),
         )

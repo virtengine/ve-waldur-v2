@@ -42,6 +42,7 @@ from waldur_mastermind.marketplace.enums import (
 )
 from waldur_mastermind.marketplace_remote import models
 from waldur_mastermind.marketplace_remote.constants import (
+    LOCAL_PLUGIN_OPTIONS,
     OFFERING_COMPONENT_FIELDS,
     OFFERING_FIELDS,
     PLAN_FIELDS,
@@ -51,6 +52,7 @@ from waldur_mastermind.marketplace_remote.exceptions import RemoteStatusSyncFail
 if TYPE_CHECKING:
     from waldur_api_client.models.base_public_plan import BasePublicPlan
     from waldur_api_client.models.offering_component import OfferingComponent
+    from waldur_api_client.models.offering_user import OfferingUser
     from waldur_api_client.models.order_details import OrderDetails
     from waldur_api_client.models.project import Project
     from waldur_api_client.models.public_offering_details import PublicOfferingDetails
@@ -119,6 +121,65 @@ def pull_fields(fields: Iterable[str], local_object, remote_dict):
             changed_fields.add(field)
     if changed_fields:
         local_object.save(update_fields=changed_fields)
+    return changed_fields
+
+
+def keep_local_plugin_options(local_offering, remote_dict: dict) -> dict:
+    """Return ``remote_dict`` with the local value of consumer-side plugin options.
+
+    ``plugin_options`` is pulled as a whole, which would otherwise overwrite
+    switches this Waldur sets for its own users on every pull.
+    """
+    remote_options = remote_dict.get("plugin_options")
+    if not isinstance(remote_options, dict):
+        return remote_dict
+    local_options = local_offering.plugin_options or {}
+    kept = {
+        key: local_options[key] for key in LOCAL_PLUGIN_OPTIONS if key in local_options
+    }
+    if not kept:
+        return remote_dict
+    return {**remote_dict, "plugin_options": {**remote_options, **kept}}
+
+
+def _remote_offering_user_runtime_metadata(
+    remote_offering_user: OfferingUser,
+) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if remote_offering_user.runtime_state:
+        values["runtime_state"] = remote_offering_user.runtime_state.value
+    if isinstance(remote_offering_user.service_provider_comment, str):
+        values["service_provider_comment"] = (
+            remote_offering_user.service_provider_comment
+        )
+    if isinstance(remote_offering_user.service_provider_comment_url, str):
+        values["service_provider_comment_url"] = (
+            remote_offering_user.service_provider_comment_url
+        )
+    return values
+
+
+def pull_offering_user_runtime_state_fields(
+    local_offering_user,
+    remote_offering_user: OfferingUser,
+) -> list[str]:
+    """Copy runtime metadata from a remote offering user onto the local one."""
+    changed_fields = []
+    for field, remote_value in _remote_offering_user_runtime_metadata(
+        remote_offering_user
+    ).items():
+        local_value = getattr(local_offering_user, field) or ""
+        if remote_value != local_value:
+            setattr(local_offering_user, field, remote_value)
+            changed_fields.append(field)
+    if changed_fields:
+        local_offering_user.save(update_fields=changed_fields)
+        logger.info(
+            "Pulled offering user runtime metadata for %s in offering %s: %s",
+            local_offering_user.user.username,
+            local_offering_user.offering.uuid.hex,
+            ", ".join(changed_fields),
+        )
     return changed_fields
 
 

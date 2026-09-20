@@ -32,6 +32,10 @@ class LifecyclePluginOptionsPersistenceTest(test.APITestCase):
         ("enable_resource_access_subnets", True),
         ("conceal_subnet_restricted_resources", True),
         ("resource_projects_limit_policy", "per_project"),
+        ("enable_resource_limit_change_requests", True),
+        ("enable_resource_limit_change_requests", False),
+        ("enable_scim_entitlements", True),
+        ("enable_scim_entitlements", False),
     )
     @unpack
     def test_option_persists(self, key, value):
@@ -43,9 +47,14 @@ class LifecyclePluginOptionsPersistenceTest(test.APITestCase):
                 "enable_resource_access_subnets": True,
                 "conceal_subnet_restricted_resources": True,
                 "resource_projects_limit_policy": "aggregate",
+                "enable_resource_limit_change_requests": True,
+                "enable_scim_entitlements": True,
             }
         )
         self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertEqual(
+            serializer.validated_data["enable_resource_limit_change_requests"], True
+        )
         self.assertEqual(
             serializer.validated_data["enable_resource_access_subnets"], True
         )
@@ -55,6 +64,7 @@ class LifecyclePluginOptionsPersistenceTest(test.APITestCase):
         self.assertEqual(
             serializer.validated_data["resource_projects_limit_policy"], "aggregate"
         )
+        self.assertEqual(serializer.validated_data["enable_scim_entitlements"], True)
 
     def test_invalid_limit_policy_rejected(self):
         serializer = serializers.MergedPluginOptionsSerializer(

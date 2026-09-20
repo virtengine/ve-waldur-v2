@@ -19,6 +19,7 @@ from drf_spectacular.utils import (
     extend_schema,
     extend_schema_view,
 )
+from rest_framework import permissions as rf_permissions
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
@@ -26,9 +27,10 @@ from rest_framework.response import Response
 from rest_framework.viewsets import ReadOnlyModelViewSet
 
 from waldur_core.core.models import User
-from waldur_core.core.permissions import IsAdminOrReadOnly
+from waldur_core.core.permissions import IsAdminOrReadOnly, IsStaff
 from waldur_core.core.utils import get_ip_address, is_uuid_like
 from waldur_core.core.views import ActionsViewSet, count_action
+from waldur_core.permissions import hygiene
 from waldur_core.permissions.filters import UserPermissionFilter
 from waldur_core.permissions.utils import (
     add_user,
@@ -327,6 +329,25 @@ class RoleViewSet(ActionsViewSet):
 
     clone_to_customer_serializer_class = serializers.RoleCloneSerializer
 
+    @extend_schema(
+        summary="Role hygiene report",
+        description="Staff-only. Reports roles whose name is not a machine "
+        "code, whose scope or organization binding is wrong, that are silently "
+        "global, or that carry permissions inert for their scope. Read-only.",
+        responses=serializers.RoleHygieneReportSerializer,
+    )
+    # IsStaff rather than a local is_staff test: it also rejects a deactivated
+    # staff account and a personal access token without the STAFF_ACCESS scope,
+    # which a hand-rolled check silently lets through.
+    @action(
+        detail=False,
+        methods=["get"],
+        permission_classes=[rf_permissions.IsAuthenticated, IsStaff],
+    )
+    def hygiene_report(self, request):
+        report = hygiene.build_report(models.Role.objects.all())
+        return Response(report, status=status.HTTP_200_OK)
+
 
 class CustomerRoleConcealmentViewSet(ActionsViewSet):
     """Staff-only management of per-organization role concealments (deny-list).
@@ -391,9 +412,15 @@ def _user_can_view_scope_team(user, scope) -> bool:
     either is sufficient.
 
     Consumer-side (any scope type)
-        Staff / support, or a caller holding any active ``UserRole`` on the
+        Staff / support, or a caller holding an active ``UserRole`` on the
         scope tree: the scope itself, its enclosing customer, or any project
-        under that customer. Resolved in a single SQL EXISTS.
+        under that customer. A role held on a customer counts only if it
+        grants ``CUSTOMER.VIEW_TEAM``, and one held on a project only if it
+        grants ``PROJECT.VIEW_TEAM`` — so a zero-permission organization role
+        (a reader or placeholder) does not expose the member list. A role
+        held on the scope itself, when that scope is neither a customer nor a
+        project (resource, offering, call, ...), needs no permission.
+        Resolved in a single SQL EXISTS.
 
     Provider-side (only Resource / ResourceProject)
         A caller holding ``UPDATE_OFFERING`` on the offering selling this
@@ -412,23 +439,37 @@ def _user_can_view_scope_team(user, scope) -> bool:
         return True
 
     # Consumer-side: UserRole on the scope, its customer, or any project
-    # under that customer.
-    scope_meta = scope._meta
-    q = Q(
-        content_type__app_label=scope_meta.app_label,
-        content_type__model=scope_meta.model_name,
-        object_id=scope.id,
-    )
+    # under that customer. Customer and project rows must carry the matching
+    # view-team permission; rows on any other scope type need none.
+    def grants_team_view(scope_type):
+        return Q(
+            role_id__in=models.RolePermission.objects.filter(
+                permission=enums.TEAM_VIEW_PERMISSIONS[scope_type].value
+            ).values("role_id")
+        )
+
+    customer_type = enums.TYPE_MAP["customer"]
+    project_type = enums.TYPE_MAP["project"]
+    scope_type = (scope._meta.app_label, scope._meta.model_name)
+    q = Q(pk__in=[])
+    if scope_type not in enums.TEAM_VIEW_PERMISSIONS:
+        q |= Q(
+            content_type__app_label=scope_type[0],
+            content_type__model=scope_type[1],
+            object_id=scope.id,
+        )
     customer = _get_customer(scope)
     if customer is not None:
         q |= Q(
-            content_type__app_label="structure",
-            content_type__model="customer",
+            grants_team_view(customer_type),
+            content_type__app_label=customer_type[0],
+            content_type__model=customer_type[1],
             object_id=customer.id,
         )
         q |= Q(
-            content_type__app_label="structure",
-            content_type__model="project",
+            grants_team_view(project_type),
+            content_type__app_label=project_type[0],
+            content_type__model=project_type[1],
             object_id__in=structure_models.Project.objects.filter(
                 customer_id=customer.id
             ).values_list("id", flat=True),

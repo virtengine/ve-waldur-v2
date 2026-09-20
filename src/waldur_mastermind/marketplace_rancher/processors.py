@@ -41,7 +41,6 @@ from waldur_rancher import models as rancher_models
 from waldur_rancher.enums import AGENT_ROLE, SERVER_ROLE, NodeRoleType
 from waldur_rancher.executors import ClusterCreateExecutor, ClusterDeleteExecutor
 from waldur_rancher.serializers import RancherClusterCreateSerializer
-from waldur_rancher.validators import related_vm_can_be_deleted
 
 from . import const, serializers
 
@@ -171,7 +170,11 @@ class RancherCreateProcessor(processors.AbstractCreateResourceProcessor):
     def update_subnets(self, tenants: list[os_models.Tenant]):
         # Limit applocation pools for subnets used for Rancher nodes
         for tenant in tenants:
-            subnet = os_models.SubNet.objects.filter(tenant=tenant).first()
+            subnet = (
+                os_models.SubNet.objects.filter(tenant=tenant)
+                .order_by("created", "id")
+                .first()
+            )
             if not subnet:
                 continue
 
@@ -264,7 +267,11 @@ class RancherCreateProcessor(processors.AbstractCreateResourceProcessor):
             ]
             data_volume_size = self.order.attributes["worker_nodes_data_volume_size"]
 
-        subnet = os_models.SubNet.objects.filter(tenant=tenant).first()
+        subnet = (
+            os_models.SubNet.objects.filter(tenant=tenant)
+            .order_by("created", "id")
+            .first()
+        )
         if not subnet:
             raise rf_serializers.ValidationError(
                 f'Subnets for tenant "{tenant.name}" not found'
@@ -404,7 +411,11 @@ class RancherCreateProcessor(processors.AbstractCreateResourceProcessor):
                     "Unable to create load balance because OpenStack image does not exist."
                 )
 
-            subnet = os_models.SubNet.objects.filter(tenant=tenant).first()
+            subnet = (
+                os_models.SubNet.objects.filter(tenant=tenant)
+                .order_by("created", "id")
+                .first()
+            )
             if not subnet:
                 raise rf_serializers.ValidationError(
                     "Unable to create load balance because OpenStack subnet does not exist."
@@ -838,8 +849,6 @@ class RancherDeleteProcessor(processors.AbstractDeleteResourceProcessor):
         cluster = cast(rancher_models.Cluster, self.get_resource().scope)
         for validator in ResourceViewSet.destroy_validators:
             validator(cluster)
-        for node in cluster.node_set.all():
-            related_vm_can_be_deleted(node)
 
     def send_request(self, user, resource: Resource):
         cluster = cast(rancher_models.Cluster, resource.scope)

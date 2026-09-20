@@ -10,6 +10,7 @@ from rest_framework.exceptions import ValidationError
 from waldur_core.permissions import models, utils
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
 from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
+from waldur_core.permissions.serializers import clone_role_for_customer
 from waldur_core.structure.tests import factories, fixtures
 
 
@@ -532,6 +533,35 @@ class PermissionFactoryValidationTest(TestCase):
         self.assertIsNotNone(result)
 
 
+class SingleRolePerScopeTest(TestCase):
+    def setUp(self):
+        self.project = factories.ProjectFactory()
+        self.user = factories.UserFactory()
+        self.project.add_user(self.user, ProjectRole.MANAGER)
+
+    def test_disabled_by_default_allows_second_role(self):
+        utils.validate_role_grant(self.project, self.user, ProjectRole.ADMIN)
+
+    @override_config(INVITATION_DISABLE_MULTIPLE_ROLES=True)
+    def test_enabled_blocks_second_role(self):
+        with self.assertRaisesMessage(
+            ValidationError, "User already has role within this scope."
+        ):
+            utils.validate_role_grant(self.project, self.user, ProjectRole.ADMIN)
+
+    @override_config(INVITATION_DISABLE_MULTIPLE_ROLES=True)
+    def test_enabled_allows_role_in_another_scope(self):
+        other_project = factories.ProjectFactory(customer=self.project.customer)
+
+        utils.validate_role_grant(other_project, self.user, ProjectRole.ADMIN)
+
+    @override_config(INVITATION_DISABLE_MULTIPLE_ROLES=True)
+    def test_enabled_allows_role_after_previous_is_revoked(self):
+        utils.delete_user(self.project, self.user, ProjectRole.MANAGER)
+
+        utils.validate_role_grant(self.project, self.user, ProjectRole.ADMIN)
+
+
 class OnlyOneProjectManagerTest(TestCase):
     def setUp(self):
         self.project = factories.ProjectFactory()
@@ -589,3 +619,141 @@ class OnlyOneProjectManagerTest(TestCase):
         )
 
         utils.validate_role_grant(self.project, self.other_user, ProjectRole.MANAGER)
+
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_enabled_blocks_second_manager_via_clone(self):
+        clone = clone_role_for_customer(
+            ProjectRole.MANAGER, self.project.customer, conceal_template=False
+        )
+        self.project.add_user(self.manager, ProjectRole.MANAGER)
+
+        with self.assertRaisesMessage(
+            ValidationError, "Project already has an active project manager."
+        ):
+            utils.validate_role_grant(self.project, self.other_user, clone)
+
+    @override_config(ONLY_ONE_PROJECT_MANAGER=True)
+    def test_enabled_counts_clone_manager_as_existing_manager(self):
+        clone = clone_role_for_customer(
+            ProjectRole.MANAGER, self.project.customer, conceal_template=False
+        )
+        self.project.add_user(self.manager, clone)
+
+        with self.assertRaisesMessage(
+            ValidationError, "Project already has an active project manager."
+        ):
+            utils.validate_role_grant(
+                self.project, self.other_user, ProjectRole.MANAGER
+            )
+
+
+class TemplateAwareRoleMatchingTest(TestCase):
+    """Role checks resolve organization-scoped clones one level deep: a user
+    holding a clone satisfies a check for the clone's template, never the
+    reverse (issue #316)."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.customer = self.fixture.customer
+        self.project = self.fixture.project
+        self.user = factories.UserFactory()
+        self.clone = clone_role_for_customer(
+            ProjectRole.MEMBER, self.customer, conceal_template=False
+        )
+        utils.add_user(self.project, self.user, self.clone)
+
+    def test_clone_holder_satisfies_has_user_for_template(self):
+        self.assertTrue(utils.has_user(self.project, self.user, ProjectRole.MEMBER))
+
+    def test_template_holder_does_not_satisfy_has_user_for_clone(self):
+        member = factories.UserFactory()
+        utils.add_user(self.project, member, ProjectRole.MEMBER)
+        self.assertFalse(utils.has_user(self.project, member, self.clone))
+
+    def test_match_clones_false_is_identity_strict(self):
+        self.assertFalse(
+            utils.has_user(
+                self.project, self.user, ProjectRole.MEMBER, match_clones=False
+            )
+        )
+        self.assertTrue(
+            utils.has_user(self.project, self.user, self.clone, match_clones=False)
+        )
+
+    def test_expiration_time_applies_to_clone_match(self):
+        expiring = factories.UserFactory()
+        utils.add_user(
+            self.project,
+            expiring,
+            self.clone,
+            expiration_time=timezone.now() + timezone.timedelta(days=1),
+        )
+        self.assertTrue(utils.has_user(self.project, expiring, ProjectRole.MEMBER))
+        # Not a permanent role
+        self.assertFalse(
+            utils.has_user(
+                self.project, expiring, ProjectRole.MEMBER, expiration_time=None
+            )
+        )
+        # Expired by then
+        self.assertFalse(
+            utils.has_user(
+                self.project,
+                expiring,
+                ProjectRole.MEMBER,
+                expiration_time=timezone.now() + timezone.timedelta(days=2),
+            )
+        )
+
+    def test_orphaned_clone_no_longer_matches_template(self):
+        # Deleting a template SET_NULLs its clones; an orphan is a plain
+        # custom role and must not match anything but itself.
+        self.clone.template = None
+        self.clone.save()
+        self.assertFalse(utils.has_user(self.project, self.user, ProjectRole.MEMBER))
+        self.assertTrue(utils.has_user(self.project, self.user, self.clone))
+
+
+class TemplateAwareBulkLookupTest(TestCase):
+    """Bulk role lookups resolve organization-scoped clones one level deep,
+    matching the intent of the checks they back (issue #316)."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.customer = self.fixture.customer
+        self.project = self.fixture.project
+        self.user = factories.UserFactory()
+        self.clone = clone_role_for_customer(
+            ProjectRole.MEMBER, self.customer, conceal_template=False
+        )
+        utils.add_user(self.project, self.user, self.clone)
+
+    def test_bulk_lookups_include_clone_holders(self):
+        project_ct = ContentType.objects.get_for_model(self.project)
+        self.assertIn(self.user, utils.get_users(self.project, RoleEnum.PROJECT_MEMBER))
+        self.assertIn(
+            self.user.id,
+            list(utils.get_user_ids(project_ct, [self.project.id], ProjectRole.MEMBER)),
+        )
+        self.assertIn(
+            self.user.id,
+            list(
+                utils.get_user_ids(
+                    project_ct, [self.project.id], RoleEnum.PROJECT_MEMBER
+                )
+            ),
+        )
+        self.assertIn(
+            self.project.id,
+            list(utils.get_scope_ids(self.user, project_ct, ProjectRole.MEMBER)),
+        )
+
+    def test_mail_fanout_reaches_clone_holders(self):
+        # Backs e.g. resource-termination notifications, which look up
+        # get_user_mails(ProjectRole.ADMIN) and used to skip clone holders.
+        admin = factories.UserFactory()
+        admin_clone = clone_role_for_customer(
+            ProjectRole.ADMIN, self.customer, conceal_template=False
+        )
+        utils.add_user(self.project, admin, admin_clone)
+        self.assertIn(admin.email, self.project.get_user_mails(ProjectRole.ADMIN))

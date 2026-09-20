@@ -25,8 +25,12 @@ class MarketplaceVMwareConfig(AppConfig):
         manager.register(
             offering_type=VMWARE_VM_OFFERING,
             create_resource_processor=processors.VirtualMachineCreateProcessor,
+            update_resource_processor=processors.VirtualMachineUpdateProcessor,
+            delete_resource_processor=processors.VirtualMachineDeleteProcessor,
             service_type=VMwareConfig.service_name,
             can_update_limits=True,
+            # Limits map onto VirtualMachine.cores and .ram, both integer fields.
+            max_limit_decimal_places=0,
             components=(
                 Component(
                     type="cpu",

@@ -20,6 +20,30 @@ class SupportedFormat:
     TEXT = "text"
 
 
+#: Fallback when the operator blanked the setting out of the database. The
+#: same value is the Constance default.
+DEFAULT_ISSUE_KEY_PREFIX = "WLD"
+
+
+def build_backend_id(uuid, marker: str = "") -> str:
+    """Compose the id of a locally-created ticket, comment or attachment.
+
+    Shape is ``<PREFIX>[-<marker>]-<8 hex chars>``, e.g. ``WLD-A1B2C3D4`` for a
+    ticket and ``WLD-C-A1B2C3D4`` for its comment. The prefix is operator
+    configurable; ids already stored on an object are never recomputed, so a
+    changed prefix only affects objects created after the change.
+    """
+    # Normalised rather than trusted: the setting is validated on write, but a
+    # value stored before that validation existed, or written straight into the
+    # database, would otherwise end up inside every ticket key. A stray newline
+    # there reaches the mail subject and makes every support notification raise.
+    prefix = (
+        config.WALDUR_SUPPORT_ISSUE_KEY_PREFIX or ""
+    ).strip().upper() or DEFAULT_ISSUE_KEY_PREFIX
+    parts = [prefix, marker, uuid.hex[:8].upper()]
+    return "-".join(part for part in parts if part)
+
+
 def get_active_backend() -> "SupportBackend":
     backend_type = config.WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE
     if backend_type == SupportBackendType.ATLASSIAN:
@@ -93,6 +117,34 @@ class SupportBackend:
 
     def destroy_is_available(self, issue=None):
         return False
+
+    def get_available_statuses(self, issue) -> list[str]:
+        """Statuses Waldur may move this issue to.
+
+        Empty whenever the remote service desk owns the ticket lifecycle: for
+        Jira, Zammad and SMAX the status only ever travels inbound, through
+        `sync_single_issue` and the webhook receivers. Only a backend that
+        answers `update_is_available` with True has any business offering
+        transitions here.
+        """
+        return []
+
+    def issue_is_active(self, issue) -> bool:
+        """Is the ticket still open for changes?
+
+        `resolved` comes from `IssueStatus.check_success_status`, which answers
+        None both while a ticket is being worked on and whenever the status
+        registry cannot classify it: a missing terminal type, an unknown status
+        name, an unexpected type value. Every one of those reads as active, so
+        this predicate fails open on a misconfigured registry rather than
+        locking a deployment out of its own tickets.
+
+        Each call costs several queries, since `resolved` is an uncached
+        property. `BasicBackend` overrides this with the stored resolution date,
+        which it keeps in step itself; a backend that cannot do the same should
+        keep using this.
+        """
+        return issue is not None and issue.resolved is None
 
     def comment_create_is_available(self, issue=None):
         return True

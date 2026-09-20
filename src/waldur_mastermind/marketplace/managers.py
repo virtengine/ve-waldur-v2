@@ -39,9 +39,13 @@ class OfferingQuerySet(django_models.QuerySet):
         connected_customers = get_connected_customers(user)
         connected_projects = get_connected_projects(user)
         connected_offerings = get_connected_offerings(user)
+        # A service provider manager holds their role on the ServiceProvider,
+        # not on its customer, so the customer clause alone misses them.
+        connected_service_providers = get_connected_serviceproviders(user)
 
         return self.filter(
             Q(customer__in=connected_customers)
+            | Q(customer__serviceprovider__in=connected_service_providers)
             | Q(project__in=connected_projects)
             | Q(id__in=connected_offerings)
         ).distinct()
@@ -50,8 +54,16 @@ class OfferingQuerySet(django_models.QuerySet):
     def _restricted_forbidden_ids(queryset, user):
         """Ids of offerings in queryset that restrict access via
         plugin_options['restricted_to_roles'] to roles the user does not hold.
+        Empty for staff and support, who are not subject to the restriction.
         The check is coarse (role held in any scope); precise per-project
         authorization happens at order creation."""
+        # Staff and support outrank offering-level role restrictions, exactly as
+        # they do in filter_by_ordering_availability_for_user. Without this the
+        # `accessible` filter hides restricted offerings from staff, who then
+        # cannot reach them in the catalog to order from at all.
+        if not user.is_anonymous and (user.is_staff or user.is_support):
+            return set()
+
         restricted = queryset.filter(
             plugin_options__has_key="restricted_to_roles"
         ).values_list("id", "plugin_options")
@@ -352,6 +364,17 @@ def get_user_resource_descended_customer_ids(user):
     )
 
 
+def get_user_managed_service_provider_customer_ids(user):
+    """Lazy QuerySet of Customer IDs whose ServiceProvider the user holds any
+    active role on. The role sits on the provider, not on its customer, so
+    ``get_connected_customers`` never sees it; it lets the user find the
+    organization in the portal, nothing more. Uses the same notion of a
+    provider-side role as ``OfferingQuerySet.filter_for_user``."""
+    return models.ServiceProvider.objects.filter(
+        id__in=get_connected_serviceproviders(user)
+    ).values_list("customer_id", flat=True)
+
+
 class ResourceManager(MixinManager):
     def get_queryset(self):
         return ResourceQuerySet(self.model, using=self._db)
@@ -424,6 +447,36 @@ def get_connected_offerings_by_permission(user, permission):
     if not roles:
         return models.Offering.objects.none().values_list("id", flat=True)
     return get_connected_offerings(user, roles)
+
+
+def filter_orders_for_user(queryset, user):
+    """Restrict an Order queryset to the rows the user is allowed to list.
+
+    Orders are visible to both the service consumer and the service provider.
+    Shared by OrderViewSet and by the media access rule for order attachments,
+    so a download cannot outlive the permission that the API itself enforces.
+    """
+    if not user.is_authenticated:
+        return queryset.none()
+
+    if user.is_staff or user.is_support:
+        return queryset
+
+    connected_projects = get_connected_projects_by_permission(
+        user, PermissionEnum.LIST_ORDERS
+    )
+    connected_customers = get_connected_customers_by_permission(
+        user, PermissionEnum.LIST_ORDERS
+    )
+    connected_offerings = get_connected_offerings_by_permission(
+        user, PermissionEnum.LIST_ORDERS
+    )
+    return queryset.filter(
+        Q(project__in=connected_projects)
+        | Q(project__customer__in=connected_customers)
+        | Q(offering__customer__in=connected_customers)
+        | Q(offering__in=connected_offerings)
+    )
 
 
 def get_connected_serviceproviders(user, role=None):

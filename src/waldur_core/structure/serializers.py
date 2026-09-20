@@ -5,7 +5,6 @@ from datetime import datetime
 
 from constance import config
 from cryptography.hazmat.primitives.serialization import load_ssh_public_key
-from dbtemplates import models as dbtemplate_models
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core import exceptions as django_exceptions
@@ -28,10 +27,12 @@ from waldur_core.checklist.utils import serialize_completion_answers
 from waldur_core.core import fields as core_fields
 from waldur_core.core import models as core_models
 from waldur_core.core import serializers as core_serializers
+from waldur_core.core import template_utils
 from waldur_core.core import validators as core_validators
 from waldur_core.core.enums import CoreStates, ReviewStates
 from waldur_core.core.fields import MappedChoiceField
 from waldur_core.core.models import DESCRIPTION_LENGTH
+from waldur_core.passkeys import policy as passkey_policy
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CustomerRole
 from waldur_core.permissions.models import UserRole
@@ -51,6 +52,7 @@ from waldur_core.structure.models import CUSTOMER_DETAILS_FIELDS
 from waldur_core.structure.notifications import NOTIFICATIONS
 from waldur_core.structure.registry import get_resource_type, get_service_type
 from waldur_core.structure.utils_data_access import log_user_data_access_sync
+from waldur_core.user_actions import serializers as user_action_serializers
 from waldur_mastermind.marketplace.enums import ResourceStates
 
 logger = logging.getLogger(__name__)
@@ -521,6 +523,7 @@ class ProjectMetadataAnswerSerializer(serializers.Serializer):
             "to their labels."
         ),
     )
+    modified = serializers.DateTimeField(help_text="When this answer was last saved.")
 
 
 def fetch_project_metadata_completions(project_ids):
@@ -552,7 +555,10 @@ class ProjectSerializer(
         help_text="Number of active resources in this project"
     )
     project_metadata = serializers.SerializerMethodField(
-        help_text="Answers to the customer's project-metadata checklist (read-only)."
+        help_text=(
+            "Answers to the customer's project-metadata checklist (read-only): "
+            "the latest answer per question."
+        )
     )
     oecd_fos_2007_label = serializers.CharField(
         read_only=True,
@@ -763,8 +769,10 @@ class ProjectSerializer(
                     # Support users can see but not edit
                     fields["staff_notes"].read_only = True
 
-        # Handle grace_period_days field visibility and permissions
-        if "grace_period_days" in fields:
+        # Handle staff-only override fields (visible to all, editable by staff)
+        for field_name in ("grace_period_days",):
+            if field_name not in fields:
+                continue
             user = self.context["request"].user
             # Check if this is schema generation context (drf-spectacular)
             # When generating schema, we want to include all fields
@@ -775,7 +783,7 @@ class ProjectSerializer(
             if not is_schema_generation:
                 if not user.is_staff:
                     # Make field read-only for non-staff users
-                    fields["grace_period_days"].read_only = True
+                    fields[field_name].read_only = True
 
         # Make all fields read-only for terminated (soft-deleted) projects
         if isinstance(self.instance, models.Project) and self.instance.is_removed:
@@ -854,14 +862,20 @@ class ProjectSerializer(
         customer = (
             attrs.get("customer") if not self.instance else self.instance.customer
         )
-        end_date = attrs.get("end_date")
-
-        if end_date:
-            if not has_permission(
-                self.context["request"], PermissionEnum.DELETE_PROJECT, customer
-            ):
-                raise exceptions.PermissionDenied()
-            attrs["end_date_requested_by"] = self.context["request"].user
+        # Guard every actual change to the end date, including a change to null.
+        # Testing the value for truthiness let an explicit {"end_date": null}
+        # through unchecked, so removing a project's expiry — which keeps it
+        # alive indefinitely — was easier than setting one. A write that repeats
+        # the current value is left alone, so unrelated partial updates that echo
+        # the field are not blocked.
+        if "end_date" in attrs:
+            current_end_date = self.instance.end_date if self.instance else None
+            if attrs["end_date"] != current_end_date:
+                if not has_permission(
+                    self.context["request"], PermissionEnum.DELETE_PROJECT, customer
+                ):
+                    raise exceptions.PermissionDenied()
+                attrs["end_date_requested_by"] = self.context["request"].user
 
         # Each "field X is mandatory" flag below enforces the constraint on
         # create, or on an update that explicitly sets the field to null. An
@@ -1092,6 +1106,22 @@ class CustomerListSerializer(serializers.ListSerializer):
 
         if not customer_ids:
             return super().to_representation(data)
+
+        # Rows reached only through a service provider role are narrowed to
+        # identity fields, so skip the aggregations for them entirely.
+        service_provider_manager_only_ids = (
+            managers.get_service_provider_manager_only_customer_ids(
+                request.user, customer_ids
+            )
+            if request
+            else set()
+        )
+        self.context["service_provider_manager_only_ids"] = (
+            service_provider_manager_only_ids
+        )
+        customer_ids = [
+            cid for cid in customer_ids if cid not in service_provider_manager_only_ids
+        ]
 
         # 2. Build the bulk context dictionary
         bulk_context = {
@@ -1324,6 +1354,12 @@ class CustomerSerializer(
     users_count = serializers.SerializerMethodField(
         help_text="Number of users with access to this organization"
     )
+    is_service_provider_manager_only = serializers.SerializerMethodField(
+        help_text=(
+            "True when the requesting user's only link to this organization is a "
+            "role on its service provider. Such a row carries only identity fields."
+        )
+    )
     project_metadata_checklist = serializers.SlugRelatedField(
         slug_field="uuid",
         queryset=Checklist.objects.filter(
@@ -1376,6 +1412,7 @@ class CustomerSerializer(
             "user_affiliations",
             "user_identity_sources",
             "default_affiliations",
+            "is_service_provider_manager_only",
         ) + CUSTOMER_DETAILS_FIELDS
         staff_only_fields = (
             "access_subnets",
@@ -1398,6 +1435,55 @@ class CustomerSerializer(
         extra_kwargs = {
             "url": {"lookup_field": "uuid"},
         }
+
+    # What a service provider manager without any role on the organization
+    # itself may read: the identity marketplace-service-providers already
+    # publishes, plus the provider link the portal needs to open its workspace.
+    SERVICE_PROVIDER_MANAGER_FIELDS = frozenset(
+        (
+            "url",
+            "uuid",
+            "name",
+            "native_name",
+            "display_name",
+            "abbreviation",
+            "slug",
+            "image",
+            "country",
+            "country_name",
+            "is_service_provider",
+            "service_provider",
+            "service_provider_uuid",
+            "is_service_provider_manager_only",
+        )
+    )
+
+    # Filters and ordering on CustomerViewSet (query over registration code and
+    # agreement number, ordering by contact_details) still act on these rows,
+    # so a manager could infer hidden values of their own provider's
+    # organization by probing. Accepted: it is their own organization, and the
+    # narrowing is about not presenting internal details, not secrecy.
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if instance.id in self._get_service_provider_manager_only_ids(instance):
+            return {
+                key: value
+                for key, value in data.items()
+                if key in self.SERVICE_PROVIDER_MANAGER_FIELDS
+            }
+        return data
+
+    def _get_service_provider_manager_only_ids(self, instance) -> set:
+        # A list computes these once per page in CustomerListSerializer.
+        ids = self.context.get("service_provider_manager_only_ids")
+        if ids is not None:
+            return ids
+        request = self.context.get("request")
+        if not request:
+            return set()
+        return managers.get_service_provider_manager_only_customer_ids(
+            request.user, [instance.id]
+        )
 
     def get_fields(self):
         fields = super().get_fields()
@@ -1520,6 +1606,11 @@ class CustomerSerializer(
     def get_display_name(self, customer) -> str:
         return customer.get_display_name()
 
+    def get_is_service_provider_manager_only(self, customer) -> bool:
+        # The portal reads this instead of re-deriving it from user permissions,
+        # which cannot see every rule that makes an organization visible.
+        return customer.id in self._get_service_provider_manager_only_ids(customer)
+
     def get_projects_count(self, customer) -> int:
         # Use annotated value if available (from ViewSet.get_queryset)
         if hasattr(customer, "annotated_projects_count"):
@@ -1600,8 +1691,22 @@ class CustomerSerializer(
         return count_customer_users(customer)
 
 
+class ScopedOfferingSerializer(serializers.Serializer):
+    """An offering an access subnet applies to, with enough to label it."""
+
+    uuid = serializers.CharField()
+    name = serializers.CharField()
+    # False once the organization has terminated its last resource of the
+    # offering. The scope is kept so re-provisioning restores protection, but
+    # the portal has to show it as stale — it can be removed, not re-added, and
+    # is no longer exported.
+    has_live_resources = serializers.BooleanField()
+
+
 class AccessSubnetSerializer(
-    core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer
+    core_serializers.AccessSubnetMixin,
+    core_serializers.AugmentedSerializerMixin,
+    serializers.HyperlinkedModelSerializer,
 ):
     class Meta:
         model = models.AccessSubnet
@@ -1610,13 +1715,135 @@ class AccessSubnetSerializer(
             "inet",
             "description",
             "customer",
+            "applies_to_portal",
+            "offerings",
+            "scoped_offerings",
+            "is_staff_managed",
         )
         extra_kwargs = {
             "customer": {"lookup_field": "uuid"},
         }
         protected_fields = ["customer"]
+        read_only_fields = ["is_staff_managed", "scoped_offerings"]
 
     inet = serializers.CharField()
+    scoped_offerings = ScopedOfferingSerializer(many=True, read_only=True)
+    offerings = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        help_text="UUIDs of offerings this network may reach. Only offerings "
+        "the organization consumes and that enable access subnets are accepted.",
+    )
+
+    def to_representation(self, instance):
+        from waldur_mastermind.marketplace import models as marketplace_models
+
+        data = super().to_representation(instance)
+        scopes = marketplace_models.AccessSubnetOfferingScope.objects.filter(
+            access_subnet=instance
+        ).select_related("offering")
+        data["offerings"] = [scope.offering.uuid.hex for scope in scopes]
+        # Names travel with the entry because there is no way to look an
+        # offering up by uuid from the portal, and a dormant one is absent from
+        # the list of offerings the organization consumes.
+        data["scoped_offerings"] = [
+            {
+                "uuid": scope.offering.uuid.hex,
+                "name": scope.offering.name,
+                "has_live_resources": marketplace_models.Resource.objects.filter(
+                    project__customer_id=instance.customer_id,
+                    offering_id=scope.offering_id,
+                )
+                .exclude(state=marketplace_models.Resource.States.TERMINATED)
+                .exists(),
+            }
+            for scope in scopes
+        ]
+        return data
+
+    def _already_scoped(self):
+        """Offering ids this entry is already scoped to."""
+        from waldur_mastermind.marketplace import models as marketplace_models
+
+        if self.instance is None:
+            return set()
+        return set(
+            marketplace_models.AccessSubnetOfferingScope.objects.filter(
+                access_subnet=self.instance
+            ).values_list("offering_id", flat=True)
+        )
+
+    def _resolve_offerings(self, customer, uuids):
+        """Offerings the customer may scope this subnet to.
+
+        Rejects anything the customer does not consume or that has not opted
+        into access subnets — the two conditions that would otherwise surface
+        as a confusing failure after the fact.
+
+        Offerings already scoped are exempt from those checks. An organization
+        that terminates its last resource of an offering keeps the scope, and
+        re-validating it would reject every subsequent edit of the entry —
+        including the one removing that very scope, leaving no way out.
+        """
+        from waldur_mastermind.marketplace import models as marketplace_models
+
+        if not uuids:
+            return []
+        offerings = list(
+            marketplace_models.Offering.objects.filter(uuid__in=uuids).distinct()
+        )
+        found = {offering.uuid.hex for offering in offerings}
+        missing = {str(value).replace("-", "") for value in uuids} - found
+        if missing:
+            raise exceptions.ValidationError(
+                {"offerings": _("Offerings not found: %s") % ", ".join(sorted(missing))}
+            )
+        already_scoped = self._already_scoped()
+        for offering in offerings:
+            if offering.id in already_scoped:
+                continue
+            if not (offering.plugin_options or {}).get(
+                "enable_resource_access_subnets"
+            ):
+                raise exceptions.ValidationError(
+                    {
+                        "offerings": _(
+                            "Access subnets are not enabled for offering %s."
+                        )
+                        % offering.name
+                    }
+                )
+            if (
+                not marketplace_models.Resource.objects.filter(
+                    project__customer=customer, offering=offering
+                )
+                .exclude(state=marketplace_models.Resource.States.TERMINATED)
+                .exists()
+            ):
+                raise exceptions.ValidationError(
+                    {
+                        "offerings": _(
+                            "This organization has no resources of offering %s."
+                        )
+                        % offering.name
+                    }
+                )
+        return offerings
+
+    def _sync_offerings(self, instance, offerings):
+        from waldur_mastermind.marketplace import models as marketplace_models
+
+        scope_model = marketplace_models.AccessSubnetOfferingScope
+        wanted = {offering.id for offering in offerings}
+        existing = scope_model.objects.filter(access_subnet=instance)
+        # Delete individually rather than with a bulk queryset delete so the
+        # post_delete audit handler fires for each removed scope.
+        for scope in existing.exclude(offering_id__in=wanted):
+            scope.delete()
+        present = set(existing.values_list("offering_id", flat=True))
+        for offering in offerings:
+            if offering.id not in present:
+                scope_model.objects.create(access_subnet=instance, offering=offering)
 
     def validate(self, validated_data):
         if not self.instance:
@@ -1625,8 +1852,70 @@ class AccessSubnetSerializer(
 
             if not has_permission(self.context["request"], permission, customer):
                 raise exceptions.PermissionDenied()
+        else:
+            self.validate_staff_managed()
+            customer = self.instance.customer
 
+        if "offerings" in validated_data:
+            self._resolve_offerings(customer, validated_data["offerings"])
         return validated_data
+
+    def create(self, validated_data):
+        offerings = validated_data.pop("offerings", None)
+        instance = super().create(validated_data)
+        if offerings is not None:
+            self._sync_offerings(
+                instance, self._resolve_offerings(instance.customer, offerings)
+            )
+        return instance
+
+    def update(self, instance, validated_data):
+        offerings = validated_data.pop("offerings", None)
+        instance = super().update(instance, validated_data)
+        if offerings is not None:
+            self._sync_offerings(
+                instance, self._resolve_offerings(instance.customer, offerings)
+            )
+        return instance
+
+
+class AccessSubnetImpactAddressSerializer(serializers.Serializer):
+    """One address that can reach a resource, and where it came from."""
+
+    inet = serializers.CharField()
+    description = serializers.CharField(allow_blank=True)
+    # Provider defaults are published on the offering and are not editable by
+    # the consumer, so an address it never added still needs explaining.
+    source = serializers.ChoiceField(choices=["organization", "provider_default"])
+    is_staff_managed = serializers.BooleanField()
+
+
+class AccessSubnetImpactResourceSerializer(serializers.Serializer):
+    """A resource and the addresses that may reach it.
+
+    Only resources of offerings that opted into access subnets appear, so every
+    row here has an allow-list that means something.
+    """
+
+    resource_uuid = serializers.CharField()
+    resource_name = serializers.CharField()
+    project_name = serializers.CharField()
+    offering_uuid = serializers.CharField()
+    offering_name = serializers.CharField()
+    # False means the list is advisory: exported for an external firewall, but
+    # Waldur itself does not act on it.
+    concealment_enabled = serializers.BooleanField()
+    # True when nothing restricts this resource, so it is reachable from
+    # anywhere. This is the case the redesign exists to expose.
+    unrestricted = serializers.BooleanField()
+    addresses = AccessSubnetImpactAddressSerializer(many=True)
+    packed = serializers.ListField(child=serializers.CharField())
+
+
+class AccessSubnetImpactSerializer(serializers.Serializer):
+    """Which of an organization's resources each access subnet reaches."""
+
+    resources = AccessSubnetImpactResourceSerializer(many=True)
 
 
 class BasicCustomerSerializer(serializers.ModelSerializer):
@@ -1994,6 +2283,18 @@ class ProjectPermissionLogSerializer(
         }
 
 
+class UserListSerializer(serializers.ListSerializer):
+    """Resolves permission scopes for the whole page before serializing it.
+
+    See UserSerializer.prime_permission_scopes.
+    """
+
+    def to_representation(self, data):
+        users = list(data)
+        self.child.prime_permission_scopes(users)
+        return super().to_representation(users)
+
+
 class UserSerializer(
     core_serializers.SlugSerializerMixin,
     core_serializers.RestrictedSerializerMixin,
@@ -2024,35 +2325,34 @@ class UserSerializer(
     identity_provider_fields = serializers.SerializerMethodField()
     has_active_session = serializers.SerializerMethodField()
     has_usable_password = serializers.SerializerMethodField()
+    has_passkey = serializers.SerializerMethodField()
+    passkey_count = serializers.SerializerMethodField()
     ip_address = serializers.CharField(read_only=True, required=False, allow_null=True)
     birth_date = serializers.DateField(required=False, allow_null=True)
     should_protect_user_details = serializers.BooleanField(read_only=True)
+
+    # Populated per page by UserListSerializer; None for a single instance.
+    _page_scope_cache = None
+    _page_perms_cache = None
 
     @extend_schema_field(PermissionSerializer(many=True))
     def get_permissions(self, user: core_models.User):
         return self._serialize_permissions(user, PermissionSerializer)
 
-    def _serialize_permissions(self, user: core_models.User, serializer_class):
+    def _get_user_permissions(self, user: core_models.User):
         # Use prefetched permissions if available (from UserViewSet.get_queryset)
         # to avoid N+1 queries. Fall back to query for backwards compatibility.
         if hasattr(user, "prefetched_permissions"):
-            perms = list(user.prefetched_permissions)
-        else:
-            perms = list(
-                UserRole.objects.filter(user=user, is_active=True).select_related(
-                    "user", "role", "created_by", "content_type"
-                )
+            return list(user.prefetched_permissions)
+        return list(
+            UserRole.objects.filter(user=user, is_active=True).select_related(
+                "user", "role", "created_by", "content_type"
             )
+        )
 
-        # Batch-load scope objects (Project, Customer) to avoid N+1 queries
-        # when the permission serializer accesses scope.uuid, scope.customer.uuid, etc.
-        scope_ids_by_ct = {}
-        for perm in perms:
-            if perm.content_type_id and perm.object_id:
-                scope_ids_by_ct.setdefault(perm.content_type_id, []).append(
-                    perm.object_id
-                )
-
+    @staticmethod
+    def _resolve_scopes(scope_ids_by_ct):
+        """Load the permission scopes (Project, Customer) in one query per type."""
         scope_objects = {}
         for ct_id, obj_ids in scope_ids_by_ct.items():
             ct = ContentType.objects.get_for_id(ct_id)
@@ -2064,6 +2364,41 @@ class UserSerializer(
                 qs = qs.select_related("customer")
             for obj in qs:
                 scope_objects[(ct_id, obj.id)] = obj
+        return scope_objects
+
+    def prime_permission_scopes(self, users):
+        """Resolve the scopes of every user on this page in one pass.
+
+        Scope loading was already batched, but only within a single user, so a
+        page of 100 users cost 100 x (one query per scope type). Collecting the
+        whole page first collapses that to one query per scope type.
+        """
+        perms_by_user = {}
+        scope_ids_by_ct = {}
+        for user in users:
+            perms = self._get_user_permissions(user)
+            perms_by_user[user.pk] = perms
+            for perm in perms:
+                if perm.content_type_id and perm.object_id:
+                    scope_ids_by_ct.setdefault(perm.content_type_id, set()).add(
+                        perm.object_id
+                    )
+        self._page_perms_cache = perms_by_user
+        self._page_scope_cache = self._resolve_scopes(scope_ids_by_ct)
+
+    def _serialize_permissions(self, user: core_models.User, serializer_class):
+        if self._page_perms_cache is not None and user.pk in self._page_perms_cache:
+            perms = self._page_perms_cache[user.pk]
+            scope_objects = self._page_scope_cache
+        else:
+            perms = self._get_user_permissions(user)
+            scope_ids_by_ct = {}
+            for perm in perms:
+                if perm.content_type_id and perm.object_id:
+                    scope_ids_by_ct.setdefault(perm.content_type_id, []).append(
+                        perm.object_id
+                    )
+            scope_objects = self._resolve_scopes(scope_ids_by_ct)
 
         valid_perms = []
         for perm in perms:
@@ -2099,6 +2434,22 @@ class UserSerializer(
     def get_has_usable_password(self, user: core_models.User) -> bool:
         return user.has_usable_password()
 
+    def get_has_passkey(self, user: core_models.User) -> bool:
+        return self.get_passkey_count(user) > 0
+
+    def get_passkey_count(self, user: core_models.User) -> int:
+        # Reported as 0 rather than hidden when passkeys are disabled, so the
+        # frontend has one shape to render regardless of deployment config.
+        if not passkey_policy.is_enabled():
+            return 0
+        # UserViewSet annotates this for the list, where counting per row would
+        # be an N+1. Single-instance use (e.g. /api/users/me) falls through to
+        # one query, which is what it would have cost anyway.
+        annotated = getattr(user, "active_passkey_count", None)
+        if annotated is not None:
+            return annotated
+        return user.passkey_credentials.filter(is_active=True).count()
+
     def get_token_expires_at(self, user: core_models.User) -> None | datetime:
         if hasattr(user, "auth_token") and user.auth_token and user.token_lifetime:
             return user.auth_token.created + timezone.timedelta(
@@ -2107,6 +2458,7 @@ class UserSerializer(
 
     class Meta:
         model = core_models.User
+        list_serializer_class = UserListSerializer
         fields = (
             "url",
             "uuid",
@@ -2147,6 +2499,8 @@ class UserSerializer(
             "should_protect_user_details",
             "has_active_session",
             "has_usable_password",
+            "has_passkey",
+            "passkey_count",
             "ip_address",
             # User profile attributes
             "gender",
@@ -2173,6 +2527,8 @@ class UserSerializer(
             "active_isds",
             "deactivation_reason",
             "is_admin_deactivated",
+            # Raw identity provider claims (staff/support only, see get_fields)
+            "details",
         )
         read_only_fields = (
             "uuid",
@@ -2185,11 +2541,16 @@ class UserSerializer(
             "should_protect_user_details",
             "has_active_session",
             "has_usable_password",
+            "has_passkey",
+            "passkey_count",
             "attribute_sources",
             "active_isds",
             "is_admin_deactivated",
             "uid_number",
             "primary_gid",
+            # Provider-asserted, and now load-bearing for role assignment:
+            # nothing may PATCH a user's claims into existence.
+            "details",
         )
         extra_kwargs = {
             "url": {"lookup_field": "uuid"},
@@ -2205,12 +2566,22 @@ class UserSerializer(
         except (KeyError, AttributeError):
             return fields
 
-        if user.is_anonymous:
-            return fields
-
         # Check if this is schema generation context (drf-spectacular)
         # When generating schema, we want to include all fields
         if getattr(self.context.get("view"), "swagger_fake_view", False):
+            return fields
+
+        # Raw identity provider claims. Whatever the provider puts in the claims
+        # listed in IdentityProvider.extra_fields lands here verbatim, and
+        # auto-provisioning rules match on it to grant roles — so this is a
+        # support and debugging surface, not a profile field. Staff and support
+        # only, the user themselves included. Checked before the anonymous
+        # return below so an unauthenticated caller cannot receive it either;
+        # AnonymousUser has no is_support, hence the getattr.
+        if not (user.is_staff or getattr(user, "is_support", False)):
+            fields.pop("details", None)
+
+        if user.is_anonymous:
             return fields
 
         if not user.is_staff:
@@ -2306,9 +2677,23 @@ class UserSerializer(
         # User can see the token either via details view or /api/users/me
 
         if isinstance(self.instance, list) and len(self.instance) == 1:
-            return self.instance[0] == user
+            is_self = self.instance[0] == user
         else:
-            return self.instance == user
+            is_self = self.instance == user
+
+        if not is_self:
+            return False
+
+        # `user` here is request.user, which impersonation has already
+        # replaced with the impersonated account — so "her own token" reads as
+        # true for an impersonator viewing /api/users/me, and hands them a
+        # durable credential for somebody else. Impersonation is meant to let
+        # staff see what a user sees, not to walk away with their token.
+        request = self.context.get("request")
+        if request is not None and getattr(request.user, "impersonator", None):
+            return False
+
+        return True
 
     def _is_staff_editing_other_user(self):
         try:
@@ -3149,26 +3534,13 @@ class NotificationTemplateDetailSerializers(serializers.ModelSerializer):
         }
 
     def get_content(self, obj: core_models.NotificationTemplate) -> str | None:
-        try:
-            return dbtemplate_models.Template.objects.get(name=obj.path).content
-        except dbtemplate_models.Template.DoesNotExist:
-            return None
+        return obj.content or None
 
     def get_original_content(self, obj) -> str | None:
-        from django.template.engine import Engine
-        from django.template.loaders.app_directories import Loader
-
-        loader = Loader(Engine())
-        for origin in loader.get_template_sources(obj.path):
-            try:
-                source = loader.get_contents(origin)
-            except Exception:
-                continue
-            if source:
-                return source
+        return template_utils.get_original_content(obj.path)
 
     def get_is_content_overridden(self, obj) -> bool:
-        return self.get_content(obj) != self.get_original_content(obj)
+        return template_utils.is_template_overridden(obj)
 
 
 class NotificationSerializer(serializers.HyperlinkedModelSerializer):
@@ -3259,7 +3631,16 @@ class AuthTokenSerializer(serializers.HyperlinkedModelSerializer):
 
 
 class UserAuthTokenSerializer(AuthTokenSerializer):
-    token = serializers.ReadOnlyField(source="key")
+    """Metadata about another user's token, deliberately without the key.
+
+    This backs staff-only endpoints, and it used to return the raw key. That
+    made a single compromised staff password enough to obtain a durable,
+    passkey-free session as any user in the deployment — no second factor
+    could mean anything while it stood, because the credential could simply be
+    read out. The remaining fields answer the operational questions the
+    endpoints exist for (does the user have a session, how old is it) without
+    handing over the credential itself.
+    """
 
     class Meta:
         model = authtoken_models.Token
@@ -3270,7 +3651,6 @@ class UserAuthTokenSerializer(AuthTokenSerializer):
             "user_username",
             "user_is_active",
             "user_token_lifetime",
-            "token",
         )
 
 
@@ -3457,7 +3837,8 @@ class ProjectAnswerSerializer(serializers.ModelSerializer):
         """Get count of answers."""
         completion = self._get_completion_data(project)
         if completion:
-            return completion.answers.count()
+            # Answered questions, not per-user answer rows
+            return completion.answers.values("question_id").distinct().count()
         return 0
 
     def get_unanswered_required_count(self, project) -> int:
@@ -3470,9 +3851,12 @@ class ProjectAnswerSerializer(serializers.ModelSerializer):
         total_required = checklist.questions.filter(required=True).count()
 
         if completion:
-            answered_required = completion.answers.filter(
-                question__required=True
-            ).count()
+            answered_required = (
+                completion.answers.filter(question__required=True)
+                .values("question_id")
+                .distinct()
+                .count()
+            )
             return max(0, total_required - answered_required)
         else:
             return total_required
@@ -3486,7 +3870,11 @@ class ProjectAnswerDetailSerializer(serializers.Serializer):
     answer_uuid = serializers.UUIDField(read_only=True, allow_null=True)
     answer_data = serializers.JSONField(read_only=True, allow_null=True)
     answered_by = serializers.CharField(read_only=True, allow_null=True)
-    answered_at = serializers.DateTimeField(read_only=True, allow_null=True)
+    answered_at = serializers.DateTimeField(
+        read_only=True,
+        allow_null=True,
+        help_text="When the shown answer was last saved.",
+    )
     requires_review = serializers.BooleanField(read_only=True)
 
 
@@ -3565,13 +3953,18 @@ class QuestionAnswerSerializer(serializers.ModelSerializer):
         project_ct = ContentType.objects.get_for_model(models.Project)
 
         # Get answers for this question across all projects
-        answers = Answer.objects.filter(
-            question=question,
-            completion__scope_content_type=project_ct,
-            completion__scope_object_id__in=[p.id for p in projects],
-        ).select_related("user", "completion")
+        answers = (
+            Answer.objects.filter(
+                question=question,
+                completion__scope_content_type=project_ct,
+                completion__scope_object_id__in=[p.id for p in projects],
+            )
+            .select_related("user", "completion")
+            .order_by("modified", "id")
+        )
 
-        # Create mapping of project_id -> answer
+        # Create mapping of project_id -> answer. Answers are per-user rows; later
+        # rows overwrite earlier ones, so each project keeps its latest answer.
         answers_by_project = {
             answer.completion.scope_object_id: answer for answer in answers
         }
@@ -3593,6 +3986,7 @@ class QuestionAnswerSerializer(serializers.ModelSerializer):
         data = self._get_projects_and_answers_data(question)
         return data["answered_projects_count"]
 
+    @extend_schema_field(ProjectAnswerDetailSerializer(many=True))
     def get_project_answers(self, question) -> list[dict]:
         """Get all project answers for this question."""
         data = self._get_projects_and_answers_data(question)
@@ -3614,7 +4008,8 @@ class QuestionAnswerSerializer(serializers.ModelSerializer):
                             question, answer.answer_data
                         ),
                         "answered_by": answer.user.full_name if answer.user else None,
-                        "answered_at": answer.created,
+                        # The shown answer's last save, not when its row was created
+                        "answered_at": answer.modified,
                         "requires_review": answer.requires_review,
                     }
                 )
@@ -3755,4 +4150,44 @@ class SetErredSerializer(serializers.Serializer):
     error_message = serializers.CharField(required=False, allow_blank=True, default="")
     error_traceback = serializers.CharField(
         required=False, allow_blank=True, default=""
+    )
+
+
+class DashboardGeneralStatsSerializer(serializers.Serializer):
+    pending_permission_requests = serializers.IntegerField(read_only=True)
+    active_invitations = serializers.IntegerField(read_only=True)
+    pending_onboarding_applications = serializers.IntegerField(read_only=True)
+
+
+class DashboardPendingActionSerializer(serializers.Serializer):
+    type = serializers.CharField(read_only=True)
+    title = serializers.CharField(read_only=True)
+    description = serializers.CharField(read_only=True)
+    variant = serializers.ChoiceField(
+        read_only=True, choices=["info", "warning", "error"]
+    )
+    deadline = serializers.DateTimeField(read_only=True, allow_null=True)
+    count = serializers.IntegerField(read_only=True, allow_null=True)
+    # The object the action is about (invoice, offering, ...) and the customer
+    # it belongs to, so the frontend can deep-link: an invoice detail page
+    # needs both the organisation and the invoice uuid. Route names live in
+    # the frontend, so the feed carries identifiers rather than URLs.
+    target_uuid = serializers.UUIDField(read_only=True, allow_null=True)
+    customer_uuid = serializers.UUIDField(read_only=True, allow_null=True)
+    # Set only for items backed by a UserAction row. It addresses that row on
+    # the existing silence/unsilence/execute_action endpoints, so the feed can
+    # carry the queue's controls without duplicating them here. Computed items
+    # have no row and leave this null.
+    uuid = serializers.UUIDField(read_only=True, allow_null=True)
+    urgency = serializers.CharField(read_only=True, allow_null=True)
+    # UI-Router state and params, carried through from the queue. Computed
+    # items keep routing frontend-side and leave these empty.
+    route_name = serializers.CharField(read_only=True, allow_null=True)
+    route_params = serializers.DictField(read_only=True)
+    can_silence = serializers.BooleanField(read_only=True)
+    # The queue's own serializer, not a copy of it: an earlier copy declared
+    # api_endpoint as a CharField, and "False" is truthy in JS, so every
+    # navigation-only action executed server-side instead of navigating.
+    actions = user_action_serializers.CorrectiveActionSerializer(
+        read_only=True, many=True
     )

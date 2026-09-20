@@ -1,5 +1,13 @@
 workflow:
   rules:
+    # Release pipelines triggered by waldur-docs must not be auto-cancelled by a
+    # later push to develop: the tag job sits pending behind the whole test chain,
+    # and `conservative` mode cancels a pipeline whose non-interruptible job has
+    # not started yet. This block overrides the one from tag-release.yml, so the
+    # rule has to be repeated here.
+    - if: '$CI_PIPELINE_SOURCE == "pipeline" && $RELEASE_VERSION'
+      auto_cancel:
+        on_new_commit: none
     - if: '$CI_PIPELINE_SOURCE == "child_pipeline"'
       when: always
     - when: always
@@ -9,6 +17,8 @@ include:
     file: "/templates/release/tag-release.yml"
   - project: "waldur/waldur-pipelines"
     file: "/templates/stages.yml"
+  - project: "waldur/waldur-pipelines"
+    file: "/templates/test/python-linters.yml"
   - project: "waldur/waldur-pipelines"
     file: "/templates/test/check-merge-compatibility.yml"
   - project: "waldur/waldur-pipelines"
@@ -25,6 +35,8 @@ include:
     file: "/templates/deploy/dev-env-update.yml"
   - project: "waldur/waldur-pipelines"
     file: "/templates/test/vulnerability-scan.yml"
+  - project: "waldur/waldur-pipelines"
+    file: "/templates/test/license-scan.yml"
   # Temporarily disabled - SBOMs taking too much space in docs
   # - project: "waldur/waldur-pipelines"
   #   file: "/templates/sbom/generate-python-codebase-sbom.yml"
@@ -69,14 +81,39 @@ before_script:
         - tests/**/* # Include the tests directory in changes
         - .gitlab-ci.yml # A change to the CI file itself should trigger tests
 
+# For jobs that only *analyse the Python source* — pyright, makemigrations
+# --check, and the two AST checkers. Same as .unit_test_rules with two
+# differences:
+#
+#   - no `.gitlab-ci.yml`. Editing CI config cannot change what pyright or
+#     makemigrations find in src/, so those jobs were running on every
+#     CI-config-only merge request for nothing. See #293.
+#   - plus `scripts/**/*`, which closes a real gap: two of these jobs run a
+#     checker out of scripts/, but scripts/ was in no filter, so editing
+#     scripts/check_action_request_none.py never ran the job that uses it.
+#     (`Validate documentation` already filters on its own script this way.)
+#
+# `Run linters`, `Generate test pipeline` and `Run tests dynamically` stay on
+# .unit_test_rules: the linter validates the YAML itself, and the other two are
+# the test selector, which must get a say whenever CI config changes.
+.source_analysis_rules: &source_analysis_rules
+  rules:
+    # Skip tests if said so
+    - if: '$SKIP_TESTS == "true" || $SKIP_TESTS == "yes"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    # If tagged release
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - src/**/*
+        - scripts/**/*
+        - pyproject.toml
+        - uv.lock
+
 Run linters:
-  image: registry.hpc.ut.ee/mirror/library/python:3.13-bookworm
-  stage: test
-  interruptible: true
+  extends: .Run linters template
   <<: *unit_test_rules
-  script:
-    - pip install prek
-    - prek run --all-files
 
 Scan Python dependencies:
   extends: .Vulnerability scan template
@@ -87,15 +124,15 @@ Check TransactionTestCase usage:
   image: registry.hpc.ut.ee/mirror/library/python:3.13-bookworm
   stage: test
   interruptible: true
-  <<: *unit_test_rules
+  <<: *source_analysis_rules
   script:
-    - python scripts/analyze_transaction_test_cases.py --ci --baseline 80
+    - python scripts/analyze_transaction_test_cases.py --ci --baseline 0
 
 Check Action decorators:
   image: registry.hpc.ut.ee/mirror/library/python:3.13-bookworm
   stage: test
   interruptible: true
-  <<: *unit_test_rules
+  <<: *source_analysis_rules
   script:
     - pip install libcst
     - python scripts/check_action_request_none.py src/
@@ -151,7 +188,18 @@ Generate OpenAPI schema:
       when: never
     - if: '$CI_COMMIT_BRANCH == "develop"'
     - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
+    # This rule had no `changes:` filter at all, so the job ran on every merge
+    # request — including docs-only ones — for ~93s. The schema is generated
+    # from the Python source, so only these paths can change its output:
+    # serializers/views/models under src/, and the drf-spectacular pin.
+    # `.gitlab-ci.yml` is included because this job's own script (the dev
+    # version computation below) lives there. See #293.
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - src/**/*
+        - pyproject.toml
+        - uv.lock
+        - .gitlab-ci.yml
   script:
     - export VERSION="${RELEASE_VERSION:-$CI_COMMIT_TAG}"
     - |
@@ -178,6 +226,7 @@ Generate OpenAPI schema:
 Check database migrations:
   extends: .Unit test runner
   stage: test
+  <<: *source_analysis_rules
   script:
     - uv run waldur makemigrations --check --dry-run
   variables:
@@ -211,24 +260,12 @@ Check startup memory budget:
       - scripts/memory_profiles/startup_components.csv
     expire_in: 1 week
 
-Run migration tests:
-  extends: .Unit test runner
-  rules:
-    # Skip tests if said so
-    - if: '$SKIP_TESTS == "true" || $SKIP_TESTS == "yes"'
-      when: never
-    # Always run on develop branch to ensure it's clean
-    - if: '$CI_COMMIT_BRANCH == "develop"'
-    # Always run on tagged releases
-    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
-    # For merge requests, only run if migration files have changed
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - src/**/migrations/*.py
+.migration_test_settings:
   script:
     - |
       echo "[+] Setting up test database configuration..."
       cat > src/waldur_mastermind/test_settings.py <<-EOF
+      import os
       from waldur_core.server.test_settings import *
       from django.db.backends.base.schema import BaseDatabaseSchemaEditor
 
@@ -239,7 +276,7 @@ Run migration tests:
       DATABASES = {
           'default': {
               'ENGINE': 'django.db.backends.postgresql',
-              'NAME': 'test_waldur',
+              'NAME': os.environ.get('WALDUR_DB_NAME', 'test_waldur'),
               'USER': 'runner',
               'HOST': 'postgres',
               'PORT': 5432,
@@ -247,8 +284,51 @@ Run migration tests:
           }
       }
       EOF
+
+Run migration tests:
+  extends: .Unit test runner
+  rules:
+    # Skip tests if said so
+    - if: '$SKIP_TESTS == "true" || $SKIP_TESTS == "yes"'
+      when: never
+    # Tagged releases always replay the whole chain, unconditionally. This is
+    # the backstop that makes gating develop safe: a develop push may skip the
+    # job, but no release ships without a clean from-scratch `migrate`.
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
+    # develop used to run this unconditionally, which cost ~1822s — 76% of the
+    # develop pipeline — replaying a chain that had not changed. Measured over
+    # the last 80 develop pushes, 61 touched none of the paths below. Gate it on
+    # the same filter merge requests already use. See #293.
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      changes: &migration_test_changes
+        - src/**/migrations/*.py
+        # The fresh-install path and its equivalence check live here.
+        - src/waldur_core/core/management/commands/migrate_fresh.py
+        - scripts/squash_migrations.py
+        - docker/rootfs/usr/local/bin/initdb
+        # A Django or other dependency bump can break replay without touching a
+        # migration file. Until now only the unconditional develop run caught
+        # that (5 of the last 80 pushes), so it has to be part of the filter —
+        # otherwise gating develop would silently drop that coverage.
+        - uv.lock
+        - pyproject.toml
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *migration_test_changes
+  script:
+    - !reference [.migration_test_settings, script]
+    - |
       uv run waldur migrate --noinput
-  services:
+      # Fresh-install path (`migrate_fresh` builds the schema from the models in
+      # seconds and fakes the migrations) must produce exactly the schema the full
+      # replay produces. Snapshot both databases and diff them; auto-generated
+      # constraint names are ignored, everything structural is compared.
+      echo "[+] Verifying migrate_fresh produces the same schema as migrate..."
+      uv run python scripts/squash_migrations.py snapshot-db > schema_migrated.txt
+      uv run python -c "import psycopg; psycopg.connect('host=postgres user=runner password=waldur dbname=postgres', autocommit=True).execute('CREATE DATABASE test_fresh')"
+      time WALDUR_DB_NAME=test_fresh uv run waldur migrate_fresh
+      WALDUR_DB_NAME=test_fresh uv run python scripts/squash_migrations.py snapshot-db > schema_fresh.txt
+      uv run python scripts/squash_migrations.py compare-schema schema_migrated.txt schema_fresh.txt
+  services: &migration_postgres
     - name: "registry.hpc.ut.ee/mirror/library/postgres:15-alpine"
       alias: postgres
       command:
@@ -264,11 +344,62 @@ Run migration tests:
           "-ctemp_buffers=16MB",
           "-cwal_buffers=48MB",
         ]
-  variables:
+  variables: &migration_db_variables
     POSTGRES_DB: test_waldur
     POSTGRES_USER: runner
     POSTGRES_PASSWORD: waldur
     DJANGO_SETTINGS_MODULE: waldur_mastermind.test_settings
+
+Run upgrade migration test:
+  extends: .Unit test runner
+  rules:
+    - if: '$SKIP_TESTS == "true" || $SKIP_TESTS == "yes"'
+      when: never
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      changes: *migration_test_changes
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *migration_test_changes
+  script:
+    - !reference [.migration_test_settings, script]
+    - |
+      # Every deployment upgrades an existing database, and the job above only
+      # ever starts from an empty one. That let regenerated squashes depend on a
+      # migration newer than the range they replace: Django counts a squash as
+      # applied wherever its originals are, so `migrate` refused every upgraded
+      # database with InconsistentMigrationHistory (#354). Initialise a database
+      # from the newest release tag (other than the one being built) and run this
+      # commit's `migrate` on top. `migrate_fresh` at the baseline takes seconds,
+      # records exactly what `migrate` records, and its from-the-models schema is
+      # what every `initdb` since 2026-08-29 produced.
+      echo "[+] Locating the previous release..."
+      BASELINE=$(git -c versionsort.suffix=-rc ls-remote --tags --refs --sort=-v:refname origin '[0-9]*.[0-9]*.[0-9]*' \
+        | sed 's|.*refs/tags/||' | grep -vx "${CI_COMMIT_TAG:-}" | head -1)
+      test -n "$BASELINE"
+      echo "[+] Baseline: $BASELINE"
+      git fetch --quiet --depth=1 origin "refs/tags/$BASELINE:refs/tags/$BASELINE"
+      # The build directory persists between attempts (GIT_STRATEGY: fetch) but /tmp
+      # does not, so a failed attempt leaves .git/worktrees/baseline registered against
+      # a path that no longer exists and every retry dies on "missing but already
+      # registered worktree". Clear the stale registration first.
+      git worktree prune
+      git worktree add --quiet --detach /tmp/baseline "$BASELINE"
+      cp src/waldur_mastermind/test_settings.py /tmp/baseline/src/waldur_mastermind/
+      uv run python -c "import psycopg; psycopg.connect('host=postgres user=runner password=waldur dbname=postgres', autocommit=True).execute('CREATE DATABASE test_upgrade')"
+      echo "[+] Initialising a database from $BASELINE..."
+      (cd /tmp/baseline && UV_CACHE_DIR=$CI_PROJECT_DIR/.uv-cache uv sync --group dev --quiet && WALDUR_DB_NAME=test_upgrade uv run waldur migrate_fresh)
+      echo "[+] Upgrading it with this commit's migrations..."
+      time WALDUR_DB_NAME=test_upgrade uv run waldur migrate --noinput
+      # The upgraded database must end up with the schema a fresh install of this
+      # commit gets (auto-generated constraint names aside).
+      echo "[+] Comparing the upgraded schema with a fresh one..."
+      uv run python -c "import psycopg; psycopg.connect('host=postgres user=runner password=waldur dbname=postgres', autocommit=True).execute('CREATE DATABASE test_fresh')"
+      WALDUR_DB_NAME=test_fresh uv run waldur migrate_fresh
+      WALDUR_DB_NAME=test_upgrade uv run python scripts/squash_migrations.py snapshot-db > schema_upgraded.txt
+      WALDUR_DB_NAME=test_fresh uv run python scripts/squash_migrations.py snapshot-db > schema_fresh.txt
+      uv run python scripts/squash_migrations.py compare-schema schema_fresh.txt schema_upgraded.txt
+  services: *migration_postgres
+  variables: *migration_db_variables
 
 Run demo presets tests:
   extends: .Unit test runner
@@ -282,9 +413,6 @@ Run demo presets tests:
         - src/waldur_mastermind/marketplace/demo_presets/**/*
         - src/waldur_mastermind/marketplace/management/commands/import_structure.py
         - src/waldur_mastermind/marketplace/management/commands/cleanup_structure.py
-        # Also validate edits to this job's own CI config (cheap now that the
-        # migration replay is skipped — see --no-migrations below).
-        - .gitlab-ci.yml
   script:
     - |
       echo "[+] Setting up test database configuration..."
@@ -335,9 +463,117 @@ Run demo presets tests:
     POSTGRES_PASSWORD: waldur
     DJANGO_SETTINGS_MODULE: waldur_mastermind.test_settings
 
+# The VMware plugin is validated against vcsim, VMware's vCenter simulator
+# (shipped inside govmomi, VMware's official Go SDK). These tests are excluded
+# from the sharded suite by a collection-time skip in
+# src/waldur_vmware/tests/conftest.py — that suite runs with `-m 'not slow'`,
+# which does not opt into the marker — so they need a job of their own.
+#
+# vcsim proves call shapes and payloads, not vCenter behaviour: it is a
+# developer tool, not a complete implementation. Acceptance against a live
+# vCenter is still required before release.
+Run VMware integration tests:
+  extends: .Unit test runner
+  rules:
+    - if: '$SKIP_TESTS == "true" || $SKIP_TESTS == "yes"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - src/waldur_vmware/**/*
+  script:
+    - |
+      echo "[+] Setting up test database configuration..."
+      cat > src/waldur_mastermind/test_settings.py <<-EOF
+      from waldur_core.server.test_settings import *
+      from django.db.backends.base.schema import BaseDatabaseSchemaEditor
+
+      # Using UNLOGGED tables in PostgreSQL is a significant performance boost for
+      # tests, as it reduces disk I/O by not writing to the WAL.
+      BaseDatabaseSchemaEditor.sql_create_table = "CREATE UNLOGGED TABLE %(table)s (%(definition)s)"
+
+      DATABASES = {
+          'default': {
+              'ENGINE': 'django.db.backends.postgresql',
+              'NAME': 'test_waldur',
+              'USER': 'runner',
+              'HOST': 'postgres',
+              'PORT': 5432,
+              'PASSWORD': 'waldur',
+          }
+      }
+      EOF
+    - uv run pytest --no-migrations -m vcsim src/waldur_vmware/ -v
+  services:
+    - name: "registry.hpc.ut.ee/mirror/library/postgres:15-alpine"
+      alias: postgres
+      command:
+        [
+          "postgres",
+          "-cfsync=off",
+          "-cfull_page_writes=off",
+          "-cmax_connections=1000",
+          "-cshared_buffers=1GB",
+          "-ceffective_cache_size=4GB",
+          "-cwork_mem=32MB",
+          "-cmaintenance_work_mem=32MB",
+          "-ctemp_buffers=16MB",
+          "-cwal_buffers=48MB",
+        ]
+    # -api-version: vcsim defaults to 6.5, which is older than anything we
+    # target. The inventory is plural where the code makes a choice, so that the
+    # get_default_* helpers are tested for which object they pick.
+    #
+    # The tag is pinned rather than :latest, so that a govmomi release cannot
+    # redden this job on its own. Keep it in step with docker/vcsim-dev/.
+    - name: "registry.hpc.ut.ee/mirror/vmware/vcsim:v0.56.0"
+      alias: vcsim
+      command:
+        [
+          "-l",
+          "0.0.0.0:8989",
+          "-api-version",
+          "8.0.1.0",
+          "-username",
+          "waldur",
+          "-password",
+          "waldur",
+          "-dc",
+          "1",
+          "-cluster",
+          "1",
+          "-host",
+          "2",
+          "-vm",
+          "2",
+          "-ds",
+          "2",
+          "-pg",
+          "2",
+          "-pool",
+          "1",
+          "-folder",
+          "1",
+        ]
+  variables:
+    POSTGRES_DB: test_waldur
+    POSTGRES_USER: runner
+    POSTGRES_PASSWORD: waldur
+    DJANGO_SETTINGS_MODULE: waldur_mastermind.test_settings
+    VCSIM_URL: "https://vcsim:8989"
+    VCSIM_USERNAME: waldur
+    VCSIM_PASSWORD: waldur
+
 # This is the "preparation" job. It's not parallelized.
 # Its only responsibilities are to check for merge conflicts and generate the dynamic
 # child pipeline configuration based on the code changes.
+#
+# Selection (tests/select_tests.py) works from a diff: merge-base..HEAD on a merge
+# request, first-parent..HEAD for a merge commit landing on develop (so a merge is
+# re-tested on the real post-merge tree, but only its own fan-out), and the whole
+# suite otherwise. Set FULL_TEST_RUN=true (e.g. on a nightly schedule without
+# SKIP_TESTS) to force the whole suite as a backstop.
 Generate test pipeline:
   stage: test
   extends: .Unit test runner
@@ -361,6 +597,9 @@ Generate test pipeline:
       tests/generate-pipeline.sh
   artifacts:
     # We need to save both generated files as artifacts.
+    # Consumed by the 'Run tests dynamically' trigger job in the same pipeline,
+    # so they have no value once that pipeline finishes.
+    expire_in: 1 day
     paths:
       - generated-pipeline.yml
     reports:
@@ -402,6 +641,7 @@ Run tests dynamically:
 
 Run type checkings:
   extends: .Unit test runner
+  <<: *source_analysis_rules
   script:
     - |
       uv run pyright \
@@ -477,17 +717,83 @@ Build docker image for tests:
       ${CI_PROJECT_DIR}
     - buildah push "$WALDUR_MASTERMIND_TEST_IMAGE"
 
+# Builds the image the downstream E2E suite actually runs on for merge requests.
+#
+# Before this job existed, "Trigger integration tests" passed
+# ${CI_REGISTRY_IMAGE}:latest on every pipeline — but the two jobs that write
+# that tag ("Publish the YOLO multiarch docker image" and "Publish the latest
+# multiarch docker image") both inherit `$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH`
+# from waldur-pipelines /templates/release/publish-multiarch.yml. Nothing in an
+# MR pipeline built an MR image, so every MR ran the full 13-job E2E suite
+# against whatever develop last published: ~800s of blocking wall-clock and
+# ~67 runner-minutes spent on a result that could not describe the MR. See #293.
+#
+# Mirrors waldur-homeport's "Build test docker image", which has always pinned
+# its downstream to ${CI_REGISTRY_IMAGE}:${CI_MERGE_REQUEST_ID}-e2e.
+Build MR image for integration tests:
+  stage: test
+  interruptible: true
+  image: "quay.io/buildah/stable"
+  rules:
+    # Skip tests if said so
+    - if: '$SKIP_TESTS == "true" || $SKIP_TESTS == "yes"'
+      when: never
+    # Same change filter as the trigger that consumes this image — building it
+    # for a docs-only MR would be pure cost, since the trigger would not fire.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: &integration_test_changes
+        - src/**/*
+        - docker/**/*
+        - Dockerfile
+        - pyproject.toml
+        - uv.lock
+  variables:
+    DOCKER_REGISTRY: registry.hpc.ut.ee/mirror/
+  cache: []
+  before_script:
+    - echo "[+] Build image for merge request ${CI_MERGE_REQUEST_ID}"
+    # Baked into the image at / by `COPY docker/rootfs /`, same as the YOLO job.
+    - echo $CI_COMMIT_SHA > docker/rootfs/COMMIT_SHA
+    - echo "${CI_REGISTRY_PASSWORD}" | buildah login -u "${CI_REGISTRY_USER}" --password-stdin "${CI_REGISTRY}"
+  script:
+    - buildah bud
+      --platform=linux/amd64
+      --build-arg DOCKER_REGISTRY="${DOCKER_REGISTRY}"
+      -t "${CI_REGISTRY_IMAGE}:${CI_MERGE_REQUEST_ID}-e2e"
+      -f "${CI_PROJECT_DIR}/Dockerfile"
+      "${CI_PROJECT_DIR}"
+    - buildah push "${CI_REGISTRY_IMAGE}:${CI_MERGE_REQUEST_ID}-e2e"
+
 Publish the latest multiarch docker image:
   extends: .Publish multiarch latest docker image template
+  # The template's dind service comes from public.ecr.aws, which rate-limits
+  # anonymous pulls ("toomanyrequests: Rate exceeded"). Use the UT mirror.
+  services:
+    - name: registry.hpc.ut.ee/mirror/library/docker:27-dind
+      command: ["--mtu=1400"]
+      alias: docker
   script:
     - docker context create builder
     - docker buildx create builder --use
     - docker buildx imagetools create --tag opennode/${CI_PROJECT_NAME}:latest opennode/${CI_PROJECT_NAME}:yolo
-    - docker buildx imagetools create --tag ${CI_REGISTRY_IMAGE}:latest opennode/${CI_PROJECT_NAME}:yolo
+    # The yolo tag is an OCI index holding the linux/amd64 image plus a buildx
+    # attestation manifest (platform unknown/unknown). Copying the whole index
+    # into the GitLab registry fails on the attestation with "blob unknown to
+    # registry", so copy just the platform image — which is all the integration
+    # tests and docker-compose consume. Attestations stay on Docker Hub.
+    - apk add --no-cache skopeo
+    - skopeo copy --override-os linux --override-arch amd64
+      docker://opennode/${CI_PROJECT_NAME}:yolo
+      docker://${CI_REGISTRY_IMAGE}:latest
 
 Publish the YOLO multiarch docker image:
   extends: .Publish multiarch latest docker image template
   stage: test
+  # See the comment above: avoid the rate-limited public.ecr.aws dind image.
+  services:
+    - name: registry.hpc.ut.ee/mirror/library/docker:27-dind
+      command: ["--mtu=1400"]
+      alias: docker
   variables:
     IMAGE_TAG: "opennode/${CI_PROJECT_NAME}:yolo"
   before_script:
@@ -524,11 +830,15 @@ Test Multi-arch docker image build:
     # Skip tests if said so
     - if: '$SKIP_TESTS == "true" || $SKIP_TESTS == "yes"'
       when: never
+    # `.gitlab-ci.yml` is deliberately not in the filter — same reasoning as
+    # "Trigger integration tests" above. This job takes ~410s (measured on
+    # pipeline 128116) and is `allow_failure: true`, so on a CI-config-only
+    # merge request it spent that time without being able to block anything.
+    # What it actually exercises is the Dockerfile and its build context.
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
         - Dockerfile
         - docker/**/*
-        - .gitlab-ci.yml
   variables:
     DOCKER_REGISTRY: registry.hpc.ut.ee/mirror/
   cache: []
@@ -739,8 +1049,19 @@ Trigger integration tests:
     project: waldur/waldur-integration-testing
     branch: main
     strategy: depend
+  # Without `needs:` this bridge is only stage-ordered, so it could not start
+  # until every job in `test`, `build` and `release` had finished — including the
+  # ~23-minute 15-shard unit suite — although all it depends on is one image.
+  # Naming the image producers lets the E2E suite overlap the unit tests instead
+  # of queueing behind them. Both are `optional` because only one exists in any
+  # given pipeline: the MR build on merge requests, the release job on develop.
+  # See #293.
+  needs:
+    - job: Build MR image for integration tests
+      optional: true
+    - job: Publish the latest multiarch docker image
+      optional: true
   variables:
-    WALDUR_MASTERMIND_IMAGE: "${CI_REGISTRY_IMAGE}:latest"
     # TRIGGER_SOURCE is forwarded to the downstream E2E suite so it can identify
     # which upstream repo triggered it (backend-only jobs stay on for mastermind).
     TRIGGER_SOURCE: mastermind
@@ -750,16 +1071,55 @@ Trigger integration tests:
       when: never
     # Only run E2E when a change can affect backend behaviour or the stack image.
     # Docs-only / lint-config-only changes (CHANGELOG, *.md, docs/**) skip it.
+    #
+    # `.gitlab-ci.yml` is deliberately NOT in the filter. It used to be, which
+    # meant any CI-config-only merge request paid a full image build plus the
+    # 13-job downstream suite (~67 runner-minutes) even when the change could
+    # not possibly affect E2E behaviour — MR !6128, which only edits a
+    # migration-test rule, is exactly that case. GitLab's `changes:` cannot tell
+    # which part of the file moved, so it is all-or-nothing.
+    #
+    # If you are changing the E2E wiring here and want the suite to exercise it
+    # (as !6126 did), include any change under `src/**` in the same merge
+    # request — a real backend change already does. A `RUN_E2E=true` variable
+    # was tried instead and does not work: `glab ci run` and the pipeline API
+    # create branch pipelines, not `merge_request_event` ones, so a rule keyed
+    # on both never matches and the pipeline comes back empty.
+    #
+    # WALDUR_MASTERMIND_IMAGE is set per-rule, not in `variables:` above: on
+    # develop the release job has just republished :latest, but on a merge
+    # request :latest is still develop's image and testing it says nothing about
+    # the MR — so MRs get the image built from their own code. Each rule sets it
+    # explicitly rather than relying on a job-level default, because getting
+    # this wrong is silent: the suite goes green against someone else's code.
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      changes: &integration_test_changes
-        - src/**/*
-        - docker/**/*
-        - Dockerfile
-        - pyproject.toml
-        - uv.lock
-        - .gitlab-ci.yml
+      changes: *integration_test_changes
+      variables:
+        WALDUR_MASTERMIND_IMAGE: "${CI_REGISTRY_IMAGE}:latest"
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes: *integration_test_changes
+      variables:
+        WALDUR_MASTERMIND_IMAGE: "${CI_REGISTRY_IMAGE}:${CI_MERGE_REQUEST_ID}-e2e"
 
 Release tag:
   extends: .release-tag-base
+
+# Fails when a dependency arrives under a licence Waldur cannot ship — strong
+# copyleft (GPL, AGPL), source-available (SSPL, BUSL, Elastic) or non-OSI
+# use-restricted (Hippocratic, JSON). LGPL and MPL pass but stay listed in the
+# artifact. See #285.
+#
+# The two exemptions are defective upstream metadata, not incompatible licences:
+# matrix-nio ships its whole licence text in the `License:` field (it is ISC),
+# and django-jsoneditor publishes an empty one.
+#
+# allow_failure is inherited as true from the template. Drop it to false once
+# #286 (html2text is GPL-3.0-or-later) is closed.
+Check dependency licences:
+  extends: .Licence gate (python) template
+  variables:
+    LICENCE_EXEMPT_PACKAGES: "matrix-nio django-jsoneditor"
+    # Beyond the template's default git: python-ldap (via django-auth-ldap)
+    # publishes no wheel on any platform, so the sync builds it from its sdist
+    # and needs a compiler plus the OpenLDAP and Cyrus SASL headers.
+    LICENCE_SYSTEM_PACKAGES: "git build-essential libldap2-dev libsasl2-dev"

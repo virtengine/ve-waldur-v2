@@ -32,7 +32,7 @@ from waldur_mastermind.marketplace_openstack import (
 from waldur_pid import tasks as pid_tasks
 from waldur_pid import utils as pid_utils
 
-from . import executors, models, utils
+from . import billing_mode, executors, models, utils
 
 
 class GoogleCredentialsAdminForm(ModelForm):
@@ -146,8 +146,32 @@ class PosixIdPoolAdmin(admin.ModelAdmin):
 
 class PosixIdentityAdmin(admin.ModelAdmin):
     model = models.PosixIdentity
-    list_display = ("uid", "gid", "pool", "offering", "released_at")
-    raw_id_fields = ("pool", "offering")
+    list_display = (
+        "uid",
+        "gid",
+        "pool",
+        "user",
+        "offering",
+        "released_at",
+        "recyclable",
+    )
+    list_filter = ("recyclable",)
+    raw_id_fields = ("pool", "offering", "user")
+    actions = ["return_values_to_the_pool"]
+
+    @admin.action(description="Return withheld values to the pool")
+    def return_values_to_the_pool(self, request, queryset):
+        """Clear the recycling hold on released identities.
+
+        The retrofit and the re-point action free values that are still stamped
+        on files in the provider's filesystem, so they are withheld from
+        recycling until an operator confirms the filesystem has been reconciled.
+        This is that confirmation.
+        """
+        count = queryset.filter(released_at__isnull=False, recyclable=False).update(
+            recyclable=True
+        )
+        self.message_user(request, f"{count} value(s) returned to their pool.")
 
 
 class ScreenshotsInline(admin.StackedInline):
@@ -258,9 +282,32 @@ class PlanOrganizationGroupsInline(admin.StackedInline):
     extra = 1
 
 
+class PlanAdminForm(ModelForm):
+    """Same rules as the API: a mode needs builtin components and is frozen
+    while resources use the plan."""
+
+    def clean_billing_mode(self):
+        mode = self.cleaned_data.get("billing_mode")
+        offering = self.instance.offering if self.instance.pk else None
+        if offering is None:
+            return mode
+        error = billing_mode.check_plan_billing_mode(offering, mode, self.instance)
+        if error:
+            raise ValidationError(error)
+        return mode
+
+
 class PlanAdmin(ConnectedResourceMixin, VersionAdmin, admin.ModelAdmin):
-    list_display = ("name", "offering", "archived", "unit", "unit_price")
-    list_filter = ("offering", "archived")
+    form = PlanAdminForm
+    list_display = (
+        "name",
+        "offering",
+        "archived",
+        "billing_mode",
+        "unit",
+        "unit_price",
+    )
+    list_filter = ("offering", "archived", "billing_mode")
     search_fields = ("name", "offering__name")
     inlines = [PlanComponentInline, PlanOrganizationGroupsInline]
     protected_fields = ("unit", "unit_price", "article_code")
@@ -273,6 +320,7 @@ class PlanAdmin(ConnectedResourceMixin, VersionAdmin, admin.ModelAdmin):
         "article_code",
         "max_amount",
         "archived",
+        "billing_mode",
     ) + readonly_fields
 
     def scope_link(self, obj):
@@ -290,7 +338,6 @@ class OfferingAdminForm(ModelForm):
         widgets = {
             "attributes": JsonWidget(),
             "options": JsonWidget(),
-            "secret_options": JsonWidget(),
             "plugin_options": JsonWidget(),
             "referrals": JsonWidget(),
         }
@@ -325,7 +372,12 @@ def get_admin_link_for_scope(scope):
 class OfferingUserInline(admin.TabularInline):
     model = models.OfferingUser
     fields = ("user", "username", "created")
-    readonly_fields = ("created",)
+    # username is read-only because a provider-backed account's is owned by its
+    # ServiceProviderAccount and the model refuses a write here. Read-only for
+    # every row rather than conditionally: the inline is a view onto one
+    # offering's accounts, some backed and some not, and a field that is
+    # editable on some rows and not others is worse than one that never is.
+    readonly_fields = ("created", "username")
     extra = 1
 
 
@@ -409,6 +461,7 @@ class OfferingAdmin(VersionAdmin, admin.ModelAdmin):
         "scope_link",
         "citation_count",
         "uuid",
+        "secret_options",
     )
 
     def scope_link(self, obj):

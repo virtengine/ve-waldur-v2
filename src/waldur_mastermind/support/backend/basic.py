@@ -1,5 +1,6 @@
 import logging
 from datetime import timedelta
+from functools import cached_property
 
 from constance import config
 from django.core.cache import cache
@@ -7,7 +8,7 @@ from django.utils import timezone
 
 from waldur_mastermind.support import models
 
-from . import SupportBackend, SupportBackendError
+from . import SupportBackend, SupportBackendError, build_backend_id
 
 logger = logging.getLogger(__name__)
 
@@ -15,23 +16,23 @@ logger = logging.getLogger(__name__)
 class BasicBackend(SupportBackend):
     backend_name = "basic"
 
+    #: Status a new ticket opens in. `IssueStatus` cannot supply this: it is a
+    #: registry of *terminal* statuses only — its `type` has just RESOLVED and
+    #: CANCELED — so the non-terminal status a ticket starts in is never a row
+    #: in that table.
+    default_status = "Open"
+
     @classmethod
     def from_settings(cls, settings_dict=None):
         """Create a BasicBackend instance, optionally configured from a settings dict."""
         return cls()
 
     def create_issue(self, issue):
-        issue.backend_id = f"WLD-{issue.uuid.hex[:8].upper()}"
+        issue.backend_id = build_backend_id(issue.uuid)
         issue.key = issue.backend_id
 
         if not issue.status:
-            default_status = models.IssueStatus.objects.exclude(
-                type__in=[
-                    models.IssueStatus.Types.RESOLVED,
-                    models.IssueStatus.Types.CANCELED,
-                ]
-            ).first()
-            issue.status = default_status.name if default_status else "Open"
+            issue.status = self.default_status
 
         if config.WALDUR_SUPPORT_SLA_ENABLED:
             self._set_sla_deadlines(issue)
@@ -52,9 +53,11 @@ class BasicBackend(SupportBackend):
                     f"Status transition from '{old_status}' to '{new_status}' is not allowed."
                 )
 
-            # Check if issue is now resolved
-            if models.IssueStatus.check_success_status(new_status) is not None:
-                issue.resolution_date = timezone.now()
+            # Set the resolution date when the issue closes, and clear it again
+            # when it is reopened. Assigning `now()` unconditionally would also
+            # rewrite the closure timestamp when a ticket moves between two
+            # terminal statuses, skewing the "closed this month" count.
+            issue.sync_resolution_date()
 
         issue.save()
 
@@ -62,7 +65,7 @@ class BasicBackend(SupportBackend):
         return
 
     def create_comment(self, comment):
-        comment.backend_id = f"WLD-C-{comment.uuid.hex[:8].upper()}"
+        comment.backend_id = build_backend_id(comment.uuid, "C")
         comment.save(update_fields=["backend_id"])
 
         # Track first response time
@@ -78,11 +81,49 @@ class BasicBackend(SupportBackend):
         return
 
     def create_attachment(self, attachment):
-        attachment.backend_id = f"WLD-A-{attachment.uuid.hex[:8].upper()}"
+        attachment.backend_id = build_backend_id(attachment.uuid, "A")
         attachment.save(update_fields=["backend_id"])
 
     def delete_attachment(self, attachment):
         return
+
+    def issue_is_active(self, issue) -> bool:
+        """Cheaper than the base predicate, and answers the same question.
+
+        `resolution_date` is a stored column that `update_issue`, `set_resolved`
+        and `set_canceled` keep in step with the status, and it is already what
+        `Issue.objects.open()`, the SLA badge and the support statistics key
+        off. Reading it costs nothing, where the base `resolved` property runs
+        three or four queries every time. That matters here because these
+        predicates are serialized per issue *and per comment*: on the base
+        implementation a fifty-comment thread paid several hundred queries and
+        as many log lines to render.
+        """
+        return issue is not None and issue.resolution_date is None
+
+    # A ticket that has reached Resolved or Canceled is closed for changes.
+    # Staff are not exempt: the way to add something to a closed ticket is to
+    # reopen it, which staff and support can already do. This mirrors the SMAX
+    # backend, and keeps `add_comment_is_available` a property of the ticket
+    # rather than of whoever is asking.
+    def comment_create_is_available(self, issue=None):
+        return self.issue_is_active(issue)
+
+    def comment_update_is_available(self, comment=None):
+        return self.issue_is_active(comment.issue)
+
+    def comment_destroy_is_available(self, comment=None):
+        return self.issue_is_active(comment.issue)
+
+    def attachment_create_is_available(self, issue=None):
+        return self.issue_is_active(issue)
+
+    def attachment_destroy_is_available(self, attachment=None):
+        # Deliberately not gated on the ticket being open. Closing a ticket must
+        # not strip the only supported way to remove a file from it: an erasure
+        # request arrives long after the ticket is resolved, and the alternative
+        # is the Django admin or a shell.
+        return True
 
     def get_users(self):
         return
@@ -102,8 +143,42 @@ class BasicBackend(SupportBackend):
     def destroy_is_available(self, issue=None):
         return True
 
-    def attachment_destroy_is_available(self, attachment=None):
-        return True
+    @cached_property
+    def _status_workflow(self) -> dict[str, set[str]] | None:
+        """The configured workflow as from-status -> to-statuses, or None.
+
+        Read once per backend instance: serializing a list of issues asks for
+        every issue's transitions, and querying the table per issue is an N+1.
+        """
+        transitions: dict[str, set[str]] = {}
+        for from_status, to_status in models.IssueStatusTransition.objects.values_list(
+            "from_status", "to_status"
+        ):
+            transitions.setdefault(from_status, set()).add(to_status)
+        return transitions or None
+
+    @cached_property
+    def _registered_statuses(self) -> set[str]:
+        # The default status is included deliberately: `IssueStatus` only ever
+        # holds terminal statuses, so without it a ticket resolved by mistake
+        # could never be reopened on a deployment that configured no workflow.
+        return {self.default_status} | set(
+            models.IssueStatus.objects.values_list("name", flat=True)
+        )
+
+    def get_available_statuses(self, issue) -> list[str]:
+        """Statuses this issue may move to, per the configured workflow.
+
+        `IssueStatusTransition` is the workflow definition. When an operator has
+        not defined one, `is_transition_allowed` permits everything, so offer
+        the registered statuses instead — that is at least Resolved and Canceled
+        on a deployment that configured the terminal statuses at all.
+        """
+        if self._status_workflow is not None:
+            candidates = self._status_workflow.get(issue.status, set())
+        else:
+            candidates = self._registered_statuses
+        return sorted(candidates - {issue.status})
 
     def _set_sla_deadlines(self, issue):
         response_hours = config.WALDUR_SUPPORT_SLA_RESPONSE_HOURS

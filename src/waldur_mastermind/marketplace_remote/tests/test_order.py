@@ -67,7 +67,7 @@ class OrderReviewByProviderTest(test.APITestCase):
         self.assertFalse(order_should_not_be_reviewed_by_provider(self.order))
 
 
-class LimitsUpdateTest(test.APITransactionTestCase):
+class LimitsUpdateTest(test.APITestCase):
     def setUp(self) -> None:
         self.fixture = marketplace_fixtures.MarketplaceFixture()
         self.offering = self.fixture.offering
@@ -83,6 +83,7 @@ class LimitsUpdateTest(test.APITransactionTestCase):
         self.offering_component.billing_type = BillingTypes.LIMIT
         self.offering_component.save()
         CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_RESOURCE_LIMITS)
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_ORDER)
         ServiceProviderRole.MANAGER.add_permission(
             PermissionEnum.UPDATE_RESOURCE_LIMITS
         )

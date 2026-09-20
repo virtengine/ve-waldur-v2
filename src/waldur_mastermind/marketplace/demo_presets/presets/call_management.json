@@ -273,6 +273,44 @@
       "country": "EE"
     }
   ],
+  "customer_credits": [
+    {
+      "uuid": "afc42000000000000000000000000001",
+      "customer_uuid": "b4000000000000000000000000000002",
+      "value": "240000",
+      "expected_consumption": "20000",
+      "minimal_consumption_logic": "fixed",
+      "grace_coefficient": "0.1",
+      "apply_as_minimal_consumption": true,
+      "end_date": "2027-07-01",
+      "created": "2026-01-15T00:00:00",
+      "offering_uuids": []
+    },
+    {
+      "uuid": "afc42000000000000000000000000002",
+      "customer_uuid": "b4000000000000000000000000000003",
+      "value": "180000",
+      "expected_consumption": "15000",
+      "minimal_consumption_logic": "fixed",
+      "grace_coefficient": "0.1",
+      "apply_as_minimal_consumption": true,
+      "end_date": "2027-07-01",
+      "created": "2026-01-15T00:00:00",
+      "offering_uuids": []
+    },
+    {
+      "uuid": "afc42000000000000000000000000003",
+      "customer_uuid": "b4000000000000000000000000000004",
+      "value": "120000",
+      "expected_consumption": "10000",
+      "minimal_consumption_logic": "fixed",
+      "grace_coefficient": "0.1",
+      "apply_as_minimal_consumption": true,
+      "end_date": "2027-07-01",
+      "created": "2026-01-15T00:00:00",
+      "offering_uuids": []
+    }
+  ],
   "projects": [
     {
       "uuid": "c4000000000000000000000000000001",
@@ -291,6 +329,71 @@
       "name": "Climate Modeling Initiative",
       "description": "High-resolution climate modeling and prediction",
       "customer_uuid": "b4000000000000000000000000000004"
+    }
+  ],
+  "project_credits": [
+    {
+      "uuid": "afc43000000000000000000000000001",
+      "project_uuid": "c4000000000000000000000000000001",
+      "value": "220000",
+      "expected_consumption": "18000",
+      "minimal_consumption_logic": "fixed",
+      "grace_coefficient": "0.1",
+      "apply_as_minimal_consumption": true,
+      "end_date": "2027-07-01",
+      "created": "2026-01-20T00:00:00"
+    },
+    {
+      "uuid": "afc43000000000000000000000000002",
+      "project_uuid": "c4000000000000000000000000000002",
+      "value": "160000",
+      "expected_consumption": "13000",
+      "minimal_consumption_logic": "fixed",
+      "grace_coefficient": "0.1",
+      "apply_as_minimal_consumption": true,
+      "end_date": "2027-07-01",
+      "created": "2026-01-20T00:00:00"
+    },
+    {
+      "uuid": "afc43000000000000000000000000003",
+      "project_uuid": "c4000000000000000000000000000003",
+      "value": "100000",
+      "expected_consumption": "8000",
+      "minimal_consumption_logic": "fixed",
+      "grace_coefficient": "0.1",
+      "apply_as_minimal_consumption": true,
+      "end_date": "2027-07-01",
+      "created": "2026-01-20T00:00:00"
+    }
+  ],
+  "project_estimated_cost_policies": [
+    {
+      "uuid": "93400000000000000000000000000001",
+      "project_uuid": "c4000000000000000000000000000001",
+      "limit_cost": 20000,
+      "period": 2,
+      "actions": "notify_organization_owners,request_pausing",
+      "options": {},
+      "has_fired": false
+    },
+    {
+      "uuid": "93400000000000000000000000000002",
+      "project_uuid": "c4000000000000000000000000000002",
+      "limit_cost": 12000,
+      "period": 2,
+      "actions": "notify_organization_owners,request_downscaling",
+      "options": {},
+      "has_fired": true,
+      "fired_datetime": "2026-07-18T09:15:00Z"
+    },
+    {
+      "uuid": "93400000000000000000000000000003",
+      "project_uuid": "c4000000000000000000000000000003",
+      "limit_cost": 30000,
+      "period": 2,
+      "actions": "notify_organization_owners",
+      "options": {},
+      "has_fired": false
     }
   ],
   "user_agreements": [
@@ -1307,7 +1410,10 @@
       "category_uuid": "d4000000000000000000000000000001",
       "customer_uuid": "b4000000000000000000000000000001",
       "description": "Standard HPC allocation for research projects",
-      "getting_started": "## Getting Started with HPC Allocation\n\n### Access\nSSH to hpc.research-council.edu\n\n### Job Submission\nUse SLURM for job scheduling\n\n### Support\nEmail: hpc-support@research-council.edu"
+      "getting_started": "## Getting Started with HPC Allocation\n\n### Access\nSSH to hpc.research-council.edu\n\n### Job Submission\nUse SLURM for job scheduling\n\n### Support\nEmail: hpc-support@research-council.edu",
+      "plugin_options": {
+        "enable_purchase_order_upload": true
+      }
     },
     {
       "uuid": "f4000000000000000000000000000002",
@@ -1364,6 +1470,22 @@
         "tres_billing_enabled": true
       },
       "getting_started": "## Getting Started with SLURM HPC Allocation\n\n### Access\n```bash\nssh username@slurm.research-council.edu\n```\n\n### Check Your Allocation\n```bash\nsacctmgr show user $USER format=User,Account,QOS\nsbalance -u $USER\n```\n\n### Submit a Job\n```bash\n#!/bin/bash\n#SBATCH --job-name=my_job\n#SBATCH --nodes=2\n#SBATCH --ntasks-per-node=48\n#SBATCH --time=24:00:00\n\nsrun ./my_application\n```\n\n### Support\nEmail: hpc-support@research-council.edu"
+    },
+    {
+      "uuid": "f4000000000000000000000000000006",
+      "name": "Managed Analytics Platform",
+      "type": "Marketplace.Basic",
+      "state": 2,
+      "shared": true,
+      "billable": true,
+      "category_uuid": "d4000000000000000000000000000001",
+      "customer_uuid": "b4000000000000000000000000000001",
+      "description": "Prepaid analytics seats. Procurement requires a purchase order before an order is approved.",
+      "getting_started": "## Managed Analytics Platform\n\n### Purchase orders\nThis offering is sold against a purchase order. Attach the PDF to your order before requesting approval.\n\n### Seats\nSeats are prepaid for the subscription period and cannot be topped up mid-period.",
+      "plugin_options": {
+        "enable_purchase_order_upload": true,
+        "require_purchase_order_upload": true
+      }
     }
   ],
   "offering_components": [
@@ -1373,8 +1495,11 @@
       "type": "cpu_hours",
       "name": "CPU Core Hours",
       "description": "CPU compute time allocation",
-      "billing_type": "usage",
-      "measured_unit": "hours"
+      "billing_type": "limit",
+      "measured_unit": "hours",
+      "limit_period": "total",
+      "min_value": 1000,
+      "max_value": 500000
     },
     {
       "uuid": "c4000000000000000000000000000102",
@@ -1383,7 +1508,10 @@
       "name": "Scratch Storage",
       "description": "Fast scratch storage",
       "billing_type": "limit",
-      "measured_unit": "GB"
+      "measured_unit": "GB",
+      "limit_period": "month",
+      "min_value": 100,
+      "max_value": 5000
     },
     {
       "uuid": "c4000000000000000000000000000201",
@@ -1391,8 +1519,11 @@
       "type": "gpu_hours",
       "name": "GPU Hours",
       "description": "GPU compute time",
-      "billing_type": "usage",
-      "measured_unit": "hours"
+      "billing_type": "limit",
+      "measured_unit": "hours",
+      "limit_period": "total",
+      "min_value": 100,
+      "max_value": 50000
     },
     {
       "uuid": "c4000000000000000000000000000202",
@@ -1400,8 +1531,11 @@
       "type": "cpu_hours",
       "name": "CPU Core Hours",
       "description": "CPU compute time",
-      "billing_type": "usage",
-      "measured_unit": "hours"
+      "billing_type": "limit",
+      "measured_unit": "hours",
+      "limit_period": "total",
+      "min_value": 1000,
+      "max_value": 1000000
     },
     {
       "uuid": "c4000000000000000000000000000301",
@@ -1410,7 +1544,10 @@
       "name": "Storage Capacity",
       "description": "Research data storage",
       "billing_type": "limit",
-      "measured_unit": "TB"
+      "measured_unit": "TB",
+      "limit_period": "annual",
+      "min_value": 1,
+      "max_value": 500
     },
     {
       "uuid": "c4000000000000000000000000000401",
@@ -1419,7 +1556,10 @@
       "name": "vCPU Cores",
       "description": "Virtual CPU cores",
       "billing_type": "limit",
-      "measured_unit": "cores"
+      "measured_unit": "cores",
+      "limit_period": "month",
+      "min_value": 2,
+      "max_value": 256
     },
     {
       "uuid": "c4000000000000000000000000000402",
@@ -1428,7 +1568,10 @@
       "name": "Memory",
       "description": "RAM allocation",
       "billing_type": "limit",
-      "measured_unit": "GB"
+      "measured_unit": "GB",
+      "limit_period": "month",
+      "min_value": 4,
+      "max_value": 1024
     },
     {
       "uuid": "c4000000000000000000000000000501",
@@ -1436,8 +1579,11 @@
       "type": "cpu",
       "name": "CPU Hours",
       "description": "CPU core hours for SLURM jobs",
-      "billing_type": "usage",
-      "measured_unit": "hours"
+      "billing_type": "limit",
+      "measured_unit": "hours",
+      "limit_period": "total",
+      "min_value": 1000,
+      "max_value": 2000000
     },
     {
       "uuid": "c4000000000000000000000000000502",
@@ -1445,8 +1591,11 @@
       "type": "ram",
       "name": "Memory Hours",
       "description": "Memory allocation in GB-hours",
-      "billing_type": "usage",
-      "measured_unit": "GB-hours"
+      "billing_type": "limit",
+      "measured_unit": "GB-hours",
+      "limit_period": "total",
+      "min_value": 1000,
+      "max_value": 8000000
     },
     {
       "uuid": "c4000000000000000000000000000503",
@@ -1454,8 +1603,108 @@
       "type": "gpu",
       "name": "GPU Hours",
       "description": "GPU compute hours for accelerated workloads",
-      "billing_type": "usage",
-      "measured_unit": "hours"
+      "billing_type": "limit",
+      "measured_unit": "hours",
+      "limit_period": "total",
+      "min_value": 0,
+      "max_value": 100000
+    },
+    {
+      "uuid": "c4000000000000000000000000000103",
+      "offering_uuid": "f4000000000000000000000000000001",
+      "type": "onboarding",
+      "name": "Onboarding and account setup",
+      "description": "One-off charge raised when the allocation is activated.",
+      "billing_type": "one",
+      "measured_unit": "project"
+    },
+    {
+      "uuid": "c4000000000000000000000000000203",
+      "offering_uuid": "f4000000000000000000000000000002",
+      "type": "support_hours",
+      "name": "Dedicated support",
+      "description": "Support hours bought up front for the duration of the award.",
+      "billing_type": "one",
+      "measured_unit": "hours",
+      "is_prepaid": true,
+      "min_prepaid_duration": 1,
+      "max_prepaid_duration": 12,
+      "prepaid_duration_step": 1,
+      "min_value": 0,
+      "max_value": 100
+    },
+    {
+      "uuid": "c4000000000000000000000000000104",
+      "offering_uuid": "f4000000000000000000000000000001",
+      "type": "priority_support",
+      "name": "Priority support",
+      "description": "Support hours paid up front for the duration of the award.",
+      "billing_type": "one",
+      "measured_unit": "hours",
+      "is_prepaid": true,
+      "min_prepaid_duration": 1,
+      "max_prepaid_duration": 12,
+      "prepaid_duration_step": 1,
+      "min_value": 0,
+      "max_value": 200
+    },
+    {
+      "uuid": "c4000000000000000000000000000601",
+      "offering_uuid": "f4000000000000000000000000000006",
+      "type": "analyst_seats",
+      "name": "Analyst seats",
+      "description": "Named seats paid up front for the subscription period.",
+      "billing_type": "one",
+      "measured_unit": "seats",
+      "is_prepaid": true,
+      "min_prepaid_duration": 1,
+      "max_prepaid_duration": 12,
+      "prepaid_duration_step": 1,
+      "min_value": 0,
+      "max_value": 100
+    },
+    {
+      "uuid": "c4000000000000000000000000000602",
+      "offering_uuid": "f4000000000000000000000000000006",
+      "type": "platform_setup",
+      "name": "Platform setup",
+      "description": "One-off onboarding charge raised when the platform is provisioned.",
+      "billing_type": "one",
+      "measured_unit": "project"
+    }
+  ],
+  "slurm_periodic_policies": [
+    {
+      "uuid": "9f400000000000000000000000000001",
+      "offering_uuid": "f4000000000000000000000000000005",
+      "apply_to_all": true,
+      "actions": "notify_organization_owners,request_slurm_resource_downscaling",
+      "limit_type": "GrpTRESMins",
+      "tres_billing_enabled": true,
+      "tres_billing_weights": {
+        "CPU": 0.015625,
+        "Mem": 0.001953125,
+        "GRES/gpu": 0.25
+      },
+      "carryover_factor": 25,
+      "grace_ratio": 0.2,
+      "carryover_enabled": true,
+      "raw_usage_reset": true,
+      "qos_strategy": "progressive",
+      "component_limits": [
+        {
+          "type": "cpu",
+          "limit": 100000
+        },
+        {
+          "type": "ram",
+          "limit": 200000
+        },
+        {
+          "type": "gpu",
+          "limit": 2000
+        }
+      ]
     }
   ],
   "plans": [
@@ -1481,7 +1730,7 @@
       "uuid": "14000000000000000000000000000004",
       "name": "Cloud VM Plan",
       "offering_uuid": "f4000000000000000000000000000004",
-      "unit": "month"
+      "unit": "day"
     },
     {
       "uuid": "14000000000000000000000000000005",
@@ -1489,6 +1738,19 @@
       "offering_uuid": "f4000000000000000000000000000005",
       "unit": "month",
       "description": "SLURM allocation for competitive research grants with periodic usage policies"
+    },
+    {
+      "uuid": "14000000000000000000000000000006",
+      "name": "Research Storage Plan (archive tier)",
+      "offering_uuid": "f4000000000000000000000000000003",
+      "unit": "month",
+      "description": "Cheaper tier for cold data, restored on request."
+    },
+    {
+      "uuid": "14000000000000000000000000000008",
+      "name": "Analytics Prepaid Plan",
+      "offering_uuid": "f4000000000000000000000000000006",
+      "unit": "month"
     }
   ],
   "plan_components": [
@@ -1496,13 +1758,17 @@
       "plan_uuid": "14000000000000000000000000000001",
       "component_uuid": "c4000000000000000000000000000101",
       "price": "0.05",
-      "amount": 0
+      "amount": 0,
+      "discount_formula": "15 if usage >= 200000 else 8 if usage >= 100000 else 0",
+      "discount_aggregation": "resource"
     },
     {
       "plan_uuid": "14000000000000000000000000000001",
       "component_uuid": "c4000000000000000000000000000102",
       "price": "0.01",
-      "amount": 0
+      "amount": 0,
+      "discount_formula": "10 if usage >= 1000 else 0",
+      "discount_aggregation": "customer"
     },
     {
       "plan_uuid": "14000000000000000000000000000002",
@@ -1525,13 +1791,13 @@
     {
       "plan_uuid": "14000000000000000000000000000004",
       "component_uuid": "c4000000000000000000000000000401",
-      "price": "5.00",
+      "price": "0.20",
       "amount": 0
     },
     {
       "plan_uuid": "14000000000000000000000000000004",
       "component_uuid": "c4000000000000000000000000000402",
-      "price": "2.50",
+      "price": "0.08",
       "amount": 0
     },
     {
@@ -1550,6 +1816,42 @@
       "plan_uuid": "14000000000000000000000000000005",
       "component_uuid": "c4000000000000000000000000000503",
       "price": "0.50",
+      "amount": 0
+    },
+    {
+      "plan_uuid": "14000000000000000000000000000001",
+      "component_uuid": "c4000000000000000000000000000103",
+      "price": "250.00",
+      "amount": 0
+    },
+    {
+      "plan_uuid": "14000000000000000000000000000002",
+      "component_uuid": "c4000000000000000000000000000203",
+      "price": "75.00",
+      "amount": 0
+    },
+    {
+      "plan_uuid": "14000000000000000000000000000006",
+      "component_uuid": "c4000000000000000000000000000301",
+      "price": "6.00",
+      "amount": 0
+    },
+    {
+      "plan_uuid": "14000000000000000000000000000001",
+      "component_uuid": "c4000000000000000000000000000104",
+      "price": "45.00",
+      "amount": 0
+    },
+    {
+      "plan_uuid": "14000000000000000000000000000008",
+      "component_uuid": "c4000000000000000000000000000601",
+      "price": "120.00",
+      "amount": 0
+    },
+    {
+      "plan_uuid": "14000000000000000000000000000008",
+      "component_uuid": "c4000000000000000000000000000602",
+      "price": "400.00",
       "amount": 0
     }
   ],
@@ -1606,6 +1908,17 @@
       "reviewer_identity_visible_to_submitters": false,
       "reviews_visible_to_submitters": false,
       "fixed_duration_in_days": 180
+    },
+    {
+      "uuid": "ca200000000000000000000000000005",
+      "name": "Rolling access requests",
+      "description": "Minimal workflow: one offering, one decision, no review panel.",
+      "manager_uuid": "ca100000000000000000000000000001",
+      "created_by_uuid": "a4000000000000000000000000000002",
+      "state": "active",
+      "reviewer_identity_visible_to_submitters": false,
+      "reviews_visible_to_submitters": false,
+      "fixed_duration_in_days": 90
     }
   ],
   "requested_offerings": [
@@ -1660,6 +1973,25 @@
       "plan_uuid": "14000000000000000000000000000004",
       "state": "requested",
       "description": "Cloud VM package pending approval"
+    },
+    {
+      "uuid": "ca300000000000000000000000000007",
+      "call_uuid": "ca200000000000000000000000000001",
+      "offering_uuid": "f4000000000000000000000000000005",
+      "plan_uuid": "14000000000000000000000000000005",
+      "state": "accepted",
+      "description": "Batch allocation on the council cluster.",
+      "approved_by_uuid": "a4000000000000000000000000000001"
+    },
+    {
+      "uuid": "ca300000000000000000000000000008",
+      "call_uuid": "ca200000000000000000000000000005",
+      "offering_uuid": "f4000000000000000000000000000001",
+      "plan_uuid": "14000000000000000000000000000001",
+      "state": "accepted",
+      "description": "The only offering this call grants.",
+      "approved_by_uuid": "a4000000000000000000000000000001",
+      "require_purchase_order": true
     }
   ],
   "call_resource_templates": [
@@ -1758,6 +2090,13 @@
       "cutoff_time": "relative:-90days",
       "allocation_date": "relative:-60days",
       "review_duration_in_days": 30
+    },
+    {
+      "uuid": "ca500000000000000000000000000005",
+      "call_uuid": "ca200000000000000000000000000005",
+      "start_time": "relative:-5days",
+      "cutoff_time": "relative:+85days",
+      "review_duration_in_days": 7
     }
   ],
   "proposals": [
@@ -1765,13 +2104,11 @@
       "uuid": "ca600000000000000000000000000001",
       "name": "Quantum Error Correction Simulations",
       "round_uuid": "ca500000000000000000000000000001",
-      "state": "submitted",
+      "state": "in_review",
       "created_by_uuid": "a4000000000000000000000000000006",
       "description": "This research program will develop and implement novel quantum error correction codes optimized for near-term quantum hardware. Using large-scale HPC simulations, we will benchmark these codes against current state-of-the-art approaches and identify promising candidates for experimental implementation.",
       "project_summary": "This proposal requests HPC resources for large-scale quantum error correction code simulations. We aim to develop and benchmark novel quantum error correction codes that can be implemented on near-term quantum hardware. Our team combines expertise in quantum computing theory, numerical simulation methods, and experimental quantum physics.",
       "project_duration": 365,
-      "project_is_confidential": false,
-      "project_has_civilian_purpose": true,
       "oecd_fos_2007_code": "1.3",
       "_team_comment": "PI: Niels Bohr (quantum theory), Co-PI: Project Manager (simulation expertise), Team Member: Project Member (data analysis)"
     },
@@ -1784,8 +2121,6 @@
       "description": "We will employ high-throughput density functional theory (DFT) calculations combined with machine learning models to screen thousands of candidate materials for next-generation lithium-ion and solid-state batteries. This computational approach significantly accelerates the materials discovery process compared to experimental trial-and-error methods.",
       "project_summary": "We propose to use high-throughput computational screening to discover new battery electrode materials. Our approach combines DFT calculations with machine learning to accelerate the discovery process. The interdisciplinary team includes computational chemists, materials scientists, and machine learning experts.",
       "project_duration": 365,
-      "project_is_confidential": false,
-      "project_has_civilian_purpose": true,
       "oecd_fos_2007_code": "2.5",
       "_team_comment": "PI: Linus Pauling (materials chemistry), Co-I: Rachel Carson (data modeling)"
     },
@@ -1798,8 +2133,6 @@
       "description": "Our project will implement adaptive mesh refinement (AMR) techniques in global climate models to achieve unprecedented resolution in critical regions such as mountain ranges, coastlines, and urban areas. This will enable more accurate predictions of extreme weather events and regional climate impacts.",
       "project_summary": "This project aims to enhance global climate model resolution using adaptive mesh refinement techniques. We will focus on improving precipitation predictions in mountainous regions. The team includes climate scientists, numerical methods specialists, and HPC software engineers.",
       "project_duration": 365,
-      "project_is_confidential": false,
-      "project_has_civilian_purpose": true,
       "oecd_fos_2007_code": "1.5",
       "_team_comment": "PI: Rachel Carson (climate science), Team: 2 postdocs (not yet in system)"
     },
@@ -1807,12 +2140,10 @@
       "uuid": "ca600000000000000000000000000004",
       "name": "Large Language Model Fine-tuning",
       "round_uuid": "ca500000000000000000000000000003",
-      "state": "submitted",
+      "state": "in_review",
       "created_by_uuid": "00000000000000000000000000000004",
       "project_summary": "We request GPU resources to fine-tune large language models for scientific text understanding. The models will be optimized for extracting structured information from research papers.",
       "project_duration": 180,
-      "project_is_confidential": false,
-      "project_has_civilian_purpose": true,
       "oecd_fos_2007_code": "1.2"
     },
     {
@@ -1823,8 +2154,6 @@
       "created_by_uuid": "a4000000000000000000000000000007",
       "project_summary": "This proposal focuses on using deep learning methods for protein structure prediction. We will develop and train neural networks to predict 3D protein structures from amino acid sequences.",
       "project_duration": 180,
-      "project_is_confidential": false,
-      "project_has_civilian_purpose": true,
       "oecd_fos_2007_code": "1.6"
     },
     {
@@ -1837,8 +2166,6 @@
       "project_uuid": "c4000000000000000000000000000001",
       "project_summary": "We propose large-scale molecular dynamics simulations of membrane protein complexes. This work will provide insights into drug binding mechanisms and membrane transport.",
       "project_duration": 180,
-      "project_is_confidential": false,
-      "project_has_civilian_purpose": true,
       "allocation_comment": "Excellent proposal with strong scientific merit",
       "oecd_fos_2007_code": "1.6"
     },
@@ -1850,8 +2177,6 @@
       "created_by_uuid": "a4000000000000000000000000000008",
       "project_summary": "Training neural networks for short-term weather prediction using historical data.",
       "project_duration": 180,
-      "project_is_confidential": false,
-      "project_has_civilian_purpose": true,
       "allocation_comment": "Insufficient technical detail in methodology",
       "oecd_fos_2007_code": "1.5"
     },
@@ -1864,8 +2189,6 @@
       "approved_by_uuid": "a4000000000000000000000000000001",
       "project_summary": "Monte Carlo simulation of particle physics events for LHC data analysis.",
       "project_duration": 365,
-      "project_is_confidential": false,
-      "project_has_civilian_purpose": true,
       "allocation_comment": "Strong track record and clear methodology",
       "oecd_fos_2007_code": "1.3"
     },
@@ -1878,8 +2201,6 @@
       "approved_by_uuid": "a4000000000000000000000000000001",
       "project_summary": "CFD simulations for aerodynamic optimization of wind turbine blades.",
       "project_duration": 365,
-      "project_is_confidential": false,
-      "project_has_civilian_purpose": true,
       "allocation_comment": "Important application with clear industrial impact",
       "oecd_fos_2007_code": "2.3"
     },
@@ -1891,8 +2212,6 @@
       "created_by_uuid": "a4000000000000000000000000000007",
       "project_summary": "Development of genomic analysis pipeline for population genetics studies.",
       "project_duration": 365,
-      "project_is_confidential": false,
-      "project_has_civilian_purpose": true,
       "allocation_comment": "Resource request not well justified",
       "oecd_fos_2007_code": "1.6"
     },
@@ -1904,8 +2223,6 @@
       "created_by_uuid": "a4000000000000000000000000000007",
       "project_summary": "AI-powered platform for virtual screening of drug candidates.",
       "project_duration": 180,
-      "project_is_confidential": true,
-      "project_has_civilian_purpose": true,
       "oecd_fos_2007_code": "3.1"
     },
     {
@@ -1916,8 +2233,6 @@
       "created_by_uuid": "00000000000000000000000000000005",
       "project_summary": "N-body simulations of galaxy formation and evolution.",
       "project_duration": 365,
-      "project_is_confidential": false,
-      "project_has_civilian_purpose": true,
       "oecd_fos_2007_code": "1.3"
     },
     {
@@ -1928,8 +2243,6 @@
       "created_by_uuid": "a4000000000000000000000000000006",
       "project_summary": "Direct numerical simulation of compressible turbulence at exascale to resolve the fine-scale energy cascade; awaiting the applicant's award response before provisioning.",
       "project_duration": 365,
-      "project_is_confidential": false,
-      "project_has_civilian_purpose": true,
       "oecd_fos_2007_code": "1.3"
     },
     {
@@ -1940,8 +2253,6 @@
       "created_by_uuid": "a4000000000000000000000000000007",
       "project_summary": "GPU-accelerated cryo-EM density map refinement; currently at technical assessment awaiting the responsible role to complete the required feasibility checklist.",
       "project_duration": 365,
-      "project_is_confidential": false,
-      "project_has_civilian_purpose": true,
       "oecd_fos_2007_code": "1.6"
     },
     {
@@ -1952,8 +2263,6 @@
       "created_by_uuid": "a4000000000000000000000000000008",
       "project_summary": "Design and simulation of a metropolitan-scale photonic quantum network; all evaluation steps complete, awaiting the allocation decision.",
       "project_duration": 365,
-      "project_is_confidential": false,
-      "project_has_civilian_purpose": true,
       "oecd_fos_2007_code": "1.3"
     },
     {
@@ -1964,8 +2273,6 @@
       "created_by_uuid": "a4000000000000000000000000000008",
       "project_summary": "High-fidelity gyrokinetic modeling of fusion plasma turbulence; technical assessment in progress with the feasibility checklist completed.",
       "project_duration": 365,
-      "project_is_confidential": false,
-      "project_has_civilian_purpose": true,
       "oecd_fos_2007_code": "1.3"
     }
   ],
@@ -2246,7 +2553,9 @@
       "limits": {
         "cpu_hours": 50000,
         "storage": 500
-      }
+      },
+      "created": "2026-01-15T00:00:00",
+      "end_date": "2027-01-14"
     },
     {
       "uuid": "d4000000000000000000000000000002",
@@ -2259,7 +2568,9 @@
       "limits": {
         "gpu_hours": 2000,
         "cpu_hours": 30000
-      }
+      },
+      "created": "2026-02-01T00:00:00",
+      "end_date": "2026-11-30"
     },
     {
       "uuid": "d4000000000000000000000000000003",
@@ -2271,7 +2582,9 @@
       "attributes": {},
       "limits": {
         "storage": 20
-      }
+      },
+      "created": "2026-03-10T00:00:00",
+      "end_date": "2027-03-09"
     },
     {
       "uuid": "d4000000000000000000000000000004",
@@ -2284,7 +2597,9 @@
       "limits": {
         "cpu_hours": 80000,
         "storage": 800
-      }
+      },
+      "created": "2026-04-01T00:00:00",
+      "end_date": "2026-09-30"
     },
     {
       "uuid": "d4000000000000000000000000000005",
@@ -2297,7 +2612,9 @@
       "limits": {
         "vcpu": 16,
         "ram": 64
-      }
+      },
+      "created": "2026-05-20T00:00:00",
+      "end_date": "2027-05-19"
     },
     {
       "uuid": "d4000000000000000000000000000006",
@@ -2309,7 +2626,9 @@
       "attributes": {},
       "limits": {
         "storage": 50
-      }
+      },
+      "created": "2026-06-01T00:00:00",
+      "end_date": "2026-12-31"
     },
     {
       "uuid": "d4000000000000000000000000000007",
@@ -2322,7 +2641,9 @@
       "limits": {
         "gpu_hours": 1000,
         "cpu_hours": 20000
-      }
+      },
+      "created": "2026-01-15T00:00:00",
+      "end_date": "2027-01-14"
     },
     {
       "uuid": "d4000000000000000000000000000008",
@@ -2335,7 +2656,9 @@
       "limits": {
         "cpu_hours": 60000,
         "storage": 400
-      }
+      },
+      "created": "2026-02-01T00:00:00",
+      "end_date": "2026-11-30"
     },
     {
       "uuid": "d4000000000000000000000000000009",
@@ -2348,7 +2671,9 @@
       "limits": {
         "gpu_hours": 3000,
         "cpu_hours": 25000
-      }
+      },
+      "created": "2026-03-10T00:00:00",
+      "end_date": "2027-03-09"
     },
     {
       "uuid": "d400000000000000000000000000000a",
@@ -2360,7 +2685,9 @@
       "attributes": {},
       "limits": {
         "storage": 30
-      }
+      },
+      "created": "2026-04-01T00:00:00",
+      "end_date": "2026-09-30"
     },
     {
       "uuid": "d400000000000000000000000000000b",
@@ -2373,7 +2700,9 @@
       "limits": {
         "vcpu": 8,
         "ram": 32
-      }
+      },
+      "created": "2026-05-20T00:00:00",
+      "end_date": "2027-05-19"
     },
     {
       "uuid": "d400000000000000000000000000000c",
@@ -2386,7 +2715,9 @@
       "limits": {
         "cpu_hours": 40000,
         "storage": 300
-      }
+      },
+      "created": "2026-06-01T00:00:00",
+      "end_date": "2026-12-31"
     },
     {
       "uuid": "d400000000000000000000000000000d",
@@ -2403,7 +2734,9 @@
         "cpu": 100000,
         "ram": 200000,
         "gpu": 2000
-      }
+      },
+      "created": "2026-01-15T00:00:00",
+      "end_date": "2027-01-14"
     },
     {
       "uuid": "d400000000000000000000000000000e",
@@ -2420,7 +2753,9 @@
         "cpu": 80000,
         "ram": 160000,
         "gpu": 1500
-      }
+      },
+      "created": "2026-02-01T00:00:00",
+      "end_date": "2026-11-30"
     },
     {
       "uuid": "d400000000000000000000000000000f",
@@ -2437,7 +2772,9 @@
         "cpu": 150000,
         "ram": 300000,
         "gpu": 500
-      }
+      },
+      "created": "2026-03-10T00:00:00",
+      "end_date": "2027-03-09"
     }
   ],
   "user_roles": [
@@ -2798,7 +3135,8 @@
     "SITE_NAME": "Research Grant Portal",
     "SITE_DESCRIPTION": "Competitive research grant management platform for proposal submission, peer review, and resource allocation.",
     "MARKETPLACE_LANDING_PAGE": "Research Computing Services",
-    "CURRENCY_NAME": "EUR"
+    "CURRENCY_NAME": "EUR",
+    "SERVICE_ACCESS_MODE": "both"
   },
   "expertise_categories": [
     {
@@ -4249,6 +4587,18 @@
       "call_uuid": "ca200000000000000000000000000002",
       "proposal_role": "PROPOSAL.MEMBER",
       "project_role": "PROJECT.MEMBER"
+    },
+    {
+      "uuid": "d1000000000000000000000000000005",
+      "call_uuid": "ca200000000000000000000000000005",
+      "proposal_role": "PROPOSAL.MANAGER",
+      "project_role": "PROJECT.MANAGER"
+    },
+    {
+      "uuid": "d1000000000000000000000000000006",
+      "call_uuid": "ca200000000000000000000000000005",
+      "proposal_role": "PROPOSAL.MEMBER",
+      "project_role": "PROJECT.MEMBER"
     }
   ],
   "call_workflow_steps": [
@@ -4315,6 +4665,19 @@
       "responsible_role": "applicant",
       "applicant_visible": true,
       "transition_mode": "automatic_on_completion"
+    },
+    {
+      "call_uuid": "ca200000000000000000000000000005",
+      "step": "allocation_decision",
+      "is_enabled": true,
+      "responsible_role": "call_manager",
+      "transition_mode": "manual",
+      "applicant_visible": true
+    },
+    {
+      "call_uuid": "ca200000000000000000000000000005",
+      "step": "administrative_check",
+      "is_enabled": false
     }
   ],
   "proposal_workflow_step_instances": [

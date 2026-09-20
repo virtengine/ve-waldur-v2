@@ -35,6 +35,7 @@ import json
 import logging
 from typing import NamedTuple
 
+from django.contrib.contenttypes.models import ContentType
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db.models import Q
 
@@ -179,8 +180,20 @@ def build_messages(
             if scope_keys
             else set()
         )
+        # Self-referential user scope: identity authorizes delivery — the
+        # consumer's owner IS the affected user (a role can never grant this).
+        # is_active is already enforced by the consumer queryset above.
+        identity_allowed_user_ids = set()
+        if scope_keys:
+            user_ct_id = _user_ct_id()
+            identity_allowed_user_ids = {
+                object_id for ct_id, object_id in scope_keys if ct_id == user_ct_id
+            }
         for consumer in bound:
-            if consumer.user_id not in allowed_user_ids:
+            if (
+                consumer.user_id not in allowed_user_ids
+                and consumer.user_id not in identity_allowed_user_ids
+            ):
                 consumers.pop(consumer.id, None)
 
     if not consumers:
@@ -213,6 +226,97 @@ def build_messages(
     return DispatchResult(messages, delivered_user_ids)
 
 
+_OBSERVABLE_OBJECT_TYPE_VALUES = frozenset(
+    member.value for member in ObservableObjectType
+)
+
+
+def delivery_blocked_reason(consumer) -> str | None:
+    """Why nothing at all can reach this consumer, or None if something can.
+
+    Kept next to :func:`build_messages` so the two cannot drift: the ladder
+    below walks the drop conditions in the order the dispatcher applies them —
+    the candidate querysets (``user__is_active``, ``queue_created``, a non-empty
+    ``rmq_username``), the staff/support bypass, the global-consumer
+    staff/support filter, and finally the batched role re-check.
+
+    The last rung is deliberately WIDER than dispatch: it asks whether the owner
+    holds a role anywhere in the chain of *any* binding, rather than against one
+    event's scope-keys. So an empty answer means "something is being delivered",
+    not "everything is".
+
+    It is the standalone registration guard (``holds_any_role_on_scope_or_ancestor``,
+    which the serializer applies), NOT the site-agent one: ``register_queue``
+    also admits an identity manager, who holds no role on the offering at all.
+    Such a consumer is reported blocked here — correctly, since dispatch drops
+    it too — which is why the message says the owner holds no role rather than
+    that they lost one.
+
+    ``object_types`` is only half-modelled, and deliberately so. Dispatch drops
+    a message per event when the type is outside the allow-list; whether a given
+    consumer will ever see a matching event cannot be decided from the row. What
+    *can* be decided is an allow-list none of whose entries is a live
+    :class:`ObservableObjectType` — a type that was renamed or removed out from
+    under a stored row — which matches nothing by construction.
+    """
+    user = consumer.user
+    if not user.is_active:
+        return "Owner account is deactivated."
+    if not consumer.queue_created:
+        return "Queue is not provisioned in RabbitMQ."
+    if not consumer.rmq_username:
+        return "Consumer has no RabbitMQ credential."
+    # Before the staff/support bypass: a dead type filter drops the message
+    # after authorization, so privilege does not rescue it.
+    if consumer.object_types and not any(
+        object_type in _OBSERVABLE_OBJECT_TYPE_VALUES
+        for object_type in consumer.object_types
+    ):
+        return (
+            "None of the object types this consumer filters on still exists, "
+            "so every event is dropped by the filter."
+        )
+    if user.is_staff or user.is_support:
+        return None
+
+    scopes = list(consumer.scopes.all())
+    if not scopes:
+        return (
+            "Owner is no longer staff/support, so this global consumer "
+            "receives nothing."
+        )
+
+    # Self-referential user bindings are authorized by identity, not by a role,
+    # exactly as in build_messages. Everything else contributes its scope chain
+    # to ONE role query, rather than a query per binding.
+    user_ct_id = _user_ct_id()
+    role_keys = set()
+    resolvable = False
+    for binding in scopes:
+        if binding.content_type_id == user_ct_id:
+            if binding.object_id == user.id:
+                return None
+            # Someone else's identity: no role can ever authorize it, so it
+            # contributes no scope keys — but it IS a live binding, and leaving
+            # it out of `resolvable` would report a consumer bound only to other
+            # users (a staff registration whose owner was later demoted) as
+            # pointing at rows that no longer exist.
+            resolvable = True
+            continue
+        scope = binding.scope
+        if scope is not None:
+            resolvable = True
+            role_keys.update(permission_utils.scope_keys_for(scope))
+    if not resolvable:
+        # Every binding is a dangling GenericFK — the bound project/offering row
+        # was deleted. Distinct from a role problem: the fix is to re-register,
+        # not to restore a role.
+        return "The entities this consumer is bound to no longer exist."
+    if permission_utils.users_with_role_on_any_scope_key({user.id}, role_keys):
+        return None
+    return "Owner holds no role on any scope this consumer is bound to."
+
+
 def dispatch_global_event(
     payload_builder,
     object_type: ObservableObjectType,
@@ -221,6 +325,39 @@ def dispatch_global_event(
     """Fire-and-forget delivery of a user-centric event to global consumers."""
     result = build_messages(
         [], payload_builder, object_type, event_type, include_global=True
+    )
+    if result.messages:
+        logging_tasks.publish_messages.delay(result.messages)
+
+
+def _user_ct_id() -> int:
+    # Lazy import: this module deliberately keeps its import surface minimal
+    # (see the module docstring); ContentType.get_for_model is cached.
+    from waldur_core.core.models import User
+
+    return ContentType.objects.get_for_model(User).id
+
+
+def dispatch_user_event(
+    affected_user,
+    payload_builder,
+    object_type: ObservableObjectType,
+    event_type: str | None = None,
+) -> None:
+    """Deliver a user-centric event to global consumers AND to the affected
+    user's self-bound consumers (the self-referential ``user`` scope).
+
+    Global consumers keep receiving everything exactly as with
+    ``dispatch_global_event``; the ``(user_ct, user_id)`` scope-key
+    additionally matches consumers bound to the affected user, authorized by
+    identity rather than by role in ``build_messages``.
+    """
+    result = build_messages(
+        [(_user_ct_id(), affected_user.id)],
+        payload_builder,
+        object_type,
+        event_type,
+        include_global=True,
     )
     if result.messages:
         logging_tasks.publish_messages.delay(result.messages)
@@ -257,7 +394,8 @@ def emit_user_profile(sender, instance, created=False, **kwargs):
             changed[field] = [old_value, new_value]
     if not changed:
         return
-    dispatch_global_event(
+    dispatch_user_event(
+        instance,
         lambda: {
             "user_uuid": _hex(instance.uuid),
             "user_username": instance.username,
@@ -280,7 +418,8 @@ def emit_user_lifecycle(sender, instance, created=False, **kwargs):
         if not old or old.get("is_active") == instance.is_active:
             return
         action = "activated" if instance.is_active else "deactivated"
-    dispatch_global_event(
+    dispatch_user_event(
+        instance,
         lambda: {
             "user_uuid": _hex(instance.uuid),
             "user_username": instance.username,
@@ -297,7 +436,8 @@ def emit_user_lifecycle(sender, instance, created=False, **kwargs):
 def emit_user_lifecycle_delete(sender, instance, **kwargs):
     if get_skip_side_effects():
         return
-    dispatch_global_event(
+    dispatch_user_event(
+        instance,
         lambda: {
             "user_uuid": _hex(instance.uuid),
             "user_username": instance.username,
@@ -326,7 +466,8 @@ def emit_user_ssh_key_save(sender, instance, created=False, **kwargs):
     if get_skip_side_effects():
         return
     action = "added" if created else "updated"
-    dispatch_global_event(
+    dispatch_user_event(
+        instance.user,
         lambda: _ssh_key_payload(instance, action),
         ObservableObjectType.USER_SSH_KEY,
         event_type=f"ssh_key_{action}",
@@ -336,7 +477,8 @@ def emit_user_ssh_key_save(sender, instance, created=False, **kwargs):
 def emit_user_ssh_key_delete(sender, instance, **kwargs):
     if get_skip_side_effects():
         return
-    dispatch_global_event(
+    dispatch_user_event(
+        instance.user,
         lambda: _ssh_key_payload(instance, "removed"),
         ObservableObjectType.USER_SSH_KEY,
         event_type="ssh_key_removed",
@@ -362,7 +504,8 @@ def _build_role_payload(permission, granted):
 def _dispatch_role_change(permission, granted):
     if get_skip_side_effects():
         return
-    dispatch_global_event(
+    dispatch_user_event(
+        permission.user,
         lambda: _build_role_payload(permission, granted),
         ObservableObjectType.USER_ROLE,
         event_type="role_granted" if granted else "role_revoked",

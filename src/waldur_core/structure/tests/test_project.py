@@ -115,6 +115,107 @@ class ProjectUpdateDeleteTest(test.APITestCase):
         self.assertTrue(Project.objects.filter(pk=pk).exists())
 
 
+class ProjectEndDatePermissionTest(test.APITestCase):
+    """Who may change Project.end_date through the project endpoint.
+
+    Setting a date has always required DELETE_PROJECT on the customer;
+    clearing one used to require nothing beyond the ability to update the
+    project at all.
+    """
+
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+
+    def test_user_without_delete_permission_cannot_clear_end_date(self):
+        """Removing an expiry must not be easier than setting one.
+
+        The permission check used to test the submitted value for truthiness, so
+        an explicit null slipped through unguarded and anyone able to update the
+        project could keep it alive indefinitely.
+        """
+        ProjectRole.MANAGER.add_permission(PermissionEnum.UPDATE_PROJECT)
+        self.addCleanup(
+            lambda: ProjectRole.MANAGER.delete_permission(PermissionEnum.UPDATE_PROJECT)
+        )
+        project = self.fixture.project
+        project.end_date = timezone.now().date() + timedelta(days=90)
+        project.save()
+
+        self.client.force_authenticate(self.fixture.manager)
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(project), {"end_date": None}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        project.refresh_from_db()
+        self.assertIsNotNone(project.end_date)
+
+    def test_user_without_delete_permission_cannot_set_end_date(self):
+        ProjectRole.MANAGER.add_permission(PermissionEnum.UPDATE_PROJECT)
+        self.addCleanup(
+            lambda: ProjectRole.MANAGER.delete_permission(PermissionEnum.UPDATE_PROJECT)
+        )
+        project = self.fixture.project
+
+        self.client.force_authenticate(self.fixture.manager)
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(project),
+            {"end_date": (timezone.now().date() + timedelta(days=90)).isoformat()},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        project.refresh_from_db()
+        self.assertIsNone(project.end_date)
+
+    def test_user_with_delete_permission_can_clear_end_date(self):
+        CustomerRole.OWNER.add_permission(PermissionEnum.UPDATE_PROJECT)
+        CustomerRole.OWNER.add_permission(PermissionEnum.DELETE_PROJECT)
+        self.addCleanup(
+            lambda: CustomerRole.OWNER.delete_permission(PermissionEnum.UPDATE_PROJECT)
+        )
+        self.addCleanup(
+            lambda: CustomerRole.OWNER.delete_permission(PermissionEnum.DELETE_PROJECT)
+        )
+        project = self.fixture.project
+        project.end_date = timezone.now().date() + timedelta(days=90)
+        project.save()
+
+        self.client.force_authenticate(self.fixture.owner)
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(project), {"end_date": None}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        project.refresh_from_db()
+        self.assertIsNone(project.end_date)
+
+    def test_resubmitting_the_same_end_date_is_not_blocked(self):
+        """A partial update that echoes the current value changes nothing.
+
+        Unrelated PATCHes that round-trip the whole object must not start
+        failing just because they carry the end date they already had.
+        """
+        ProjectRole.MANAGER.add_permission(PermissionEnum.UPDATE_PROJECT)
+        self.addCleanup(
+            lambda: ProjectRole.MANAGER.delete_permission(PermissionEnum.UPDATE_PROJECT)
+        )
+        end_date = timezone.now().date() + timedelta(days=90)
+        project = self.fixture.project
+        project.end_date = end_date
+        project.save()
+
+        self.client.force_authenticate(self.fixture.manager)
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(project),
+            {"end_date": end_date.isoformat(), "description": "unrelated edit"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        project.refresh_from_db()
+        self.assertEqual(project.end_date, end_date)
+        self.assertEqual(project.description, "unrelated edit")
+
+
 @ddt
 class ProjectCreateTest(test.APITestCase):
     def setUp(self):
@@ -1402,20 +1503,23 @@ class ProjectRecoveryTest(test.APITestCase):
         )
         self.assertEqual(response1.status_code, status.HTTP_200_OK)
 
-        # Soft delete and recover again
+        # Soft delete cancels open invitations. Refresh so soft-delete does not
+        # overwrite termination_metadata (incl. invitation_sent) with a stale
+        # in-memory copy from setUp.
+        self.project.refresh_from_db()
         self.project.delete()
         response2 = self.client.post(
             self.url, {"send_invitations_to_previous_members": True}
         )
         self.assertEqual(response2.status_code, status.HTTP_200_OK)
 
-        # Should not create duplicate invitations
+        # invitation_sent in termination_metadata prevents a second batch
         project_ct = ContentType.objects.get_for_model(self.project)
         invitations = Invitation.objects.filter(
             content_type=project_ct, object_id=self.project.id
         )
-        # Should still be 2 invitations, not 4
         self.assertEqual(invitations.count(), 2)
+        self.assertEqual(invitations.filter(state=InvitationState.CANCELED).count(), 2)
 
     def test_legacy_project_basic_recovery_works(self):
         """Test recovery of project that was deleted before termination metadata feature."""

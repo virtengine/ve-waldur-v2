@@ -13,6 +13,8 @@ LANGUAGE_CHOICES = [
     "nb",
     "ar",
     "cs",
+    "hr",
+    "km",
 ]
 
 SCRIPT_RUN_MODE_CHOICES = [
@@ -47,6 +49,11 @@ MARKETPLACE_CARD_STYLE_CHOICES = [
     ("minimal", "Minimal"),
 ]
 
+OPENPORTAL_MEMBERSHIP_SYNC_MODE_CHOICES = [
+    ("invitation", "Invite the user and wait for them to accept"),
+    ("direct", "Add the user to the project immediately"),
+]
+
 LOGIN_PAGE_LAYOUT_CHOICES = [
     ("split-screen", "Split-screen"),
     ("centered-card", "Centered-card"),
@@ -75,6 +82,7 @@ LOGIN_PAGE_LAYOUT_CHOICES = [
 ]
 
 SUPPORT_BACKEND_CHOICES = [
+    ("basic", "Basic"),
     ("atlassian", "Atlassian"),
     ("zammad", "Zammad"),
     ("smax", "SMAX"),
@@ -100,6 +108,14 @@ OFFERING_VISIBILITY_CHOICES = [
     ("show_restricted_disabled", "Show all but mark inaccessible as disabled"),
     ("hide_inaccessible", "Hide offerings user cannot access"),
     ("require_membership", "Hide all unless user belongs to an organization/project"),
+]
+
+# How an applicant reaches services. Governs navigation and entry points only;
+# the API keeps serving everything in every mode.
+SERVICE_ACCESS_MODE_CHOICES = [
+    ("calls", "Calls only"),
+    ("marketplace", "Marketplace only"),
+    ("both", "Marketplace and calls"),
 ]
 
 AI_ASSISTANT_ENABLED_ROLES_CHOICES = [
@@ -159,8 +175,14 @@ OFFERING_TYPE_CHOICES = [
     ("VMware.VirtualMachine", "VMware Virtual Machine"),
     ("Waldur.RemoteOffering", "Remote Offering"),
     ("Marketplace.Script", "Script"),
-    ("SlurmInvoices.SlurmPackage", "SLURM Package"),
     ("Marketplace.Slurm", "Site Agent"),
+]
+
+PROPOSAL_CONFIGURABLE_FIELD_CHOICES = [
+    ("project_summary", "Summary"),
+    ("description", "Description"),
+    ("science_sub_domain", "Science domain"),
+    ("supporting_documentation", "Supporting documentation"),
 ]
 
 USER_ATTRIBUTE_CHOICES = [
@@ -195,6 +217,13 @@ USER_ATTRIBUTE_CHOICES = [
     ("primary_gid", "Primary GID"),
 ]
 
+# Keep in sync with waldur_core.users.scim.server.matching.IDENTIFYING_ATTRIBUTES.
+SCIM_USER_MATCH_ATTRIBUTE_CHOICES = [
+    ("username", "Username"),
+    ("email", "Email"),
+    ("civil_number", "Civil number"),
+]
+
 REPORTING_SCREEN_CHOICES = [
     # Resources
     ("resource-usage", "Resources: Usage"),
@@ -209,6 +238,10 @@ REPORTING_SCREEN_CHOICES = [
     ("usage-by-customer", "Resources: Usage by customer"),
     ("usage-by-org-type", "Resources: Usage by organization type"),
     ("usage-by-creator", "Resources: Usage by creator"),
+    (
+        "projects-by-affiliated-organization",
+        "Resources: Projects by affiliated organization",
+    ),
     # Proposals
     ("call-performance", "Proposals: Call performance"),
     ("review-progress", "Proposals: Review progress"),
@@ -252,6 +285,17 @@ CONSTANCE_ADDITIONAL_FIELDS = {
     "color_field": ["django.forms.CharField", {"required": False}],
     "html_field": ["django.forms.CharField", {"required": False}],
     "text_field": ["django.forms.CharField", {"required": False}],
+    # String setting that must not be blanked out - an empty value would change
+    # the meaning of the setting rather than just unset it.
+    "non_empty_field": ["django.forms.CharField", {"required": True}],
+    # Three to five capital latin letters. Validated here as well as in the
+    # settings serializer: the Django admin builds its form straight from this
+    # table and never reaches DRF, so a serializer-only rule let an admin store
+    # a prefix with a space or a newline in it.
+    "issue_key_prefix_field": [
+        "django.forms.RegexField",
+        {"regex": r"^[A-Z]{3,5}$", "required": True, "strip": True},
+    ],
     "url_field": ["django.forms.URLField", {"required": False}],
     "secret_field": ["django.forms.CharField", {"required": False}],
     "dict_field": ["waldur_core.core.serializers.DictField", {"required": False}],
@@ -283,10 +327,13 @@ CONSTANCE_CONFIG_CHOICES = {
     "LOGIN_PAGE_LAYOUT": LOGIN_PAGE_LAYOUT_CHOICES,
     "MARKETPLACE_LAYOUT_MODE": MARKETPLACE_LAYOUT_MODE_CHOICES,
     "MARKETPLACE_CARD_STYLE": MARKETPLACE_CARD_STYLE_CHOICES,
+    "OPENPORTAL_MEMBERSHIP_SYNC_MODE": OPENPORTAL_MEMBERSHIP_SYNC_MODE_CHOICES,
     "WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE": SUPPORT_BACKEND_CHOICES,
     "ZAMMAD_ARTICLE_TYPE": ZAMMAD_ARTICLE_TYPE_CHOICES,
     "DEFAULT_OFFERING_USER_ATTRIBUTES": USER_ATTRIBUTE_CHOICES,
     "DEFAULT_CALL_USER_ATTRIBUTES": USER_ATTRIBUTE_CHOICES,
+    "DEFAULT_PROPOSAL_REQUIRED_FIELDS": PROPOSAL_CONFIGURABLE_FIELD_CHOICES,
+    "DEFAULT_PROPOSAL_HIDDEN_FIELDS": PROPOSAL_CONFIGURABLE_FIELD_CHOICES,
     "INVITATION_ALLOWED_FIELDS": USER_ATTRIBUTE_CHOICES,
     "ENABLED_USER_PROFILE_ATTRIBUTES": USER_ATTRIBUTE_CHOICES,
     "MANDATORY_USER_ATTRIBUTES": USER_ATTRIBUTE_CHOICES,
@@ -297,7 +344,9 @@ CONSTANCE_CONFIG_CHOICES = {
     "FEDERATED_IDENTITY_LOCKED_FIELDS": USER_ATTRIBUTE_CHOICES,
     "FEDERATED_IDENTITY_DEACTIVATION_POLICY": DEACTIVATION_POLICY_CHOICES,
     "SCIM_INBOUND_ALLOWED_ATTRIBUTES": USER_ATTRIBUTE_CHOICES,
+    "SCIM_USER_MATCH_WALDUR_ATTRIBUTE": SCIM_USER_MATCH_ATTRIBUTE_CHOICES,
     "RESTRICTED_OFFERING_VISIBILITY_MODE": OFFERING_VISIBILITY_CHOICES,
+    "SERVICE_ACCESS_MODE": SERVICE_ACCESS_MODE_CHOICES,
     "SSH_KEY_ALLOWED_TYPES": SSH_KEY_TYPE_CHOICES,
     "ENABLED_REPORTING_SCREENS": REPORTING_SCREEN_CHOICES,
     "AI_ASSISTANT_ENABLED_ROLES": AI_ASSISTANT_ENABLED_ROLES_CHOICES,
@@ -357,6 +406,30 @@ CONSTANCE_CONFIG = {
         "'show_restricted_disabled': Show all but mark inaccessible as disabled. "
         "'hide_inaccessible': Hide offerings user cannot access. "
         "'require_membership': Hide all unless user belongs to an organization/project.",
+        "choice_field",
+    ),
+    "SERVICE_ACCESS_MODE": (
+        "both",
+        "How users reach services. "
+        "'calls': only through calls for proposals, no marketplace navigation. "
+        "'marketplace': the marketplace is the single entry point; calls are "
+        "reached through an offering and proposals are tracked in the user "
+        "profile. "
+        "'both': marketplace and calls are browsable independently. "
+        "Navigation only — the API serves the same data in every mode.",
+        "choice_field",
+    ),
+    "OPENPORTAL_MEMBERSHIP_SYNC_MODE": (
+        "invitation",
+        "How to add a user to a project when an OpenPortal award lists them as "
+        "a member. "
+        "'invitation': create a pending invitation, so the user accepts, agrees "
+        "to the terms and is provisioned locally before gaining access. "
+        "'direct': create the account if it does not exist and grant the role "
+        "immediately. "
+        "A pending invitation is reported back to the allocating portal as a "
+        "member either way, so the award reaches a consistent state without "
+        "waiting for the user to act.",
         "choice_field",
     ),
     "ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT": (
@@ -456,7 +529,7 @@ CONSTANCE_CONFIG = {
     ),
     "INVITATION_DISABLE_MULTIPLE_ROLES": (
         False,
-        "Do not allow user to accept multiple roles within the same scope (project or organization) using invitation. When enabled, users can still accept invitations to different scopes but cannot have multiple roles in the same scope.",
+        "Do not allow a user to hold multiple roles within the same scope (project or organization). Applies to invitations, permission requests and direct role assignment. When enabled, users can still get roles in different scopes but cannot have multiple roles in the same scope.",
     ),
     "ONLY_ONE_PROJECT_MANAGER": (
         False,
@@ -641,6 +714,13 @@ CONSTANCE_CONFIG = {
         True,
         "Toggler for request type displaying",
     ),
+    "WALDUR_SUPPORT_ISSUE_KEY_PREFIX": (
+        "WLD",
+        "Prefix of ticket keys created by the built-in service desk, "
+        "e.g. WLD in WLD-A1B2C3D4. Three to five capital latin letters. "
+        "Keys of existing tickets are not rewritten.",
+        "issue_key_prefix_field",
+    ),
     "WALDUR_SUPPORT_PROVIDER_ROUTING_ENABLED": (
         False,
         "Enable automatic routing of tickets to provider helpdesks.",
@@ -691,6 +771,12 @@ CONSTANCE_CONFIG = {
         "secret_field",
     ),
     "ATLASSIAN_OAUTH2_CLIENT_ID": ("", "OAuth 2.0 Client ID", "secret_field"),
+    "ATLASSIAN_OAUTH2_CLIENT_SECRET": (
+        "",
+        "OAuth 2.0 Client Secret. With the client ID set, Waldur obtains and renews "
+        "access tokens itself (client credentials grant).",
+        "secret_field",
+    ),
     "ATLASSIAN_OAUTH2_ACCESS_TOKEN": ("", "OAuth 2.0 Access Token", "secret_field"),
     "ATLASSIAN_OAUTH2_TOKEN_TYPE": ("Bearer", "OAuth 2.0 Token Type"),
     "ATLASSIAN_VERIFY_SSL": (
@@ -712,7 +798,7 @@ CONSTANCE_CONFIG = {
     ),
     "ATLASSIAN_EXCLUDED_ATTACHMENT_TYPES": (
         "",
-        "Comma-separated list of file extenstions not allowed for attachment.",
+        "Comma-separated list of file extensions not allowed for attachment.",
     ),
     "ATLASSIAN_DESCRIPTION_TEMPLATE": ("", "Template for issue description"),
     "ATLASSIAN_SUMMARY_TEMPLATE": ("", "Template for issue summary"),
@@ -931,11 +1017,15 @@ CONSTANCE_CONFIG = {
     ),
     "FREEIPA_USERNAME_PREFIX": (
         "waldur_",
-        "Prefix to be appended to all usernames created in FreeIPA by Waldur",
+        "Prefix to be appended to all usernames created in FreeIPA by Waldur. "
+        "It marks which accounts are managed by Waldur, so it may not be empty.",
+        "non_empty_field",
     ),
     "FREEIPA_GROUPNAME_PREFIX": (
         "waldur_",
-        "Prefix to be appended to all group names created in FreeIPA by Waldur",
+        "Prefix to be appended to all group names created in FreeIPA by Waldur. "
+        "It marks which groups are managed by Waldur, so it may not be empty.",
+        "non_empty_field",
     ),
     "FREEIPA_BLACKLISTED_USERNAMES": (
         ["root"],
@@ -974,6 +1064,31 @@ CONSTANCE_CONFIG = {
         "attribute of the Waldur User extension. When enabled, SCIM is authoritative: "
         "a full-replace (PUT / PATCH replace) that omits a key deletes it, including "
         "keys the user added via the UI. Off by default because SSH keys grant access.",
+    ),
+    "SCIM_USER_MATCH_WALDUR_ATTRIBUTE": (
+        "username",
+        "Waldur user attribute that links an inbound SCIM user to an existing "
+        "account. Must be username or an enabled identifying attribute. With "
+        "username, new accounts are named after the matched value.",
+        "choice_field",
+    ),
+    "SCIM_USER_MATCH_SCIM_ATTRIBUTE": (
+        "userName",
+        "SCIM attribute holding the value matched against "
+        "SCIM_USER_MATCH_WALDUR_ATTRIBUTE, e.g. userName, emails, or an extension "
+        "path such as urn:mace:surf.nl:sram:scim:extension:User.eduPersonUniqueId.",
+    ),
+    "SRAM_INTEGRATION_ENABLED": (
+        False,
+        "Accept SCIM provisioning from SURF Research Access Management (SRAM) at "
+        "/scim/v2/sram/. Also requires SCIM_INBOUND_ENABLED and a staff service-account "
+        "token registered as the service's SCIM bearer token in SRAM.",
+    ),
+    "SRAM_PLACEHOLDER_ROLE_TEMPLATE": (
+        "",
+        "Name of the organization role whose permissions SRAM placeholder roles "
+        "copy. Empty gives placeholders no permissions. Placeholders are refreshed "
+        "on the next push or by 'waldur sram_resync'.",
     ),
     "SCIM_PULL_API_URL": (
         "",
@@ -1068,6 +1183,13 @@ CONSTANCE_CONFIG = {
         "Seconds to cache successful token introspection results. Reduces load on the introspection endpoint. "
         "Set to 0 to disable caching. Default: 300 (5 minutes).",
     ),
+    "OIDC_REGISTRATION_METHOD": (
+        "oidc",
+        "Value stored in User.registration_method for accounts created or adopted "
+        "via Bearer token introspection (OIDCAuthentication). Set to the social "
+        "IdP provider slug (e.g. 'eduteams') when introspection and OAuth share "
+        "the same identity provider so IdentityProvider.protected_fields apply.",
+    ),
     "OIDC_ACCESS_TOKEN_ENABLED": (
         False,
         "If true, OIDC complete view returns access token instead of Waldur token",
@@ -1082,6 +1204,29 @@ CONSTANCE_CONFIG = {
         "URLs are rendered as clickable links; include the scheme "
         "(e.g. https://example.com) so bare URLs are linked.",
         "text_field",
+    ),
+    "OIDC_BLOCKED_LOGIN_RESPONSE_MESSAGE": (
+        "Access to this deployment is restricted.",
+        "The message to show when an existing account is refused at login because its email "
+        "no longer matches OIDC_ALLOWED_USER_EMAIL_PATTERNS. Kept separate from the account "
+        "creation message so a long-standing user is not told their account cannot be created. "
+        "URLs are rendered as clickable links; include the scheme "
+        "(e.g. https://example.com) so bare URLs are linked.",
+        "text_field",
+    ),
+    "OIDC_ALLOWED_USER_EMAIL_PATTERNS": (
+        [],
+        "Comma-separated list of regular expressions matched against the user email, "
+        "e.g. '.*@example\\.com'. Only has an effect when OIDC_BLOCK_CREATION_OF_UNINVITED_USERS is enabled. "
+        "When non-empty, a user whose email matches any of the patterns may sign up without an invitation, "
+        "and existing users must keep matching in order to log in - except staff and support users, "
+        "users holding at least one unexpired role, users with a pending invitation and users matching "
+        "an autoprovisioning rule, which are always allowed. Only interactive logins are gated; "
+        "background identity synchronisation is not. "
+        "Patterns must match the whole email and are case-insensitive. "
+        "Note: values are split on commas, so a pattern cannot contain a comma - "
+        "'{n,m}' quantifiers are not supported, repeat the expression instead.",
+        "list_field",
     ),
     "OIDC_MATCHMAKING_BY_EMAIL": (
         False,
@@ -1120,6 +1265,18 @@ CONSTANCE_CONFIG = {
     "DEFAULT_CALL_USER_ATTRIBUTES": (
         ["username", "full_name", "email"],
         "Default applicant attributes exposed to call reviewers when no explicit CallApplicantVisibilityConfig exists.",
+        "multiple_choice_field",
+    ),
+    "DEFAULT_PROPOSAL_REQUIRED_FIELDS": (
+        ["project_summary"],
+        "Project details fields a new call requires by default. Applied when the "
+        "call is created; changing this never alters an existing call.",
+        "multiple_choice_field",
+    ),
+    "DEFAULT_PROPOSAL_HIDDEN_FIELDS": (
+        [],
+        "Project details fields a new call does not ask for at all. Applied when "
+        "the call is created; changing this never alters an existing call.",
         "multiple_choice_field",
     ),
     "INVITATION_ALLOWED_FIELDS": (
@@ -1447,6 +1604,18 @@ CONSTANCE_CONFIG = {
         1048576,
         "Minimum table size in bytes (default 1MB) to monitor. Smaller tables are ignored.",
     ),
+    # User Revision History
+    "USER_REVISION_RETENTION_DAYS": (
+        730,
+        "Delete user profile revision history older than this many days. "
+        "Set to 0 to keep it forever.",
+    ),
+    "USER_REVISION_KEEP_MINIMUM": (
+        20,
+        "Always keep at least this many most recent revisions per user, however "
+        "old they are. Must be above 0, otherwise pruning can erase a user's "
+        "history entirely.",
+    ),
     # User Actions Configuration
     "USER_ACTIONS_ENABLED": (
         False,
@@ -1660,7 +1829,7 @@ CONSTANCE_CONFIG = {
     ),
     "MATRIX_LIVEKIT_KEY": (
         "",
-        "LiveKit API key for the Element Call SFU (Calls observability tab).",
+        "LiveKit API key for the call SFU (Calls observability tab).",
     ),
     "MATRIX_LIVEKIT_SECRET": (
         "",
@@ -1690,6 +1859,17 @@ CONSTANCE_CONFIG = {
         20,
         "Maximum number of active PATs per user.",
     ),
+    "PAT_MAX_ACL_ENTRIES": (
+        20,
+        "Maximum number of network ACL entries per personal access token.",
+    ),
+    "PAT_MAX_AUDIT_EVENTS_PER_HOUR": (
+        50,
+        "Maximum audit events a single personal access token may generate per "
+        "hour, counted separately for source-address changes and for "
+        "rejections. Bounds the event table against a caller who holds one "
+        "valid token and rotates source addresses.",
+    ),
 }
 
 CONSTANCE_CONFIG_FIELDSETS = {
@@ -1716,6 +1896,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "ANONYMOUS_USER_CAN_VIEW_OFFERINGS",
         "ANONYMOUS_USER_CAN_VIEW_PLANS",
         "RESTRICTED_OFFERING_VISIBILITY_MODE",
+        "SERVICE_ACCESS_MODE",
         "SHOW_OFFERING_COVER_IMAGE",
         "ENABLE_MARKDOWN_IMAGE_UPLOAD",
         "ENFORCE_USER_CONSENT_FOR_OFFERINGS",
@@ -1744,6 +1925,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "AFFILIATION_REQUIRED_AT_PROJECT_CREATION",
         "PROJECT_NAME_REGEX",
         "PROJECT_NAME_REGEX_ERROR_MESSAGE",
+        "OPENPORTAL_MEMBERSHIP_SYNC_MODE",
     ),
     "Telemetry": (
         "TELEMETRY_URL",
@@ -1807,6 +1989,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "WALDUR_SUPPORT_ENABLED",
         "WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE",
         "WALDUR_SUPPORT_DISPLAY_REQUEST_TYPE",
+        "WALDUR_SUPPORT_ISSUE_KEY_PREFIX",
         "WALDUR_SUPPORT_PROVIDER_ROUTING_ENABLED",
         "WALDUR_SUPPORT_AUTO_ASSIGN",
         "WALDUR_SUPPORT_AUTO_ASSIGN_STRATEGY",
@@ -1822,6 +2005,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "ATLASSIAN_TOKEN",
         "ATLASSIAN_PERSONAL_ACCESS_TOKEN",
         "ATLASSIAN_OAUTH2_CLIENT_ID",
+        "ATLASSIAN_OAUTH2_CLIENT_SECRET",
         "ATLASSIAN_OAUTH2_ACCESS_TOKEN",
         "ATLASSIAN_OAUTH2_TOKEN_TYPE",
         "ATLASSIAN_PROJECT_ID",
@@ -1877,6 +2061,8 @@ CONSTANCE_CONFIG_FIELDSETS = {
     ),
     "Proposal settings": (
         "PROPOSAL_REVIEW_DURATION",
+        "DEFAULT_PROPOSAL_REQUIRED_FIELDS",
+        "DEFAULT_PROPOSAL_HIDDEN_FIELDS",
         "REVIEWER_PROFILES_ENABLED",
         "COI_DETECTION_ENABLED",
         "COI_DISCLOSURE_REQUIRED",
@@ -1905,6 +2091,8 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "DEACTIVATE_USER_IF_NO_ROLES",
         "OIDC_BLOCK_CREATION_OF_UNINVITED_USERS",
         "OIDC_BLOCK_CREATION_OF_UNINVITED_USERS_RESPONSE_MESSAGE",
+        "OIDC_ALLOWED_USER_EMAIL_PATTERNS",
+        "OIDC_BLOCKED_LOGIN_RESPONSE_MESSAGE",
         "OIDC_MATCHMAKING_BY_EMAIL",
         "OIDC_ACCESS_TOKEN_ENABLED",
         "REMOTE_EDUTEAMS_REFRESH_TOKEN",
@@ -1949,6 +2137,10 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "SCIM_INBOUND_SOURCE_NAME",
         "SCIM_INBOUND_ALLOWED_ATTRIBUTES",
         "SCIM_INBOUND_SSH_KEYS_ENABLED",
+        "SCIM_USER_MATCH_WALDUR_ATTRIBUTE",
+        "SCIM_USER_MATCH_SCIM_ATTRIBUTE",
+        "SRAM_INTEGRATION_ENABLED",
+        "SRAM_PLACEHOLDER_ROLE_TEMPLATE",
         "SCIM_PULL_API_URL",
         "SCIM_PULL_API_KEY",
         "SCIM_PULL_SOURCE_NAME",
@@ -1960,6 +2152,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "OIDC_CLIENT_SECRET",
         "OIDC_USER_FIELD",
         "OIDC_CACHE_TIMEOUT",
+        "OIDC_REGISTRATION_METHOD",
         "OIDC_DEFAULT_LOGOUT_URL",
         "WALDUR_AUTH_SOCIAL_ROLE_CLAIM",
     ),
@@ -2038,6 +2231,10 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "TABLE_GROWTH_RETENTION_DAYS",
         "TABLE_GROWTH_MIN_SIZE_BYTES",
     ),
+    "User Revision History": (
+        "USER_REVISION_RETENTION_DAYS",
+        "USER_REVISION_KEEP_MINIMUM",
+    ),
     "User Actions": (
         "USER_ACTIONS_ENABLED",
         "USER_ACTIONS_PENDING_ORDER_HOURS",
@@ -2093,6 +2290,8 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "PAT_ENABLED",
         "PAT_MAX_LIFETIME_DAYS",
         "PAT_MAX_TOKENS_PER_USER",
+        "PAT_MAX_ACL_ENTRIES",
+        "PAT_MAX_AUDIT_EVENTS_PER_HOUR",
     ),
     "Site Agent Logs": ("SITE_AGENT_LOG_MAX_ROWS_PER_IDENTITY",),
 }
@@ -2109,6 +2308,7 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "SHOW_OFFERING_COVER_IMAGE",
     "ENABLE_MARKDOWN_IMAGE_UPLOAD",
     "RESTRICTED_OFFERING_VISIBILITY_MODE",
+    "SERVICE_ACCESS_MODE",
     "DOCS_URL",
     "SHORT_PAGE_TITLE",
     "FULL_PAGE_TITLE",
@@ -2153,6 +2353,7 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "AI_ASSISTANT_NAME",
     "MATRIX_ENABLED",
     "AFFILIATES_ENABLED",
+    "SRAM_INTEGRATION_ENABLED",
     # Support plugin
     "WALDUR_SUPPORT_ENABLED",
     "WALDUR_SUPPORT_DISPLAY_REQUEST_TYPE",
@@ -2191,4 +2392,5 @@ PUBLIC_CONSTANCE_SETTINGS = (
     # Personal Access Tokens
     "PAT_ENABLED",
     "ONLY_ONE_PROJECT_MANAGER",
+    "INVITATION_DISABLE_MULTIPLE_ROLES",
 )

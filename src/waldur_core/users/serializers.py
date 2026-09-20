@@ -15,6 +15,7 @@ from waldur_core.permissions.utils import (
     check_grant_policy,
     get_valid_models,
     validate_only_one_project_manager,
+    validate_scope_available,
 )
 from waldur_core.structure.models import Customer, Project
 from waldur_core.structure.permissions import _get_customer
@@ -167,6 +168,9 @@ class BaseInvitationSerializer(BaseInvitationDetailsSerializer):
                 "Role and scope should belong to the same content type."
             )
 
+        # Fail here rather than at accept time, so the inviter learns the scope
+        # rejects grants before the email goes out.
+        validate_scope_available(scope)
         _enforce_role_available_for_scope(scope, role)
         validate_only_one_project_manager(scope, role)
         return attrs
@@ -678,8 +682,32 @@ class InvitationDuplicateSerializer(serializers.Serializer):
     existing_invitation_uuid = serializers.UUIDField(allow_null=True, required=False)
 
 
+class InvitationExistingRoleSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    role = serializers.UUIDField(
+        format="hex", help_text="UUID of the role requested for this email"
+    )
+    existing_role = serializers.UUIDField(
+        format="hex", help_text="UUID of the role the user already holds in the scope"
+    )
+    existing_role_name = serializers.CharField(
+        help_text="Name of the role the user already holds in the scope"
+    )
+    existing_role_description = serializers.CharField(
+        help_text="Human-readable description of the role the user already holds, "
+        "for display. Falls back to the role name when the description is blank."
+    )
+    is_same_role = serializers.BooleanField(
+        help_text="Whether the role already held is the one being requested. This "
+        "reports what the scope currently holds, not the outcome of a grant: "
+        "acceptance is decided per accepting user and also depends on the "
+        "INVITATION_DISABLE_MULTIPLE_ROLES and ONLY_ONE_PROJECT_MANAGER settings."
+    )
+
+
 class InvitationDuplicateCheckResponseSerializer(serializers.Serializer):
     duplicates = InvitationDuplicateSerializer(many=True)
+    existing_roles = InvitationExistingRoleSerializer(many=True)
 
 
 class VisibleInvitationDetailsSerializer(BaseInvitationDetailsSerializer):
@@ -817,6 +845,12 @@ class SubmitRequestResponseSerializer(serializers.Serializer):
     uuid = serializers.CharField(help_text="UUID of the created permission request")
     scope_name = serializers.CharField(help_text="Name of the invitation scope")
     scope_uuid = serializers.CharField(help_text="UUID of the invitation scope")
+    scope_type = serializers.ChoiceField(
+        choices=list(TYPE_MAP),
+        required=False,
+        allow_null=True,
+        help_text="Type of the invitation scope (e.g., 'customer', 'project')",
+    )
     auto_approved = serializers.BooleanField(
         help_text="Whether the request was automatically approved"
     )

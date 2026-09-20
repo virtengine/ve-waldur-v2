@@ -1,7 +1,7 @@
 # Resource API Keys
 
-How a site-agent resource's API keys are generated, applied, revealed, rotated
-and revoked. The motivating case is inference resources (Envoy AI Gateway keys),
+How a site-agent resource's API keys are generated, applied, revealed and
+rotated. The motivating case is inference resources (Envoy AI Gateway keys),
 but nothing here is Envoy-specific: the croit-s3 plugin uses the same lifecycle
 for S3 access/secret pairs, which is what surfaced the mutable-`client_id` case
 below. The agent-side mechanics build on the
@@ -10,10 +10,10 @@ below. The agent-side mechanics build on the
 
 ## Overview
 
-- A resource owns **multiple** API keys, each independently revealed, rotated
-  and revoked from the portal.
-- **Zero-downtime rotation**: rotating or revoking one key never disturbs the
-  others, so consumers on a different key keep working.
+- A resource owns **multiple** API keys, each independently revealed and
+  rotated from the portal. The count is fixed at provisioning.
+- **Zero-downtime rotation**: rotating one key never disturbs the others, so
+  consumers on a different key keep working.
 - **The stored key is always a working key.** Waldur never hands a member a key
   the gateway would reject.
 - **Safe visibility**: members read the keys on demand, but they are never
@@ -25,9 +25,9 @@ below. The agent-side mechanics build on the
 backend-specific format, e.g. the `sk-` prefix) lives in the site-agent plugin.
 Waldur is a management layer, not the source of provider secrets. Crucially, the
 agent **applies the key to the gateway first, then reports it to Waldur** — so
-Waldur only ever stores a key that is already live. Waldur-side minting was
-rejected because it creates phantom keys: generate → store → the apply fails →
-Waldur holds a key the gateway never accepted.
+Waldur only ever stores a key that is already live. Minting in Waldur instead
+produces phantom keys: generate → store → the apply fails → Waldur holds a key
+the gateway never accepted.
 
 **Waldur stores the key, encrypted, for reveal.** For multiple members to read a
 key later, something durable and member-reachable must hold it. The agent has no
@@ -38,9 +38,10 @@ source.
 
 **Multiple keys per resource, not per user.** Two keys are provisioned by
 default — two independent keys are what make rotation zero-downtime, and they
-model the operator reality of primary/standby credentials. Per-user keys were
-rejected: they multiply the provisioning surface for a credential that is
-inherently shared, and revocation is solved by rotating/revoking the shared keys.
+model the operator reality of primary/standby credentials. Keys are not per user:
+that multiplies the provisioning surface for a credential that is inherently
+shared, and cutting a departed member's access is solved by rotating the shared
+keys.
 
 ## Model
 
@@ -51,9 +52,9 @@ inherently shared, and revocation is solved by rotating/revoking the shared keys
 | `resource` | `ForeignKey` — a resource owns a collection of keys |
 | `client_id` | the backend's **public** identifier, e.g. `<resource_backend_id>-<n>` (one gateway Secret entry) or an S3 access key; unique per resource, and may move on rotation |
 | `key_ciphertext` | the agent-generated value, Fernet-encrypted ([field encryption](#encryption-at-rest)) |
-| `fingerprint` | `sk-AbCd...WxYz` — recognizable without revealing |
 | `state` | FSM, aligned to resource states (below) |
 | `error_message` | agent-reported failure detail when `Erred` |
+| `modified` | `TimeStampedModel`; rotation rewrites the row in place, so this is the age of the secret currently in use — the portal shows it as *Issued* |
 
 The key value is deliberately **not** on `Resource`: it never touches the broad
 `ResourceSerializer`, gets its own permission-gated endpoints, and stays out of
@@ -80,11 +81,14 @@ the standard `StateIndicator` (`@/core/StateIndicator`) — no bespoke badge:
 | `Creating` | agent is generating + applying the initial key | spinner |
 | `OK` | applied and live at the gateway | green |
 | `Updating` | rotation in flight (agent applying a new value) | spinner |
-| `Terminating` | revoke in flight (agent removing the Secret entry) | spinner |
 | `Erred` | the agent could not apply the change | red |
 
-`Creating`/`Updating`/`Terminating` are the transitional (spinner) states, matching
-how `ResourceStateField` treats a resource. A confirmed revoke deletes the row.
+`Creating` and `Updating` are the transitional (spinner) states, matching how
+`ResourceStateField` treats a resource.
+
+There is deliberately **no `Terminating`**: nothing removes a single key, and
+termination cleanup deletes the rows outright (`callbacks.py`) rather than walking
+them through a state.
 
 ```mermaid
 stateDiagram-v2
@@ -92,18 +96,15 @@ stateDiagram-v2
     Creating --> OK: report_created
     OK --> Updating: rotate
     Updating --> OK: set_key
-    OK --> Terminating: revoke
-    Terminating --> [*]: destroy (row deleted)
     Creating --> Erred: set_erred
     Updating --> Erred: set_erred
-    Terminating --> Erred: set_erred
     Erred --> Updating: rotate (retry)
-    Erred --> Terminating: revoke (retry)
     Erred --> OK: set_key
+    OK --> [*]: resource terminated (rows deleted)
 ```
 
-Erred is always recoverable (rotate/revoke retries from the portal, or the agent
-finally applying via `set_key`), and `set_erred` is deliberately not allowed from
+Erred is always recoverable (a rotate retry from the portal, or the agent finally
+applying via `set_key`), and `set_erred` is deliberately not allowed from
 `OK` — a stale failure report must not flip a key that has since been applied.
 
 ## Flows
@@ -134,12 +135,11 @@ sequenceDiagram
     W-->>M: {api_key}  (decrypted)
 ```
 
-**Revoke** mirrors rotate: portal → `Terminating` → slim event → agent deletes
-that `client_id` from the Secret → confirms with `DELETE` → Waldur deletes the
-row. The other keys are never touched, so revoking or rotating one key is always
-zero-downtime.
+Rotation never touches the other keys, so a consumer authenticating with a
+sibling key keeps working throughout — that is what makes it zero-downtime, and
+why two keys are provisioned.
 
-The rotation/revoke event (observable type `resource_api_key_rotation`) carries a
+The rotation event (observable type `resource_api_key_rotation`) carries a
 **slim** payload — resource/key identifiers, `client_id`, and the action, never
 key material. The key only ever travels agent → Waldur, in the `report_created` /
 `set_key` request body (TLS), and is encrypted on receipt. When a resource is
@@ -153,8 +153,8 @@ resource with `?resource_uuid=`.
 
 Consumer side:
 
-- `GET /` and `GET /{uuid}/` — list/retrieve status (fingerprint, `client_id`,
-  state, error message — no secret). Visible to resource project/customer
+- `GET /` and `GET /{uuid}/` — list/retrieve status (`client_id`, state,
+  `modified`, error message — no secret). Visible to resource project/customer
   members and the provider organization.
 - `GET /{uuid}/reveal/` — return the decrypted value (in the body, never the
   URL, with `Cache-Control: no-store`). Restricted to **consumer-side** access —
@@ -164,34 +164,47 @@ Consumer side:
   `OK` key is revealed — a transitional key's stored value may not match the
   gateway. **Audited** — each reveal emits the `marketplace_resource_api_key_revealed`
   event identifying the key.
-- `POST /{uuid}/rotate/` and `POST /{uuid}/revoke/` — mark `Updating` /
-  `Terminating` and emit the agent event. Gated on `RESOURCE.MANAGE_USERS`
-  (project or customer scope); rejected unless the key is `OK` (or `Erred`, for
-  retries) and the resource is live (not terminating/terminated). Rotation emits
-  the `marketplace_resource_api_key_rotated` audit event.
+- `POST /{uuid}/rotate/` — mark `Updating` and emit the agent event. Gated on
+  `RESOURCE.MANAGE_USERS` (project or customer scope); rejected unless the key is
+  `OK` (or `Erred`, for retries) and the resource is live (not
+  terminating/terminated). Emits the `marketplace_resource_api_key_rotated` audit
+  event.
 
-The initial keys are provisioned at resource creation (the Envoy plugin makes
-two). Adding further keys on demand is intentionally **not** exposed: the
-sensible maximum is backend-specific, so a generic mastermind cap would be
-premature — it belongs with the site-agent plugin when a concrete need appears.
+The keys are provisioned at resource creation (both supporting plugins make two)
+and **rotation is the only operation on them**: it replaces a key's value in
+place, so the count never changes after provisioning. Neither adding nor removing
+a key is exposed, which is what makes "this resource has the keys it was
+provisioned with" true by construction. A per-backend maximum, if one is ever
+needed, belongs with the site-agent plugin — the sensible number is
+backend-specific.
 
-Provider side (used by the site agent), gated on `RESOURCE.MANAGE_API_KEY` on
-the offering customer:
+`destroy` is in `disabled_actions`: an ungated delete could drop a row whose key
+still serves at the backend. Termination cleanup deletes the rows directly (see
+[States](#states)).
+
+Provider side (used by the site agent), gated on `RESOURCE.MANAGE_API_KEY` held
+on any of the provider-side scopes the permission is granted at — the offering
+itself (`OFFERING.MANAGER`, which is what a site agent runs as), the offering's
+customer (`CUSTOMER.OWNER`), or that customer's `ServiceProvider`
+(`CUSTOMER.MANAGER`). The list of keys is likewise visible to the provider
+organization, but reading a value is not: `reveal` stays consumer-side only.
 
 - `POST /report_created/` — the agent pushes a freshly-applied key value after
   provisioning; Waldur encrypts, stores, and the row lands `OK`. Idempotent per
-  `(resource, client_id)` — but rejected while a revoke is in flight for that
-  key (`Terminating`) and once the resource itself is terminating/terminated,
-  so a stale duplicate can never resurrect a revoked key.
+  `(resource, client_id)` — but rejected once the resource itself is
+  terminating/terminated, so a stale duplicate can never resurrect a key of a
+  resource on its way out.
 - `POST /{uuid}/set_key/` — the agent pushes a rotated value; Waldur encrypts,
   stores, transitions to `OK`. Takes an optional `client_id` for backends whose
   public identifier rotates with the secret (see the model above); a value
   already held by a sibling key of the same resource is rejected.
 - `POST /{uuid}/set_erred/` — the agent reports an apply failure → `Erred`.
-- `DELETE /{uuid}/` — the agent confirms Secret removal → row deleted (only
-  legal while `Terminating`).
+(There is no `DELETE`: see above.)
 
 ## Encryption at rest {#encryption-at-rest}
+
+This is one of several encrypted columns; see [Field encryption](field-encryption.md)
+for the general feature (what is encrypted, key configuration, rotation, backups).
 
 Keys are encrypted with Fernet via `waldur_core.core.encryption`
 (`encrypt_value` / `decrypt_value` / `is_encrypted`), keyed by
@@ -208,9 +221,16 @@ every fallback. To rotate:
 1. Generate a new Fernet key, set it as `FIELD_ENCRYPTION_KEY`, and move the
    previous key into `FIELD_ENCRYPTION_KEY_FALLBACKS`. Existing rows still
    decrypt (via the fallback); new writes use the new primary.
-2. Re-save the encrypted rows over time (rotation naturally re-encrypts each key
-   under the new primary).
-3. Once no row references the old key, drop it from `FIELD_ENCRYPTION_KEY_FALLBACKS`.
+2. Run `waldur reencrypt_fields`, which rewrites every stored token under the new
+   primary. Waiting for rows to be re-saved on their own does not work here: a key
+   is only rewritten when it happens to be rotated, so there is no point at which
+   you could tell the old key had become unnecessary.
+3. Drop the old key from `FIELD_ENCRYPTION_KEY_FALLBACKS`.
+
+`waldur reencrypt_fields --dry-run` reports the same counts without writing, and in
+particular how many rows **no** configured key can decrypt. That is worth checking
+on its own: such rows are invisible until someone calls `reveal` and gets a 409, and
+the only fix is to restore the key that wrote them.
 
 When no dedicated key is configured, the key is derived from `SECRET_KEY` (with
 a startup warning). That derived key always remains an **implicit last-resort
@@ -231,17 +251,11 @@ Defense-in-depth against at-rest exposure, not a secrets manager.
 
 ## Usage and billing
 
-Usage is attributed **per resource**, not per key. The gateway forwards
-`x-client-id` per key (`<resource_backend_id>-<n>`), and the rollup happens at
-the **usage-shipper** (a Vector pipeline): its `remap` transform strips the
-`-<n>` suffix, so usage is recorded under the resource's `backend_id`:
+A resource owns several keys, but usage is attributed **per resource** — otherwise
+rotating a key would split a tenant's bill in two. No backend meters per key.
 
-```coffee
-# usage-shipper (Vector) remap transform
-cid = replace(cid, r'-\d+$', "")
-```
-
-The `envoy-usage` reporting backend then queries the warehouse by
-`resource_backend_id` unchanged — it stays per-resource with no key enumeration.
-(Pause / restore / terminate, which act on the gateway Secret rather than usage,
-still fan out to **every** client-id the resource owns.)
+How each backend gets there is plugin-specific and documented with the plugin.
+The Envoy AI Gateway tags requests with a per-key `x-client-id` and strips the key
+suffix during the usage rollup; croit-s3 meters the S3 user directly, so keys never
+enter usage at all. Either way Waldur sees one usage stream per resource, and
+adding or rotating a key does not change it.

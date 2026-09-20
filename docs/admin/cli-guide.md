@@ -2,24 +2,19 @@
 
 ## ai_assistant
 
-AI Assistant management commands.
+Check the AI Assistant's configuration and score it against the
+validation scenario packs. The subcommands are listed below; each
+takes --help of its own.
 
-  Available subcommands:
-
-```yaml
-health       - Check AI Assistant infrastructure health
-validate_scenarios - Validate scenario YAML files
-test_evaluation   - Test evaluation with real AI Assistant responses
-run_all       - Run all checks (health, validate, test)
-```
-
-  Examples:
+Examples:
 
 ```yaml
 waldur ai_assistant health
 waldur ai_assistant validate_scenarios
 waldur ai_assistant test_evaluation
 waldur ai_assistant test_evaluation --scenario greeting_no_tool
+waldur ai_assistant test_evaluation --user support --preload-tools
+waldur ai_assistant test_evaluation --preset credit_realistic
 waldur ai_assistant run_all
 ```
 
@@ -31,10 +26,12 @@ usage: waldur ai_assistant
 positional arguments:
   {health,validate_scenarios,test_evaluation,run_all}
                         Available subcommands
-    health              Check AI Assistant infrastructure health
-    validate_scenarios  Validate scenario YAML files
-    test_evaluation     Test evaluation with real AI Assistant responses
-    run_all             Run all checks (health, validate, test)
+    health              Check the LLM configuration, endpoint and a live
+                        request
+    validate_scenarios  Parse the scenario packs and report what they cover
+    test_evaluation     Put the scenario packs to the live LLM and score the
+                        answers
+    run_all             health, then validate_scenarios, then test_evaluation
 
 ```
 
@@ -137,6 +134,46 @@ positional arguments:
 
 ```
 
+## backfill_credit_ledger
+
+Reconstruct credit drawdown that predates the transaction ledger, from compensation invoice items and minimal-consumption audit events. Run with --dry-run first to see how much evidence survives.
+
+```bash
+
+usage: waldur backfill_credit_ledger [--dry-run] [--customer CUSTOMER_UUID]
+                                     [--project PROJECT_UUID] [--since SINCE]
+                                     [--until UNTIL]
+                                     [--infer-period {previous-month,none}]
+                                     [--no-opening-balance] [--force]
+
+options:
+  --dry-run             Report what would be written, and write nothing.
+  --customer CUSTOMER_UUID
+                        Only the credits of the organization with this UUID.
+  --project PROJECT_UUID
+                        Only the allocation of the project with this UUID. The
+                        organization credit is a separate balance and is left
+                        alone.
+  --since SINCE         Ignore evidence before this billing month (YYYY-MM).
+  --until UNTIL         Ignore evidence after this billing month (YYYY-MM).
+  --infer-period {previous-month,none}
+                        How to date minimal-consumption draws, whose events
+                        carry no billing period. 'previous-month' assumes the
+                        run billed the month before it was emitted, which
+                        holds for scheduled finalization; 'none' leaves the
+                        period empty, so the rows count towards the totals but
+                        towards no month — and are then not subject to
+                        --since/--until.
+  --no-opening-balance  Skip the balancing row, leaving only rows backed by
+                        evidence. Totals then no longer reconcile to the
+                        current value of any credit granted before the ledger
+                        existed.
+  --force               Redo credits that already carry backfilled rows: the
+                        previous reconstruction is deleted and written again.
+                        Only rows this command wrote are touched.
+
+```
+
 ## backfill_plan_periods
 
 Backfill plan_period on ComponentUsage records where it is NULL. This fixes incorrect quarterly/annual/total usage calculations caused by ComponentUsage records created without a plan_period.
@@ -168,6 +205,42 @@ options:
 ## check_provider_helpdesks
 
 Check connectivity of all active provider helpdesks.
+
+## check_role_names
+
+Report malformed, mis-scoped and silently global roles.
+
+  Read-only: nothing is created, changed or deleted. Exits with status 1 when
+  an error-severity finding is reported, so it can run as an ops check. The
+  status follows what the filters actually report.
+
+  Usage:
+
+```yaml
+waldur check_role_names
+waldur check_role_names --severity warning
+waldur check_role_names --format json
+waldur check_role_names --check global-custom-role --check org-role-unmanaged
+```
+
+```bash
+
+usage: waldur check_role_names [--format {text,json}]
+                               [--severity {error,warning,info}]
+                               [--check {clone-name-drift,cross-scope-permission,global-custom-role,label-equals-name,label-missing,multi-org-binding,name-not-a-code,org-role-unmanaged,scope-prefix-mismatch,system-name-unknown,system-scope-mismatch,template-without-scope}]
+                               [--exit-zero]
+
+options:
+  --format {text,json}  Output format (default: text)
+  --severity {error,warning,info}
+                        Lowest severity to report (default: info, i.e.
+                        everything)
+  --check {clone-name-drift,cross-scope-permission,global-custom-role,label-equals-name,label-missing,multi-org-binding,name-not-a-code,org-role-unmanaged,scope-prefix-mismatch,system-name-unknown,system-scope-mismatch,template-without-scope}
+                        Report only this check; repeat for several
+  --exit-zero           Always exit with status 0, even when errors are
+                        reported
+
+```
 
 ## clean_celery_results
 
@@ -254,6 +327,21 @@ options:
   --older-than-months OLDER_THAN_MONTHS
                         Only delete records older than N months (0 = delete
                         all).
+
+```
+
+## collapse_posix_identities
+
+Collapse per-offering POSIX identities of a user into one identity per POSIX ID pool. Dry run unless --apply is given.
+
+```bash
+
+usage: waldur collapse_posix_identities [--pool POOL] [--apply]
+
+options:
+  --pool POOL  Limit the run to the POSIX ID pool with the given UUID. May be
+               given multiple times.
+  --apply      Perform the collapse. Without it the command only reports.
 
 ```
 
@@ -658,22 +746,6 @@ positional arguments:
 
 ```
 
-## import_azure_image
-
-Import Azure image
-
-```bash
-
-usage: waldur import_azure_image [--sku SKU] [--publisher PUBLISHER]
-                                 [--offer OFFER]
-
-options:
-  --sku SKU
-  --publisher PUBLISHER
-  --offer OFFER
-
-```
-
 ## import_marketplace_orders
 
 Create marketplace order for each resource if it does not yet exist.
@@ -809,6 +881,24 @@ options:
 
 ```
 
+## init_service_desk_defaults
+
+Seed the terminal issue statuses, and the default request type used by the built-in service desk. Existing rows are left untouched, so the command is safe to re-run. Request types are seeded only when the active backend is one Waldur owns; a deployment backed by a remote service desk gets its types from there.
+
+## list_missing_resources
+
+List OpenStack resources which are marked as missing at the backend. Deletion is left to the operator: each resource is linked to a marketplace resource, invoice items and order history.
+
+```bash
+
+usage: waldur list_missing_resources [--days DAYS]
+
+options:
+  --days DAYS  Only report resources missing for at least this many days
+               (default: 7).
+
+```
+
 ## load_categories
 
 Loads a categories for the Marketplace
@@ -874,11 +964,20 @@ Sync notifications and their templates from a JSON/YAML config file to the DB.
 
 ```bash
 
-usage: waldur load_notifications notifications_file
+usage: waldur load_notifications [--prune] notifications_file
 
 positional arguments:
   notifications_file  Path to a JSON or YAML file mapping notification keys to
                       their enabled status (bool).
+
+options:
+  --prune             Delete Notification rows whose key is no longer in the
+                      NOTIFICATIONS registry, along with any of their
+                      templates that are not shared with a registered
+                      notification and have no operator-customised content.
+                      Without this flag, orphaned rows are only reported.
+                      Never enabled by default (e.g. by initdb) — an
+                      unattended boot should not delete data.
 
 ```
 
@@ -920,6 +1019,21 @@ options:
                         Leave empty for the default version.
   -f, --force           Force loading agreements even if they are already
                         defined in DB.
+
+```
+
+## migrate_fresh
+
+Create the schema of an empty database from the models and record all migrations as applied.
+
+```bash
+
+usage: waldur migrate_fresh [--check] [--database DATABASE]
+
+options:
+  --check              Only report whether the database is empty (exit 0) or
+                       not (exit 1).
+  --database DATABASE  Database alias to initialize (default: default).
 
 ```
 
@@ -982,7 +1096,7 @@ options:
 
 ## organization_access_subnets
 
-Dumps information about organization access subnets, merging adjacent or overlapping networks.
+Dumps the addresses allowed to sign in to the portal on behalf of an organization, merging adjacent or overlapping networks. Entries that apply only to resources of an offering are excluded — those are exported by resource_access_subnets.
 
 ```bash
 
@@ -1011,12 +1125,18 @@ Override settings stored in django-constance. The example of .yaml file:
 
 ```bash
 
-usage: waldur override_constance_settings constance_settings_file
+usage: waldur override_constance_settings [--if-unset] constance_settings_file
 
 positional arguments:
   constance_settings_file
                         Specifies location of file in YAML format containing
                         new settings
+
+options:
+  --if-unset            Seed rather than override: skip any setting that
+                        already has a stored value, so a change made in the UI
+                        survives the next run. Use this for settings an
+                        administrator is expected to manage.
 
 ```
 
@@ -1048,7 +1168,7 @@ positional arguments:
 
 ## override_templates
 
-Override dbtemplates content from a YAML file. Use --clean to remove DB templates not present in the file.
+Override notification template content from a YAML file. Use --clean to reset templates not present in the file to their filesystem default.
 
 ```bash
 
@@ -1058,8 +1178,8 @@ positional arguments:
   templates_file  Path to a YAML file mapping template names to their content.
 
 options:
-  -c, --clean     Remove DB templates whose names are not present in the file
-                  (full sync mode).
+  -c, --clean     Reset templates not present in the file to their filesystem
+                  default (full sync mode).
 
 ```
 
@@ -1221,26 +1341,123 @@ options:
 
 ```
 
+## rebill_historical_usage
+
+Re-bill ComponentUsage records whose invoice item is missing or stale because their invoice was already finalized when the usage was reported or corrected (e.g. via waldur_site_load_historical_usage in waldur-site-agent). Staff-only, one-off correction tool. Never run automatically or on a schedule. Pass -v 2 (or -v 3) for debug-level logging of every decision this command makes.
+
+```bash
+
+usage: waldur rebill_historical_usage [--execute] [--offering OFFERING_UUID]
+                                      [--resource RESOURCE_UUID]
+                                      [--start-date START_DATE]
+                                      [--end-date END_DATE]
+                                      [--allow-aggregated-discount-recompute]
+
+options:
+  --execute             Actually apply the correction. Without this flag the
+                        command always runs as a dry run -- it computes and
+                        prints the exact same plan (inside one transaction
+                        spanning every resource-period in the run,
+                        deliberately rolled back at the very end) but writes
+                        nothing to the database. Cost Policy previews
+                        therefore see earlier periods' corrections in the same
+                        dry run too, matching what --execute would actually
+                        produce. This default is deliberate: review the
+                        printed plan first, then re-run with --execute once it
+                        looks right.
+  --offering OFFERING_UUID
+                        Only process resources belonging to the offering with
+                        this UUID.
+  --resource RESOURCE_UUID
+                        Only process the resource with this UUID.
+  --start-date START_DATE
+                        Only billing periods on or after this date (format:
+                        YYYY-MM-DD).
+  --end-date END_DATE   Only billing periods on or before this date (format:
+                        YYYY-MM-DD).
+  --allow-aggregated-discount-recompute
+                        Allow recomputing volume discounts for offering
+                        components that use the aggregated (non-per-resource)
+                        discount scope. This also rewrites discount amounts
+                        for OTHER resources sharing that offering component on
+                        the same invoice. Review the printed sibling-impact
+                        report (from a plain dry-run invocation) before using
+                        this.
+
+```
+
 ## rebuild_billing
 
 Create or update price estimates based on invoices.
+
+## reconcile_autoprovisioned_roles
+
+Re-apply auto-provisioning rules, granting and revoking roles.
+
+```bash
+
+usage: waldur reconcile_autoprovisioned_roles (--username USERNAME | --all)
+                                              [--dry-run] [--rate RATE]
+
+options:
+  --username USERNAME  Reconcile a single user identified by their Waldur
+                       username.
+  --all                Reconcile every active user.
+  --dry-run            Report what would change without writing anything.
+  --rate RATE          Users per second when using --all. 0 (default) means no
+                       limit.
+
+```
+
+## reencrypt_fields
+
+Re-encrypt stored secrets under the current FIELD_ENCRYPTION_KEY. Run this after promoting a new key (with the previous one in FIELD_ENCRYPTION_KEY_FALLBACKS) so the old key can then be retired; rows are otherwise only re-encrypted when they happen to be rewritten. Use --dry-run to audit which rows the configured keys can still decrypt.
+
+```bash
+
+usage: waldur reencrypt_fields [--dry-run]
+
+options:
+  --dry-run  Report what would be re-encrypted without writing anything
+
+```
 
 ## removestalect
 
 Remove Django event log records with stale content types.
 
-## resource_access_subnets
+## reprovision_matrix_rooms
 
-Dumps per-resource access subnets for consumption by external firewalls, merging adjacent or overlapping networks. Only resources of offerings that opt in via the enable_resource_access_subnets plugin option have subnets.
+Reset every active Matrix room and provisioned user profile so the homeserver rebuilds them. Use after moving to a new homeserver, whose room ids and user tokens are different from the old one's. Do not run it against the homeserver the rooms already live on: old rooms are not deleted, so each one keeps its history while Waldur replaces it with an empty room. Equivalent to POST /api/admin/matrix/reprovision/, for deployments where reaching the API as staff is harder than reaching a shell.
 
 ```bash
 
-usage: waldur resource_access_subnets [-r OFFERING] [-o OUTPUT]
+usage: waldur reprovision_matrix_rooms [--dry-run] [-y]
+
+options:
+  --dry-run  Report what would be reset without writing anything
+  -y, --yes  Do not prompt for confirmation
+
+```
+
+## resource_access_subnets
+
+Dumps consumer access subnets for consumption by external firewalls, merging adjacent or overlapping networks. Subnets are defined per (customer, offering) pair and apply to all of that customer's resources of the offering. Only offerings that opt in via the enable_resource_access_subnets plugin option have subnets.
+
+```bash
+
+usage: waldur resource_access_subnets [-r OFFERING]
+                                      [--include-organization-subnets]
+                                      [-o OUTPUT]
 
 options:
   -r, --offering OFFERING
                         Limit the dump to resources of the offering with the
-                        given UUID.
+                        given UUID. May be given multiple times.
+  --include-organization-subnets
+                        Also merge in the organization-level access subnets of
+                        customers owning non-terminated resources of the
+                        selected offerings.
   -o, --output OUTPUT   Specifies file to which the merged subnets will be
                         written. The output will be printed to stdout by
                         default.
@@ -1258,6 +1475,27 @@ usage: waldur retry_failed_routing [--dry-run]
 options:
   --dry-run  Only list issues that would be retried, without actually
              retrying.
+
+```
+
+## revoke_unverified_staff_tokens
+
+Delete API tokens held by staff and support accounts that were not issued behind a passkey, and report the personal access tokens that predate enforcement. Part of turning on PASSKEY_ENFORCED_FOR_STAFF.
+
+```bash
+
+usage: waldur revoke_unverified_staff_tokens [--dry-run]
+                                             [--revoke-personal-access-tokens]
+
+options:
+  --dry-run             Report what would be deleted without deleting
+                        anything.
+  --revoke-personal-access-tokens
+                        Also revoke personal access tokens held by staff and
+                        support accounts. Off by default: these typically
+                        drive CI and automation, so revoking them without
+                        warning breaks pipelines rather than merely logging
+                        somebody out.
 
 ```
 
@@ -1332,6 +1570,10 @@ options:
                         (default: 5).
 
 ```
+
+## sram_resync
+
+Re-apply the last SCIM payload SRAM pushed for every group, e.g. after upgrading or changing SRAM settings. SRAM itself only re-sends changed groups.
 
 ## status
 
@@ -1429,5 +1671,22 @@ options:
                         UUID of OpenStack offering to test against (creates
                         temporary tenant)
   --quiet               Suppress SSL warnings and other verbose output
+
+```
+
+## web_shell
+
+Serve `waldur shell` to staff in the browser. Development only: needs DEBUG, WALDUR_CORE['WEB_SHELL_ENABLED'] and WALDUR_CORE['WEB_SHELL_URL'].
+
+```bash
+
+usage: waldur web_shell [--host HOST] [--port PORT] [--fetch-assets]
+                        [--mint USERNAME]
+
+options:
+  --host HOST
+  --port PORT      Port to listen on. Defaults to the port of WEB_SHELL_URL.
+  --fetch-assets   Download ghostty-web 0.4.0-waldur.2 and exit.
+  --mint USERNAME  Print a single-use link for a staff user and exit.
 
 ```

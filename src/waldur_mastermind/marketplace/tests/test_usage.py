@@ -1,4 +1,5 @@
 import datetime
+import decimal
 
 from ddt import data, ddt
 from django.test import override_settings
@@ -14,10 +15,13 @@ from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.common.mixins import UnitPriceMixin
 from waldur_mastermind.common.utils import parse_datetime
 from waldur_mastermind.invoices import models as invoice_models
+from waldur_mastermind.invoices.compensations import MonthlyCompensation
+from waldur_mastermind.invoices.tests import factories as invoice_factories
 from waldur_mastermind.marketplace import callbacks, models
 from waldur_mastermind.marketplace.enums import (
     BillingTypes,
     LimitPeriods,
+    MissingUsagePolicies,
     OrderStates,
     OrderTypes,
     ResourceStates,
@@ -138,35 +142,136 @@ class SubmitUsageTest(test.APITestCase):
             ).exists()
         )
 
-    def test_set_recurring_to_false_for_other_usages_in_this_period(self):
+    def _submit_usage_data(self, payload):
         self.client.force_authenticate(self.fixture.staff)
-        payload = self.get_usage_data()
-        payload["usages"][0]["recurring"] = True
         response = self.client.post(
             "/api/marketplace-component-usages/set_usage/", payload
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        date = timezone.now()
-        billing_period = core_utils.month_start(date)
-        usage = models.ComponentUsage.objects.get(
+        return models.ComponentUsage.objects.get(
             resource=self.resource,
             component=self.offering_component,
-            date=date,
-            billing_period=billing_period,
+            billing_period=core_utils.month_start(timezone.now()),
         )
-        self.assertTrue(usage.recurring)
+
+    def test_missing_usage_policy_is_reset_for_other_usages_in_this_period(self):
+        payload = self.get_usage_data()
+        payload["usages"][0]["missing_usage_policy"] = MissingUsagePolicies.REUSE
+        usage = self._submit_usage_data(payload)
+        self.assertEqual(usage.missing_usage_policy, MissingUsagePolicies.REUSE)
+
         new_plan_period = models.ResourcePlanPeriod.objects.create(
             resource=self.plan_period.resource,
             plan=self.plan_period.plan,
         )
         self.plan_period = new_plan_period
+        self._submit_usage_data(self.get_usage_data())
+        usage.refresh_from_db()
+        self.assertEqual(usage.missing_usage_policy, MissingUsagePolicies.NONE)
+
+    def test_missing_usage_policy_defaults_to_none(self):
+        usage = self._submit_usage_data(self.get_usage_data())
+        self.assertEqual(usage.missing_usage_policy, MissingUsagePolicies.NONE)
+
+    def test_zero_missing_usage_policy_is_stored(self):
         payload = self.get_usage_data()
+        payload["usages"][0]["missing_usage_policy"] = MissingUsagePolicies.ZERO
+        usage = self._submit_usage_data(payload)
+        self.assertEqual(usage.missing_usage_policy, MissingUsagePolicies.ZERO)
+
+    def test_deprecated_recurring_flag_maps_to_reuse_policy(self):
+        payload = self.get_usage_data()
+        payload["usages"][0]["recurring"] = True
+        usage = self._submit_usage_data(payload)
+        self.assertEqual(usage.missing_usage_policy, MissingUsagePolicies.REUSE)
+
+    def test_deprecated_recurring_flag_is_exposed_in_the_api(self):
+        payload = self.get_usage_data()
+        payload["usages"][0]["missing_usage_policy"] = MissingUsagePolicies.REUSE
+        usage = self._submit_usage_data(payload)
+        response = self.client.get(
+            "/api/marketplace-component-usages/",
+            {"resource_uuid": self.resource.uuid.hex},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        rows = {row["uuid"]: row for row in response.data}
+        self.assertTrue(rows[usage.uuid.hex]["recurring"])
+        self.assertEqual(
+            rows[usage.uuid.hex]["missing_usage_policy"], MissingUsagePolicies.REUSE
+        )
+
+    def test_usages_can_be_filtered_by_missing_usage_policy(self):
+        """Support needs to list every component set to carry values forward."""
+        self.client.force_authenticate(self.fixture.staff)
+        for component_type, policy in (
+            ("cpu", MissingUsagePolicies.ZERO),
+            ("ram", MissingUsagePolicies.REUSE),
+        ):
+            # One entry per request: get_usage_data() always reports "ram" as
+            # its second component, and a later entry for the same component
+            # resets the policy set by an earlier one.
+            response = self.client.post(
+                "/api/marketplace-component-usages/set_usage/",
+                {
+                    "plan_period": self.plan_period.uuid.hex,
+                    "usages": [
+                        {
+                            "type": component_type,
+                            "amount": 5,
+                            "missing_usage_policy": policy,
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        def list_policies(**query):
+            response = self.client.get("/api/marketplace-component-usages/", query)
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            return sorted(row["missing_usage_policy"] for row in response.data)
+
+        self.assertEqual(
+            list_policies(),
+            sorted([MissingUsagePolicies.ZERO, MissingUsagePolicies.REUSE]),
+        )
+        self.assertEqual(
+            list_policies(missing_usage_policy=MissingUsagePolicies.ZERO),
+            [MissingUsagePolicies.ZERO],
+        )
+        self.assertEqual(
+            list_policies(missing_usage_policy=MissingUsagePolicies.REUSE),
+            [MissingUsagePolicies.REUSE],
+        )
+        self.assertEqual(
+            list_policies(
+                missing_usage_policy=[
+                    MissingUsagePolicies.ZERO,
+                    MissingUsagePolicies.REUSE,
+                ]
+            ),
+            sorted([MissingUsagePolicies.ZERO, MissingUsagePolicies.REUSE]),
+        )
+        self.assertEqual(
+            list_policies(missing_usage_policy=MissingUsagePolicies.NONE), []
+        )
+
+    def test_invalid_missing_usage_policy_filter_is_rejected(self):
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(
+            "/api/marketplace-component-usages/",
+            {"missing_usage_policy": "nonsense"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_conflicting_recurring_and_policy_are_rejected(self):
+        self.client.force_authenticate(self.fixture.staff)
+        payload = self.get_usage_data()
+        payload["usages"][0]["recurring"] = True
+        payload["usages"][0]["missing_usage_policy"] = MissingUsagePolicies.ZERO
         response = self.client.post(
             "/api/marketplace-component-usages/set_usage/", payload
         )
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        usage.refresh_from_db()
-        self.assertFalse(usage.recurring)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_submit_usage_with_description(self):
         description = "My first usage report"
@@ -1512,6 +1617,61 @@ class UsageBackfillInvoiceTest(test.APITestCase):
         # Note: The exact behavior might depend on how user usage aggregation is implemented
         # This test documents the expected invoice behavior
 
+    def test_usage_update_finds_cost_item_not_compensation_item(self):
+        """A compensation item copies the main item's `details` wholesale
+        (MonthlyCompensation.calculate_current_compensations), so it also
+        carries `offering_component_type`. Re-reporting usage on a still-
+        mutable invoice that already has a compensation item must update the
+        cost item, never the compensation item that happens to share the
+        same resource + offering_component_type."""
+        self.client.force_authenticate(self.fixture.staff)
+
+        payload = {
+            "plan_period": self.plan_period.uuid.hex,
+            "usages": [{"type": "cpu", "amount": 5}],
+        }
+        response = self.client.post(
+            "/api/marketplace-component-usages/set_usage/", payload
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        invoice = invoice_models.Invoice.objects.get(
+            customer=self.fixture.customer, year=2024, month=2
+        )
+        cost_item = invoice.items.get(
+            resource=self.resource, details__offering_component_type="cpu"
+        )
+
+        credit = invoice_factories.CustomerCreditFactory(
+            customer=self.fixture.customer, value=decimal.Decimal("1000")
+        )
+        MonthlyCompensation(
+            self.fixture.customer, invoice=invoice
+        ).apply_compensations()
+
+        compensation_item = invoice.items.get(
+            resource=self.resource, credit=credit, details__is_compensation=True
+        )
+        # Confirms the ambiguity actually exists for this test to be meaningful.
+        self.assertEqual(
+            compensation_item.details.get("offering_component_type"), "cpu"
+        )
+
+        # Report higher usage while the invoice is still mutable.
+        payload["usages"][0]["amount"] = 8
+        response = self.client.post(
+            "/api/marketplace-component-usages/set_usage/", payload
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        cost_item.refresh_from_db()
+        compensation_item.refresh_from_db()
+        self.assertEqual(cost_item.quantity, 8)
+        self.assertFalse(cost_item.details.get("is_compensation"))
+        # Untouched by the usage update -- only the compensation engine may
+        # change it.
+        self.assertEqual(compensation_item.unit_price, decimal.Decimal("-50"))
+
     def test_usage_update_rejected_for_finalized_invoice(self):
         """Usage reported for a month whose invoice is already finalized should not update the invoice item."""
         self.client.force_authenticate(self.fixture.staff)
@@ -1668,6 +1828,113 @@ class ServiceProviderUsageDateBackfillTest(test.APITestCase):
         """Test that service providers cannot specify date for usage-based components when backfilling past billing periods."""
         # Authenticate as service provider owner
         self.client.force_authenticate(self.fixture.owner)
+
+        backfill_date = datetime.datetime(2023, 12, 15, 10, 0, 0, tzinfo=datetime.UTC)
+
+        payload = {
+            "plan_period": self.plan_period.uuid.hex,
+            "date": backfill_date.isoformat(),
+            "usages": [
+                {
+                    "type": "usage_cpu",  # Usage-based component
+                    "amount": 10,
+                }
+            ],
+        }
+
+        response = self.client.post(
+            "/api/marketplace-component-usages/set_usage/", payload
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(
+            "Service providers can only specify date for limit-based or prepaid billing components when backfilling past billing periods",
+            str(response.data),
+        )
+
+    def test_service_provider_can_backfill_usage_based_components_when_invoice_is_pending(
+        self,
+    ):
+        """Usage-based components can be backfilled into a past billing period
+        as long as the customer's invoice for that period is still mutable
+        (not yet frozen)."""
+        self.client.force_authenticate(self.fixture.owner)
+
+        invoice_factories.InvoiceFactory(
+            customer=self.consumer_customer,
+            year=2023,
+            month=12,
+            state=invoice_models.Invoice.States.PENDING,
+        )
+
+        backfill_date = datetime.datetime(2023, 12, 15, 10, 0, 0, tzinfo=datetime.UTC)
+
+        payload = {
+            "plan_period": self.plan_period.uuid.hex,
+            "date": backfill_date.isoformat(),
+            "usages": [
+                {
+                    "type": "usage_cpu",  # Usage-based component
+                    "amount": 10,
+                }
+            ],
+        }
+
+        response = self.client.post(
+            "/api/marketplace-component-usages/set_usage/", payload
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        usage = models.ComponentUsage.objects.get(
+            resource=self.resource,
+            component=self.usage_component,
+        )
+        self.assertEqual(usage.date, backfill_date)
+        self.assertEqual(usage.billing_period, datetime.date(2023, 12, 1))
+
+    def test_service_provider_can_backfill_usage_based_components_when_invoice_is_pending_finalization(
+        self,
+    ):
+        """PENDING_FINALIZATION (grace period) invoices are mutable too."""
+        self.client.force_authenticate(self.fixture.owner)
+
+        invoice_factories.InvoiceFactory(
+            customer=self.consumer_customer,
+            year=2023,
+            month=12,
+            state=invoice_models.Invoice.States.PENDING_FINALIZATION,
+        )
+
+        backfill_date = datetime.datetime(2023, 12, 15, 10, 0, 0, tzinfo=datetime.UTC)
+
+        payload = {
+            "plan_period": self.plan_period.uuid.hex,
+            "date": backfill_date.isoformat(),
+            "usages": [
+                {
+                    "type": "usage_cpu",  # Usage-based component
+                    "amount": 10,
+                }
+            ],
+        }
+
+        response = self.client.post(
+            "/api/marketplace-component-usages/set_usage/", payload
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_service_provider_cannot_backfill_usage_based_components_when_invoice_is_frozen(
+        self,
+    ):
+        """Once the invoice for the backfilled period is frozen (CREATED),
+        usage-based backfill is rejected even though an invoice exists."""
+        self.client.force_authenticate(self.fixture.owner)
+
+        invoice_factories.InvoiceFactory(
+            customer=self.consumer_customer,
+            year=2023,
+            month=12,
+            state=invoice_models.Invoice.States.CREATED,
+        )
 
         backfill_date = datetime.datetime(2023, 12, 15, 10, 0, 0, tzinfo=datetime.UTC)
 

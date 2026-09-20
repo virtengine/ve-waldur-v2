@@ -1,5 +1,6 @@
 import logging
 from decimal import Decimal
+from functools import partial
 from typing import Any
 
 import httpx
@@ -8,7 +9,7 @@ from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
-from django.db.models import signals
+from django.db.models import F, Q, signals
 from django.template import Context, Template
 from django.utils import timezone
 from django.utils.timezone import now
@@ -17,6 +18,7 @@ from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from waldur_core.checklist import models as checklist_models
+from waldur_core.core import encryption
 from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import ReviewStates
 from waldur_core.core.middleware import get_skip_side_effects
@@ -36,6 +38,7 @@ from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.billing import MarketplaceBillingService
 from waldur_mastermind.marketplace.enums import (
     BASIC_OFFERING,
+    AccountSettingSources,
     BillingTypes,
     MaintenanceState,
     OfferingStates,
@@ -62,6 +65,7 @@ from waldur_mastermind.marketplace.models import (
     Plan,
     PlanComponent,
     Resource,
+    ResourceEndDateChangeRequest,
     RobotAccount,
     ScopedServiceAccount,
     Screenshot,
@@ -69,6 +73,7 @@ from waldur_mastermind.marketplace.models import (
 from waldur_mastermind.marketplace.permissions import (
     order_should_not_be_reviewed_by_consumer,
 )
+from waldur_mastermind.marketplace.secret_options import is_sensitive_key
 from waldur_mastermind.notifications.models import AdminAnnouncement
 
 from . import callbacks, log, models, order_approval, posix_ids, tasks, utils
@@ -263,6 +268,44 @@ def notify_approvers_when_order_is_created(
             transaction.on_commit(
                 lambda: tasks.notify_consumer_about_pending_order.delay(order.uuid)
             )
+
+
+def notify_recipients_when_order_is_created(
+    sender, instance: Order, created=False, **kwargs
+):
+    """Notify the recipients configured on the offering about a new order.
+
+    Fires on creation regardless of the approval state, so that offerings which
+    auto-approve are covered too. The task re-reads the order after commit, so
+    state changes made later in the creating transaction are irrelevant.
+
+    Orders nobody placed are skipped, on two signals. Import commands and the
+    orphan-resource reconciliation sweep insert orders directly in a terminal
+    state, as audit records for work that already happened. Robots place orders
+    on their own initiative: the cost-policy sweep creates one termination order
+    per over-budget resource, and openportal mirrors remote activity. Announcing
+    either as a new order would be wrong, and both arrive in bulk.
+    """
+    if get_skip_side_effects():
+        return
+
+    if not created:
+        return
+
+    if instance.state in OrderStates.TERMINAL_STATES:
+        return
+
+    if instance.created_by is None or core_utils.is_robot_user(instance.created_by):
+        return
+
+    secret_options = instance.offering.secret_options or {}
+    if not secret_options.get("order_notification_emails") and not secret_options.get(
+        "order_notification_roles"
+    ):
+        return
+
+    order_uuid = instance.uuid
+    transaction.on_commit(lambda: tasks.notify_about_new_order.delay(order_uuid))
 
 
 def maybe_auto_approve_order_for_project(
@@ -486,6 +529,30 @@ def revoke_roles_on_offering_deletion(sender, instance: Offering, **kwargs):
         permission.revoke(reason="Offering deletion")
 
 
+def encrypt_secret_options_on_raw_save(sender, instance, raw=False, **kwargs):
+    """Encrypt secret_options on a raw save (django-reversion revert, loaddata).
+
+    A raw save skips the field's pre_save, so secret_options would be stored without
+    encryption. On a revert it also arrives empty — the field is excluded from reversion
+    — which would wipe the live credentials; restore the current value first in that
+    case. Then encrypt here. skip_encrypted keeps an already-encrypted value (e.g. one
+    that no configured key can decrypt) from being wrapped a second time.
+    """
+    if not raw:
+        return
+
+    data = instance.secret_options
+    if not data and instance.pk:
+        data = (
+            sender._base_manager.filter(pk=instance.pk)
+            .values_list("secret_options", flat=True)
+            .first()
+        ) or {}
+    instance.secret_options = encryption.encrypt_dict_values(
+        data, is_sensitive_key, skip_encrypted=True
+    )
+
+
 def update_category_offerings_count(sender, **kwargs):
     """Update the count of offerings for each category."""
     for category in models.Category.objects.all():
@@ -600,6 +667,13 @@ def switch_resource_plan_period_when_plan_is_updated(
 
     if instance.plan:
         callbacks.create_resource_plan_period(instance)
+
+    # Hourly usage accumulates "current value × hours since the last poll".
+    # Restart that clock at the switch so the first poll under the new plan
+    # counts only the hours that belong to it.
+    models.ComponentUsagePollRecord.objects.filter(resource=instance).update(
+        last_poll_time=now()
+    )
 
 
 def change_order_state(sender, instance, created=False, **kwargs):
@@ -728,11 +802,13 @@ def sync_current_usages_from_component_usage(
     resource = instance.resource
     component_type = instance.component.type
 
+    # A month may hold one row per plan period after a plan switch; the
+    # row of the latest period is the current one.
     latest = (
         models.ComponentUsage.objects.filter(
             resource=resource, component=instance.component
         )
-        .order_by("-billing_period")
+        .order_by("-billing_period", F("plan_period__start").desc(nulls_last=True))
         .first()
     )
     if not latest:
@@ -836,7 +912,7 @@ def evaluate_usage_limit_on_resource_limit_change(
 
 
 def update_or_create_quotas(resource: Resource):
-    components_map = resource.offering.get_limit_components()
+    components_map = resource.offering.get_limit_components(resource.plan)
     for key, value in resource.limits.items():
         component = components_map.get(key)
         if component:
@@ -1393,7 +1469,7 @@ def resource_state_has_been_changed(
 def delete_expired_project_if_every_resource_has_been_terminated(
     sender, instance: Resource, created=False, **kwargs
 ):
-    """Delete an expired project if all its resources have been terminated."""
+    """Schedule deletion of an expired project once its last resource is terminated."""
     if created:
         return
 
@@ -1403,36 +1479,27 @@ def delete_expired_project_if_every_resource_has_been_terminated(
     if instance.state != ResourceStates.TERMINATED:
         return
 
-    # Ensure customer relationship is loaded to avoid KeyError during quota cleanup
     project = instance.project
-    try:
-        # Test if customer relationship is accessible
-        _ = project.customer
-    except (AttributeError, KeyError):
-        # Reload project with customer relationship if not accessible
-        project = project.__class__.objects.select_related("customer").get(
-            pk=project.pk
-        )
+    if not project.is_expired:
+        return
 
-    if project.is_expired:
-        resources = (
-            models.Resource.objects.filter(project=project)
-            .exclude(
-                state__in=(
-                    ResourceStates.ERRED,
-                    ResourceStates.TERMINATED,
-                )
+    has_active_resources = (
+        models.Resource.objects.filter(project=project)
+        .exclude(
+            state__in=(
+                ResourceStates.ERRED,
+                ResourceStates.TERMINATED,
             )
-            .exists()
         )
-        if not resources:
-            event_logger.emit(
-                "Project {project_name} is going to be deleted because end date has been reached and there are no active resources.",
-                event_type=EventType.PROJECT_DELETION_TRIGGERED,
-                event_context={"project": project},
-                scopes=[project, project.customer],
-            )
-            project.delete()
+        .exists()
+    )
+    if has_active_resources:
+        return
+
+    # Deletion cascades through quota ledgers and can take minutes; run it in a
+    # task instead of the request that terminated the last resource.
+    project_uuid = project.uuid.hex
+    transaction.on_commit(lambda: tasks.delete_expired_project.delay(project_uuid))
 
 
 def log_offering_user_created(sender, instance: OfferingUser, created=False, **kwargs):
@@ -1457,28 +1524,38 @@ def log_offering_user_deleted(sender, instance: OfferingUser, **kwargs):
     )
 
 
-def log_offering_user_username_updated(
+def log_offering_user_fields_updated(
     sender, instance: OfferingUser, created=False, **kwargs
 ):
     if created:
         return
-    if not instance.tracker.has_changed("username"):
+
+    tracked_fields = (
+        "username",
+        "runtime_state",
+        "service_provider_comment",
+        "service_provider_comment_url",
+    )
+    changed_fields = [
+        field for field in tracked_fields if instance.tracker.has_changed(field)
+    ]
+    if not changed_fields:
         return
 
-    old_username = instance.tracker.previous("username")
-    new_username = instance.username
+    event_context = {
+        "offering_user_uuid": instance.uuid.hex,
+        "changed_fields": changed_fields,
+        "offering": instance.offering,
+        "affected_user": instance.user,
+    }
+    for field in changed_fields:
+        event_context[f"old_{field}"] = instance.tracker.previous(field) or ""
+        event_context[f"new_{field}"] = getattr(instance, field) or ""
 
     event_logger.emit(
-        "Offering user username changed for {offering_user_uuid}: '{old_username}' -> '{new_username}'.",
+        "Offering user fields changed for {offering_user_uuid}.",
         event_type=EventType.MARKETPLACE_OFFERING_USER_UPDATED,
-        event_context={
-            "offering_user_uuid": instance.uuid.hex,
-            "old_username": old_username or "",
-            "new_username": new_username or "",
-            "changed_fields": ["username"],
-            "offering": instance.offering,
-            "affected_user": instance.user,
-        },
+        event_context=event_context,
         scopes=[instance.offering, instance.offering.customer],
     )
 
@@ -1811,15 +1888,87 @@ def update_offering_user_username_after_offering_settings_change(
     ):
         return
 
+    # Compared as resolved, so dropping an option the provider already sets to
+    # the same value is not a change, and dropping one it sets differently is.
     old_plugin_options = offering.tracker.previous("plugin_options") or {}
-    new_plugin_options = offering.plugin_options or {}
-    default_policy = utils.UsernameGenerationPolicy.SERVICE_PROVIDER.value
-    old_policy = old_plugin_options.get("username_generation_policy", default_policy)
-    new_policy = new_plugin_options.get("username_generation_policy", default_policy)
-
-    if old_policy == new_policy:
+    old_settings = _username_settings(offering, plugin_options=old_plugin_options)
+    if old_settings == _username_settings(offering):
         return
 
+    _regenerate_offering_usernames(offering, "offering plugin_options change")
+
+
+#: Account settings a generated username depends on.
+USERNAME_ACCOUNT_SETTINGS = ("username_generation_policy", "username_anonymized_prefix")
+
+
+def update_offering_user_username_after_provider_settings_change(
+    sender, instance: models.ServiceProvider, created=False, **kwargs
+):
+    """Regenerate usernames on the provider's offerings that inherit a changed setting.
+
+    An offering that sets the changed setting itself is unaffected by the
+    provider value, so its usernames are left alone.
+    """
+    if created:
+        return
+
+    provider = instance
+    if not provider.tracker.has_changed("account_options"):
+        return
+    previous_options = provider.tracker.previous("account_options") or {}
+    current_options = provider.account_options or {}
+    changed = {
+        name
+        for name in USERNAME_ACCOUNT_SETTINGS
+        if previous_options.get(name) != current_options.get(name)
+    }
+    if not changed:
+        return
+
+    offerings = models.Offering.objects.filter(
+        customer_id=provider.customer_id,
+        type__in=OFFERING_USER_ALLOWED_OFFERING_TYPES,
+    ).select_related("customer__serviceprovider")
+    for offering in offerings:
+        old_values = {}
+        for name in USERNAME_ACCOUNT_SETTINGS:
+            value, source = offering.resolve_account_setting_with_source(name)
+            if name in changed and source != AccountSettingSources.OFFERING:
+                value = (
+                    previous_options.get(name)
+                    or models.Offering.ACCOUNT_SETTING_DEFAULTS[name]
+                )
+            old_values[name] = value
+        if _username_settings_from(old_values) == _username_settings(offering):
+            continue
+        _regenerate_offering_usernames(offering, "service provider settings change")
+
+
+def _username_settings_from(values: dict) -> tuple:
+    """The part of ``values`` that changes a generated username.
+
+    The anonymized prefix counts only under the anonymized policy; under any
+    other policy it is not part of the name.
+    """
+    policy = values["username_generation_policy"]
+    if policy == utils.UsernameGenerationPolicy.ANONYMIZED.value:
+        return policy, values["username_anonymized_prefix"]
+    return policy, None
+
+
+def _username_settings(offering: models.Offering, plugin_options=None) -> tuple:
+    return _username_settings_from(
+        {
+            name: offering.resolve_account_setting_with_source(
+                name, plugin_options=plugin_options
+            )[0]
+            for name in USERNAME_ACCOUNT_SETTINGS
+        }
+    )
+
+
+def _regenerate_offering_usernames(offering: models.Offering, trigger: str):
     offering_users = models.OfferingUser.objects.filter(
         offering=offering,
         state__in=[
@@ -1827,13 +1976,19 @@ def update_offering_user_username_after_offering_settings_change(
             OfferingUserStates.CREATING,
             OfferingUserStates.OK,
         ],
+        # A backed account's username is owned by its provider account and
+        # refreshed by propagation; writing it here is refused.
+        service_provider_account__isnull=True,
     )
 
     for offering_user in offering_users:
-        new_username = utils.generate_username(offering_user.user, offering)
+        new_username = utils.generate_username(
+            offering_user.user, offering, offering_user
+        )
         old_username = offering_user.username
         logger.info(
-            "OfferingUser username refresh after offering plugin_options change: offering_user_uuid=%s offering_uuid=%s old_username=%r new_username=%r affected_user_uuid=%s",
+            "OfferingUser username refresh after %s: offering_user_uuid=%s offering_uuid=%s old_username=%r new_username=%r affected_user_uuid=%s",
+            trigger,
             offering_user.uuid.hex,
             offering.uuid.hex,
             old_username,
@@ -1861,17 +2016,35 @@ def update_offering_user_username_after_user_change(sender, instance: User, **kw
     user = instance
 
     # Update username for offering users only if site_username has been changed
-    if not user.tracker.has_changed("details") or not user.details.get("site_username"):
+    if not user.tracker.has_changed("details"):
+        return
+    details = user.details if isinstance(user.details, dict) else {}
+    if not details.get("site_username"):
         return
 
+    # The policy may be set on the offering or defaulted by its provider, and
+    # resolve_account_setting is Python-side, so the filter selects a superset
+    # -- either names it -- and the loop confirms per row. A plain filter on
+    # plugin_options would miss every offering that inherits the policy from
+    # its provider, which is the gap provider account options introduced.
+    policy = utils.UsernameGenerationPolicy.IDENTITY_CLAIM.value
     offering_users = models.OfferingUser.objects.filter(
+        Q(offering__plugin_options__username_generation_policy=policy)
+        | Q(
+            offering__customer__serviceprovider__account_options__username_generation_policy=policy
+        ),
         user=user,
         offering__type__in=OFFERING_USER_ALLOWED_OFFERING_TYPES,
-        offering__plugin_options__username_generation_policy=utils.UsernameGenerationPolicy.IDENTITY_CLAIM.value,
-    )
+        # A backed account's username is owned by its provider account and
+        # refreshed by propagation; writing it here is refused.
+        service_provider_account__isnull=True,
+    ).select_related("offering__customer__serviceprovider")
 
     for offering_user in offering_users:
         offering = offering_user.offering
+        if offering.resolve_account_setting("username_generation_policy") != policy:
+            # The offering overrides its provider with a different policy.
+            continue
         old_username = offering_user.username
         new_username = utils.generate_username(user, offering)
         logger.info(
@@ -1907,13 +2080,30 @@ def update_offering_user_username_after_freeipa_profile_update(
     if not profile.tracker.has_changed("username") or not created:
         return
 
+    # The policy may be set on the offering or defaulted by its provider, and
+    # resolve_account_setting is Python-side, so the filter selects a superset
+    # -- either names it -- and the loop confirms per row. A plain filter on
+    # plugin_options would miss every offering that inherits the policy from
+    # its provider, which is the gap provider account options introduced.
+    policy = utils.UsernameGenerationPolicy.FREEIPA.value
     offering_users = models.OfferingUser.objects.filter(
+        Q(offering__plugin_options__username_generation_policy=policy)
+        | Q(
+            offering__customer__serviceprovider__account_options__username_generation_policy=policy
+        ),
         user=profile.user,
         is_restricted=False,
-        offering__plugin_options__username_generation_policy=utils.UsernameGenerationPolicy.FREEIPA.value,
-    )
+        # A backed account's username is owned by its provider account and
+        # refreshed by propagation; writing it here is refused.
+        service_provider_account__isnull=True,
+    ).select_related("offering__customer__serviceprovider")
 
     for offering_user in offering_users:
+        if (
+            offering_user.offering.resolve_account_setting("username_generation_policy")
+            != policy
+        ):
+            continue
         logger.info(
             "Updating %s username after FreeIPA profile %s change",
             offering_user,
@@ -2568,7 +2758,78 @@ def send_offering_user_created_message(
         ObservableObjectType.OFFERING_USER,
     )
     if messages:
-        logging_tasks.publish_messages.delay(messages)
+        transaction.on_commit(partial(logging_tasks.publish_messages.delay, messages))
+
+
+def _provider_account_payload(account, action: str) -> dict:
+    """The wire payload for one provider-account change."""
+    metadata = account.backend_metadata or {}
+    return {
+        "service_provider_account_uuid": account.uuid.hex,
+        "user_uuid": account.user.uuid.hex,
+        "username": account.username,
+        "state": account.get_state_display(),
+        "runtime_state": account.runtime_state,
+        "action": action,
+        # Unlike the per-offering event, this one carries the POSIX identity:
+        # a directory writer consuming it has no offering to read them back
+        # from, and re-fetching per account is what the agents already avoid.
+        "uidnumber": metadata.get("uidnumber"),
+        "primarygroup": metadata.get("primarygroup"),
+        "login_shell": metadata.get("loginShell"),
+        "home_directory": metadata.get("homeDir"),
+    }
+
+
+def _publish_provider_account(account, action: str) -> None:
+    messages = marketplace_utils.prepare_provider_account_messages(
+        account, _provider_account_payload(account, action)
+    )
+    if messages:
+        transaction.on_commit(partial(logging_tasks.publish_messages.delay, messages))
+
+
+def send_provider_account_created_message(
+    sender, instance: models.ServiceProviderAccount, created=False, **kwargs
+):
+    """Announce a new provider-level account."""
+    if not created or get_skip_side_effects():
+        return
+    _publish_provider_account(instance, "create")
+
+
+def send_provider_account_updated_message(
+    sender, instance: models.ServiceProviderAccount, created=False, **kwargs
+):
+    """Announce a change to a provider-level account.
+
+    Only the fields the tracker watches are worth an event; a save that touches
+    nothing a consumer can observe should not wake every queue.
+    """
+    if created or get_skip_side_effects():
+        return
+    watched = (
+        "username",
+        "state",
+        "runtime_state",
+        "is_restricted",
+        "service_provider_comment",
+        "service_provider_comment_url",
+        # A UID/GID/home change is exactly what a directory writer needs to hear.
+        "backend_metadata",
+    )
+    if not any(instance.tracker.has_changed(field) for field in watched):
+        return
+    _publish_provider_account(instance, "update")
+
+
+def send_provider_account_deleted_message(
+    sender, instance: models.ServiceProviderAccount, **kwargs
+):
+    """Announce a provider-level account going away."""
+    if get_skip_side_effects():
+        return
+    _publish_provider_account(instance, "delete")
 
 
 def send_offering_user_updated_message(
@@ -2605,7 +2866,7 @@ def send_offering_user_updated_message(
         ObservableObjectType.OFFERING_USER,
     )
     if messages:
-        logging_tasks.publish_messages.delay(messages)
+        transaction.on_commit(partial(logging_tasks.publish_messages.delay, messages))
 
 
 def send_offering_user_deleted_message(sender, instance: models.OfferingUser, **kwargs):
@@ -2630,7 +2891,7 @@ def send_offering_user_deleted_message(sender, instance: models.OfferingUser, **
         ObservableObjectType.OFFERING_USER,
     )
     if messages:
-        logging_tasks.publish_messages.delay(messages)
+        transaction.on_commit(partial(logging_tasks.publish_messages.delay, messages))
 
 
 USER_FIELD_TO_ATTRIBUTE = marketplace_utils.USER_FIELD_TO_ATTRIBUTE
@@ -2705,7 +2966,9 @@ def send_user_attribute_update_message(sender, instance, created=False, **kwargs
             offering, payload, ObservableObjectType.OFFERING_USER
         )
         if messages:
-            logging_tasks.publish_messages.delay(messages)
+            transaction.on_commit(
+                partial(logging_tasks.publish_messages.delay, messages)
+            )
 
 
 def notify_users_about_tos_update_signal(sender, instance, created, **kwargs):
@@ -2834,6 +3097,9 @@ def trigger_scim_sync_on_offering_endpoint_change(
     if not config.SCIM_MEMBERSHIP_SYNC_ENABLED or not scim_tasks.is_scim_configured():
         return
 
+    if not scim_tasks.offering_enables_scim_entitlements(instance.offering):
+        return
+
     if not instance.url or not instance.url.startswith("ssh://"):
         return
 
@@ -2845,6 +3111,9 @@ def trigger_scim_sync_on_offering_user_ok(
 ):
     """Trigger SCIM entitlements synchronization when OfferingUser transitions to OK with username."""
     if not config.SCIM_MEMBERSHIP_SYNC_ENABLED or not scim_tasks.is_scim_configured():
+        return
+
+    if not scim_tasks.offering_enables_scim_entitlements(instance.offering):
         return
 
     if created or not instance.tracker.has_changed("state"):
@@ -2863,6 +3132,9 @@ def trigger_scim_sync_on_resource_ok(
 ):
     """Trigger SCIM entitlements synchronization when resource transitions to OK."""
     if not config.SCIM_MEMBERSHIP_SYNC_ENABLED or not scim_tasks.is_scim_configured():
+        return
+
+    if not scim_tasks.offering_enables_scim_entitlements(instance.offering):
         return
 
     if created or not instance.tracker.has_changed("state"):
@@ -3037,8 +3309,68 @@ def log_resource_limit_change_request_events(sender, instance, created=False, **
         )
 
 
+def log_resource_end_date_change_request_events(
+    sender, instance, created=False, **kwargs
+):
+    """Record who asked for an end date and what was decided.
+
+    Unlike a limit change request, approving this one produces no order, so
+    without these events the resource's audit trail would show the date moving
+    with nothing explaining who asked for it — and a rejected request would
+    leave no trace at all.
+    """
+    resource = instance.resource
+    event_context = {
+        "resource_end_date_change_request": instance,
+        "resource": resource,
+    }
+    if created:
+        event_logger.emit(
+            f"{instance.created_by} requested the end date of resource "
+            f"{resource.name} be changed to {instance.requested_end_date}.",
+            event_type=EventType.MARKETPLACE_RESOURCE_END_DATE_CHANGE_REQUEST_CREATED,
+            event_context=event_context,
+            scopes=[resource],
+        )
+        return
+
+    if not instance.tracker.has_changed("state"):
+        return
+
+    if instance.state == ReviewStates.APPROVED:
+        event_logger.emit(
+            f"{instance.reviewed_by} approved changing the end date of resource "
+            f"{resource.name} to {instance.requested_end_date}.",
+            event_type=EventType.MARKETPLACE_RESOURCE_END_DATE_CHANGE_REQUEST_APPROVED,
+            event_context=event_context,
+            scopes=[resource],
+        )
+    elif instance.state == ReviewStates.REJECTED:
+        event_logger.emit(
+            f"{instance.reviewed_by} rejected changing the end date of resource "
+            f"{resource.name} to {instance.requested_end_date}.",
+            event_type=EventType.MARKETPLACE_RESOURCE_END_DATE_CHANGE_REQUEST_REJECTED,
+            event_context=event_context,
+            scopes=[resource],
+        )
+    elif instance.state == ReviewStates.CANCELED:
+        # Withdrawn by the requester, so there is no reviewer to name.
+        event_logger.emit(
+            f"{instance.created_by} withdrew the request to change the end date "
+            f"of resource {resource.name} to {instance.requested_end_date}.",
+            event_type=EventType.MARKETPLACE_RESOURCE_END_DATE_CHANGE_REQUEST_CANCELED,
+            event_context=event_context,
+            scopes=[resource],
+        )
+
+
 def release_posix_allocations_on_consumer_deletion(sender, instance, **kwargs):
     """Mark the deleted POSIX id consumer's identity as released.
+
+    A user identity is shared across the offerings that resolve to one pool, so
+    deleting an offering user releases nothing while another account of that user
+    still resolves there; only the last one frees the value. Robot accounts and
+    groups are released per consumer.
 
     A released value is recycled automatically on the next allocation from the
     same pool and namespace; the released row is kept as an audit trail. Note:
@@ -3048,7 +3380,7 @@ def release_posix_allocations_on_consumer_deletion(sender, instance, **kwargs):
     posix_ids.release_posix_allocations(instance)
 
 
-def get_resource_access_subnet_changes(instance):
+def get_access_subnet_changes(instance):
     """Return {field: (old, new)} for fields that genuinely changed.
 
     The tracker reports the ``inet`` CidrAddressField as changed whenever it is
@@ -3064,47 +3396,36 @@ def get_resource_access_subnet_changes(instance):
     return changes
 
 
-def generate_resource_access_subnet_changes(changes):
-    """Render a {field: (old, new)} change map as a human-readable string."""
-    changes_string = "Resource access subnet has been updated.\n"
-    for key, (old_value, new_value) in changes.items():
-        changes_string += (
-            f"{key} has been changed from '{old_value}' to '{new_value}'. "
-        )
-    return changes_string
+def log_access_subnet_offering_scope_save(sender, instance, created=False, **kwargs):
+    """Log an access subnet gaining an offering scope.
 
-
-def log_resource_access_subnet_save(sender, instance, created=False, **kwargs):
-    """Log resource access subnet creation and updates."""
-    if created:
-        event_logger.emit(
-            f"Resource access subnet {instance} has been created.",
-            event_type=EventType.RESOURCE_ACCESS_SUBNET_CREATION_SUCCEEDED,
-            event_context={"resource_access_subnet": instance},
-            scopes=[instance, instance.resource, instance.resource.project],
-        )
-        return
-
-    changes = get_resource_access_subnet_changes(instance)
-    if not changes:
-        # Nothing genuinely changed (e.g. a save that only re-assigned the same
-        # values) — do not emit a noisy no-op update event.
+    Only creation is interesting: the row carries nothing but the two foreign
+    keys, so there is no field a later save could meaningfully change. Edits to
+    the address or its description are logged against the subnet itself.
+    """
+    if not created:
         return
     event_logger.emit(
-        generate_resource_access_subnet_changes(changes),
-        event_type=EventType.RESOURCE_ACCESS_SUBNET_UPDATE_SUCCEEDED,
-        event_context={"resource_access_subnet": instance},
-        scopes=[instance, instance.resource, instance.resource.project],
+        f"Access subnet {instance.access_subnet} now applies to "
+        f"{instance.offering.name}.",
+        event_type=EventType.ACCESS_SUBNET_UPDATE_SUCCEEDED,
+        event_context={"access_subnet": instance.access_subnet},
+        scopes=[
+            instance.access_subnet,
+            instance.access_subnet.customer,
+            instance.offering,
+        ],
     )
 
 
-def log_resource_access_subnet_deletion(sender, instance, **kwargs):
-    """Log successful resource access subnet deletion."""
+def log_access_subnet_offering_scope_deletion(sender, instance, **kwargs):
+    """Log an access subnet losing an offering scope."""
     event_logger.emit(
-        f"Resource access subnet {instance} has been deleted.",
-        event_type=EventType.RESOURCE_ACCESS_SUBNET_DELETION_SUCCEEDED,
-        event_context={"resource_access_subnet": instance},
-        scopes=[instance.resource, instance.resource.project],
+        f"Access subnet {instance.access_subnet} no longer applies to "
+        f"{instance.offering.name}.",
+        event_type=EventType.ACCESS_SUBNET_UPDATE_SUCCEEDED,
+        event_context={"access_subnet": instance.access_subnet},
+        scopes=[instance.access_subnet.customer, instance.offering],
     )
 
 
@@ -3119,8 +3440,8 @@ def log_offering_access_subnet_save(sender, instance, created=False, **kwargs):
         )
         return
 
-    # Reuse the resource change-detection helper: it only inspects the tracker.
-    changes = get_resource_access_subnet_changes(instance)
+    # Reuse the shared change-detection helper: it only inspects the tracker.
+    changes = get_access_subnet_changes(instance)
     if not changes:
         return
     changes_string = "Offering access subnet has been updated.\n"
@@ -3144,3 +3465,93 @@ def log_offering_access_subnet_deletion(sender, instance, **kwargs):
         event_context={"offering_access_subnet": instance},
         scopes=[instance.offering, instance.offering.customer],
     )
+
+
+def send_order_state_change_to_message_queue(
+    sender, instance: Order, created=False, **kwargs
+):
+    """Emit an order event on every state transition, for any offering type.
+
+    The single emitter for order events: site agents demultiplex on
+    order_state and skip non-actionable ones; UI clients use the events as
+    cache-invalidation hints. Payloads are enriched with resource, project
+    and plan context by the ORDER enricher.
+    """
+    if get_skip_side_effects():
+        return
+    order = instance
+    if created:
+        return
+    if not order.tracker.has_changed("state"):
+        return
+
+    payload = {"order_uuid": order.uuid.hex, "order_state": order.get_state_display()}
+    messages = marketplace_utils.prepare_messages(
+        order.offering, payload, ObservableObjectType.ORDER
+    )
+    if messages:
+        transaction.on_commit(partial(logging_tasks.publish_messages.delay, messages))
+
+
+def send_end_date_change_request_to_message_queue(
+    sender, instance: ResourceEndDateChangeRequest, created=False, **kwargs
+):
+    """Emit an end date change request event on creation and every state change.
+
+    This is what lets an external approval system take the decision: it hears
+    about a new pending request, records its own identifier via set_backend_id,
+    and later calls approve or reject. The terminal states are emitted too, so a
+    request resolved inside Waldur does not leave the external system waiting.
+    """
+    if get_skip_side_effects():
+        return
+    end_date_request = instance
+    if not created and not end_date_request.tracker.has_changed("state"):
+        return
+
+    resource = end_date_request.resource
+    payload = {
+        "request_uuid": end_date_request.uuid.hex,
+        "request_state": end_date_request.get_state_display(),
+        "resource_uuid": resource.uuid.hex,
+        "resource_name": resource.name,
+        "requested_end_date": end_date_request.requested_end_date.isoformat(),
+        "current_end_date": resource.end_date.isoformat()
+        if resource.end_date
+        else None,
+        "comment": end_date_request.comment or "",
+        "backend_id": end_date_request.backend_id,
+    }
+    messages = marketplace_utils.prepare_messages(
+        resource.offering,
+        payload,
+        ObservableObjectType.RESOURCE_END_DATE_CHANGE_REQUEST,
+    )
+    if messages:
+        transaction.on_commit(partial(logging_tasks.publish_messages.delay, messages))
+
+
+def send_resource_state_change_to_message_queue(
+    sender, instance: Resource, created=False, **kwargs
+):
+    """Emit a resource event on creation and every state transition.
+
+    Does not overlap with the site-agent plugin's flag-change emitter
+    (downscaled/restrict_member_access/paused), which is a different trigger.
+    The enricher adds resource_state, project and limits context.
+    """
+    if get_skip_side_effects():
+        return
+    resource = instance
+    if not created and not resource.tracker.has_changed("state"):
+        return
+
+    payload = {
+        "resource_uuid": resource.uuid.hex,
+        "resource_backend_id": resource.backend_id,
+    }
+    messages = marketplace_utils.prepare_messages(
+        resource.offering, payload, ObservableObjectType.RESOURCE
+    )
+    if messages:
+        transaction.on_commit(partial(logging_tasks.publish_messages.delay, messages))

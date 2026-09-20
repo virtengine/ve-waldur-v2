@@ -160,6 +160,154 @@ class OrderEndDateCreateTest(BaseOrderCreateTest):
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    @freeze_time("2026-07-27")
+    @override_constance_config(ENABLE_ORDER_START_DATE=True)
+    def test_end_date_allowed_when_within_max_offset_from_future_start_date(self):
+        """
+        Repro: project Sep 17–Dec 4, offering max_offset=120 from start_date.
+        Dec 4 is beyond today+120 but within start_date+120 and project end.
+        """
+        self.project.start_date = datetime.date(2026, 9, 17)
+        self.project.end_date = datetime.date(2026, 12, 4)
+        self.project.save()
+
+        offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
+        offering.plugin_options = {
+            "is_resource_termination_date_required": True,
+            "default_resource_termination_offset_in_days": 90,
+            "max_resource_termination_offset_in_days": 120,
+        }
+        offering.save()
+
+        response = self.create_order(
+            self.fixture.owner,
+            offering,
+            add_payload={
+                "start_date": "2026-09-17",
+                "attributes": {
+                    "name": "test",
+                    "end_date": "2026-12-04",
+                },
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        resource = models.Resource.objects.last()
+        self.assertEqual(resource.end_date, datetime.date(2026, 12, 4))
+
+    @freeze_time("2026-07-27")
+    @override_constance_config(ENABLE_ORDER_START_DATE=True)
+    def test_end_date_rejected_when_beyond_max_offset_from_future_start_date(self):
+        self.project.start_date = datetime.date(2026, 9, 17)
+        self.project.end_date = datetime.date(2027, 6, 1)
+        self.project.save()
+
+        offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
+        offering.plugin_options = {
+            "is_resource_termination_date_required": True,
+            "default_resource_termination_offset_in_days": 90,
+            "max_resource_termination_offset_in_days": 120,
+        }
+        offering.save()
+
+        # start_date + 120 = 2027-01-15; requested end is beyond that
+        response = self.create_order(
+            self.fixture.owner,
+            offering,
+            add_payload={
+                "start_date": "2026-09-17",
+                "attributes": {
+                    "name": "test",
+                    "end_date": "2027-02-01",
+                },
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("end_date", response.data)
+
+    @freeze_time("2026-07-27")
+    @override_constance_config(ENABLE_ORDER_START_DATE=True)
+    def test_end_date_rejected_when_after_project_end_date(self):
+        self.project.start_date = datetime.date(2026, 9, 17)
+        self.project.end_date = datetime.date(2026, 12, 4)
+        self.project.save()
+
+        offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
+        offering.plugin_options = {
+            "is_resource_termination_date_required": True,
+            "default_resource_termination_offset_in_days": 90,
+            "max_resource_termination_offset_in_days": 200,
+        }
+        offering.save()
+
+        response = self.create_order(
+            self.fixture.owner,
+            offering,
+            add_payload={
+                "start_date": "2026-09-17",
+                "attributes": {
+                    "name": "test",
+                    "end_date": "2026-12-10",
+                },
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("end_date", response.data)
+
+    @freeze_time("2026-07-27")
+    @override_constance_config(ENABLE_ORDER_START_DATE=True)
+    def test_end_date_rejected_when_before_start_date(self):
+        self.project.start_date = datetime.date(2026, 9, 17)
+        self.project.end_date = datetime.date(2026, 12, 4)
+        self.project.save()
+
+        offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
+        offering.plugin_options = {
+            "is_resource_termination_date_required": True,
+            "default_resource_termination_offset_in_days": 90,
+            "max_resource_termination_offset_in_days": 120,
+        }
+        offering.save()
+
+        # end_date is after today but before the order start_date
+        response = self.create_order(
+            self.fixture.owner,
+            offering,
+            add_payload={
+                "start_date": "2026-09-17",
+                "attributes": {
+                    "name": "test",
+                    "end_date": "2026-08-01",
+                },
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("end_date", response.data)
+
+    @freeze_time("2026-07-27")
+    @override_constance_config(ENABLE_ORDER_START_DATE=True)
+    def test_default_end_date_uses_future_start_date_and_caps_at_project_end(self):
+        self.project.start_date = datetime.date(2026, 9, 17)
+        self.project.end_date = datetime.date(2026, 12, 4)
+        self.project.save()
+
+        offering = factories.OfferingFactory(state=OfferingStates.ACTIVE)
+        offering.plugin_options = {
+            "is_resource_termination_date_required": True,
+            # start_date + 90 = 2026-12-16, beyond project end → clamp to Dec 4
+            "default_resource_termination_offset_in_days": 90,
+            "max_resource_termination_offset_in_days": 120,
+        }
+        offering.save()
+
+        response = self.create_order(
+            self.fixture.owner,
+            offering,
+            add_payload={"start_date": "2026-09-17"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        resource = models.Resource.objects.last()
+        self.assertEqual(resource.end_date, datetime.date(2026, 12, 4))
+
 
 class OrderCreatePrepaidTest(BaseOrderCreateTest):
     def setUp(self):
@@ -277,6 +425,62 @@ class OrderCreatePrepaidTest(BaseOrderCreateTest):
 
         # Assert
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    @freeze_time("2024-01-01")
+    def test_stated_months_outrank_the_date_derived_count(self):
+        # The browser computed end_date from a local "today" one day ahead of
+        # the server's: 12 months + 1 day would round up to 13 and fail a max
+        # of 12, but the client stated 12 months and that is what is checked.
+        self.prepaid_component.max_prepaid_duration = 12
+        self.prepaid_component.save()
+        payload = {
+            "attributes": {"end_date": "2025-01-02", "prepaid_duration_months": 12}
+        }
+
+        response = self.create_order(self.user, self.offering, add_payload=payload)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+    @freeze_time("2024-01-01")
+    def test_without_stated_months_the_date_still_decides(self):
+        self.prepaid_component.max_prepaid_duration = 12
+        self.prepaid_component.save()
+        payload = {"attributes": {"end_date": "2025-01-02"}}
+
+        response = self.create_order(self.user, self.offering, add_payload=payload)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("attributes.end_date", response.data)
+
+    @freeze_time("2024-01-01")
+    def test_stated_months_are_validated_against_the_component(self):
+        payload = {
+            "attributes": {"end_date": "2027-01-01", "prepaid_duration_months": 36}
+        }
+
+        response = self.create_order(self.user, self.offering, add_payload=payload)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("attributes.prepaid_duration_months", response.data)
+
+    @freeze_time("2024-01-01")
+    def test_stated_months_must_be_a_positive_integer(self):
+        payload = {
+            "attributes": {"end_date": "2025-01-01", "prepaid_duration_months": "abc"}
+        }
+
+        response = self.create_order(self.user, self.offering, add_payload=payload)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("attributes.prepaid_duration_months", response.data)
+
+    def test_end_date_is_still_required_when_months_are_stated(self):
+        payload = {"attributes": {"prepaid_duration_months": 12}}
+
+        response = self.create_order(self.user, self.offering, add_payload=payload)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("attributes.end_date", response.data)
 
 
 class RenewalSerializerConstraintsTest(TestCase):

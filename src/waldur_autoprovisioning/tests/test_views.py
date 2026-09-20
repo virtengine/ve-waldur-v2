@@ -61,7 +61,7 @@ class RuleTestMatchEndpointTest(test.APITestCase):
         self.assertTrue(response.data["would_provision"])
         self.assertEqual(response.data["block_reason"], "")
         self.assertEqual(response.data["resolved_project_name"], target.username)
-        # Six filter results, email_patterns matched
+        # Seven filter results, email_patterns matched
         filter_names = {fr["name"] for fr in response.data["filter_results"]}
         self.assertEqual(
             filter_names,
@@ -72,6 +72,7 @@ class RuleTestMatchEndpointTest(test.APITestCase):
                 "nationalities",
                 "organization_types",
                 "assurance_levels",
+                "claims",
             },
         )
         email_fr = next(
@@ -211,3 +212,138 @@ class RuleTestMatchEndpointTest(test.APITestCase):
         self.assertEqual(
             response.data["resolved_project_name"], f"{target.username}_workspace"
         )
+
+    def test_project_action_reports_a_project_to_create(self, _):
+        # The account predates the rule, so nothing was provisioned for it yet.
+        target = _user(email="hit@example.com")
+        rule = autoprovisioning_factories.RuleFactory(
+            plan=None, user_email_patterns=[r".+@example\.com"]
+        )
+        self.client.force_authenticate(self.staff)
+        response = self._post(rule, target.uuid)
+        self.assertTrue(response.data["would_provision"])
+        self.assertEqual(response.data["project_action"], "create")
+
+    def test_project_action_reports_an_existing_project(self, _):
+        rule = autoprovisioning_factories.RuleFactory(
+            plan=None, user_email_patterns=[r".+@example\.com"]
+        )
+        # Provisioned on account creation.
+        target = _user(email="hit@example.com")
+        self.client.force_authenticate(self.staff)
+        response = self._post(rule, target.uuid)
+        self.assertTrue(response.data["would_provision"])
+        self.assertEqual(response.data["project_action"], "existing")
+
+    def test_deleted_project_blocks_a_rule_that_only_grants_a_project_role(self, _):
+        rule = autoprovisioning_factories.RuleFactory(
+            plan=None, user_email_patterns=[r".+@example\.com"]
+        )
+        target = _user(email="hit@example.com")
+        structure_models.Project.available_objects.get(
+            customer=rule.customer, name=target.username
+        ).delete()
+        self.client.force_authenticate(self.staff)
+        response = self._post(rule, target.uuid)
+        self.assertFalse(response.data["would_provision"])
+        self.assertEqual(response.data["project_action"], "not_recreated")
+        self.assertIn("not recreated", response.data["block_reason"])
+
+    def test_project_action_is_null_for_an_organization_only_rule(self, _):
+        from waldur_core.permissions.fixtures import CustomerRole
+
+        rule = autoprovisioning_factories.RuleFactory(
+            plan=None,
+            create_project=False,
+            customer_role=CustomerRole.OWNER,
+            user_email_patterns=[r".+@example\.com"],
+        )
+        target = _user(email="hit@example.com")
+        self.client.force_authenticate(self.staff)
+        response = self._post(rule, target.uuid)
+        self.assertTrue(response.data["would_provision"])
+        self.assertIsNone(response.data["project_action"])
+
+
+@patch("waldur_autoprovisioning.handlers.process_order_on_commit")
+class UnconfiguredClaimsTest(test.APITestCase):
+    """`unconfigured_claims` tells two look-alike failures apart.
+
+    An empty user value in the dry-run reads the same whether the provider sent
+    a different value or never sent the claim at all — but the fixes are
+    opposite: adjust the rule, versus add the claim to the provider's extra
+    fields. Without this an administrator cannot tell which they are looking at.
+    """
+
+    def setUp(self):
+        self.staff = structure_factories.UserFactory(is_staff=True)
+        self.target = User.objects.create(
+            username="claims-target", email="target@example.com"
+        )
+
+    def _post(self, rule):
+        self.client.force_authenticate(self.staff)
+        return self.client.post(
+            autoprovisioning_factories.RuleFactory.get_url(rule, "test-match"),
+            {"user_uuid": self.target.uuid.hex},
+        )
+
+    def _provider(self, **kwargs):
+        from waldur_auth_social.models import IdentityProvider
+
+        return IdentityProvider.objects.create(
+            provider="keycloak",
+            client_id="cid",
+            client_secret="secret",
+            discovery_url="http://idp.test/.well-known/openid-configuration",
+            userinfo_url="http://idp.test/userinfo",
+            token_url="http://idp.test/token",
+            auth_url="http://idp.test/auth",
+            **kwargs,
+        )
+
+    def test_claim_nobody_passes_through_is_reported(self, _):
+        rule = autoprovisioning_factories.RuleFactory(
+            plan=None, user_claims={"entitlements": ["urn:x:*"]}
+        )
+        response = self._post(rule)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["unconfigured_claims"], ["entitlements"])
+
+    def test_claim_listed_in_extra_fields_is_not_reported(self, _):
+        self._provider(extra_fields="roles")
+        rule = autoprovisioning_factories.RuleFactory(
+            plan=None, user_claims={"roles": ["acme-owner"]}
+        )
+        response = self._post(rule)
+        self.assertEqual(response.data["unconfigured_claims"], [])
+
+    def test_only_the_unpassed_claims_are_reported(self, _):
+        self._provider(extra_fields="roles")
+        rule = autoprovisioning_factories.RuleFactory(
+            plan=None,
+            user_claims={"roles": ["acme-owner"], "entitlements": ["urn:x:*"]},
+        )
+        response = self._post(rule)
+        self.assertEqual(response.data["unconfigured_claims"], ["entitlements"])
+
+    def test_a_claim_mapped_onto_a_profile_field_counts_as_passed_through(self, _):
+        self._provider(attribute_mapping={"organization": "schac_home_organization"})
+        rule = autoprovisioning_factories.RuleFactory(
+            plan=None, user_claims={"schac_home_organization": ["example.org"]}
+        )
+        response = self._post(rule)
+        self.assertEqual(response.data["unconfigured_claims"], [])
+
+    def test_an_inactive_provider_does_not_count(self, _):
+        self._provider(extra_fields="roles", is_active=False)
+        rule = autoprovisioning_factories.RuleFactory(
+            plan=None, user_claims={"roles": ["acme-owner"]}
+        )
+        response = self._post(rule)
+        self.assertEqual(response.data["unconfigured_claims"], ["roles"])
+
+    def test_a_rule_without_claims_reports_nothing(self, _):
+        rule = autoprovisioning_factories.RuleFactory(plan=None)
+        response = self._post(rule)
+        self.assertEqual(response.data["unconfigured_claims"], [])
