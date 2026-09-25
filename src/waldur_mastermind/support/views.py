@@ -486,7 +486,7 @@ class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
 
         try:
             with transaction.atomic():
-                new_child, old_helpdesks = tasks.reroute_issue_to_provider(
+                new_child, withdrawn = tasks.reroute_issue_to_provider(
                     issue, new_helpdesk
                 )
         except Exception:
@@ -500,14 +500,17 @@ class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
 
         issue_id = issue.id
         new_child_id = new_child.id
-        old_helpdesk_ids = [helpdesk.id for helpdesk in old_helpdesks]
+        withdrawn_args = [
+            (helpdesk.id, child_uuid, child_key)
+            for helpdesk, child_uuid, child_key in withdrawn
+        ]
         transaction.on_commit(
             lambda: tasks.notify_provider_new_ticket.delay(new_child_id)
         )
-        for helpdesk_id in old_helpdesk_ids:
+        for args in withdrawn_args:
             transaction.on_commit(
-                lambda helpdesk_id=helpdesk_id: tasks.notify_provider_ticket_withdrawn.delay(
-                    issue_id, helpdesk_id
+                lambda args=args: tasks.notify_provider_ticket_withdrawn.delay(
+                    issue_id, *args
                 )
             )
 
@@ -626,7 +629,16 @@ class CommentViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
         if not backend.get_active_backend().comment_update_is_available(comment):
             raise ValidationError("Updating is not available.")
 
-    update_permissions = partial_update_permissions = [structure_permissions.is_staff]
+    def _update_permission(request, view, obj=None):
+        if obj is None:
+            return
+        active_backend = backend.get_active_backend()
+        if not backend.comment_change_is_permitted(
+            request.user, obj, active_backend.comment_author_update_is_supported
+        ):
+            raise rf_exceptions.PermissionDenied()
+
+    update_permissions = partial_update_permissions = [_update_permission]
     update_validators = partial_update_validators = [_update_is_available_validator]
 
     @transaction.atomic()
@@ -638,7 +650,16 @@ class CommentViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
         if not backend.get_active_backend().comment_destroy_is_available(comment):
             raise ValidationError("Comment cannot be destroyed.")
 
-    destroy_permissions = [structure_permissions.is_staff]
+    def _destroy_permission(request, view, obj=None):
+        if obj is None:
+            return
+        active_backend = backend.get_active_backend()
+        if not backend.comment_change_is_permitted(
+            request.user, obj, active_backend.comment_author_destroy_is_supported
+        ):
+            raise rf_exceptions.PermissionDenied()
+
+    destroy_permissions = [_destroy_permission]
     destroy_validators = [_destroy_is_available_validator]
 
     def get_queryset(self):

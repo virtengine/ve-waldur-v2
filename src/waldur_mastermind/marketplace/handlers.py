@@ -34,6 +34,7 @@ from waldur_core.users.enums import InvitationState
 from waldur_core.users.scim import tasks as scim_tasks
 from waldur_core.users.tasks import process_invitation
 from waldur_freeipa.models import Profile
+from waldur_mastermind.common.utils import price_has_changed
 from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.billing import MarketplaceBillingService
 from waldur_mastermind.marketplace.enums import (
@@ -243,7 +244,13 @@ def notify_approvers_when_order_is_created(
         OrderStates.PENDING_PROVIDER,
     ):
         if order_should_not_be_reviewed_by_consumer(order):
-            order.review_by_consumer(order.created_by)
+            # An order can arrive with its consumer review already recorded --
+            # proposal allocation stamps the call manager who accepted the
+            # proposal. review_by_consumer overwrites both fields and saves
+            # every column, so recording it again would discard that
+            # timestamp and cost one extra UPDATE per granted resource.
+            if order.consumer_reviewed_by_id is None:
+                order.review_by_consumer(order.created_by)
             if order.project.start_date and order.project.start_date > now().date():
                 order.state = OrderStates.PENDING_PROJECT
                 order.save(update_fields=["state"])
@@ -257,7 +264,9 @@ def notify_approvers_when_order_is_created(
                     order.id,
                     order.resource,
                 )
-                tasks.process_order_on_commit(order, order.created_by)
+                tasks.process_order_on_commit(
+                    order, utils.get_order_processing_user(order)
+                )
             else:
                 order.state = OrderStates.PENDING_PROVIDER
                 order.save(update_fields=["state"])
@@ -296,6 +305,13 @@ def notify_recipients_when_order_is_created(
         return
 
     if instance.created_by is None or core_utils.is_robot_user(instance.created_by):
+        return
+
+    # An order placed automatically records the person it is for, not somebody
+    # who placed it. Proposal allocation is the case in point: announcing one
+    # new order per granted resource on allocation day is exactly the bulk
+    # this guard exists to avoid.
+    if instance.placed_automatically:
         return
 
     secret_options = instance.offering.secret_options or {}
@@ -445,7 +461,14 @@ def update_resource_state_on_order_rejection_error_or_cancellation(
         return
     resource = order.resource
     if order.state in (OrderStates.REJECTED, OrderStates.CANCELED):
-        if order.type == OrderTypes.CREATE:
+        # CREATE and RESTORE both mean the resource never came up, so a refused
+        # one goes back to TERMINATED — which is also what restore_validators
+        # require, so the user can ask again. RESTORE needs saying explicitly:
+        # the restore view moves the resource TERMINATED -> CREATING before the
+        # order exists, so without this branch a refused restore would fall
+        # through to set_state_ok() and leave a resource that was never
+        # restored looking alive.
+        if order.type in (OrderTypes.CREATE, OrderTypes.RESTORE):
             resource.set_state_terminated()
             resource.save(update_fields=["state"])
 
@@ -1131,7 +1154,9 @@ def plan_component_has_been_updated(
     if created:
         return
 
-    if instance.tracker.has_changed("price"):
+    if instance.tracker.has_changed("price") and price_has_changed(
+        instance.tracker.previous("price"), instance.price
+    ):
         event_logger.emit(
             f"Current price of component {instance.component.type} in plan {instance.plan.name} has been updated.",
             event_type=EventType.MARKETPLACE_PLAN_COMPONENT_CURRENT_PRICE_UPDATED,
@@ -1144,7 +1169,9 @@ def plan_component_has_been_updated(
             },
             scopes=get_plan_component_scopes(instance),
         )
-    if instance.tracker.has_changed("future_price"):
+    if instance.tracker.has_changed("future_price") and price_has_changed(
+        instance.tracker.previous("future_price"), instance.future_price
+    ):
         event_logger.emit(
             f"Future price of component {instance.component.type} in plan {instance.plan.name} has been updated.",
             event_type=EventType.MARKETPLACE_PLAN_COMPONENT_FUTURE_PRICE_UPDATED,
@@ -1157,7 +1184,9 @@ def plan_component_has_been_updated(
             },
             scopes=get_plan_component_scopes(instance),
         )
-    if instance.tracker.has_changed("amount"):
+    if instance.tracker.has_changed("amount") and price_has_changed(
+        instance.tracker.previous("amount"), instance.amount
+    ):
         event_logger.emit(
             f"Quota of component {instance.component.type} in plan {instance.plan.name} has been updated.",
             event_type=EventType.MARKETPLACE_PLAN_COMPONENT_QUOTA_UPDATED,
@@ -2651,27 +2680,39 @@ def close_course_accounts_after_project_removal(
     if not settings.WALDUR_CORE.get("COURSE_ACCOUNT_USE_API"):
         return
 
-    course_accounts = models.CourseAccount.objects.filter(project=instance)
-    if not course_accounts.exists():
-        return
-    try:
-        api_access_token = utils.get_course_account_api_token()
-    except httpx.HTTPError:
-        logger.error(
-            "Unable to get course account API token, skipping accounts removal for project %s",
-            instance,
+    # Project.delete() defaults to a soft delete, but soft=False (Customer.delete()
+    # hard-deleting every project once none remain active, or the admin's
+    # "hard-delete soft-deleted projects" action) does a real DB delete, and
+    # CourseAccount.project is CASCADE - the row would be gone by the time a task
+    # re-read it by uuid. So the account's uuid/username/user_id are captured here,
+    # before the delete completes, and handed to the task instead of re-queried.
+    #
+    # Closing runs in a task rather than inline here because it calls a
+    # third-party API per account: looping synchronously blocked whichever
+    # caller triggered the deletion (an unrelated order state-transition
+    # request, in one observed case) on that backend's latency, with no
+    # bound on the outbound call. Batching every account from this project
+    # into one task (rather than one task per account) also means the API
+    # token is fetched once per project instead of once per account - and
+    # that fetch only ever happens inside the task, never here, so it can't
+    # reintroduce the same blocking-call-in-a-request problem for the
+    # synchronous hard-delete callers above.
+    accounts = list(
+        models.CourseAccount.objects.filter(project=instance).values(
+            "uuid", "user__username", "user_id"
         )
+    )
+    if not accounts:
         return
-
-    for course_account in course_accounts:
-        try:
-            utils.close_course_account(course_account, api_access_token)
-        except httpx.HTTPError:
-            logger.error(
-                "Unable to close course account %s from project %s",
-                course_account.user.username,
-                instance,
-            )
+    payload = [
+        {
+            "uuid": account["uuid"].hex,
+            "username": account["user__username"],
+            "user_id": account["user_id"],
+        }
+        for account in accounts
+    ]
+    transaction.on_commit(lambda: tasks.close_course_accounts_task.delay(payload))
 
 
 def log_terms_of_service_consent_granted(
@@ -3043,9 +3084,12 @@ def process_billing_on_resource_save(
 ):
     """
     Handle resource state changes and billing events.
+
+    Skipped under ``skip_side_effects()``: bulk imports and the offering merge
+    rewrite resources without meaning to terminate and reissue invoice items.
     """
     resource = instance
-    if created:
+    if created or get_skip_side_effects():
         return
 
     tracker = resource.tracker

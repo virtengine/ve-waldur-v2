@@ -1,6 +1,7 @@
 import collections
 import datetime
 import decimal
+import functools
 import hashlib
 import logging
 import uuid as uuid_mod
@@ -42,13 +43,16 @@ from waldur_mastermind.invoices.models import InvoiceItem
 from waldur_mastermind.marketplace import (
     exceptions,
     models,
+    offering_merge,
     plugins,
     utils,
 )
+from waldur_mastermind.marketplace import log as marketplace_log
 from waldur_mastermind.marketplace.catalog_loaders.eessi import EESSICatalogLoader
 from waldur_mastermind.marketplace.catalog_loaders.spack import SpackCatalogLoader
 from waldur_mastermind.marketplace.enums import (
     BillingTypes,
+    CourseAccountState,
     LimitPeriods,
     MaintenanceState,
     OfferingStates,
@@ -166,6 +170,116 @@ def create_course_account_task(course_account_uuid_hex: str, owner_username: str
         course_account.error_message = error_message
         course_account.set_state_erred()
         course_account.save(update_fields=["error_message", "state"])
+
+
+@shared_task
+def close_course_account_task(course_account_uuid_hex: str):
+    """Close a single course account via the external API.
+
+    Used by the destroy action, where the row is known to exist (the
+    ViewSet already resolved it) and closing one account at a time is
+    right - a direct API caller shouldn't wait on, or be blocked by,
+    anyone else's account.
+    """
+    try:
+        course_account = models.CourseAccount.objects.get(uuid=course_account_uuid_hex)
+    except models.CourseAccount.DoesNotExist:
+        logger.error(
+            "CourseAccount %s not found, skipping task", course_account_uuid_hex
+        )
+        return
+
+    _close_course_account_and_mark_erred_on_any_failure(course_account)
+
+
+@shared_task
+def close_course_accounts_task(accounts: list[dict]):
+    """Close every course account of one deleted project via the external API.
+
+    Batched into one task per project rather than one task per account so
+    the API token is fetched once here instead of once per account - and
+    only ever inside this task, never in the pre_delete signal that
+    scheduled it, so a slow token endpoint can't block whichever request
+    or admin action triggered the project deletion.
+
+    Each account's uuid/username/user_id is passed in rather than
+    re-queried, because CourseAccount.project is CASCADE: a hard project
+    delete (Customer.delete() once no active projects remain, or the
+    admin's "hard-delete soft-deleted projects" action) removes the row
+    before this task runs, and re-reading by uuid would silently skip
+    closing that account at the backend.
+    """
+    if not accounts:
+        return
+
+    try:
+        api_access_token = utils.get_course_account_api_token()
+    except httpx.HTTPError as exc:
+        logger.error(
+            "Unable to get course account API token, skipping %s accounts: %s",
+            len(accounts),
+            exc,
+        )
+        return
+
+    for account in accounts:
+        uuid_hex = account["uuid"]
+        username = account["username"]
+        user_id = account["user_id"]
+        try:
+            course_account = models.CourseAccount.objects.get(uuid=uuid_hex)
+        except models.CourseAccount.DoesNotExist:
+            if not username:
+                # No backend account was ever created for this one either.
+                continue
+            try:
+                utils.close_course_account_by_username(username, api_access_token)
+            except Exception as exc:
+                logger.error(
+                    "Failed to close course account %s at backend "
+                    "(local row already deleted): %s",
+                    username,
+                    exc,
+                )
+                continue
+            if user_id:
+                core_models.User.objects.filter(pk=user_id).update(
+                    is_active=False,
+                    deactivation_reason=f"Course account for {username} closed",
+                )
+            continue
+
+        _close_course_account_and_mark_erred_on_any_failure(
+            course_account, api_access_token
+        )
+
+
+def _close_course_account_and_mark_erred_on_any_failure(
+    course_account: models.CourseAccount, api_access_token: str | None = None
+):
+    """Run close_course_account and guarantee the account never gets stuck.
+
+    close_course_account itself only marks ERRED for httpx.HTTPError/ValueError
+    (the expected "backend call failed" cases). Anything else it lets
+    propagate - e.g. ValidationError when COURSE_ACCOUNT_URL isn't
+    configured - which would otherwise leave the account stuck in PENDING
+    forever: both destroy and retry require OK/ERRED as their source state,
+    so a PENDING account can't be re-attempted through the API at all.
+    """
+    try:
+        utils.close_course_account(course_account, api_access_token)
+    except Exception as exc:
+        logger.error(
+            "Failed to close course account %s: %s", course_account.uuid.hex, exc
+        )
+        course_account.refresh_from_db()
+        if course_account.state not in (
+            CourseAccountState.CLOSED,
+            CourseAccountState.ERRED,
+        ):
+            course_account.set_state_erred()
+            course_account.error_message = str(exc)
+            course_account.save(update_fields=["state", "error_message"])
 
 
 @shared_task
@@ -684,6 +798,104 @@ def calculate_allocated_for_month(
         ).aggregate(total=Sum("quantity"))
 
         return Decimal(str(items_agg["total"] or 0))
+
+
+# The maximum value ComponentUsageMonthly's max_digits=20, decimal_places=2 holds.
+MAX_USAGE_SUMMARY_DECIMAL = Decimal("999999999999999999.99")
+
+
+def refresh_component_usage_summary(
+    component: models.OfferingComponent, year: int, month: int, delete_empty=False
+) -> bool:
+    """Recalculate the ComponentUsageMonthly row of one component and month.
+
+    Returns True if a row was saved. A month with neither consumption nor
+    allocation gets no row; with ``delete_empty`` an existing one is removed,
+    so a component whose usage moved elsewhere does not keep a stale summary.
+    """
+    billing_period = datetime.date(year, month, 1)
+    consumed = calculate_consumed_for_month(component, year, month)
+    allocated = calculate_allocated_for_month(component, year, month)
+
+    if consumed == Decimal("0") and allocated == Decimal("0"):
+        if delete_empty:
+            models.ComponentUsageMonthly.objects.filter(
+                component=component, billing_period=billing_period
+            ).delete()
+        return False
+
+    usage_percent = None
+    if allocated > 0:
+        usage_percent = round((consumed * 100) / allocated, 2)
+
+    # Safety clamp to prevent DB overflow from corrupted JSONB data
+    consumed = min(consumed, MAX_USAGE_SUMMARY_DECIMAL)
+    allocated = min(allocated, MAX_USAGE_SUMMARY_DECIMAL)
+
+    models.ComponentUsageMonthly.objects.update_or_create(
+        component=component,
+        billing_period=billing_period,
+        defaults={
+            "total_consumed": consumed,
+            "total_allocated": allocated,
+            "usage_percent": usage_percent,
+        },
+    )
+    return True
+
+
+def _log_verification(merge: models.OfferingMerge):
+    if merge.verification and not merge.verification.get("passed", True):
+        marketplace_log.log_offering_merge_verification_failed(merge)
+
+
+@shared_task(name="waldur_mastermind.marketplace.execute_offering_merge")
+def execute_offering_merge(merge_uuid: str):
+    """Run a queued offering merge and record the outcome in the event log.
+
+    A refused merge (``OfferingMergeError``) ends as ``failed`` with the reason
+    in ``error_message``; it is an expected outcome, so the task succeeds.
+    Any other error fails the task after the record is marked ``failed``.
+    """
+    merge = models.OfferingMerge.objects.get(uuid=merge_uuid)
+    try:
+        merge = offering_merge.execute(merge)
+    except Exception as error:
+        merge.refresh_from_db()
+        if merge.state == models.OfferingMerge.States.FAILED:
+            marketplace_log.log_offering_merge_failed(merge, "execution")
+        if isinstance(error, offering_merge.OfferingMergeError):
+            logger.warning("Offering merge %s was refused: %s", merge_uuid, error)
+            return
+        raise
+    marketplace_log.log_offering_merge_executed(merge)
+    _log_verification(merge)
+
+
+@shared_task(name="waldur_mastermind.marketplace.undo_offering_merge")
+def undo_offering_merge(merge_uuid: str):
+    """Undo a merge the API moved to ``undoing``.
+
+    If the engine refuses (something changed since the API checked), the merge
+    returns to ``done`` with the reason in ``error_message``: it is still in
+    effect, so ``failed``, which allows a fresh preview and execution, would
+    be wrong.
+    """
+    merge = models.OfferingMerge.objects.get(uuid=merge_uuid)
+    try:
+        merge = offering_merge.undo(merge)
+    except Exception as error:
+        merge.refresh_from_db()
+        if merge.error_message:
+            marketplace_log.log_offering_merge_failed(merge, "undo")
+        if isinstance(error, offering_merge.OfferingMergeError):
+            logger.warning(
+                "Undo of offering merge %s was refused: %s", merge_uuid, error
+            )
+            return
+        raise
+    marketplace_log.log_offering_merge_undone(merge)
+    _log_verification(merge)
 
 
 @shared_task
@@ -1342,6 +1554,11 @@ def process_pending_start_date_orders():
         start_date__lte=today,
     )
 
+    # Resolved once for the sweep: get_system_robot is a get_or_create, and
+    # every order placed automatically would otherwise pay a query for the
+    # same row.
+    system_robot = core_utils.get_system_robot()
+
     for order in orders_to_process:
         logger.info(
             "Processing order %s (%s) as its start date %s has been reached.",
@@ -1352,8 +1569,17 @@ def process_pending_start_date_orders():
         order.set_state_executing()
         order.save(update_fields=["state"])
         # Use transaction.on_commit to ensure the state change is saved
-        # before the processing task is queued.
-        transaction.on_commit(lambda: process_order_on_commit(order, order.created_by))
+        # before the processing task is queued. Bind the arguments now rather
+        # than closing over the loop variable: a lambda would read whatever
+        # `order` holds when the callback runs, so a batch of several orders
+        # would process the last one repeatedly and strand the rest.
+        transaction.on_commit(
+            functools.partial(
+                process_order_on_commit,
+                order,
+                utils.get_order_processing_user(order, system_robot),
+            )
+        )
 
 
 @shared_task(name="waldur_mastermind.marketplace.process_pending_project_orders")
@@ -1365,14 +1591,20 @@ def process_pending_project_orders():
     orders = models.Order.objects.filter(
         state=OrderStates.PENDING_PROJECT, project__in=active_project_ids
     )
+    # Same reason as the start-date sweep above: one get_or_create for the
+    # batch rather than one per order.
+    system_robot = core_utils.get_system_robot()
     for order in orders:
-        continue_order_processing(order)
+        continue_order_processing(order, system_robot)
 
 
-def continue_order_processing(order: models.Order):
+def continue_order_processing(order: models.Order, system_robot=None):
     """
     Advances an order to the next logical state after consumer/project approval.
     Checks for provider review and the order's own start_date.
+
+    ``system_robot`` is an optional pre-resolved robot for callers sweeping a
+    batch; see ``utils.get_order_processing_user``.
     """
     if utils.order_should_not_be_reviewed_by_provider(order):
         if order.start_date and order.start_date > timezone.now().date():
@@ -1382,7 +1614,9 @@ def continue_order_processing(order: models.Order):
             order.set_state_executing()
             order.save(update_fields=["state"])
             transaction.on_commit(
-                lambda: process_order_on_commit(order, order.created_by)
+                lambda: process_order_on_commit(
+                    order, utils.get_order_processing_user(order, system_robot)
+                )
             )
     else:
         order.state = models.OrderStates.PENDING_PROVIDER

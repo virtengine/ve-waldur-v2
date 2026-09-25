@@ -2938,6 +2938,21 @@ class Order(
     consumer_rejection_comment = models.TextField(blank=True, default="")
     provider_rejection_comment = models.TextField(blank=True, default="")
 
+    placed_automatically = models.BooleanField(
+        default=False,
+        editable=False,
+        help_text=(
+            "The order was placed by an automated flow on behalf of the "
+            "person in created_by, rather than by that person. Proposal "
+            "allocation sets this: the call review authorised the spend and "
+            "the accepting call manager is recorded as the consumer "
+            "reviewer, while created_by only names who the order is for. "
+            "Such an order is not announced as a new order, and is carried "
+            "out with system authority, since the person named need hold no "
+            "role on the project."
+        ),
+    )
+
     auto_approved_by_rule = models.ForeignKey(
         "ProjectOrderAutoApproval",
         on_delete=models.SET_NULL,
@@ -3596,6 +3611,16 @@ class BaseAccount(
         abstract = True
         ordering = ["username", "id"]
 
+    # The comment explains a pending state; it no longer applies once the account is OK.
+    SERVICE_PROVIDER_COMMENT_FIELDS = (
+        "service_provider_comment",
+        "service_provider_comment_url",
+    )
+
+    def _clear_service_provider_comment(self):
+        self.service_provider_comment = ""
+        self.service_provider_comment_url = ""
+
     @transition(
         field=state,
         source=[
@@ -3622,7 +3647,7 @@ class BaseAccount(
         target=OfferingUserStates.OK,
     )
     def set_ok(self):
-        pass
+        self._clear_service_provider_comment()
 
     @transition(
         field=state,
@@ -3663,10 +3688,7 @@ class BaseAccount(
         target=OfferingUserStates.OK,
     )
     def set_validation_complete(self):
-        self.service_provider_comment = ""  # Clear comment when validation is complete
-        self.service_provider_comment_url = (
-            ""  # Clear comment URL when validation is complete
-        )
+        self._clear_service_provider_comment()
 
     @transition(
         field=state,
@@ -3718,7 +3740,7 @@ class BaseAccount(
         record must be able to come back from DELETED rather than asking for a
         brand-new account under a new name.
         """
-        pass
+        self._clear_service_provider_comment()
 
     @transition(
         field=state,
@@ -3765,6 +3787,25 @@ class BaseAccount(
             and (self.tracker.has_changed("username") or not self.pk)
         ):
             self.set_ok()
+            if kwargs.get("update_fields") is not None:
+                kwargs["update_fields"] = {*kwargs["update_fields"], "state"}
+        # Moving to OK clears the comment in memory; persist that even when
+        # the caller only listed "state".
+        update_fields = kwargs.get("update_fields")
+        if (
+            update_fields is not None
+            and "state" in update_fields
+            and self.state == OfferingUserStates.OK
+            and self.tracker.has_changed("state")
+        ):
+            kwargs["update_fields"] = {
+                *update_fields,
+                *(
+                    field
+                    for field in self.SERVICE_PROVIDER_COMMENT_FIELDS
+                    if self.tracker.has_changed(field)
+                ),
+            }
         super().save(*args, **kwargs)
 
     def get_log_fields(self):
@@ -6008,7 +6049,14 @@ class CourseAccount(
 
     @transition(
         field=state,
-        source=[CourseAccountState.OK, CourseAccountState.ERRED],
+        # PENDING is included because closing goes through it too: the
+        # destroy action and the project pre_delete handler both move the
+        # account to PENDING before the close task actually runs.
+        source=[
+            CourseAccountState.OK,
+            CourseAccountState.ERRED,
+            CourseAccountState.PENDING,
+        ],
         target=CourseAccountState.CLOSED,
     )
     def set_state_closed(self):
@@ -6134,3 +6182,178 @@ class ResourceEndDateChangeRequest(
         return (
             f"End date change request for {self.resource} ({self.get_state_display()})"
         )
+
+
+class OfferingMerge(core_models.UuidMixin, TimeStampedModel):
+    """A staff request to move everything that belongs to ``sources`` onto ``target``.
+
+    The merge engine in ``offering_merge.py`` drives it through its lifecycle:
+    a preview is computed and stored, the executor re-computes it under lock and
+    refuses if anything changed, then repoints every row the coverage registry
+    lists and archives the sources. Each write is journalled as an
+    :class:`OfferingMergeChange`, which is what undo replays.
+
+    Offerings are never deleted by a merge: ``Resource.offering`` cascades.
+    """
+
+    class States:
+        DRAFT = "draft"
+        PREVIEWED = "previewed"
+        QUEUED = "queued"
+        RUNNING = "running"
+        DONE = "done"
+        FAILED = "failed"
+        UNDOING = "undoing"
+        UNDONE = "undone"
+
+        CHOICES = (
+            (DRAFT, "Draft"),
+            (PREVIEWED, "Previewed"),
+            (QUEUED, "Queued"),
+            (RUNNING, "Running"),
+            (DONE, "Done"),
+            (FAILED, "Failed"),
+            (UNDOING, "Undoing"),
+            (UNDONE, "Undone"),
+        )
+
+        # The record, and its mappings, may still be edited or deleted.
+        EDITABLE = (DRAFT, PREVIEWED)
+        # A preview may be computed and stored.
+        PREVIEWABLE = (DRAFT, PREVIEWED, FAILED)
+
+    class InvoicePolicies:
+        OPEN_MONTH = "open_month"
+        ALL_MONTHS = "all_months"
+
+        CHOICES = (
+            (OPEN_MONTH, "Current open month only"),
+            (ALL_MONTHS, "All months"),
+        )
+
+    sources = models.ManyToManyField(Offering, related_name="+")
+    target = models.ForeignKey(Offering, on_delete=models.PROTECT, related_name="+")
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    plan_mapping = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_("Source plan UUID (hex) to target plan UUID (hex)."),
+    )
+    component_mapping = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_(
+            "Per source offering UUID (hex): source component type to target "
+            "component type."
+        ),
+    )
+    attribute_key_mapping = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_("Order and resource answer key renames: old key to new key."),
+    )
+    invoice_policy = models.CharField(
+        max_length=20,
+        choices=InvoicePolicies.CHOICES,
+        default=InvoicePolicies.OPEN_MONTH,
+    )
+    state = FSMField(max_length=20, default=States.DRAFT, choices=States.CHOICES)
+    preview = models.JSONField(default=dict, blank=True)
+    verification = models.JSONField(default=dict, blank=True)
+    progress = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_(
+            "Execution progress: the current step, steps and rows done and in "
+            "total. Committed outside the merge's transaction while it runs."
+        ),
+    )
+    error_message = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-created", "id"]
+
+    def __str__(self):
+        return f"Offering merge {self.uuid.hex} into {self.target} ({self.state})"
+
+    @classmethod
+    def get_url_name(cls):
+        return "marketplace-offering-merge"
+
+    @transition(
+        field=state,
+        source=[States.DRAFT, States.PREVIEWED, States.FAILED],
+        target=States.PREVIEWED,
+    )
+    def set_previewed(self):
+        pass
+
+    @transition(field=state, source=States.PREVIEWED, target=States.DRAFT)
+    def set_draft(self):
+        """An edit invalidates the stored preview."""
+
+    @transition(field=state, source=States.PREVIEWED, target=States.QUEUED)
+    def set_queued(self):
+        """Execution was requested; a second request is refused from here on."""
+
+    @transition(
+        field=state, source=[States.PREVIEWED, States.QUEUED], target=States.RUNNING
+    )
+    def set_running(self):
+        pass
+
+    @transition(field=state, source=States.RUNNING, target=States.DONE)
+    def set_done(self):
+        pass
+
+    @transition(
+        field=state,
+        source=[States.PREVIEWED, States.QUEUED, States.RUNNING],
+        target=States.FAILED,
+    )
+    def set_failed(self):
+        pass
+
+    @transition(field=state, source=States.DONE, target=States.UNDOING)
+    def set_undoing(self):
+        """Undo was requested; a second request is refused from here on."""
+
+    @transition(field=state, source=States.UNDOING, target=States.DONE)
+    def set_undo_refused(self):
+        """Undo was refused or failed; the merge is still in effect."""
+
+    @transition(field=state, source=[States.DONE, States.UNDOING], target=States.UNDONE)
+    def set_undone(self):
+        pass
+
+
+class OfferingMergeChange(models.Model):
+    """One journalled write of an offering merge: which row, which field, before and after.
+
+    ``field`` is the column's attname (``offering_id``, ``limits``, ``state``);
+    values are JSON — ids for foreign keys, whole documents for JSON fields.
+    Undo replays these in reverse order.
+    """
+
+    merge = models.ForeignKey(
+        OfferingMerge, on_delete=models.CASCADE, related_name="changes"
+    )
+    model = models.CharField(
+        max_length=150, help_text=_("Model label, e.g. marketplace.Resource.")
+    )
+    object_id = models.BigIntegerField()
+    field = models.CharField(max_length=150)
+    old_value = models.JSONField(null=True, blank=True)
+    new_value = models.JSONField(null=True, blank=True)
+    created = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["id"]
+        indexes = [
+            models.Index(fields=["merge", "model", "field"]),
+        ]
+
+    def __str__(self):
+        return f"{self.model}#{self.object_id}.{self.field}"

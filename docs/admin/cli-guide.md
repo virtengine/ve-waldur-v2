@@ -56,6 +56,41 @@ options:
 
 ```
 
+## assemble_changelog
+
+Assemble changelog fragments from changelog/next/ into a release file.
+
+```bash
+
+usage: waldur assemble_changelog --release-version RELEASE_VERSION --date DATE
+                                 [--release-type {stable,rc}]
+                                 [--base-stable BASE_STABLE]
+                                 [--previous PREVIOUS]
+                                 [--previous-release PREVIOUS_RELEASE]
+                                 [--stable-target STABLE_TARGET]
+                                 [--summary SUMMARY] [--no-clear] [--dry-run]
+
+options:
+  --release-version RELEASE_VERSION
+                        Release version (e.g., 8.0.8 or 8.0.8-rc.1)
+  --date DATE           Release date in ISO 8601 format (e.g., 2026-04-15)
+  --release-type {stable,rc}
+                        Release type (default: stable)
+  --base-stable BASE_STABLE
+                        Previous stable version (for cumulative entries)
+  --previous PREVIOUS   Immediately preceding version (for delta)
+  --previous-release PREVIOUS_RELEASE
+                        Path to the previous version's release file. An RC
+                        carries its entries forward; a stable release uses
+                        them to work out since_previous
+  --stable-target STABLE_TARGET
+                        Target stable version (for RC releases)
+  --summary SUMMARY     Release summary text
+  --no-clear            Do not clear changelog/next/ after assembly
+  --dry-run             Validate and print output without writing files
+
+```
+
 ## audit_broker_config
 
 Audit Celery / RabbitMQ broker configuration for common publisher-reliability misconfigurations.
@@ -388,26 +423,6 @@ options:
 
 ```
 
-## dedupe_tenant_offerings
-
-Report and optionally resolve tenants that have more than one per-tenant OpenStack.Instance/Volume offering.
-
-```bash
-
-usage: waldur dedupe_tenant_offerings [--tenant TENANT_ID] [--apply] [--merge]
-
-options:
-  --tenant TENANT_ID  Restrict to a single OpenStack tenant (by numeric id).
-                      Matches the tenant id printed in the self-heal ERROR
-                      log.
-  --apply             Delete empty duplicate offerings. Without this flag the
-                      command only reports (dry-run).
-  --merge             Also resolve duplicates that still own resources/orders
-                      by re-pointing them onto the keeper before deletion.
-                      Requires --apply.
-
-```
-
 ## demo_presets
 
 Manage demo data presets for Waldur.
@@ -646,6 +661,10 @@ options:
                        and policies.
 
 ```
+
+## find_username_collisions
+
+List accounts whose usernames differ only in case or in characters a username should not hold, so that one person may hold two of them. Writes nothing.
 
 ## generate_appservice_registration
 

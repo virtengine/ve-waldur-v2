@@ -2749,7 +2749,7 @@ Notification about a new comment in the issue. The recipient is issue caller.
 
 ```txt
 
-    The issue ({{ issue.key }}) you have created has a new comment
+    The issue you have created has a new comment
 
 ```
 
@@ -2852,7 +2852,7 @@ Notification about an update in the issue comment. The recipient is issue caller
 
 ```txt
 
-    Issue {{ issue.key }}. The comment has been updated
+    The comment has been updated
 
 ```
 
@@ -2896,6 +2896,62 @@ Notification about an update in the issue comment. The recipient is issue caller
     </p>
     </body>
     </html>
+
+```
+
+### support.notification_comment_updated_staff
+
+Notification to the assignee, or to all staff and support users when the ticket is unassigned, that the issue caller has edited one of their comments. Sent only by the built-in service desk.
+
+#### Templates
+
+=== "support/notification_comment_updated_staff_subject.txt"
+
+```txt
+
+    [{{ issue.key }}] Comment edited by {{ comment.author.name|default:"the requester" }}: {{ issue.summary.strip }}
+
+```
+
+=== "support/notification_comment_updated_staff_message.txt"
+
+```txt
+
+    {{ comment.author.name|default:"The requester" }} has edited a comment on a support request.
+
+    Request: {{ issue.key }}
+    Summary: {{ issue.summary.strip }}
+    Status: {{ issue.status }}
+    {% if issue.assignee %}Assignee: {{ issue.assignee.name }}
+    {% endif %}{% if issue.customer %}Organization: {{ issue.customer.name }}
+    {% endif %}{% if issue.project %}Project: {{ issue.project.name }}
+    {% endif %}
+    Previous comment:
+    {{ old_description.strip }}
+
+    Edited comment:
+    {{ comment.description.strip }}
+
+    Open the request: {{ issue_url }}
+
+```
+
+=== "support/notification_comment_updated_staff_message.html"
+
+```txt
+
+    <p>{{ comment.author.name|default:"The requester" }} has edited a comment on a support request.</p>
+    <p><strong>Request:</strong> {{ issue.key }}<br>
+    <strong>Summary:</strong> {{ issue.summary.strip }}<br>
+    <strong>Status:</strong> {{ issue.status }}
+    {% if issue.assignee %}<br><strong>Assignee:</strong> {{ issue.assignee.name }}{% endif %}
+    {% if issue.customer %}<br><strong>Organization:</strong> {{ issue.customer.name }}{% endif %}
+    {% if issue.project %}<br><strong>Project:</strong> {{ issue.project.name }}{% endif %}</p>
+    <p><strong>Previous comment:</strong></p>
+    <p>{{ old_description.strip }}</p>
+    <p><strong>Edited comment:</strong></p>
+    <p>{{ comment.description.strip }}</p>
+    <p><a href="{{ issue_url }}">Open the request</a></p>
 
 ```
 
@@ -3001,7 +3057,7 @@ Notification about a feedback related to the issue. The recipient is issue calle
 
 ```txt
 
-    Please share your feedback: {{issue.key}} {{issue.summary}}
+    Please share your feedback: {{ issue.summary }}
 
 ```
 
@@ -3082,7 +3138,7 @@ Notification about an update in the issue. The recipient is issue caller.
 
 ```txt
 
-    Updated issue: {{issue.key}} {{issue.summary}}
+    Updated issue: {{ issue.summary }}
 
 ```
 
@@ -3276,7 +3332,7 @@ Notify a provider helpdesk that a routed ticket has been escalated.
 
 ```txt
 
-    [{{ issue.key }}] ESCALATED: {{ issue.summary }}
+    [{{ child_issue.key }}] ESCALATED: {{ issue.summary }}
 
 ```
 
@@ -3396,7 +3452,7 @@ Notify a provider helpdesk that a ticket previously routed to them was rerouted 
 
 ```txt
 
-    [{{ issue.key }}] Ticket withdrawn: {{ issue.summary }}
+    [{{ child_key|default:issue.key }}] Ticket withdrawn: {{ issue.summary }}
 
 ```
 
@@ -3406,7 +3462,7 @@ Notify a provider helpdesk that a ticket previously routed to them was rerouted 
 
     A support ticket previously routed to your helpdesk has been withdrawn and reassigned to a different provider.
 
-    Ticket: {{ issue.key }}
+    Ticket: {{ child_key|default:issue.key }}
     Summary: {{ issue.summary }}
 
     No further action is required on your side. If you have already opened a corresponding ticket in your system, you may close it.
@@ -3418,7 +3474,7 @@ Notify a provider helpdesk that a ticket previously routed to them was rerouted 
 ```txt
 
     <p>A support ticket previously routed to your helpdesk has been withdrawn and reassigned to a different provider.</p>
-    <p><strong>Ticket:</strong> {{ issue.key }}<br>
+    <p><strong>Ticket:</strong> {{ child_key|default:issue.key }}<br>
     <strong>Summary:</strong> {{ issue.summary }}</p>
     <p>No further action is required on your side. If you have already opened a corresponding ticket in your system, you may close it.</p>
 

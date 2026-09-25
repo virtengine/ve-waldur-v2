@@ -3,12 +3,12 @@ import secrets
 from datetime import datetime, timedelta
 from typing import cast
 
+from constance import config
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import (
     Avg,
     Count,
-    DateTimeField,
     DurationField,
     Exists,
     ExpressionWrapper,
@@ -218,6 +218,31 @@ def validate_call_not_archived(nested_obj):
     """
     if nested_obj.call.state == CallStates.ARCHIVED:
         raise IncorrectStateException()
+
+
+def reviewers_with_email_invitation(call, reviewers):
+    """IDs of the reviewers already invited to the call by email.
+
+    An email invitation has no reviewer until it is accepted, so the
+    (call, reviewer) lookup misses it. Inviting the same person again would
+    leave two rows, and accepting the email one would then hit
+    unique_call_reviewer.
+    """
+    email_invitations = list(
+        models.CallReviewerPool.objects.filter(
+            call=call, reviewer__isnull=True
+        ).values_list("invited_user_id", "invited_email")
+    )
+    if not email_invitations:
+        return set()
+    invited_user_ids = {user_id for user_id, _ in email_invitations if user_id}
+    invited_emails = {email.lower() for _, email in email_invitations if email}
+    return {
+        reviewer.id
+        for reviewer in reviewers
+        if reviewer.user_id in invited_user_ids
+        or (reviewer.user.email and reviewer.user.email.lower() in invited_emails)
+    }
 
 
 class CallManagingOrganisationViewSet(
@@ -1505,25 +1530,32 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         reviewers = models.ReviewerProfile.objects.filter(
             uuid__in=reviewer_uuids
         ).select_related("user")
-        reviewers_by_uuid = {str(r.uuid): r for r in reviewers}
+        reviewers_by_uuid = {r.uuid: r for r in reviewers}
+        email_invited_ids = reviewers_with_email_invitation(call, reviewers)
 
         created_memberships = []
-        for reviewer_uuid in reviewer_uuids:
-            reviewer = reviewers_by_uuid.get(str(reviewer_uuid))
-            if not reviewer:
-                continue
+        with transaction.atomic():
+            for reviewer_uuid in reviewer_uuids:
+                reviewer = reviewers_by_uuid.get(reviewer_uuid)
+                if not reviewer or reviewer.id in email_invited_ids:
+                    continue
 
-            membership, created = models.CallReviewerPool.objects.get_or_create(
-                call=call,
-                reviewer=reviewer,
-                defaults={
-                    "invited_by": request.user,
-                    "max_assignments": max_assignments,
-                    "invitation_expires_at": timezone.now() + timedelta(days=14),
-                },
-            )
-            if created:
-                created_memberships.append(membership)
+                membership, created = models.CallReviewerPool.objects.get_or_create(
+                    call=call,
+                    reviewer=reviewer,
+                    defaults={
+                        "invited_by": request.user,
+                        "max_assignments": max_assignments,
+                        "invitation_expires_at": timezone.now() + timedelta(days=14),
+                    },
+                )
+                if created:
+                    created_memberships.append(membership)
+                    transaction.on_commit(
+                        lambda uuid=membership.uuid: (
+                            tasks.send_reviewer_invitation_email.delay(uuid)
+                        )
+                    )
 
         return response.Response(
             serializers.CallReviewerPoolSerializer(
@@ -1761,60 +1793,75 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         """Send invitations to all confirmed suggestions."""
         call = self.get_object()
 
-        confirmed_suggestions = list(
-            models.ReviewerSuggestion.objects.filter(
-                call=call,
-                status=ReviewerSuggestionStatuses.CONFIRMED,
-            ).select_related("reviewer")
-        )
-
-        if not confirmed_suggestions:
-            return response.Response(
-                {"invitations_sent": 0},
-                status=status.HTTP_200_OK,
-            )
-
-        # Prefetch existing pool members to avoid N+1 existence checks
-        existing_pool_reviewer_ids = set(
-            models.CallReviewerPool.objects.filter(
-                call=call,
-                reviewer_id__in=[s.reviewer_id for s in confirmed_suggestions],
-            ).values_list("reviewer_id", flat=True)
-        )
-
-        # Prepare bulk operations
-        invitations_to_create = []
-        suggestions_to_update = []
-
-        for suggestion in confirmed_suggestions:
-            # Skip if already in pool
-            if suggestion.reviewer_id in existing_pool_reviewer_ids:
-                continue
-
-            # Prepare invitation for bulk create
-            invitations_to_create.append(
-                models.CallReviewerPool(
+        with transaction.atomic():
+            # Lock the suggestions so a repeated request waits and then finds
+            # them already invited instead of inviting them twice
+            confirmed_suggestions = list(
+                models.ReviewerSuggestion.objects.filter(
                     call=call,
-                    reviewer=suggestion.reviewer,
-                    invited_by=request.user,
-                    invitation_status=ReviewerPoolInvitationStatuses.PENDING,
-                    expertise_match_score=suggestion.affinity_score,
+                    status=ReviewerSuggestionStatuses.CONFIRMED,
                 )
+                .select_related("reviewer__user")
+                .select_for_update(of=("self",))
             )
 
-            # Mark suggestion for update
-            suggestion.status = ReviewerSuggestionStatuses.INVITED
-            suggestions_to_update.append(suggestion)
+            if not confirmed_suggestions:
+                return response.Response(
+                    {"invitations_sent": 0},
+                    status=status.HTTP_200_OK,
+                )
 
-        # Bulk create invitations
-        if invitations_to_create:
-            models.CallReviewerPool.objects.bulk_create(invitations_to_create)
-
-        # Bulk update suggestion statuses
-        if suggestions_to_update:
-            models.ReviewerSuggestion.objects.bulk_update(
-                suggestions_to_update, fields=["status"]
+            # Prefetch existing pool members to avoid N+1 existence checks
+            existing_pool_reviewer_ids = set(
+                models.CallReviewerPool.objects.filter(
+                    call=call,
+                    reviewer_id__in=[s.reviewer_id for s in confirmed_suggestions],
+                ).values_list("reviewer_id", flat=True)
             )
+            existing_pool_reviewer_ids |= reviewers_with_email_invitation(
+                call, [s.reviewer for s in confirmed_suggestions]
+            )
+
+            # Prepare bulk operations
+            invitations_to_create = []
+            suggestions_to_update = []
+
+            for suggestion in confirmed_suggestions:
+                # Skip if already in pool
+                if suggestion.reviewer_id in existing_pool_reviewer_ids:
+                    continue
+
+                # Prepare invitation for bulk create
+                invitations_to_create.append(
+                    models.CallReviewerPool(
+                        call=call,
+                        reviewer=suggestion.reviewer,
+                        invited_by=request.user,
+                        invitation_status=ReviewerPoolInvitationStatuses.PENDING,
+                        expertise_match_score=suggestion.affinity_score,
+                    )
+                )
+
+                # Mark suggestion for update
+                suggestion.status = ReviewerSuggestionStatuses.INVITED
+                suggestions_to_update.append(suggestion)
+
+            # Bulk create invitations
+            if invitations_to_create:
+                models.CallReviewerPool.objects.bulk_create(invitations_to_create)
+
+            # Bulk update suggestion statuses
+            if suggestions_to_update:
+                models.ReviewerSuggestion.objects.bulk_update(
+                    suggestions_to_update, fields=["status"]
+                )
+
+            for invitation in invitations_to_create:
+                transaction.on_commit(
+                    lambda uuid=invitation.uuid: (
+                        tasks.send_reviewer_invitation_email.delay(uuid)
+                    )
+                )
 
         return response.Response(
             {"invitations_sent": len(invitations_to_create)},
@@ -2602,8 +2649,8 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         summary="Get call manager dashboard stats",
         description=(
             "Returns counts for the call manager dashboard: pending "
-            "assessments, active calls managed by the user, and overdue "
-            "reviews on calls they manage."
+            "assessments, active calls managed by the user, and reviews on "
+            "calls they manage that are due within the next few days."
         ),
         responses={200: serializers.DashboardCallManagerStatsSerializer},
     )
@@ -2620,30 +2667,18 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             round__call_id__in=managed_call_ids,
             state__in=[ProposalStates.SUBMITTED, ProposalStates.IN_REVIEW],
         ).count()
-        # review_end_date is created + review_duration_in_days, which Postgres
-        # can evaluate directly — no need to pull every pending review into
-        # Python to compare dates.
-        overdue_reviews = (
-            models.Review.objects.filter(
-                state=models.Review.States.IN_REVIEW,
-                proposal__round__call_id__in=managed_call_ids,
-                proposal__round__review_duration_in_days__isnull=False,
-            )
-            .annotate(
-                deadline=ExpressionWrapper(
-                    F("created")
-                    + timedelta(days=1) * F("proposal__round__review_duration_in_days"),
-                    output_field=DateTimeField(),
-                )
-            )
-            .filter(deadline__lt=timezone.now())
+        due_within_days = config.PROPOSAL_DASHBOARD_REVIEWS_DUE_WITHIN_DAYS
+        reviews_due_soon = (
+            models.Review.objects.filter(proposal__round__call_id__in=managed_call_ids)
+            .due_within(due_within_days)
             .count()
         )
         return response.Response(
             {
                 "pending_assessments": pending_assessments,
                 "active_calls": active_calls,
-                "overdue_reviews": overdue_reviews,
+                "reviews_due_soon": reviews_due_soon,
+                "reviews_due_within_days": due_within_days,
             },
             status=status.HTTP_200_OK,
         )
@@ -3968,22 +4003,13 @@ class ReviewViewSet(ActionsViewSet):
             completed=Count("id", filter=Q(state=models.Review.States.SUBMITTED)),
         )
 
-        # A deadline only exists when the round sets review_duration_in_days;
-        # annotating it lets Postgres do the filtering and the ordering.
+        # A deadline only exists when the round sets a review duration;
+        # computing it in SQL lets Postgres do the filtering and the ordering.
         reviews_with_deadline = (
-            own_reviews.filter(
-                state=models.Review.States.IN_REVIEW,
-                proposal__round__review_duration_in_days__isnull=False,
-            )
-            .annotate(
-                deadline=ExpressionWrapper(
-                    F("created")
-                    + timedelta(days=1) * F("proposal__round__review_duration_in_days"),
-                    output_field=DateTimeField(),
-                )
-            )
+            own_reviews.filter(state=models.Review.States.IN_REVIEW)
+            .with_deadline()
             .select_related("proposal", "proposal__round", "proposal__round__call")
-            .order_by("deadline")
+            .order_by("review_deadline")
         )
         # This list is embedded in an object, so it cannot be paginated the way
         # the standalone dashboard lists are. It carries its own total instead —
@@ -3997,7 +4023,7 @@ class ReviewViewSet(ActionsViewSet):
                 "proposal_name": review.proposal.name,
                 "call_uuid": review.proposal.round.call.uuid,
                 "call_name": review.proposal.round.call.name,
-                "due_date": review.deadline,
+                "due_date": review.review_end_date,
             }
             for review in reviews_with_deadline[:DASHBOARD_LIST_LIMIT]
         ]
@@ -5100,6 +5126,26 @@ class InvitationAcceptanceMixin:
 
         return created_conflicts
 
+    def _link_profile(self, invitation: models.CallReviewerPool, profile, user) -> None:
+        """Bind an email invitation to the reviewer profile accepting it."""
+        if invitation.reviewer:
+            return
+        # The same person may also have been invited by profile; binding this
+        # row too would violate unique_call_reviewer
+        if (
+            models.CallReviewerPool.objects.filter(
+                call=invitation.call, reviewer=profile
+            )
+            .exclude(pk=invitation.pk)
+            .exists()
+        ):
+            raise exceptions.ValidationError(
+                _("You are already in this call's reviewer pool.")
+            )
+        invitation.reviewer = profile
+        if not invitation.invited_user:
+            invitation.invited_user = user
+
     def _accept_invitation(
         self, invitation: models.CallReviewerPool
     ) -> models.CallReviewerPool:
@@ -5273,11 +5319,7 @@ class CallReviewerPoolViewSet(InvitationAcceptanceMixin, ActionsViewSet):
             error_status = error.pop("status", status.HTTP_400_BAD_REQUEST)
             return response.Response(error, status=error_status)
 
-        # Link profile to invitation if needed
-        if not invitation.reviewer:
-            invitation.reviewer = profile
-            if not invitation.invited_user:
-                invitation.invited_user = request.user
+        self._link_profile(invitation, profile, request.user)
 
         # Process optional self-declared conflicts
         # Body is the array of conflicts directly (not wrapped in a dict)
@@ -5606,6 +5648,7 @@ class PublicReviewerInvitationViewSet(InvitationAcceptanceMixin, viewsets.ViewSe
                 "call_name": call.name,
                 "call_uuid": str(call.uuid),
                 "invitation_status": invitation.invitation_status,
+                "invited_at": invitation.invited_at,
                 "expires_at": invitation.invitation_expires_at,
                 "is_expired": is_expired,
                 "max_assignments": invitation.max_assignments,
@@ -5633,6 +5676,19 @@ class PublicReviewerInvitationViewSet(InvitationAcceptanceMixin, viewsets.ViewSe
         """Accept a reviewer invitation."""
         invitation = self._get_invitation(token)
 
+        # An invitation bound to a reviewer is theirs alone to accept; the
+        # token by itself is not enough, as the link may have been forwarded
+        if invitation.reviewer:
+            if not request.user.is_authenticated:
+                return response.Response(
+                    {"error": _("Please log in to accept this invitation.")},
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
+            if invitation.reviewer.user != request.user:
+                raise exceptions.PermissionDenied(
+                    _("This invitation was sent to another reviewer.")
+                )
+
         # Use mixin methods for validation
         self._validate_invitation_status(invitation)
         self._validate_invitation_not_expired(invitation)
@@ -5643,11 +5699,7 @@ class PublicReviewerInvitationViewSet(InvitationAcceptanceMixin, viewsets.ViewSe
             error_status = error.pop("status", status.HTTP_400_BAD_REQUEST)
             return response.Response(error, status=error_status)
 
-        # Link profile to invitation if needed
-        if not invitation.reviewer:
-            invitation.reviewer = profile
-            if not invitation.invited_user:
-                invitation.invited_user = request.user
+        self._link_profile(invitation, profile, request.user)
 
         # Process optional self-declared conflicts
         declared_conflicts = request.data.get("declared_conflicts", [])

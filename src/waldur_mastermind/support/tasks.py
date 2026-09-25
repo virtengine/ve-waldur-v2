@@ -1,5 +1,6 @@
 import copy
 import logging
+import uuid
 from datetime import timedelta
 from smtplib import SMTPException
 
@@ -17,7 +18,11 @@ from waldur_core.core import utils as core_utils
 from waldur_core.core.utils import broadcast_mail, text2html
 
 from . import backend, models
-from .utils import get_feedback_link
+from .utils import (
+    format_issue_subject,
+    get_feedback_link,
+    get_issue_thread_headers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +128,25 @@ def send_comment_added_notification(serialized_comment):
 
 def notify_helpdesk_new_comment(comment):
     """Tell whoever works the ticket that its caller has commented."""
+    _notify_helpdesk_about_caller_comment(comment, "notification_comment_added_staff")
+
+
+@shared_task(name="waldur_mastermind.support.notify_helpdesk_comment_updated")
+def notify_helpdesk_comment_updated(serialized_comment, old_description):
+    """Tell whoever works the ticket that its caller has edited a comment.
+
+    They may already have acted on the original, so the old text goes along
+    with the new one.
+    """
+    comment = core_utils.deserialize_instance(serialized_comment)
+    _notify_helpdesk_about_caller_comment(
+        comment,
+        "notification_comment_updated_staff",
+        {"old_description": old_description},
+    )
+
+
+def _notify_helpdesk_about_caller_comment(comment, template, extra_context=None):
     issue = comment.issue
 
     # `broadcast_mail` consults only the Notification row, where `_send_email`
@@ -150,15 +174,17 @@ def notify_helpdesk_new_comment(comment):
     try:
         broadcast_mail(
             "support",
-            "notification_comment_added_staff",
+            template,
             {
                 "issue": issue,
                 "comment": comment,
                 "issue_url": core_utils.format_homeport_link(
                     "support/issue/{uuid}/", uuid=issue.uuid
                 ),
+                **(extra_context or {}),
             },
             recipients,
+            headers=get_issue_thread_headers(issue.uuid),
         )
     except Exception:
         logger.exception(
@@ -253,7 +279,9 @@ def _send_email(
 
     html_message = html_template.render(Context(html_context))
     text_message = text_template.render(Context(text_context, autoescape=False))
-    subject = subject_template.render(Context(context, autoescape=False)).strip()
+    subject = format_issue_subject(
+        subject_template.render(Context(context, autoescape=False)).strip(), issue
+    )
 
     logger.info("About to send an issue update notification to %s" % receiver.email)
 
@@ -263,6 +291,7 @@ def _send_email(
             text_message,
             [receiver.email],
             html_message=html_message,
+            headers=get_issue_thread_headers(issue.uuid),
         )
     except SMTPException as e:
         error_message = str(e)
@@ -499,8 +528,11 @@ def reroute_issue_to_provider(issue, new_helpdesk):
     Tears down the existing child issue(s) through the ORIGINAL provider's backend
     (a real delete for jira/zammad; a no-op for the basic backend, where the child
     row is the whole ticket), then creates a fresh child for ``new_helpdesk``.
-    Returns ``(new_child_issue, old_helpdesks)``. The caller runs this inside a
-    transaction and dispatches notifications on commit.
+    Returns ``(new_child_issue, withdrawn)``, where ``withdrawn`` holds one
+    ``(old_helpdesk, child_uuid_hex, child_key)`` per torn-down child -- the
+    child rows are gone by then, and the withdrawal notice needs their identity
+    to reach the provider in the thread they have been reading. The caller runs
+    this inside a transaction and dispatches notifications on commit.
     """
     from .backend import get_backend_for_provider
 
@@ -511,7 +543,7 @@ def reroute_issue_to_provider(issue, new_helpdesk):
     # ticket intact on failure.
     new_child = create_provider_child_issue(issue, new_helpdesk, issue.resource)
 
-    old_helpdesks = []
+    withdrawn = []
     for child in (
         issue.child_issues.select_related("provider_helpdesk")
         .exclude(id=new_child.id)
@@ -519,7 +551,7 @@ def reroute_issue_to_provider(issue, new_helpdesk):
     ):
         old_helpdesk = child.provider_helpdesk
         if old_helpdesk:
-            old_helpdesks.append(old_helpdesk)
+            withdrawn.append((old_helpdesk, child.uuid.hex, child.key))
             try:
                 get_backend_for_provider(old_helpdesk).delete_issue(child)
             except Exception:
@@ -538,13 +570,13 @@ def reroute_issue_to_provider(issue, new_helpdesk):
         "rerouted_to_provider",
         {
             "child_issue_uuid": new_child.uuid.hex,
-            "from": [str(h.service_provider) for h in old_helpdesks],
+            "from": [str(h.service_provider) for h, _, _ in withdrawn],
             "to": str(new_helpdesk.service_provider),
         },
     )
     issue.save(update_fields=["processing_log"])
 
-    return new_child, old_helpdesks
+    return new_child, withdrawn
 
 
 def get_helpdesk_personnel():
@@ -627,6 +659,7 @@ def notify_staff_new_issue(issue_id):
             "notification_issue_created",
             {"issue": issue},
             recipients,
+            headers=get_issue_thread_headers(issue.uuid),
         )
     except Exception:
         logger.exception(
@@ -656,6 +689,7 @@ def notify_provider_new_ticket(issue_id):
                 "provider_new_ticket",
                 {"issue": issue, "provider_helpdesk": helpdesk},
                 recipients,
+                headers=get_issue_thread_headers(issue.uuid),
             )
         except Exception:
             logger.exception(
@@ -664,12 +698,17 @@ def notify_provider_new_ticket(issue_id):
 
 
 @shared_task(name="waldur_mastermind.support.notify_provider_ticket_withdrawn")
-def notify_provider_ticket_withdrawn(issue_id, helpdesk_id):
+def notify_provider_ticket_withdrawn(
+    issue_id, helpdesk_id, child_uuid=None, child_key=None
+):
     """Notify a provider that a ticket previously routed to them was rerouted away.
 
     Sent to the OLD helpdesk after a reroute, so backends that cannot retract the
     external ticket (email/smax) know to drop it. The child issue has already been
-    removed, so this references the operator (parent) issue.
+    removed, so its uuid and key are passed in: the provider only ever saw the
+    child, so this mail belongs in the child's thread and under the child's key,
+    the way every other mail they got about that ticket was. Both default to the
+    operator (parent) issue for a task enqueued before this argument existed.
     """
     try:
         issue = models.Issue.objects.get(id=issue_id)
@@ -680,14 +719,21 @@ def notify_provider_ticket_withdrawn(issue_id, helpdesk_id):
     if not helpdesk.notify_on_new_ticket:
         return
 
+    thread_uuid = uuid.UUID(child_uuid) if child_uuid else issue.uuid
+
     recipients = helpdesk.get_notification_emails()
     if recipients:
         try:
             broadcast_mail(
                 "support",
                 "provider_ticket_withdrawn",
-                {"issue": issue, "provider_helpdesk": helpdesk},
+                {
+                    "issue": issue,
+                    "provider_helpdesk": helpdesk,
+                    "child_key": child_key or issue.key,
+                },
                 recipients,
+                headers=get_issue_thread_headers(thread_uuid),
             )
         except Exception:
             logger.exception(
@@ -718,6 +764,7 @@ def notify_provider_customer_comment(comment_id):
                 "provider_customer_comment",
                 {"issue": issue, "comment": comment, "provider_helpdesk": helpdesk},
                 recipients,
+                headers=get_issue_thread_headers(issue.uuid),
             )
         except Exception:
             logger.exception(
@@ -747,6 +794,7 @@ def notify_provider_sla_warning(issue_id):
                 "provider_sla_warning",
                 {"issue": issue, "provider_helpdesk": helpdesk},
                 recipients,
+                headers=get_issue_thread_headers(issue.uuid),
             )
         except Exception:
             logger.exception(
@@ -786,6 +834,7 @@ def notify_ticket_escalated(issue_id, reason):
             "notification_issue_escalated",
             {"issue": issue, "reason": reason},
             recipients,
+            headers=get_issue_thread_headers(issue.uuid),
         )
     except Exception:
         logger.exception(
@@ -816,6 +865,7 @@ def notify_provider_escalation(issue_id, reason):
                             "reason": reason,
                         },
                         recipients,
+                        headers=get_issue_thread_headers(child.uuid),
                     )
                 except Exception:
                     logger.exception(

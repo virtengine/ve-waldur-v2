@@ -4216,6 +4216,30 @@ def user_offerings_mapping(offerings):
             restore_offering_user(offering_user)
 
 
+def get_order_processing_user(order: models.Order, system_robot=None):
+    """The identity an order is carried out under.
+
+    ``processors.send_request`` replays the plugin's own viewset as this user,
+    so DRF's permission classes and serializer querysets apply to them -- the
+    delete leg in particular enforces ``is_administrator`` on the project.
+    Whoever placed an order themselves necessarily holds a role there.
+
+    An order placed automatically records in ``created_by`` the person it is
+    *for*, which grants them nothing: a call can name its applicant, or a
+    grants office that holds no project role at all. Those are carried out
+    with system authority instead, as they were before the author was
+    recorded -- whoever is named, so that provisioning does not quietly
+    depend on whether that person happens to be staff.
+
+    ``system_robot`` lets a sweep resolve the robot once and hand it in:
+    ``get_system_robot`` is a ``get_or_create``, so a batch of orders would
+    otherwise pay a query each.
+    """
+    if order.placed_automatically:
+        return system_robot or core_utils.get_system_robot()
+    return order.created_by
+
+
 def order_should_not_be_reviewed_by_provider(order: models.Order):
     offering = order.offering
     user = order.consumer_reviewed_by or order.created_by
@@ -5051,6 +5075,17 @@ def generate_mock_course_account_creation_response(
     return generate_mock_course_account_response(mock_username)
 
 
+# Explicit stand-in for httpx's implicit default (Timeout(5.0), i.e. 5s on
+# each of connect/read/write/pool) so the ceiling is visible here rather
+# than relying on a library default. NOTE: like that default, this bounds
+# each individual I/O operation, not the call's total duration - a backend
+# that trickles bytes just under this ceiling per chunk can still keep a
+# call "alive" indefinitely. That is NOT what protects gunicorn workers
+# from hanging on this call; moving the call off the request path (see
+# marketplace/tasks.py) is what does that.
+ACCOUNT_API_REQUEST_TIMEOUT = 5
+
+
 def get_account_api_token(token_url, client_id, client_secret):
     token_url = token_url.rstrip("/")
 
@@ -5069,6 +5104,7 @@ def get_account_api_token(token_url, client_id, client_secret):
             data=token_params,
             headers=token_request_headers,
             follow_redirects=True,
+            timeout=ACCOUNT_API_REQUEST_TIMEOUT,
         )
         token_response.raise_for_status()
         # Extract the token
@@ -5369,6 +5405,7 @@ def get_course_account(
             url,
             headers={"Authorization": f"Bearer {api_access_token}"},
             follow_redirects=True,
+            timeout=ACCOUNT_API_REQUEST_TIMEOUT,
         )
         response.raise_for_status()
         return response.json()
@@ -6202,6 +6239,7 @@ def close_course_account(
             url,
             headers={"Authorization": f"Bearer {api_access_token}"},
             follow_redirects=True,
+            timeout=ACCOUNT_API_REQUEST_TIMEOUT,
         )
         response.raise_for_status()
         if response.status_code == 200:
@@ -6223,8 +6261,45 @@ def close_course_account(
         course_account.set_state_erred()
         course_account.error_message = str(error_details)
         course_account.error_traceback = traceback.format_exc()
-        course_account.save(update_fields=["error_message", "error_traceback"])
+        course_account.save(update_fields=["state", "error_message", "error_traceback"])
         raise
+
+
+def close_course_account_by_username(
+    username: str, api_access_token: str | None = None
+):
+    """Close a course account at the backend by username alone, with no local row.
+
+    Used when the local CourseAccount row is already gone - a hard project
+    or customer delete CASCADEs it away before the close task runs - but
+    the backend account still needs to be closed. Unlike close_course_account,
+    this never touches a CourseAccount instance or its state.
+    """
+    if config.ENABLE_MOCK_COURSE_ACCOUNT_BACKEND:
+        logger.info(
+            f"Mock mode enabled for close_course_account_by_username: {username}"
+        )
+        return
+
+    if not settings.WALDUR_CORE.get("COURSE_ACCOUNT_USE_API"):
+        return
+
+    course_account_url = settings.WALDUR_CORE["COURSE_ACCOUNT_URL"]
+    if not course_account_url:
+        raise ValidationError("URL for course accounts is not configured")
+    course_account_url = course_account_url.rstrip("/")
+
+    if api_access_token is None:
+        api_access_token = get_course_account_api_token()
+
+    url = f"{course_account_url}/{username}/close"
+    response = httpx.put(
+        url,
+        headers={"Authorization": f"Bearer {api_access_token}"},
+        follow_redirects=True,
+        timeout=ACCOUNT_API_REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
 
 
 def get_viewset_from_basename(basename):
