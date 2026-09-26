@@ -406,23 +406,26 @@ The author is a name on the order, not an authorisation.
 #### When the author cannot receive a ticket
 
 A helpdesk ticket needs an address. If the order's author has none — an SSO
-account provisioned without an email claim, or one of the automated sweeps that
-still place orders as a robot — the caller falls back through the project's
-manager, administrator and member roles to the organization owner, taking the
-first active user with an address. Only when nobody on the project can be
-reached does the order fail, naming the project.
+account provisioned without an email claim, or an order left to the system
+robot to place — the caller falls back through the project's manager,
+administrator and member roles to the organization owner, taking the first
+active user with an address. Only when nobody on the project can be reached
+does the order fail, naming the project.
 
-Because the name is on the order itself, this keeps working after allocation:
-when the scheduled end-date or cost-policy sweep later terminates a granted
-resource, the termination order it places is a fresh one and follows the
-ordinary rules for the person who triggered it.
+Because the name is on the order itself, this keeps working after allocation.
+When the scheduled end-date sweep or a cost policy terminates a granted
+resource months later, the termination order it places is attributed to the
+author of the resource's own creation order — the contact the call named — so
+its ticket reaches the same desk. The end-date sweep prefers a more specific
+name where there is one: whoever requested the end date, on the resource and
+then on the project. A candidate deactivated since is skipped. Only a creation
+order placed on somebody's behalf — as allocation places them — passes its name
+on: a resource somebody ordered themselves, an imported one, or one reconciled
+from a backend orphan is left to the robot and the fallback above.
 
-!!! note "Known gap: termination tickets do not follow the call's author"
-    Neither sweep carries the call's order author onto the termination order it
-    places, so those orders are attributed to the system robot and their
-    helpdesk tickets fall through the project's roles instead of reaching the
-    configured contact. Tracked in
-    [waldur-mastermind#488](https://code.opennodecloud.com/waldur/waldur-mastermind/-/issues/488).
+Such a termination order is flagged `placed_automatically` and carried out with
+system authority, for the same reason an allocated order is: the contact named
+on it need hold no role on the project.
 
 ## Realistic Usage Examples
 

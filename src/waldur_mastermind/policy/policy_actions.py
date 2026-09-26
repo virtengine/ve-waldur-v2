@@ -372,8 +372,9 @@ def notify_organization_owners(policy: models.Policy):
 
 def terminate_resources(policy: models.Policy):
     from waldur_mastermind.marketplace import tasks as marketplace_tasks
+    from waldur_mastermind.marketplace import utils as marketplace_utils
 
-    user = get_system_robot()
+    system_robot = get_system_robot()
 
     resources = marketplace_models.Resource.objects.exclude(
         state__in=(ResourceStates.TERMINATED, ResourceStates.TERMINATING)
@@ -384,6 +385,17 @@ def terminate_resources(policy: models.Policy):
         return
 
     for resource in resources:
+        # The policy, not a person, decided to terminate: the order is
+        # attributed to whoever the resource's creation order was placed for
+        # on their behalf, so the helpdesk ticket it raises reaches the desk
+        # that was told about the resource in the first place instead of the
+        # first project role holder. A deactivated one cannot be reached, and
+        # a resource somebody ordered themselves names nobody -- both leave
+        # the robot, as before.
+        author = marketplace_utils.get_creation_order_author(resource)
+        if author is None or not author.is_active:
+            author = system_robot
+
         with transaction.atomic():
             order = marketplace_models.Order.objects.create(
                 resource=resource,
@@ -392,8 +404,12 @@ def terminate_resources(policy: models.Policy):
                 state=OrderStates.EXECUTING,
                 attributes={},
                 project=resource.project,
-                created_by=user,
-                consumer_reviewed_by=user,
+                created_by=author,
+                consumer_reviewed_by=system_robot,
+                # created_by names who the order is for, not who placed it: the
+                # author holds no role on the project in the general case, so
+                # the work is carried out with system authority.
+                placed_automatically=author != system_robot,
             )
 
             logger.info(
@@ -413,7 +429,10 @@ def terminate_resources(policy: models.Policy):
                 scopes=[resource] + _get_base_policy_scopes(policy),
             )
 
-            marketplace_tasks.process_order_on_commit(order, user)
+            marketplace_tasks.process_order_on_commit(
+                order,
+                marketplace_utils.get_order_processing_user(order, system_robot),
+            )
 
 
 def block_creation_of_new_resources(policy, created):

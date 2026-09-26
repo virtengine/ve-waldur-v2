@@ -352,6 +352,75 @@ class ActionsTest(test.APITestCase):
         ).get()
         self.assertEqual(order.attributes, {})
 
+    def trigger_termination(self, policy, resource=None):
+        policy.actions = "terminate_resources"
+        policy.save()
+
+        resource = resource or self.fixture.resource
+        resource.state = ResourceStates.OK
+        resource.save()
+
+        resource.offering.type = OPENSTACK_INSTANCE_OFFERING
+        resource.offering.save()
+
+        self.create_invoice_item(policy.limit_cost + 1)
+
+        return marketplace_models.Order.objects.get(
+            resource=resource,
+            type=OrderTypes.TERMINATE,
+        )
+
+    def test_terminate_resources_is_attributed_to_the_creation_order_author(self):
+        # The policy, not a person, decides to terminate. Naming the author of
+        # the resource's creation order -- for a resource granted by a call,
+        # the contact the call named -- keeps the helpdesk ticket on the desk
+        # that was told about the resource in the first place, instead of
+        # falling through to whoever holds the first project role.
+        contact = structure_factories.UserFactory()
+        self.fixture.order.created_by = contact
+        self.fixture.order.placed_automatically = True
+        self.fixture.order.save(update_fields=["created_by", "placed_automatically"])
+
+        order = self.trigger_termination(self.project_policy)
+
+        self.assertEqual(order.created_by, contact)
+        # The contact need hold no role on the project: created_by names who
+        # the order is for, and the work is carried out with system authority.
+        self.assertTrue(order.placed_automatically)
+        self.assertEqual(order.consumer_reviewed_by, core_utils.get_system_robot())
+
+    def test_terminate_resources_skips_an_inactive_creation_order_author(self):
+        self.fixture.order.created_by = structure_factories.UserFactory(is_active=False)
+        self.fixture.order.placed_automatically = True
+        self.fixture.order.save(update_fields=["created_by", "placed_automatically"])
+
+        order = self.trigger_termination(self.project_policy)
+
+        self.assertEqual(order.created_by, core_utils.get_system_robot())
+        self.assertFalse(order.placed_automatically)
+
+    def test_terminate_resources_does_not_name_whoever_ordered_the_resource(self):
+        # A creation order somebody placed themselves says who ordered the
+        # resource, not who its later orders are for -- they may have left
+        # the project since.
+        self.fixture.order.created_by = structure_factories.UserFactory()
+        self.fixture.order.save(update_fields=["created_by"])
+
+        order = self.trigger_termination(self.project_policy)
+
+        self.assertEqual(order.created_by, core_utils.get_system_robot())
+        self.assertFalse(order.placed_automatically)
+
+    def test_terminate_resources_without_a_creation_order(self):
+        # An imported resource, or one reconciled from a backend orphan, has no
+        # creation order to take a name from.
+        self.fixture.order.delete()
+
+        order = self.trigger_termination(self.project_policy)
+
+        self.assertEqual(order.created_by, core_utils.get_system_robot())
+        self.assertFalse(order.placed_automatically)
+
     @data("customer_policy", "project_policy")
     def test_request_downscaling(self, policy_name):
         policy = getattr(self, policy_name)

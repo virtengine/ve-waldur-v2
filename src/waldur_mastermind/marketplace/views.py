@@ -8701,17 +8701,45 @@ class BaseResourceViewSet(
         request,
         resource: models.Resource,
         switch_price=None,
+        order_author=None,
         **kwargs,
     ):
+        """Place an order for an action on an existing resource.
+
+        ``order_author`` names somebody other than the caller as the person the
+        order is for. It has no HTTP spelling -- the router only ever supplies
+        ``uuid`` -- and is reserved for the automated termination sweeps, which
+        replay this view as the system robot because both resolving the
+        resource and the delete leg that follows need a role on the project
+        that the person named need not hold. Such an order is marked
+        ``placed_automatically``: ``created_by`` says who it is for, and
+        ``utils.get_order_processing_user`` keeps the work on the robot.
+        """
         self.ensure_resource_operations_allowed(resource)
         with transaction.atomic():
             order = models.Order(
                 project=resource.project,
-                created_by=request.user,
+                created_by=order_author or request.user,
+                placed_automatically=order_author is not None,
                 resource=resource,
                 offering=resource.offering,
                 **kwargs,
             )
+            if (
+                order_author is not None
+                and not permissions.order_is_held_for_purchase_order(order)
+            ):
+                # Record the consumer approval up front, the way proposal
+                # allocation does. The decision was taken elsewhere -- an end
+                # date reached, a cost policy fired -- and the person named
+                # holds no role to approve with, so the order would sit in
+                # PENDING_CONSUMER and mail every approver on the project about
+                # something the robot force-approves moments later. The stamp
+                # has to be on the unsaved order: it is what
+                # notify_approvers_when_order_is_created reads the moment
+                # save() fires.
+                order.consumer_reviewed_by = request.user
+                order.consumer_reviewed_at = timezone.now()
             serializers.validate_order(order, request)
             order.init_cost()
 
@@ -8733,7 +8761,7 @@ class BaseResourceViewSet(
         responses=serializers.OrderUUIDSerializer,
     )
     @action(detail=True, methods=["post"])
-    def terminate(self, request, uuid=None):
+    def terminate(self, request, uuid=None, order_author=None):
         resource: models.Resource = self.get_object()
 
         serializer = self.get_serializer(data=request.data)
@@ -8760,6 +8788,7 @@ class BaseResourceViewSet(
             resource=resource,
             type=OrderTypes.TERMINATE,
             attributes=attributes,
+            order_author=order_author,
         )
 
     @extend_schema(responses={status.HTTP_200_OK: serializers.OrderUUIDSerializer})

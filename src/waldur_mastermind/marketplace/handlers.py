@@ -288,12 +288,15 @@ def notify_recipients_when_order_is_created(
     auto-approve are covered too. The task re-reads the order after commit, so
     state changes made later in the creating transaction are irrelevant.
 
-    Orders nobody placed are skipped, on two signals. Import commands and the
+    Orders nobody placed are skipped, on three signals. Import commands and the
     orphan-resource reconciliation sweep insert orders directly in a terminal
     state, as audit records for work that already happened. Robots place orders
     on their own initiative: the cost-policy sweep creates one termination order
-    per over-budget resource, and openportal mirrors remote activity. Announcing
-    either as a new order would be wrong, and both arrive in bulk.
+    per over-budget resource, and openportal mirrors remote activity. And an
+    order placed automatically names the person it is for, not somebody who
+    placed it: proposal allocation, and the termination sweeps when they carry
+    an allocated resource's author over. Announcing any of these as a new order
+    would be wrong, and all of them arrive in bulk.
     """
     if get_skip_side_effects():
         return
@@ -310,7 +313,8 @@ def notify_recipients_when_order_is_created(
     # An order placed automatically records the person it is for, not somebody
     # who placed it. Proposal allocation is the case in point: announcing one
     # new order per granted resource on allocation day is exactly the bulk
-    # this guard exists to avoid.
+    # this guard exists to avoid. The end-date and cost-policy sweeps land here
+    # too when they name an allocated resource's author instead of the robot.
     if instance.placed_automatically:
         return
 

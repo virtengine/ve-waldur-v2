@@ -1012,7 +1012,15 @@ def _force_approve_pending_terminate_order(pending_order):
     )
 
 
-def terminate_resource(resource, user, termination_comment=None, scheduled=False):
+def terminate_resource(
+    resource, user, termination_comment=None, scheduled=False, order_author=None
+):
+    """Place a termination order for the resource, as `user`.
+
+    `order_author` names somebody else as the person the order is for, leaving
+    `user` as the identity the work is carried out under; see
+    `ConsumerResourceViewSet.create_resource_order`.
+    """
     from waldur_mastermind.marketplace import views
 
     if scheduled:
@@ -1056,7 +1064,9 @@ def terminate_resource(resource, user, termination_comment=None, scheduled=False
         )
         return
 
-    response = create_request(view, user, {}, uuid=resource.uuid.hex)
+    response = create_request(
+        view, user, {}, uuid=resource.uuid.hex, order_author=order_author
+    )
 
     if scheduled and response and response.status_code == status.HTTP_200_OK:
         # The freshly created order may still be PENDING_CONSUMER if `user`
@@ -1072,6 +1082,37 @@ def terminate_resource(resource, user, termination_comment=None, scheduled=False
     return response
 
 
+def get_creation_order_author(resource):
+    """The person the resource's own creation order was placed for, if it was
+    placed on their behalf.
+
+    An order placed by one of the automated sweeps is nobody's doing, so the
+    only name it can carry is one decided earlier. A creation order placed
+    automatically holds that decision: a call names the author of the orders
+    it places when it grants a resource (`proposal.utils.resolve_order_author`),
+    so carrying the name over keeps the termination ticket on the same desk as
+    the creation one -- without this app having to know that calls exist.
+
+    A creation order somebody placed themselves decided nothing of the kind.
+    It says who ordered the resource, possibly years ago and possibly somebody
+    who has left the project since, and naming them would route the ticket and
+    the order mail to a person the project may no longer include. Those are
+    left to the robot and the project-role fallback, as before.
+
+    Returns None for a resource with no such creation order: one ordered by a
+    person, an imported one, or one reconciled from a backend orphan.
+    """
+    creating_order = (
+        models.Order.objects.filter(
+            resource=resource, type=OrderTypes.CREATE, placed_automatically=True
+        )
+        .select_related("created_by")
+        .order_by("created")
+        .first()
+    )
+    return creating_order.created_by if creating_order else None
+
+
 def schedule_resources_termination(resources, termination_comment=None, user=None):
     if not resources:
         return
@@ -1083,10 +1124,10 @@ def schedule_resources_termination(resources, termination_comment=None, user=Non
         # `user` would short-circuit the fallback chain on the next iteration
         # and attribute every later resource to the first resource's actor.
         #
-        # Inactive candidates are skipped: termination runs as an internal API
-        # request authenticated as the actor, and an inactive user is rejected
-        # with HTTP 401 "User inactive or deleted.", so the resource would never
-        # be terminated. The system robot is always active and is the fallback.
+        # Inactive candidates are skipped: the actor authenticates the internal
+        # termination request, and an inactive user is rejected with HTTP 401
+        # "User inactive or deleted.", so the resource would never be
+        # terminated.
         actor = next(
             (
                 candidate
@@ -1097,18 +1138,39 @@ def schedule_resources_termination(resources, termination_comment=None, user=Non
                 )
                 if candidate is not None and candidate.is_active
             ),
-            system_robot,
+            None,
         )
 
-        if not actor:
-            logger.error(
-                "User for terminating resources of project with due date does not exist."
+        if actor is not None:
+            # Somebody asked for this termination, so the request is made as
+            # them and the order is theirs, as it has always been -- including
+            # being announced to the offering's notification recipients. One
+            # who cannot approve it themselves is still force-approved below.
+            author = actor
+            response = terminate_resource(
+                resource, actor, termination_comment, scheduled=True
             )
-            return
-
-        response = terminate_resource(
-            resource, actor, termination_comment, scheduled=True
-        )
+        else:
+            # Nobody asked. A creation order placed on somebody's behalf
+            # carries the name its orders are for -- for a granted resource,
+            # the contact the call named -- and naming them is what keeps the
+            # helpdesk ticket off whoever happens to hold the first project
+            # role. They hold no role on the project in the general case, so
+            # the request is made as the robot and the order is marked
+            # placed_automatically, which keeps provisioning with the robot
+            # from there on. An inactive one can no longer be reached, and a
+            # resource somebody ordered themselves names nobody: both leave an
+            # ordinary robot-placed order, as before.
+            author = get_creation_order_author(resource)
+            if author is None or not author.is_active:
+                author = system_robot
+            response = terminate_resource(
+                resource,
+                system_robot,
+                termination_comment,
+                scheduled=True,
+                order_author=None if author == system_robot else author,
+            )
 
         if response and response.status_code != status.HTTP_200_OK:
             # Include the HTTP status and resource state so a repeating failure
@@ -1118,12 +1180,12 @@ def schedule_resources_termination(resources, termination_comment=None, user=Non
             # identically until the resource row is reconciled.
             logger.error(
                 "Terminating resource %s (state=%s, offering=%s, project=%s, "
-                "actor=%s) has failed with HTTP %s. %s",
+                "author=%s) has failed with HTTP %s. %s",
                 resource.uuid.hex,
                 resource.get_state_display(),
                 resource.offering,
                 resource.project,
-                actor,
+                author,
                 response.status_code,
                 response.rendered_content,
             )
