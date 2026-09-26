@@ -8,6 +8,7 @@ from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.enums import (
     SUPPORT_OFFERING,
     OrderStates,
+    OrderTypes,
     ResourceStates,
 )
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
@@ -282,6 +283,88 @@ class AllocatedOrderIssueCallerTest(BaseTest):
 
         self.assertEqual(order.created_by, self.applicant)
         self.assertEqual(get_order_issue(order).caller, manager)
+
+
+class TerminatedOrderIssueCallerTest(BaseTest):
+    """A termination nobody asked for raises its ticket for the same contact.
+
+    The end-date sweep places an order on nobody's initiative, so the only name
+    it can carry is the one the resource's creation order already carries --
+    for a granted resource, the contact the call named. Without it the ticket
+    falls through to whoever holds the first project role, months after the
+    creation ticket went to the grants office.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.proposal_fixture = proposal_fixtures.ProposalFixture()
+        self.call = self.proposal_fixture.call
+        self.proposal = self.proposal_fixture.proposal
+        self.proposal.state = ProposalStates.IN_REVIEW
+        self.proposal.project = None
+        self.proposal.save()
+
+        offering = self.proposal_fixture.offering
+        offering.type = SUPPORT_OFFERING
+        offering.save(update_fields=["type"])
+
+        self.grants_office = structure_factories.UserFactory()
+        self.call.order_author = models.Call.OrderAuthor.SPECIFIC_USER
+        self.call.order_author_user = self.grants_office
+        self.call.save()
+
+    def allocate(self):
+        proposal_utils.allocate_proposal(
+            self.proposal, approved_by=self.proposal_fixture.staff
+        )
+        self.proposal.refresh_from_db()
+        resource = self.proposal.requestedresource_set.first().resource
+        creation_order = marketplace_models.Order.objects.get(
+            resource=resource, type=OrderTypes.CREATE
+        )
+        # Allocation queues the processing on a celery task that tests do not
+        # run. Drive it, then finish the order and the resource the way the
+        # helpdesk resolving the creation ticket would -- a resource with an
+        # order still executing is not swept at all.
+        marketplace_utils.process_order(
+            creation_order, marketplace_utils.get_order_processing_user(creation_order)
+        )
+        creation_order.refresh_from_db()
+        creation_order.complete()
+        creation_order.save()
+        resource.refresh_from_db()
+        if resource.state != ResourceStates.OK:
+            resource.set_state_ok()
+            resource.save(update_fields=["state"])
+        return resource
+
+    def terminate(self, resource):
+        marketplace_utils.schedule_resources_termination([resource])
+        order = marketplace_models.Order.objects.get(
+            resource=resource, type=OrderTypes.TERMINATE
+        )
+        # The sweep queues the processing on a celery task that tests do not
+        # run. Drive it with the identity the handler would have passed.
+        marketplace_utils.process_order(
+            order, marketplace_utils.get_order_processing_user(order)
+        )
+        order.refresh_from_db()
+        return order
+
+    def test_termination_ticket_is_raised_for_the_call_contact(self):
+        resource = self.allocate()
+        # Whom the ticket would land on instead if the termination order named
+        # nobody reachable -- the routing this exists to keep off the project.
+        manager = structure_factories.UserFactory()
+        resource.project.add_user(manager, ProjectRole.MANAGER)
+
+        order = self.terminate(resource)
+
+        self.assertEqual(order.created_by, self.grants_office)
+        # The contact holds no role on the allocated project, so the delete leg
+        # runs as the robot while the ticket is still raised for them.
+        self.assertTrue(order.placed_automatically)
+        self.assertEqual(get_order_issue(order).caller, self.grants_office)
 
 
 class PendingOrderIssueCallerTest(BaseTest):

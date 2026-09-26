@@ -554,9 +554,10 @@ Consumer and provider approval are decided separately, by two independent gates.
 **Consumer approval** is decided by `order_should_not_be_reviewed_by_consumer()`, which applies these rules in order:
 
 1. If the offering sets `require_purchase_order_upload` and no purchase order is attached, manual approval is required — this applies to staff too. Termination orders are exempt
-2. Staff users skip consumer approval. This includes the system robot that drives scheduled sweeps and backend-triggered flows
-3. If `disable_autoapprove` is `true`, manual approval is required. It overrides every consumer-side mechanism below it: private-offering permissions, `auto_approve_in_service_provider_projects`, `auto_approve_for_roles`, project-level auto-approval rules, and the general `ORDER.APPROVE` permission that owners and managers hold by default. Termination orders are exempt: they reduce spend, so they follow the normal termination rules instead
-4. Otherwise the private-offering, same-organization (`auto_approve_in_service_provider_projects`), termination, role-based (`auto_approve_for_roles`) and `ORDER.APPROVE` rules apply, in that order
+2. An order placed automatically (`placed_automatically`) that already carries a consumer review skips consumer approval. The person named in `created_by` is who the order is for and need hold no role to approve with; the review was recorded by whoever decided on the order. Proposal allocation records the call manager who accepted the proposal, and the end-date and cost-policy termination sweeps record the system robot when they attribute a termination to the person an allocated resource's creation order was for
+3. Staff users skip consumer approval. This includes the system robot that drives scheduled sweeps and backend-triggered flows
+4. If `disable_autoapprove` is `true`, manual approval is required. It overrides every consumer-side mechanism below it: private-offering permissions, `auto_approve_in_service_provider_projects`, `auto_approve_for_roles`, project-level auto-approval rules, and the general `ORDER.APPROVE` permission that owners and managers hold by default. Termination orders are exempt: they reduce spend, so they follow the normal termination rules instead
+5. Otherwise the private-offering, same-organization (`auto_approve_in_service_provider_projects`), termination, role-based (`auto_approve_for_roles`) and `ORDER.APPROVE` rules apply, in that order
 
 **Provider approval** is decided by `order_should_not_be_reviewed_by_provider()` and is *not* affected by `disable_autoapprove`. It is governed by the offering type together with `auto_approve_remote_orders` (skips provider approval for orders from external customers) and `auto_approve_marketplace_script`.
 

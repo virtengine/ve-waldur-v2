@@ -231,7 +231,11 @@ class ProjectEndDateTest(test.APITestCase):
             # (order_should_not_be_reviewed_by_provider returns False for it),
             # so the order lands in PENDING_PROVIDER, not EXECUTING.
             self.assertEqual(order.state, OrderStates.PENDING_PROVIDER)
+            # Nobody requested the project's end date, and the resource was
+            # ordered by a person rather than on anybody's behalf, so nobody is
+            # named: the order is the robot's.
             self.assertEqual(order.created_by, core_utils.get_system_robot())
+            self.assertFalse(order.placed_automatically)
 
     def test_terminate_resources_if_project_end_date_requested_by_cannot_approve_order(
         self,
@@ -609,7 +613,11 @@ class ResourceEndDateTest(test.APITestCase):
             # by_provider returns False for BASIC_OFFERING) — the order lands
             # in PENDING_PROVIDER, not EXECUTING.
             self.assertEqual(order.state, OrderStates.PENDING_PROVIDER)
+            # Nobody requested the end date, and the resource was ordered by a
+            # person rather than on anybody's behalf, so nobody is named: the
+            # order is the robot's.
             self.assertEqual(order.created_by, self.system_robot)
+            self.assertFalse(order.placed_automatically)
 
     def test_terminate_resource_if_end_date_requested_by_is_passed(self):
         with freeze_time("2020-01-01"):
@@ -750,9 +758,10 @@ class ResourceEndDateTest(test.APITestCase):
 
     def test_terminate_resource_when_end_date_requested_by_is_inactive(self):
         # Regression: if the user who requested the end date was later
-        # deactivated, the actor must fall through to the system robot.
-        # Otherwise the internal termination request is rejected with HTTP 401
-        # "User inactive or deleted." and the resource is never terminated.
+        # deactivated, the chain must fall through past them. The requester
+        # authenticates the internal termination request, and an inactive user
+        # is rejected with HTTP 401 "User inactive or deleted.", so the
+        # resource would never be terminated.
         with freeze_time("2020-01-01"):
             inactive_user = structure_factories.UserFactory(is_active=False)
             self.resource.end_date_requested_by = inactive_user
@@ -766,6 +775,173 @@ class ResourceEndDateTest(test.APITestCase):
                 resource=self.fixture.resource, type=OrderTypes.TERMINATE
             )
             self.assertEqual(order.created_by, self.system_robot)
+
+    def test_author_of_a_creation_order_they_placed_themselves_is_not_named(self):
+        # Whoever ordered the resource decided nothing about who its later
+        # orders are for, and may have left the project since. Naming them
+        # would route the termination ticket and the order mail to them
+        # instead of to whoever holds the project now.
+        orderer = structure_factories.UserFactory()
+        self.fixture.order.created_by = orderer
+        self.fixture.order.save(update_fields=["created_by"])
+
+        with freeze_time("2020-01-01"):
+            tasks.terminate_expired_resources()
+
+        order = models.Order.objects.get(
+            resource=self.resource, type=OrderTypes.TERMINATE
+        )
+        self.assertEqual(order.created_by, self.system_robot)
+        self.assertFalse(order.placed_automatically)
+
+    def test_creation_order_author_is_used_when_nobody_requested_the_end_date(self):
+        # A resource granted by a call has an end date nobody requested: both
+        # end_date_requested_by fields are empty, and the termination order
+        # would be the robot's, whose ticket falls through to whoever holds the
+        # first project role. The creation order carries the contact the call
+        # named, and that is who the termination is for too.
+        contact = structure_factories.UserFactory()
+        self.fixture.order.created_by = contact
+        self.fixture.order.placed_automatically = True
+        self.fixture.order.save(update_fields=["created_by", "placed_automatically"])
+
+        with freeze_time("2020-01-01"):
+            tasks.terminate_expired_resources()
+
+        order = models.Order.objects.get(
+            resource=self.resource, type=OrderTypes.TERMINATE
+        )
+        self.assertEqual(order.created_by, contact)
+        # The contact holds no role on the project -- created_by only names who
+        # the order is for -- so the work stays with the robot and the order is
+        # placed, not left pending.
+        self.assertTrue(order.placed_automatically)
+        self.assertEqual(utils.get_order_processing_user(order), self.system_robot)
+        self.assertEqual(order.state, OrderStates.PENDING_PROVIDER)
+
+    def test_order_for_a_named_contact_does_not_ask_the_project_to_approve(self):
+        # The contact holds no role to approve with, so without the consumer
+        # review recorded up front the order would land in PENDING_CONSUMER and
+        # mail every approver on the project about an order the sweep
+        # force-approves as the robot moments later.
+        contact = structure_factories.UserFactory()
+        self.fixture.order.created_by = contact
+        self.fixture.order.placed_automatically = True
+        self.fixture.order.save(update_fields=["created_by", "placed_automatically"])
+
+        with freeze_time("2020-01-01"):
+            tasks.terminate_expired_resources()
+
+        order = models.Order.objects.get(
+            resource=self.resource, type=OrderTypes.TERMINATE
+        )
+        self.assertNotEqual(order.state, OrderStates.PENDING_CONSUMER)
+        self.assertEqual(order.consumer_reviewed_by, self.system_robot)
+        self.assertIsNotNone(order.consumer_reviewed_at)
+
+    def test_requested_termination_is_not_placed_automatically(self):
+        # An order somebody asked for stays theirs: it is placed as them and
+        # announced to the offering's notification recipients like any other
+        # order they place. placed_automatically is for the orders nobody
+        # placed, and suppresses that announcement.
+        requester = structure_factories.UserFactory(is_staff=True)
+        self.resource.end_date_requested_by = requester
+        self.resource.save()
+
+        with freeze_time("2020-01-01"):
+            tasks.terminate_expired_resources()
+
+        order = models.Order.objects.get(
+            resource=self.resource, type=OrderTypes.TERMINATE
+        )
+        self.assertEqual(order.created_by, requester)
+        self.assertFalse(order.placed_automatically)
+
+    def test_only_the_creation_order_is_taken_as_the_source_of_the_author(self):
+        contact = structure_factories.UserFactory()
+        self.fixture.order.created_by = contact
+        self.fixture.order.placed_automatically = True
+        self.fixture.order.save(update_fields=["created_by", "placed_automatically"])
+        # An update placed by somebody else in between says nothing about who
+        # the resource is for.
+        factories.OrderFactory(
+            project=self.resource.project,
+            offering=self.resource.offering,
+            resource=self.resource,
+            type=OrderTypes.UPDATE,
+            state=OrderStates.DONE,
+        )
+
+        with freeze_time("2020-01-01"):
+            tasks.terminate_expired_resources()
+
+        order = models.Order.objects.get(
+            resource=self.resource, type=OrderTypes.TERMINATE
+        )
+        self.assertEqual(order.created_by, contact)
+
+    def test_inactive_creation_order_author_falls_back_to_the_robot(self):
+        self.fixture.order.created_by = structure_factories.UserFactory(is_active=False)
+        self.fixture.order.placed_automatically = True
+        self.fixture.order.save(update_fields=["created_by", "placed_automatically"])
+
+        with freeze_time("2020-01-01"):
+            tasks.terminate_expired_resources()
+
+        order = models.Order.objects.get(
+            resource=self.resource, type=OrderTypes.TERMINATE
+        )
+        self.assertEqual(order.created_by, self.system_robot)
+        # Nobody is named, so the order is an ordinary one placed by the robot.
+        self.assertFalse(order.placed_automatically)
+
+    def test_end_date_requested_by_wins_over_the_creation_order_author(self):
+        self.fixture.order.created_by = structure_factories.UserFactory()
+        self.fixture.order.placed_automatically = True
+        self.fixture.order.save(update_fields=["created_by", "placed_automatically"])
+        requester = structure_factories.UserFactory(is_staff=True)
+        self.resource.end_date_requested_by = requester
+        self.resource.save()
+
+        with freeze_time("2020-01-01"):
+            tasks.terminate_expired_resources()
+
+        order = models.Order.objects.get(
+            resource=self.resource, type=OrderTypes.TERMINATE
+        )
+        self.assertEqual(order.created_by, requester)
+
+    def test_explicitly_passed_user_wins_over_the_creation_order_author(self):
+        self.fixture.order.created_by = structure_factories.UserFactory()
+        self.fixture.order.placed_automatically = True
+        self.fixture.order.save(update_fields=["created_by", "placed_automatically"])
+        terminating_user = structure_factories.UserFactory(is_staff=True)
+
+        with freeze_time("2020-01-01"):
+            utils.schedule_resources_termination([self.resource], user=terminating_user)
+
+        order = models.Order.objects.get(
+            resource=self.resource, type=OrderTypes.TERMINATE
+        )
+        self.assertEqual(order.created_by, terminating_user)
+
+    def test_resource_without_a_creation_order_is_still_terminated(self):
+        # An imported resource, or one reconciled from a backend orphan, has no
+        # creation order to take a name from.
+        resource = factories.ResourceFactory(
+            offering=self.resource.offering,
+            project=self.resource.project,
+            end_date=datetime.datetime(day=1, month=1, year=2020).date(),
+        )
+        resource.set_state_ok()
+        resource.save()
+
+        with freeze_time("2020-01-01"):
+            tasks.terminate_expired_resources()
+
+        order = models.Order.objects.get(resource=resource, type=OrderTypes.TERMINATE)
+        self.assertEqual(order.created_by, self.system_robot)
+        self.assertFalse(order.placed_automatically)
 
     def test_notification_about_resource_ending(self):
         self.fixture.manager
