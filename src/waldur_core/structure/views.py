@@ -972,6 +972,7 @@ class ProjectViewSet(
 
             # Staff and support can access any terminated project
             if user.is_staff or user.is_support:
+                self.check_object_permissions(self.request, project)
                 return project
 
             # Regular users need to have normal access to the project
@@ -984,6 +985,7 @@ class ProjectViewSet(
             if not filtered_queryset.exists():
                 raise Http404("No Project matches the given query.")
 
+            self.check_object_permissions(self.request, project)
             return project
 
         except models.Project.DoesNotExist:
@@ -1017,7 +1019,7 @@ class ProjectViewSet(
     # Checklist permissions (view access for all project members and customer roles)
     checklist_permissions = [permissions.has_project_access]
     completion_status_permissions = [permissions.has_project_access]
-    submit_answers_permissions = [permissions.is_manager]
+    submit_answers_permissions = [permissions.can_answer_project_metadata]
 
     def get_checklist_completion(self, obj):
         """Get checklist completion for project metadata."""

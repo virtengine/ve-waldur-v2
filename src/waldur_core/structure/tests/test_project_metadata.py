@@ -7,6 +7,11 @@ from rest_framework import status, test
 from waldur_core.checklist import models as checklist_models
 from waldur_core.checklist.enums import ChecklistTypes, QuestionTypes
 from waldur_core.checklist.tests import factories as checklist_factories
+from waldur_core.configuration.testing import override_config
+from waldur_core.core.tests.helpers import create_pat
+from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.permissions.models import Role, RolePermission
+from waldur_core.structure.models import Customer, Project
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
 
@@ -420,3 +425,106 @@ class ProjectMetadataCompletionTest(ProjectMetadataTestMixin, test.APITestCase):
 
         self.assertEqual(completion.checklist, self.checklist)
         self.assertFalse(completion.is_completed)
+
+
+class ProjectMetadataPermissionTest(ProjectMetadataTestMixin, test.APITestCase):
+    """Who may read and answer a project's metadata checklist."""
+
+    def setUp(self):
+        super().setUp()
+        self.customer.project_metadata_checklist = self.checklist
+        self.customer.save()
+        self.checklist_url = structure_factories.ProjectFactory.get_url(
+            self.project, action="checklist"
+        )
+        self.status_url = structure_factories.ProjectFactory.get_url(
+            self.project, action="completion_status"
+        )
+        self.submit_url = structure_factories.ProjectFactory.get_url(
+            self.project, action="submit_answers"
+        )
+        self.answers = [
+            {"question_uuid": str(self.text_question.uuid), "answer_data": "Research"}
+        ]
+
+    def holder(self, scope, *permissions):
+        """A user whose only role on scope is a custom one holding permissions.
+
+        It also holds PROJECT.LIST, without which an organization role cannot
+        see the project at all.
+        """
+        model = Project if isinstance(scope, Project) else Customer
+        role = Role.objects.create(
+            name=f"{model.__name__.upper()}.METADATA_TEST",
+            content_type=ContentType.objects.get_for_model(model),
+        )
+        for permission in (PermissionEnum.LIST_PROJECTS, *permissions):
+            RolePermission.objects.create(role=role, permission=permission.value)
+        user = structure_factories.UserFactory()
+        scope.add_user(user, role)
+        return user
+
+    def assert_access(self, user, read, answer):
+        self.client.force_authenticate(user)
+        read_status = status.HTTP_200_OK if read else status.HTTP_403_FORBIDDEN
+        answer_status = status.HTTP_200_OK if answer else status.HTTP_403_FORBIDDEN
+        self.assertEqual(self.client.get(self.checklist_url).status_code, read_status)
+        self.assertEqual(self.client.get(self.status_url).status_code, read_status)
+        response = self.client.post(self.submit_url, self.answers, format="json")
+        self.assertEqual(response.status_code, answer_status)
+
+    def test_permission_on_the_project_opens_the_checklist(self):
+        user = self.holder(self.project, PermissionEnum.UPDATE_PROJECT_METADATA)
+        self.assert_access(user, read=True, answer=True)
+
+    def test_permission_on_the_organization_opens_the_checklist(self):
+        user = self.holder(self.customer, PermissionEnum.UPDATE_PROJECT_METADATA)
+        self.assert_access(user, read=True, answer=True)
+
+    def test_a_custom_role_without_the_permission_is_refused(self):
+        user = self.holder(self.project)
+        self.assert_access(user, read=False, answer=False)
+
+    def test_project_update_reads_but_does_not_answer(self):
+        # HomePort shows it the Metadata tab, with the checklist read-only.
+        user = self.holder(self.project, PermissionEnum.UPDATE_PROJECT)
+        self.assert_access(user, read=True, answer=False)
+
+    def test_support_reads_but_does_not_answer(self):
+        self.assert_access(self.fixture.global_support, read=True, answer=False)
+
+    def use_support_token(self, *scopes):
+        support = self.fixture.global_support
+        support.can_use_personal_access_tokens = True
+        support.save(update_fields=["can_use_personal_access_tokens"])
+        _, token = create_pat(support, scopes=[scope.value for scope in scopes])
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+
+    @override_config(PAT_ENABLED=True)
+    def test_a_support_token_reads_with_the_support_scope(self):
+        self.use_support_token(PermissionEnum.SUPPORT_ACCESS)
+        response = self.client.get(self.checklist_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    @override_config(PAT_ENABLED=True)
+    def test_a_support_token_does_not_read_without_the_support_scope(self):
+        self.use_support_token(PermissionEnum.LIST_PROJECTS)
+        response = self.client.get(self.checklist_url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_a_removed_project_keeps_the_same_rules(self):
+        support = self.fixture.global_support
+        bystander = self.holder(self.customer)
+        self.project.delete()
+
+        self.assert_access(support, read=True, answer=False)
+        self.assert_access(bystander, read=False, answer=False)
+
+    def test_owners_and_managers_answer_without_the_permission(self):
+        # Role access stays: tokens scoped before the permission mattered, and
+        # roles that never received it, keep working.
+        self.assert_access(self.fixture.owner, read=True, answer=True)
+        self.assert_access(self.fixture.manager, read=True, answer=True)
+
+    def test_members_keep_reading_without_answering(self):
+        self.assert_access(self.fixture.member, read=True, answer=False)

@@ -11,7 +11,11 @@ from waldur_core.permissions.fixtures import (
     ProjectRole,
     ServiceProviderRole,
 )
-from waldur_core.permissions.utils import check_pat_support_scope, has_permission
+from waldur_core.permissions.utils import (
+    check_pat_support_scope,
+    has_permission,
+    has_permission_on_any_source,
+)
 from waldur_core.structure import models
 
 logger = logging.getLogger(__name__)
@@ -115,17 +119,33 @@ def _has_admin_access(user, project: models.Project):
     )
 
 
-def is_manager(request, view, obj=None, **kwargs):
-    """Check if user has manager access to project (customer owner or project manager)."""
+def _holds_on_project(request, permission, project: models.Project):
+    return has_permission_on_any_source(request, permission, project, ["*", "customer"])
+
+
+def can_answer_project_metadata(request, view, obj=None, **kwargs):
+    """Check if user may answer the project's metadata checklist.
+
+    Owners and project managers may by their role, and so may anyone holding
+    PROJECT.UPDATE_METADATA on the project or on its organization.
+    """
     if not obj:
         return
     project = _get_project(obj, **kwargs)
-    if not _has_manager_access(request.user, project):
+    if not (
+        _has_manager_access(request.user, project)
+        or _holds_on_project(request, PermissionEnum.UPDATE_PROJECT_METADATA, project)
+    ):
         raise exceptions.PermissionDenied()
 
 
 def has_project_access(request, view, obj=None, **kwargs):
-    """Check if user has any access to project (any project role or customer role)."""
+    """Check if user may read the project's metadata checklist.
+
+    That is anyone with a project role, an owner, global support, anyone who
+    may answer it, and anyone who may update the project, which shows them the
+    checklist on its settings page.
+    """
     if not obj:
         return
     project = _get_project(obj, **kwargs)
@@ -134,6 +154,9 @@ def has_project_access(request, view, obj=None, **kwargs):
             request.user, project
         )  # Covers customer owner + project admin/manager
         or project.has_user(request.user, ProjectRole.MEMBER)  # Project members
+        or _holds_on_project(request, PermissionEnum.UPDATE_PROJECT_METADATA, project)
+        or _holds_on_project(request, PermissionEnum.UPDATE_PROJECT, project)
+        or (request.user.is_support and check_pat_support_scope(request))
     ):
         raise exceptions.PermissionDenied()
 
