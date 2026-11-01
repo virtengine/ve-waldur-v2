@@ -17,6 +17,7 @@ from waldur_core.core.tests.helpers import create_pat
 from waldur_core.logging import models as logging_models
 from waldur_core.logging.enums import ConsumerAuthorization, EventType
 from waldur_core.logging.models import Event
+from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
 
@@ -40,10 +41,16 @@ class StandaloneConsumerAttributionTest(test.APITestCase):
         self.assertEqual(response.status_code, expected, response.content)
         return response
 
-    def _authenticate_with_pat(self, user, name="agent token"):
+    def _authenticate_with_pat(self, user, name="agent token", scopes=None):
         user.can_use_personal_access_tokens = True
         user.save(update_fields=["can_use_personal_access_tokens"])
-        pat, plaintext = create_pat(user, name=name)
+        if scopes is None:
+            # A global consumer needs the token to act as staff or support.
+            if user.is_staff:
+                scopes = [PermissionEnum.STAFF_ACCESS.value]
+            elif user.is_support:
+                scopes = [PermissionEnum.SUPPORT_ACCESS.value]
+        pat, plaintext = create_pat(user, name=name, scopes=scopes)
         self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {plaintext}")
         return pat
 
@@ -205,6 +212,12 @@ class StandaloneConsumerAttributionTest(test.APITestCase):
 
         event = self._broad_credential_events().get()
         self.assertEqual(event.context["auth_kind"], "pat")
+
+    def test_staff_pat_without_the_staff_scope_cannot_register_globally(self, *mocks):
+        staff = structure_factories.UserFactory(is_staff=True)
+        self._authenticate_with_pat(staff, scopes=[PermissionEnum.LIST_ORDERS.value])
+
+        self._register(expected=status.HTTP_403_FORBIDDEN)
 
     def test_support_pat_registration_is_audited(self, *mocks):
         """A support user may register the same global PII firehose as staff, so

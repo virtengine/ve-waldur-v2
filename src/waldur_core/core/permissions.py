@@ -180,6 +180,47 @@ class IsStaffWriterOrSupportReader(BasePermission):
         return user.is_staff and check_pat_staff_scope(request)
 
 
+def has_staff_access(request) -> bool:
+    """Whether the request may act as staff.
+
+    A staff user's personal access token acts as staff only with the staff
+    scope; scoped down to a few permissions it must not pass staff-only checks.
+    """
+    user = getattr(request, "user", None)
+    return bool(user and user.is_staff and check_pat_staff_scope(request))
+
+
+def has_support_access(request) -> bool:
+    """Whether the request may act as staff or global support; a personal
+    access token needs the staff or the support scope."""
+    user = getattr(request, "user", None)
+    return bool(
+        user
+        and (user.is_staff or getattr(user, "is_support", False))
+        and check_pat_support_scope(request)
+    )
+
+
+class TokenCarriesUserRole(BasePermission):
+    """Refuse a personal access token that would act with less than its
+    user's staff or support role.
+
+    For views that only see the user, so a token's narrower scopes cannot be
+    applied there (the AI assistant picks its tools from ``user.is_staff``).
+    The MCP server refuses the same tokens.
+    """
+
+    message = "This personal access token needs the staff or support scope here."
+
+    def has_permission(self, request, view):
+        user = request.user
+        if getattr(user, "is_staff", False) and not has_staff_access(request):
+            return False
+        if getattr(user, "is_support", False) and not has_support_access(request):
+            return False
+        return True
+
+
 def can_read_constance_secrets(request):
     """Whether this request may receive unredacted Constance secret values.
 

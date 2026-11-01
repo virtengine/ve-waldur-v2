@@ -1,5 +1,6 @@
 from rest_framework import exceptions
 
+from waldur_core.core.permissions import has_staff_access
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_mastermind.marketplace import models
 from waldur_mastermind.marketplace.enums import OrderStates, OrderTypes
@@ -12,7 +13,7 @@ def user_can_reject_order(request, view, resource=None):
 
     user = request.user
 
-    if user.is_staff:
+    if has_staff_access(request):
         return
 
     try:

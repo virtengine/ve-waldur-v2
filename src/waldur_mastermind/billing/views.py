@@ -6,6 +6,7 @@ from rest_framework import exceptions, generics, response, status
 from rest_framework import filters as rf_filters
 
 from waldur_core.core import views as core_views
+from waldur_core.core.permissions import has_support_access
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.invoices import models as invoices_models
@@ -34,7 +35,7 @@ class TotalCustomerCostView(generics.GenericAPIView):
         ]
     )
     def get(self, request, format=None):
-        if not self.request.user.is_staff and not request.user.is_support:
+        if not has_support_access(request):
             raise exceptions.PermissionDenied()
 
         customers = structure_models.Customer.objects.all()

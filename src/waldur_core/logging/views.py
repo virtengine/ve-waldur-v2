@@ -29,6 +29,7 @@ from waldur_core.core import filters as core_filters
 from waldur_core.core import models as core_models
 from waldur_core.core import permissions as core_permissions
 from waldur_core.core import utils as core_utils
+from waldur_core.core.permissions import has_staff_access, has_support_access
 from waldur_core.core.serializers import StatusSerializer
 from waldur_core.logging import (
     backend,
@@ -1201,9 +1202,9 @@ def _resolve_consumer_authorization(request, resolved_scopes) -> str:
     generic ancestor walk, or the chain an app registered for that scope type).
     """
     user = request.user
-    if user.is_staff:
+    if has_staff_access(request):
         return enums.ConsumerAuthorization.STAFF
-    if user.is_support:
+    if has_support_access(request):
         return enums.ConsumerAuthorization.SUPPORT
     user_ct_id = ContentType.objects.get_for_model(core_models.User).id
     if resolved_scopes and all(
@@ -1301,9 +1302,7 @@ class EventConsumerViewSet(
         # Empty bindings == global == the all-user PII firehose. Same guard as
         # IsSupport and as the delivery-time re-auth in event_dispatch, so the
         # two can never disagree.
-        if not resolved_scopes and not (
-            request.user.is_staff or request.user.is_support
-        ):
+        if not resolved_scopes and not (has_support_access(request)):
             raise rest_framework.exceptions.PermissionDenied(
                 "A global event consumer (empty scopes) is restricted to "
                 "staff/support. Pass `scopes` to bind the queue to entities you "

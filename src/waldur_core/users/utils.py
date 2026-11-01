@@ -15,6 +15,7 @@ from waldur_core.configuration import config
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import ReviewStates
+from waldur_core.core.permissions import has_staff_access
 from waldur_core.core.utils import pwgen
 from waldur_core.media.validators import parse_email_list
 from waldur_core.permissions.enums import PermissionEnum
@@ -265,7 +266,7 @@ def can_manage_invitation_with(request, scope, role_index=None):
     if scope._meta.model_name == "project" and getattr(scope, "is_removed", False):
         return False
 
-    if request.user.is_staff:
+    if has_staff_access(request):
         return True
 
     permission = get_create_permission(scope)
@@ -320,7 +321,7 @@ def can_manage_permission_request(request, invitation, role_index=None):
     # but not CREATE_CUSTOMER_PERMISSION is offered the approve action in the UI
     # yet receives a 404 from the API.
     if invitation.auto_create_project:
-        if request.user.is_staff:
+        if has_staff_access(request):
             return True
         return has_permission(
             request,

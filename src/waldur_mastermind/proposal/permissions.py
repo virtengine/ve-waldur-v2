@@ -3,6 +3,7 @@ from django.db.models import Q
 from rest_framework import exceptions, permissions
 
 from waldur_core.core.exceptions import IncorrectStateException
+from waldur_core.core.permissions import has_staff_access
 from waldur_core.permissions import models as permissions_models
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
 from waldur_core.permissions.utils import (
@@ -59,7 +60,7 @@ def oversees_proposal_call(request_or_user, proposal) -> bool:
 def _holds_on_proposal(request, permission, proposal) -> bool:
     user = request.user
     return (
-        user.is_staff
+        has_staff_access(request)
         or proposal.created_by_id == user.id
         or has_permission(request, permission, proposal)
     )
@@ -107,7 +108,7 @@ def can_answer_proposal_checklist(request, view, obj=None):
         return
     if not has_permission(request, PermissionEnum.UPDATE_PROPOSAL, obj):
         raise exceptions.PermissionDenied()
-    if request.user.is_staff:
+    if has_staff_access(request):
         return
     _require_draft(obj)
 
@@ -210,14 +211,21 @@ def _user_holds_offering_manager_for_proposal(user, proposal):
     return offering_manager_user_ids_for_proposal(proposal).filter(user=user).exists()
 
 
-def _user_can_act_on_active_step(user, proposal):
+def _acts_as_staff(user, staff) -> bool:
+    """`staff` is whether the request acts as staff (`has_staff_access`), so
+    that a personal access token without the staff scope does not; it
+    defaults to the user's flag."""
+    return user.is_staff if staff is None else staff
+
+
+def _user_can_act_on_active_step(user, proposal, staff=None):
     """True iff the user has the role required by the proposal's active workflow step.
 
     Staff bypass this check. When no active step exists or the active step has
     no responsible_role configured, access is allowed and the view's own
     state/concurrency guards take over.
     """
-    if user.is_staff:
+    if _acts_as_staff(user, staff):
         return True
 
     active = proposal.workflow_step_instances.filter(
@@ -259,7 +267,7 @@ def _user_can_act_on_active_step(user, proposal):
     return get_users(call, role_name=role_name).filter(pk=user.pk).exists()
 
 
-def user_can_view_internal_notes(user, proposal):
+def user_can_view_internal_notes(user, proposal, staff=None):
     """True iff the user is part of the call-management team for this proposal.
 
     Applicants never see internal workflow notes (the entire point of the
@@ -279,7 +287,7 @@ def user_can_view_internal_notes(user, proposal):
     subject; viewing notes about a proposal is the reverse. See the test
     ``test_dual_role_applicant_still_denied`` for the pinned behaviour.
     """
-    if user.is_staff:
+    if _acts_as_staff(user, staff):
         return True
     if user.id == proposal.created_by_id:
         return False
@@ -292,14 +300,14 @@ def user_can_view_internal_notes(user, proposal):
     ).exists()
 
 
-def user_can_manage_held_decision(user, proposal):
+def user_can_manage_held_decision(user, proposal, staff=None):
     """True iff the user may change a decision held for the round's publication.
 
     Staff, and whoever holds CALL.UPDATE on the call or on its managing
     organisation. Not support, who only read. The applicant is refused even
     when they also manage the call, as for internal notes.
     """
-    if user.is_staff:
+    if _acts_as_staff(user, staff):
         return True
     if user.id == proposal.created_by_id:
         return False
@@ -407,7 +415,7 @@ def can_reopen_held_decision(request, view, obj=None):
     """ActionsPermission check for reopening a held allocation decision."""
     if obj is None:
         return
-    if not user_can_manage_held_decision(request.user, obj):
+    if not user_can_manage_held_decision(request.user, obj, has_staff_access(request)):
         raise exceptions.PermissionDenied(
             "Only the call's managers can reopen a held decision."
         )
@@ -420,7 +428,7 @@ def can_act_on_active_workflow_step(request, view, obj=None):
     """ActionsPermission check for complete/reject workflow step actions."""
     if obj is None:
         return
-    if not _user_can_act_on_active_step(request.user, obj):
+    if not _user_can_act_on_active_step(request.user, obj, has_staff_access(request)):
         raise exceptions.PermissionDenied(
             "You don't hold the role required to act on the active workflow step."
         )
@@ -435,7 +443,7 @@ def can_advance_workflow_step(request, view, obj=None):
     if obj is None:
         return
     user = request.user
-    if user.is_staff:
+    if has_staff_access(request):
         return
     call = obj.round.call
     if not get_users(call, role_name=RoleEnum.CALL_MANAGER).filter(pk=user.pk).exists():
@@ -483,7 +491,7 @@ def _user_holds_step_role(user, proposal, call_step):
     return get_users(call, role_name=role_name).filter(pk=user.pk).exists()
 
 
-def user_can_answer_step_checklist(user, proposal, call_step):
+def user_can_answer_step_checklist(user, proposal, call_step, staff=None):
     """True iff the user may submit answers to a workflow step's checklist.
 
     Staff and the call's managers may always answer. Otherwise the step must be
@@ -491,7 +499,7 @@ def user_can_answer_step_checklist(user, proposal, call_step):
     the user must hold the step's responsible role. Mirrors
     ``_user_can_act_on_active_step`` so answering and acting stay consistent.
     """
-    if user.is_staff:
+    if _acts_as_staff(user, staff):
         return True
     call = proposal.round.call
     if get_users(call, role_name=RoleEnum.CALL_MANAGER).filter(pk=user.pk).exists():
@@ -507,7 +515,7 @@ def user_can_answer_step_checklist(user, proposal, call_step):
     return _user_holds_step_role(user, proposal, call_step)
 
 
-def user_can_read_step_checklist(user, proposal, call_step):
+def user_can_read_step_checklist(user, proposal, call_step, staff=None):
     """True iff the user may read a workflow step's checklist (its answers).
 
     Staff, the call's managers, and the step's responsible role — the latter
@@ -517,7 +525,7 @@ def user_can_read_step_checklist(user, proposal, call_step):
     answers here — that would bypass the ``applicant_visible`` gate enforced on
     the threaded responses endpoint.
     """
-    if user.is_staff:
+    if _acts_as_staff(user, staff):
         return True
     call = proposal.round.call
     if get_users(call, role_name=RoleEnum.CALL_MANAGER).filter(pk=user.pk).exists():
@@ -537,7 +545,9 @@ def can_read_step_checklist(request, view, obj=None):
         raise exceptions.PermissionDenied(
             "No checklist is configured for this workflow step."
         )
-    if not user_can_read_step_checklist(request.user, obj, call_step):
+    if not user_can_read_step_checklist(
+        request.user, obj, call_step, has_staff_access(request)
+    ):
         raise exceptions.PermissionDenied(
             "You do not have permission to view this step's checklist."
         )
@@ -558,7 +568,9 @@ def can_submit_step_checklist_answers(request, view, obj=None):
         raise exceptions.PermissionDenied(
             "No checklist is configured for this workflow step."
         )
-    if not user_can_answer_step_checklist(request.user, obj, call_step):
+    if not user_can_answer_step_checklist(
+        request.user, obj, call_step, has_staff_access(request)
+    ):
         raise exceptions.PermissionDenied(
             "You cannot answer this step's checklist, or the step is no longer active."
         )
@@ -589,7 +601,7 @@ def can_view_step_checklist_responses(request, view, obj=None):
             "No checklist is configured for this workflow step."
         )
     user = request.user
-    if user.is_staff:
+    if has_staff_access(request):
         return
     call = obj.round.call
     if get_users(call, role_name=RoleEnum.CALL_MANAGER).filter(pk=user.pk).exists():
@@ -737,7 +749,7 @@ def can_access_awarded_resources(request, view, obj=None):
                 "The awarded resources are not visible until the decision is released."
             )
         return
-    if user.is_staff or _user_is_call_manager(user, obj):
+    if has_staff_access(request) or _user_is_call_manager(user, obj):
         return
     raise exceptions.PermissionDenied(
         "Only the call manager can change the awarded resources."
@@ -758,7 +770,7 @@ def user_is_assignment_reviewer(request, view, obj=None):
     if obj is None:
         return
     user = request.user
-    if user.is_staff:
+    if has_staff_access(request):
         return
     entry = obj.batch.reviewer_pool_entry
     if entry.reviewer_id and entry.reviewer.user_id == user.id:

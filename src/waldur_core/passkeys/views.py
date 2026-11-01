@@ -4,6 +4,7 @@ from rest_framework import exceptions, mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
+from waldur_core.core.permissions import has_staff_access
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
 from waldur_core.passkeys import policy
@@ -128,7 +129,7 @@ class StaffPasskeyViewSet(
             raise exceptions.NotFound(
                 _("Passkey authentication is not enabled on this deployment.")
             )
-        if not request.user.is_staff:
+        if not has_staff_access(request):
             raise exceptions.PermissionDenied(
                 _("Only staff can manage another user's passkeys.")
             )

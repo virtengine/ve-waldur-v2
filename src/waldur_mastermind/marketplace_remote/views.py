@@ -64,7 +64,7 @@ from waldur_mastermind.marketplace_remote.utils import (
 
 def check_remote_resource_access(request: Request, resource: models.Resource):
     """Check if user has access to remote resource"""
-    if request.user.is_staff or request.user.is_support:
+    if core_permissions.has_support_access(request):
         return
 
     connected_projects = get_connected_projects_by_permission(
@@ -255,7 +255,9 @@ def user_is_service_provider_owner_or_service_provider_manager(
     if not obj:
         return
 
-    if _has_owner_access(request.user, obj.offering.customer):
+    if _has_owner_access(
+        request.user, obj.offering.customer, core_permissions.has_staff_access(request)
+    ):
         return
 
     if obj.offering.customer.has_user(request.user, role=ServiceProviderRole.MANAGER):

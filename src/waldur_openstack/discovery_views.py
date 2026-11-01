@@ -2,6 +2,7 @@ from drf_spectacular.utils import extend_schema
 from rest_framework import decorators, response, status
 from rest_framework import exceptions as rf_exceptions
 
+from waldur_core.core.permissions import has_staff_access
 from waldur_core.core.serializers import EmptySerializer
 from waldur_core.core.views import ActionsViewSet
 from waldur_mastermind.marketplace.models import ServiceProvider
@@ -28,7 +29,7 @@ class OpenStackDiscoveryViewSet(ActionsViewSet):
 
     def is_authorized_for_discovery(request, view, obj=None):
         """Staff users or owners of a customer that is a service provider."""
-        if request.user.is_staff:
+        if has_staff_access(request):
             return
         from waldur_core.permissions.fixtures import CustomerRole
         from waldur_core.permissions.utils import has_user
