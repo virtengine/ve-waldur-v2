@@ -1,10 +1,13 @@
+from datetime import timedelta
+
+from django.utils import timezone
 from rest_framework import status, test
 
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CustomerRole
 from waldur_core.structure.tests import fixtures
 from waldur_core.structure.tests.factories import UserFactory
-from waldur_mastermind.marketplace import enums, models
+from waldur_mastermind.marketplace import callbacks, enums, models
 from waldur_mastermind.marketplace.tests import factories
 
 
@@ -115,3 +118,61 @@ class ResourceRestoreTest(test.APITestCase):
         self.resource.refresh_from_db()
         self.assertEqual(self.resource.state, models.Resource.States.TERMINATED)
         self.assertEqual(self.client.post(url).status_code, status.HTTP_200_OK)
+
+    def refuse_restore(self):
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.ResourceFactory.get_url(self.resource, "restore")
+        self.assertEqual(self.client.post(url).status_code, status.HTTP_200_OK)
+        order = models.Order.objects.get(
+            resource=self.resource, type=enums.OrderTypes.RESTORE
+        )
+        order.state = enums.OrderStates.REJECTED
+        order.save()
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.state, models.Resource.States.TERMINATED)
+
+    def test_refused_restore_invents_no_termination_date(self):
+        self.refuse_restore()
+
+        self.assertIsNone(self.resource.terminated_at)
+
+    def test_refused_restore_keeps_the_termination_date(self):
+        terminated_at = timezone.now() - timedelta(days=30)
+        models.Resource.objects.filter(pk=self.resource.pk).update(
+            terminated_at=terminated_at
+        )
+
+        self.refuse_restore()
+
+        self.assertEqual(self.resource.terminated_at, terminated_at)
+
+    def test_failed_restore_keeps_the_termination_date(self):
+        terminated_at = timezone.now() - timedelta(days=30)
+        models.Resource.objects.filter(pk=self.resource.pk).update(
+            terminated_at=terminated_at
+        )
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.ResourceFactory.get_url(self.resource, "restore")
+        self.assertEqual(self.client.post(url).status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+
+        callbacks.resource_restore_failed(self.resource)
+
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.state, models.Resource.States.ERRED)
+        self.assertEqual(self.resource.terminated_at, terminated_at)
+
+    def test_successful_restore_clears_the_termination_date(self):
+        models.Resource.objects.filter(pk=self.resource.pk).update(
+            terminated_at=timezone.now() - timedelta(days=30)
+        )
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.ResourceFactory.get_url(self.resource, "restore")
+        self.assertEqual(self.client.post(url).status_code, status.HTTP_200_OK)
+        self.resource.refresh_from_db()
+
+        callbacks.resource_restore_succeeded(self.resource)
+
+        self.resource.refresh_from_db()
+        self.assertEqual(self.resource.state, models.Resource.States.OK)
+        self.assertIsNone(self.resource.terminated_at)

@@ -1448,6 +1448,102 @@ class ImportStructureCommandTest(TestCase):
         resource = Resource.objects.get(uuid="cccccccc-dddd-eeee-ffff-333333333333")
         self.assertTrue(resource.paused)
 
+    def test_import_resources_with_terminated_at(self):
+        """A terminated resource keeps its date, and an import never invents one."""
+        project = structure_factories.ProjectFactory()
+        offering = marketplace_factories.OfferingFactory()
+        plan = marketplace_factories.PlanFactory(offering=offering)
+        common = {
+            "state": Resource.States.TERMINATED,
+            "offering_uuid": offering.uuid.hex,
+            "plan_uuid": plan.uuid.hex,
+            "project_uuid": project.uuid.hex,
+            "attributes": {},
+            "limits": {},
+        }
+        self._create_test_json(
+            {
+                "resources": [
+                    {
+                        **common,
+                        "uuid": "aaaaaaaa-bbbb-cccc-dddd-333333333333",
+                        "name": "With date",
+                        "terminated_at": "2025-08-01T10:30:00+00:00",
+                    },
+                    {
+                        **common,
+                        "uuid": "aaaaaaaa-bbbb-cccc-dddd-444444444444",
+                        "name": "Without date",
+                    },
+                ]
+            }
+        )
+
+        self._call_import_command("-i", self.test_file_path)
+
+        self.assertEqual(
+            Resource.objects.get(name="With date").terminated_at.isoformat(),
+            "2025-08-01T10:30:00+00:00",
+        )
+        self.assertIsNone(Resource.objects.get(name="Without date").terminated_at)
+
+    def _import_over_terminated_resource(self, **resource_data):
+        resource = marketplace_factories.ResourceFactory(
+            state=Resource.States.TERMINATED
+        )
+        Resource.objects.filter(pk=resource.pk).update(
+            terminated_at="2025-08-01T10:30:00+00:00"
+        )
+        self._create_test_json(
+            {
+                "resources": [
+                    {
+                        "uuid": resource.uuid.hex,
+                        "name": resource.name,
+                        "offering_uuid": resource.offering.uuid.hex,
+                        "project_uuid": resource.project.uuid.hex,
+                        "attributes": {},
+                        "limits": {},
+                        **resource_data,
+                    }
+                ]
+            }
+        )
+        self._call_import_command("-i", self.test_file_path, "--update")
+        resource.refresh_from_db()
+        return resource
+
+    def test_update_making_a_resource_live_clears_terminated_at(self):
+        resource = self._import_over_terminated_resource(state=Resource.States.OK)
+
+        self.assertEqual(resource.state, Resource.States.OK)
+        self.assertIsNone(resource.terminated_at)
+
+    def test_update_applies_an_exported_empty_terminated_at(self):
+        resource = self._import_over_terminated_resource(
+            state=Resource.States.TERMINATED, terminated_at=None
+        )
+
+        self.assertIsNone(resource.terminated_at)
+
+    def test_update_without_the_key_keeps_terminated_at(self):
+        # A file written before the field existed says nothing about it.
+        resource = self._import_over_terminated_resource(
+            state=Resource.States.TERMINATED
+        )
+
+        self.assertEqual(
+            resource.terminated_at.isoformat(), "2025-08-01T10:30:00+00:00"
+        )
+
+    def test_update_to_an_unfinished_state_keeps_terminated_at(self):
+        # A restore in progress keeps the date, and an older file cannot know it.
+        resource = self._import_over_terminated_resource(state=Resource.States.CREATING)
+
+        self.assertEqual(
+            resource.terminated_at.isoformat(), "2025-08-01T10:30:00+00:00"
+        )
+
     def test_import_resources_with_created_date(self):
         """Test that importing resources with created field preserves the date."""
         # Create dependencies

@@ -644,6 +644,18 @@ class ExportStructureCommandTest(TestCase):
         self.assertEqual(exported_account["error_message"], "")
         self.assertIsNotNone(exported_account["created"])
 
+    def test_export_resource_terminated_at(self):
+        resource = marketplace_factories.ResourceFactory()
+        resource.set_state_terminated()
+        resource.save()
+
+        self._call_export_command()
+
+        exported_resource = self._load_exported_json()["resources"][0]
+        self.assertEqual(
+            exported_resource["terminated_at"], resource.terminated_at.isoformat()
+        )
+
     def test_export_resources(self):
         """Test that export captures resources with all relationships."""
         customer = structure_factories.CustomerFactory(name="Resource Customer")
