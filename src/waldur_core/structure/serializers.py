@@ -769,6 +769,9 @@ class ProjectSerializer(
             "effective_end_date",
             "is_in_grace_period",
         )
+        # A project changes organization through move_project, which checks both
+        # organizations and revokes roles.
+        protected_fields = ("customer",)
         extra_kwargs = {
             "url": {"lookup_field": "uuid"},
             "customer": {"lookup_field": "uuid"},

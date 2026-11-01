@@ -2584,3 +2584,84 @@ class GlobalScopeProjectTest(test.APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         customer.refresh_from_db()
         self.assertEqual(customer.name, "Renamed from the site role")
+
+
+class ProjectCustomerCannotBeChangedByUpdateTest(test.APITestCase):
+    """Moving a project has checks of its own, which only move_project applies."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.project = self.fixture.project
+        self.customer = self.fixture.customer
+        self.other_customer = factories.CustomerFactory()
+        self.url = factories.ProjectFactory.get_url(self.project)
+        ProjectRole.MANAGER.add_permission(PermissionEnum.UPDATE_PROJECT)
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_PROJECT)
+
+    def _other_customer_url(self):
+        return factories.CustomerFactory.get_url(self.other_customer)
+
+    def assert_project_stayed(self):
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.customer, self.customer)
+
+    def test_manager_owning_the_target_cannot_patch_the_project_there(self):
+        self.other_customer.add_user(self.fixture.manager, CustomerRole.OWNER)
+        self.client.force_authenticate(self.fixture.manager)
+
+        response = self.client.patch(
+            self.url, {"customer": self._other_customer_url()}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assert_project_stayed()
+
+    def test_put_cannot_change_the_customer(self):
+        self.other_customer.add_user(self.fixture.manager, CustomerRole.OWNER)
+        self.client.force_authenticate(self.fixture.manager)
+
+        response = self.client.put(
+            self.url,
+            {"name": "Renamed", "customer": self._other_customer_url()},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assert_project_stayed()
+        self.assertEqual(self.project.name, "Renamed")
+
+    def test_staff_cannot_patch_a_project_to_another_customer_either(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        response = self.client.patch(
+            self.url, {"customer": self._other_customer_url()}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assert_project_stayed()
+
+    def test_customer_is_still_set_when_a_project_is_created(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        response = self.client.post(
+            factories.ProjectFactory.get_list_url(),
+            {"name": "New", "customer": self._other_customer_url()},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        created = models.Project.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(created.customer, self.other_customer)
+
+    def test_move_project_still_moves_it(self):
+        self.client.force_authenticate(self.fixture.staff)
+
+        response = self.client.post(
+            factories.ProjectFactory.get_url(self.project, "move_project"),
+            {"customer": self._other_customer_url(), "preserve_permissions": True},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.customer, self.other_customer)
