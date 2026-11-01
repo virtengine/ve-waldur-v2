@@ -22,6 +22,7 @@ from waldur_mastermind.proposal.enums import (
     ProposalStates,
     WorkflowStepInstanceStatuses,
 )
+from waldur_mastermind.proposal.models import PROJECT_SUMMARY_LENGTH
 from waldur_mastermind.proposal.tests import factories, fixtures
 
 SVG_WITH_SCRIPT = (
@@ -173,7 +174,10 @@ class ProposalCreateTest(test.APITestCase):
 
 
 class ProposalDescriptionLengthTest(test.APITestCase):
-    """Oversized proposal descriptions must be rejected with 400, not blow up in the database."""
+    """Oversized proposal descriptions must be rejected with 400, not blow up in the database.
+
+    Create and update_project_details both write the column, so both are tried.
+    """
 
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
@@ -189,6 +193,43 @@ class ProposalDescriptionLengthTest(test.APITestCase):
                 "description": description,
             },
         )
+
+    def update_project_details(self, description):
+        url = factories.ProposalFactory.get_url(
+            self.fixture.proposal, "update_project_details"
+        )
+        return self.client.post(url, {"name": "new", "description": description})
+
+    def test_description_over_limit_is_rejected_on_update(self):
+        response = self.update_project_details("a" * (DESCRIPTION_LENGTH + 904))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("description", response.data)
+
+    def test_description_expanded_by_html_clean_is_rejected_on_update(self):
+        response = self.update_project_details(EXPANDING_DESCRIPTION)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("description", response.data)
+        self.assertIn("sanitisation", str(response.data["description"]))
+
+    def test_description_within_limit_is_accepted_on_update(self):
+        response = self.update_project_details("a" * DESCRIPTION_LENGTH)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        self.fixture.proposal.refresh_from_db()
+        self.assertEqual(len(self.fixture.proposal.description), DESCRIPTION_LENGTH)
+
+    def test_description_markup_is_stripped_on_update_as_on_create(self):
+        markup = '<svg onload="alert(1)">Aims</svg><script>x()</script>'
+
+        created = self.create_proposal(markup)
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED, created.data)
+        updated = self.update_project_details(markup)
+        self.assertEqual(updated.status_code, status.HTTP_200_OK, updated.data)
+
+        self.fixture.proposal.refresh_from_db()
+        self.assertEqual(self.fixture.proposal.description, created.data["description"])
+        self.assertNotIn("<", self.fixture.proposal.description)
+        self.assertNotIn("alert", self.fixture.proposal.description)
 
     def test_description_over_limit_is_rejected(self):
         response = self.create_proposal("a" * (DESCRIPTION_LENGTH + 904))
@@ -209,6 +250,104 @@ class ProposalDescriptionLengthTest(test.APITestCase):
 
         proposal = models.Proposal.objects.get(uuid=response.data["uuid"])
         self.assertEqual(len(proposal.description), DESCRIPTION_LENGTH)
+
+
+class ProposalSummaryLengthTest(test.APITestCase):
+    """The summary column is unbounded, so the limit the form shows is enforced by the serializers."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProposalFixture()
+        self.client.force_authenticate(self.fixture.staff)
+
+    def create_proposal(self, summary):
+        return self.client.post(
+            factories.ProposalFactory.get_list_url(),
+            {
+                "name": "new",
+                "round_uuid": self.fixture.round.uuid.hex,
+                "project_summary": summary,
+            },
+        )
+
+    def update_project_details(self, summary):
+        url = factories.ProposalFactory.get_url(
+            self.fixture.proposal, "update_project_details"
+        )
+        return self.client.post(url, {"name": "new", "project_summary": summary})
+
+    def test_summary_over_limit_is_rejected_on_create(self):
+        response = self.create_proposal("a" * (PROJECT_SUMMARY_LENGTH + 1))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("project_summary", response.data)
+
+    def test_summary_within_limit_is_accepted_on_create(self):
+        response = self.create_proposal("a" * PROJECT_SUMMARY_LENGTH)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+        proposal = models.Proposal.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(len(proposal.project_summary), PROJECT_SUMMARY_LENGTH)
+
+    def test_summary_over_limit_is_rejected_on_update(self):
+        response = self.update_project_details("a" * (PROJECT_SUMMARY_LENGTH + 1))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("project_summary", response.data)
+
+    def test_summary_within_limit_is_accepted_on_update(self):
+        response = self.update_project_details("a" * PROJECT_SUMMARY_LENGTH)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        self.fixture.proposal.refresh_from_db()
+        self.assertEqual(
+            len(self.fixture.proposal.project_summary), PROJECT_SUMMARY_LENGTH
+        )
+
+    def test_summary_omitted_on_update_keeps_the_stored_value(self):
+        self.fixture.proposal.project_summary = "kept"
+        self.fixture.proposal.save(update_fields=["project_summary"])
+
+        url = factories.ProposalFactory.get_url(
+            self.fixture.proposal, "update_project_details"
+        )
+        response = self.client.post(url, {"name": "new"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        self.fixture.proposal.refresh_from_db()
+        self.assertEqual(self.fixture.proposal.project_summary, "kept")
+
+    def _store_summary_over_limit(self):
+        # Written past the limit before it existed: through the API, an
+        # import, or a preset. Nothing trims it on upgrade.
+        stored = "a" * (PROJECT_SUMMARY_LENGTH + 500)
+        self.fixture.proposal.project_summary = stored
+        self.fixture.proposal.save(update_fields=["project_summary"])
+        return stored
+
+    def test_stored_summary_over_limit_is_kept_when_sent_back_unchanged(self):
+        stored = self._store_summary_over_limit()
+
+        response = self.update_project_details(stored)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        self.fixture.proposal.refresh_from_db()
+        self.assertEqual(self.fixture.proposal.project_summary, stored)
+
+    def test_stored_summary_over_limit_with_crlf_is_kept_when_sent_back_with_lf(self):
+        stored = ("a" * 100 + "\r\n") * 12
+        self.fixture.proposal.project_summary = stored
+        self.fixture.proposal.save(update_fields=["project_summary"])
+
+        response = self.update_project_details(stored.replace("\r\n", "\n"))
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    def test_stored_summary_over_limit_is_refused_once_edited(self):
+        stored = self._store_summary_over_limit()
+
+        response = self.update_project_details(stored + "b")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("project_summary", response.data)
+
+        self.fixture.proposal.refresh_from_db()
+        self.assertEqual(self.fixture.proposal.project_summary, stored)
 
 
 @ddt

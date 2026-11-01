@@ -79,6 +79,16 @@ from . import managers
 
 logger = logging.getLogger(__name__)
 
+# The column is unbounded text; this is the limit the applicant form shows and
+# a ModelSerializer over Proposal inherits (DRF maps TextField.max_length), so
+# create refuses a longer one. ProposalUpdateProjectDetailsSerializer declares
+# its own field instead, to keep a value stored over the limit before it
+# existed editable while unchanged, and ProposalAdmin drops it from its form
+# for the same reason. Django itself does not validate it on a TextField, so
+# ORM writes and clean_fields() stay free. Mirrored in homeport's
+# PROPOSAL_SUMMARY_MAX_LENGTH.
+PROJECT_SUMMARY_LENGTH = 1000
+
 MISSING_RESOURCE_TEMPLATE_MESSAGE = _(
     "This call only accepts its resource templates. Replace the requests for "
     "these offerings with a template: %(offerings)s."
@@ -1388,7 +1398,7 @@ class Proposal(
         null=True,
         related_name="+",
     )
-    project_summary = models.TextField(blank=True)
+    project_summary = models.TextField(blank=True, max_length=PROJECT_SUMMARY_LENGTH)
     submitted_at = models.DateTimeField(
         null=True,
         blank=True,
