@@ -15,6 +15,7 @@ from rest_framework.authtoken.models import Token
 from waldur_core.configuration.testing import override_config
 from waldur_core.core.models import PersonalAccessToken
 from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.permissions.fixtures import CustomerRole
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 from waldur_mastermind.proposal.tests import factories as proposal_factories
@@ -155,6 +156,122 @@ class PATListFilterDescendantTest(test.APITestCase):
         response = self.client.get("/api/projects/")
         uuids = {row["uuid"] for row in response.data}
         self.assertEqual(uuids, {self.bound_project.uuid.hex})
+
+
+@override_config(PAT_ENABLED=True)
+class PATBindingRemovedProjectTest(test.APITestCase):
+    """``ProjectViewSet`` reads removed projects past the queryset."""
+
+    def setUp(self):
+        self.staff = structure_factories.UserFactory(
+            is_staff=True, can_use_personal_access_tokens=True
+        )
+        Token.objects.get_or_create(user=self.staff)
+        self.bound = structure_factories.CustomerFactory(name="bound")
+        self.unbound = structure_factories.CustomerFactory(name="unbound")
+        self.inside = structure_factories.ProjectFactory(customer=self.bound)
+        self.outside = structure_factories.ProjectFactory(customer=self.unbound)
+        self.inside.delete()
+        self.outside.delete()
+
+    def _authenticate(self, user, scopes, bindings):
+        pat = _create_pat(user, scopes, bindings=bindings)
+        self.client.credentials(HTTP_AUTHORIZATION=_auth_header(pat))
+
+    def _get(self, project, bindings, user=None):
+        self._authenticate(
+            user or self.staff, [PermissionEnum.LIST_PROJECTS.value], bindings
+        )
+        return self.client.get(structure_factories.ProjectFactory.get_url(project))
+
+    def _move(self, project, target, scopes, bindings):
+        self._authenticate(self.staff, scopes, bindings)
+        return self.client.post(
+            structure_factories.ProjectFactory.get_url(project, "move_project"),
+            {
+                "customer": structure_factories.CustomerFactory.get_url(target),
+                "preserve_permissions": False,
+            },
+        )
+
+    def assert_stays_in(self, project, customer):
+        project.refresh_from_db()
+        self.assertEqual(project.customer, customer)
+
+    def test_removed_project_outside_the_binding_is_not_found(self):
+        response = self._get(self.outside, [self.bound])
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_role_in_the_project_does_not_widen_the_binding(self):
+        user = structure_factories.UserFactory(can_use_personal_access_tokens=True)
+        self.unbound.add_user(user, CustomerRole.OWNER)
+        response = self._get(self.outside, [self.bound], user=user)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_removed_project_inside_the_binding_is_found(self):
+        response = self._get(self.inside, [self.bound])
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_project_binding_finds_its_removed_project(self):
+        response = self._get(self.inside, [self.inside])
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_unscoped_token_finds_a_removed_project(self):
+        response = self._get(self.outside, [])
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_recovering_outside_the_binding_is_not_found(self):
+        self._authenticate(
+            self.staff, [PermissionEnum.CREATE_PROJECT.value], [self.bound]
+        )
+        response = self.client.post(
+            structure_factories.ProjectFactory.get_url(self.outside, "recover")
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_moving_a_project_from_outside_the_binding_is_refused(self):
+        response = self._move(
+            self.outside,
+            self.bound,
+            [PermissionEnum.CREATE_PROJECT.value],
+            [self.bound],
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assert_stays_in(self.outside, self.unbound)
+
+    def test_moving_a_project_to_outside_the_binding_is_refused(self):
+        response = self._move(
+            self.inside,
+            self.unbound,
+            [PermissionEnum.CREATE_PROJECT.value],
+            [self.bound],
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assert_stays_in(self.inside, self.bound)
+
+    def test_moving_a_project_needs_the_create_scope(self):
+        response = self._move(
+            self.inside, self.unbound, [PermissionEnum.LIST_PROJECTS.value], []
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assert_stays_in(self.inside, self.bound)
+
+    def test_moving_a_project_within_the_bindings_is_allowed(self):
+        response = self._move(
+            self.inside,
+            self.unbound,
+            [PermissionEnum.CREATE_PROJECT.value],
+            [self.bound, self.unbound],
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assert_stays_in(self.inside, self.unbound)
+
+    def test_staff_access_token_moves_a_project(self):
+        response = self._move(
+            self.outside, self.bound, [PermissionEnum.STAFF_ACCESS.value], []
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assert_stays_in(self.outside, self.bound)
 
 
 @override_config(PAT_ENABLED=True)
