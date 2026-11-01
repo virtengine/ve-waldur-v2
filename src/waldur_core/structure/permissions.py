@@ -12,6 +12,7 @@ from waldur_core.permissions.fixtures import (
     ServiceProviderRole,
 )
 from waldur_core.permissions.utils import (
+    check_pat_staff_scope,
     check_pat_support_scope,
     has_permission,
     has_permission_on_any_source,
@@ -182,11 +183,13 @@ def _get_customer(obj, **kwargs) -> models.Customer:
 def can_move_project(request, view, obj=None):
     """
     Check if user can move a project.
-    Staff users can always move projects.
+    Staff users can always move projects, unless they act through a token
+    without staff access: that token's scopes and bindings decide, as for
+    anyone else's.
     Regular users can move projects if they have CREATE_PROJECT permission
     in BOTH the source and target organizations.
     """
-    if request.user.is_staff:
+    if request.user.is_staff and check_pat_staff_scope(request):
         return
 
     if not obj:

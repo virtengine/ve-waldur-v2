@@ -63,6 +63,7 @@ from waldur_core.onboarding.models import OnboardingVerification
 from waldur_core.passkeys import policy as passkey_policy
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.models import Role, UserRole
+from waldur_core.permissions.pat_filtering import PATScopeListFilter
 from waldur_core.permissions.utils import (
     has_permission,
     permission_factory,
@@ -968,6 +969,14 @@ class ProjectViewSet(
             user = getattr(self.request, "user", None)
 
             if not user or not user.is_authenticated:
+                raise Http404("No Project matches the given query.")
+
+            # This path skips filter_queryset, which is what applies a personal
+            # access token's bindings to a live project.
+            within_token_bindings = PATScopeListFilter().filter_queryset(
+                self.request, models.Project.objects.filter(id=project.id), self
+            )
+            if not within_token_bindings.exists():
                 raise Http404("No Project matches the given query.")
 
             # Staff and support can access any terminated project
