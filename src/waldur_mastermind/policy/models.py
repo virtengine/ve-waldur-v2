@@ -216,15 +216,16 @@ class EstimatedCostPolicyMixin(invoices_models.PeriodMixin):
         """``current_cost`` split into the parts it is made of.
 
         The window's items are split into cost and credit compensation by
-        ``credit__isnull``, the discriminator ``_pending_compensation`` uses, so
-        the parts add up to ``current_cost`` exactly.
+        ``credit_compensation_q``, the discriminator ``_pending_compensation``
+        uses, so the parts add up to ``current_cost`` exactly.
         """
         invoice_items, pending = self._cost_inputs(compensation)
         window = self._window_items(invoice_items)
+        is_compensation = invoices_utils.credit_compensation_q()
         month_start = core_utils.month_start(datetime.date.today())
         return structures.CostBreakdown(
-            cost_before_credit=self._scoped_cost(window.filter(credit__isnull=True)),
-            credit_drawn=-self._scoped_cost(window.filter(credit__isnull=False)),
+            cost_before_credit=self._scoped_cost(window.exclude(is_compensation)),
+            credit_drawn=-self._scoped_cost(window.filter(is_compensation)),
             credit_pending=decimal.Decimal(pending),
             # The pending draw is all this month's, so the earlier months' part
             # is what their own items left, payments of them included.
@@ -299,7 +300,10 @@ class EstimatedCostPolicyMixin(invoices_models.PeriodMixin):
         # A payment of an earlier invoice written this month is not this
         # month's credit; counted here, it would hide the month's own draw.
         applied = -cls._scoped_cost(
-            this_month.filter(credit__isnull=False, compensated_period__isnull=True)
+            this_month.filter(
+                invoices_utils.credit_compensation_q(),
+                compensated_period__isnull=True,
+            )
         )
         return max(decimal.Decimal(0), projected - applied)
 
@@ -444,11 +448,13 @@ class EstimatedCostPolicyMixin(invoices_models.PeriodMixin):
         """This month's cost before any credit is applied.
 
         Compensations are ordinary invoice items with a negative unit_price, so
-        they are excluded rather than added back — `credit__isnull=True` is the
-        same discriminator `_pending_compensation` uses from the other side.
+        they are excluded rather than added back — `credit_compensation_q` is
+        the same discriminator `_pending_compensation` uses from the other side.
         """
         return self._scoped_cost(
-            self._this_month(invoice_items).filter(credit__isnull=True)
+            self._this_month(invoice_items).exclude(
+                invoices_utils.credit_compensation_q()
+            )
         )
 
     def _uncompensated_cost_this_month(
@@ -626,6 +632,11 @@ class ProjectEstimatedCostPolicy(EstimatedCostPolicyMixin, ProjectPolicy):
                 projected = compensation.get_project_compensation(project)
             deduction = self._pending_compensation(invoice_items, projected)
         else:
+            # Written compensation is credit too: counted, it lowered the cost
+            # at every month-end run by whatever credit paid (#906).
+            invoice_items = invoice_items.exclude(
+                invoices_utils.credit_compensation_q()
+            )
             deduction = 0
         return invoice_items, deduction
 
@@ -852,8 +863,10 @@ class OfferingEstimatedCostPolicy(EstimatedCostPolicyMixin, OfferingPolicy):
 
     def _cost_inputs(self, compensation=None):
         """An offering policy spans many customers, so no single customer's
-        credit applies: the deduction is always zero and `compensation` is
-        accepted only to match the other estimated-cost policies."""
+        credit applies: the deduction is always zero, the compensation items
+        each customer's credit writes against the offering's resources are left
+        out (#906), and `compensation` is accepted only to match the other
+        estimated-cost policies."""
         # Use optimized query based on apply_to_all setting
         if self.apply_to_all:
             # Direct filter on invoice items without customer IN clause
@@ -872,7 +885,7 @@ class OfferingEstimatedCostPolicy(EstimatedCostPolicyMixin, OfferingPolicy):
                 resource__offering=self.scope,
                 invoice__customer__in=customers,
             )
-        return items, 0
+        return items.exclude(invoices_utils.credit_compensation_q()), 0
 
     def get_current_cost(self, compensation=None) -> decimal.Decimal:
         return self._evaluated_cost(*self._cost_inputs(compensation))

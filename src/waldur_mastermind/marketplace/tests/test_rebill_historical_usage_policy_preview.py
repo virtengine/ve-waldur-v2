@@ -408,11 +408,13 @@ class CreditExhaustionOnlyCountsTheUncoveredOverageTest(BasePolicyPreviewTest):
         self._create_stale_usage(2023, 12, old_amount=1, new_amount=5)  # $50
         self._create_stale_usage(2024, 1, old_amount=1, new_amount=8)  # $80
         self._create_stale_usage(2024, 2, old_amount=1, new_amount=6)  # $60
+        # Credit-aware: the overage is the cost credit leaves, and a policy
+        # that ignores credit counts the whole cost (#906).
         policy_models.ProjectEstimatedCostPolicy.objects.create(
             scope=self.fixture.project,
             limit_cost=100,
             actions="request_pausing",
-            use_credit=False,
+            use_credit=True,
             period=invoice_models.PeriodMixin.Periods.MONTH_12,
             has_fired=False,
         )

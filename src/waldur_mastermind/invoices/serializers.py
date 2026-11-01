@@ -1381,7 +1381,7 @@ class ProjectCreditEarlierInvoicesSerializer(serializers.Serializer):
     uncovered = serializers.DecimalField(
         max_digits=16,
         decimal_places=2,
-        help_text="Uncovered cost of every month listed: what a period-Total cost policy counts of them.",
+        help_text="Uncovered cost of every month listed: what a period-Total cost policy that takes credit into account counts of them.",
     )
     uncovered_in_period = serializers.DecimalField(
         max_digits=16,

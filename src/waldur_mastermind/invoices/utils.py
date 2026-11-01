@@ -66,6 +66,18 @@ def month_q(year, month) -> Q:
     ) | Q(compensated_period=datetime.date(year, month, 1))
 
 
+def credit_compensation_q() -> Q:
+    """Invoice items that are credit compensation rather than cost.
+
+    `credit` alone does not last: it is `SET_NULL`, so deleting a credit turns
+    its compensations into what reads as negative cost. Every writer also marks
+    them `is_compensation`, and migration 0036 marked the older ones, so either
+    one is enough. `has_key` rather than `=True`, because `exclude()` on a JSON
+    value would also drop every item without the key.
+    """
+    return Q(credit__isnull=False) | Q(details__has_key="is_compensation")
+
+
 def annotate_cost_month(invoice_items: QuerySet) -> QuerySet:
     """Annotate `cost_year` and `cost_month`, the month each item counts in, for
     grouping by month; see `month_q`."""

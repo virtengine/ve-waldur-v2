@@ -1,3 +1,4 @@
+import decimal
 import logging
 
 from django.core.cache import cache
@@ -5,7 +6,6 @@ from django.db import transaction
 from django.db.models import Q
 
 from waldur_mastermind.invoices import models as invoices_models
-from waldur_mastermind.invoices import utils as invoices_utils
 from waldur_mastermind.invoices.models import CustomerCredit, ProjectCredit
 from waldur_mastermind.marketplace.exceptions import PolicyException
 
@@ -546,44 +546,6 @@ def run_reset_actions_upon_cost_policy_deletion(
 _BLOCKING_ACTION = "block_creation_of_new_resources"
 
 
-def _period_months(policy):
-    periods = invoices_models.PeriodMixin.Periods
-    return {periods.MONTH_1: 1, periods.MONTH_3: 3, periods.MONTH_12: 12}.get(
-        policy.period, 0
-    )
-
-
-def _period_query(policy):
-    """Build an invoice-month Q filter for the policy's period."""
-    import datetime
-
-    from dateutil.relativedelta import relativedelta
-    from django.db.models import Q
-
-    from waldur_core.core.utils import month_start
-
-    current_month_start = month_start(datetime.date.today())
-    query = Q()
-    for n in range(_period_months(policy)):
-        previous_month = current_month_start - relativedelta(months=n)
-        query |= invoices_utils.month_q(previous_month.year, previous_month.month)
-    return query
-
-
-def _existing_total(items_qs, policy):
-    """Sum invoice item totals matching the policy period, mirroring
-    ``EstimatedCostPolicyMixin._evaluated_cost``."""
-    from waldur_core.structure.models import Customer
-
-    active_customers = Customer.objects.filter(blocked=False, archived=False)
-    items = (
-        items_qs.filter(invoice__customer__in=active_customers)
-        .exclude(invoice__state=invoices_models.Invoice.States.CANCELED)
-        .filter(_period_query(policy))
-    )
-    return sum(item.total for item in items)
-
-
 def _block_if_policies_would_fire(policies, resource, cost, scope_label):
     """Refuse the resource if any of `policies` would fire with `cost` added.
 
@@ -627,8 +589,13 @@ def _check_customer_policies(resource, cost):
 
 
 def _check_offering_policies(resource, cost):
-    """Mirror OfferingEstimatedCostPolicy.is_triggered with `cost` added.
-    Offering policies don't apply compensation or credit shortcuts."""
+    """Refuse the resource if an offering policy would fire with `cost` added.
+
+    Offering policies take no credit into account, so `cost` is added to the
+    policy's own `current_cost` as is. A copy of its item query kept here
+    counted credit compensation after the policy stopped (#906), and let
+    resources through while it was fired.
+    """
     offering = resource.offering
     customer = resource.project.customer
     policies = models.OfferingEstimatedCostPolicy.objects.filter(
@@ -643,25 +610,11 @@ def _check_offering_policies(resource, cost):
             ).exists()
         ):
             continue
-        if policy.apply_to_all:
-            items_qs = invoices_models.InvoiceItem.objects.filter(
-                resource__offering=offering,
-                invoice__customer__blocked=False,
-                invoice__customer__archived=False,
-            )
-        else:
-            items_qs = invoices_models.InvoiceItem.objects.filter(
-                resource__offering=offering,
-                invoice__customer__organization_groups__in=(
-                    policy.organization_groups.all()
-                ),
-            )
-        existing = _existing_total(items_qs, policy)
-        projected = existing + cost
+        projected = policy.get_current_cost() + decimal.Decimal(cost or 0)
         if projected > policy.limit_cost:
             raise PolicyException(
                 f"Creation of new resources is prohibited by {policy}. "
-                f"Projected cost ({projected}) would exceed "
+                f"Projected cost ({projected:.2f}) would exceed "
                 f"limit ({policy.limit_cost})."
             )
 

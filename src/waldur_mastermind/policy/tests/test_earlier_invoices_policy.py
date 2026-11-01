@@ -15,7 +15,6 @@ from waldur_mastermind.invoices import models as invoices_models
 from waldur_mastermind.invoices import settlement
 from waldur_mastermind.invoices.tests import factories as invoices_factories
 from waldur_mastermind.marketplace.tests import fixtures as marketplace_fixtures
-from waldur_mastermind.policy import handlers
 from waldur_mastermind.policy.models import ProjectEstimatedCostPolicy
 from waldur_mastermind.policy.tests import factories as policy_factories
 
@@ -133,11 +132,5 @@ class EarlierInvoicesPolicyTest(test.APITestCase):
             scope=self.resource.offering, period=Periods.MONTH_1
         )
 
-        total = handlers._existing_total(
-            invoices_models.InvoiceItem.objects.filter(
-                resource__offering=self.resource.offering
-            ),
-            offering_policy,
-        )
-
-        self.assertEqual(total, 10)
+        # The creation check adds the new resource's cost to this figure.
+        self.assertEqual(offering_policy.get_current_cost(), 10)
