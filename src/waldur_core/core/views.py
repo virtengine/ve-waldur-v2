@@ -15,7 +15,7 @@ from django.core.cache import cache
 from django.core.exceptions import ObjectDoesNotExist
 from django.core.files.storage import default_storage
 from django.db import connection, connections, transaction
-from django.db.models import ForeignKey, ProtectedError
+from django.db.models import ForeignKey, ProtectedError, RestrictedError
 from django.http import FileResponse, HttpResponse, HttpResponseRedirect, JsonResponse
 from django.utils import timezone
 from django.utils.http import content_disposition_header
@@ -552,9 +552,16 @@ class LogoutView(generics.GenericAPIView):
 
 # noinspection PyProtectedMember
 def exception_handler(exc, context):
-    if isinstance(exc, ProtectedError):
-        if len(exc.protected_objects) == 1:
-            dependent_meta = list(exc.protected_objects)[0]._meta
+    if isinstance(exc, (ProtectedError, RestrictedError)):
+        dependent_objects = (
+            exc.protected_objects
+            if isinstance(exc, ProtectedError)
+            else exc.restricted_objects
+        )
+        if dependent_objects:
+            dependent_names = sorted(
+                {str(obj._meta.verbose_name_plural) for obj in dependent_objects}
+            )
 
             try:
                 # This exception should be raised from a viewset
@@ -569,7 +576,7 @@ def exception_handler(exc, context):
                 "Cannot delete {instance_name} with existing {dependant_objects}"
             ).format(
                 instance_name=instance_name,
-                dependant_objects=str(dependent_meta.verbose_name_plural),
+                dependant_objects=", ".join(dependent_names),
             )
 
             # We substitute exception here to get consistent representation

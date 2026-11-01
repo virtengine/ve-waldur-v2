@@ -1,10 +1,15 @@
 from unittest import mock
 
+from django.db.models import RestrictedError
 from keystoneauth1 import exceptions as keystone_exceptions
+from openstack import exceptions as openstack_exceptions
 from rest_framework import status, test
 
+from waldur_core.core import tasks as core_tasks
+from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates
-from waldur_openstack import models
+from waldur_openstack import executors, models
+from waldur_openstack.backend import OpenStackBackend
 from waldur_openstack.exceptions import OpenStackBackendError
 from waldur_openstack.octavia import OctaviaClient
 
@@ -1357,3 +1362,241 @@ class PoolMemberAddressTest(BasePoolMemberTest):
         response = self._create("2001:db8:42::10", self.ipv6_subnet)
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+
+
+class TenantLoadBalancersCleanupTest(test.APITestCase):
+    def setUp(self):
+        self.fixture = fixtures.OpenStackFixture()
+        self.tenant = self.fixture.tenant
+        self.load_balancer = factories.LoadBalancerFactory(
+            tenant=self.tenant,
+            project=self.fixture.project,
+            service_settings=self.fixture.settings,
+            vip_subnet=self.fixture.subnet,
+            backend_id="lb_backend_id",
+        )
+        self.pool = factories.PoolFactory(load_balancer=self.load_balancer)
+        factories.ListenerFactory(
+            load_balancer=self.load_balancer, default_pool=self.pool
+        )
+        factories.HealthMonitorFactory(pool=self.pool)
+        factories.PoolMemberFactory(pool=self.pool, subnet=self.fixture.subnet)
+        self.backend = OpenStackBackend(self.fixture.settings)
+
+        connection_patcher = mock.patch.object(
+            OctaviaClient, "connection", new_callable=mock.PropertyMock
+        )
+        self.connection = connection_patcher.start().return_value
+        self.addCleanup(connection_patcher.stop)
+        availability_patcher = mock.patch.object(
+            OctaviaClient, "is_available", return_value=True
+        )
+        self.mock_is_available = availability_patcher.start()
+        self.addCleanup(availability_patcher.stop)
+
+    def set_backend_load_balancers(self, *statuses):
+        self.connection.load_balancers.return_value = [
+            mock.Mock(id="lb_%s" % status.lower(), provisioning_status=status)
+            for status in statuses
+        ]
+
+    def test_load_balancers_are_cleaned_up_before_networks(self):
+        signature = executors.TenantDeleteExecutor.get_task_signature(
+            self.tenant, core_utils.serialize_instance(self.tenant)
+        )
+        methods = [
+            task.kwargs.get("backend_method") or task.kwargs.get("backend_check_method")
+            for task in signature.tasks
+        ]
+        self.assertEqual(
+            methods[1:6],
+            [
+                "are_tenant_load_balancers_settled",
+                "delete_tenant_load_balancers",
+                "are_all_tenant_load_balancers_deleted",
+                "pull_tenant_load_balancers",
+                "delete_tenant_floating_ips",
+            ],
+        )
+
+    def test_failed_termination_saves_the_reason_on_the_tenant(self):
+        serialized_tenant = core_utils.serialize_instance(self.tenant)
+
+        signature = executors.TenantDeleteExecutor.get_failure_signature(
+            self.tenant, serialized_tenant
+        )
+
+        self.assertEqual(signature.task, core_tasks.ErrorStateTransitionTask.name)
+        self.assertFalse(signature.immutable)
+
+    def test_forced_termination_still_deletes_the_tenant_row_on_failure(self):
+        serialized_tenant = core_utils.serialize_instance(self.tenant)
+
+        signature = executors.TenantDeleteExecutor.get_failure_signature(
+            self.tenant, serialized_tenant, force=True
+        )
+
+        self.assertEqual(signature.task, core_tasks.DeletionTask.name)
+
+    def test_load_balancers_being_created_or_updated_are_not_settled(self):
+        self.set_backend_load_balancers("ACTIVE", "PENDING_CREATE")
+        self.assertFalse(self.backend.are_tenant_load_balancers_settled(self.tenant))
+
+        self.set_backend_load_balancers("ERROR", "PENDING_UPDATE")
+        self.assertFalse(self.backend.are_tenant_load_balancers_settled(self.tenant))
+
+    def test_load_balancers_are_settled_once_nothing_is_changing_them(self):
+        self.set_backend_load_balancers("ACTIVE", "ERROR", "PENDING_DELETE")
+
+        self.assertTrue(self.backend.are_tenant_load_balancers_settled(self.tenant))
+
+    def test_settled_load_balancers_are_deleted_with_cascade(self):
+        self.set_backend_load_balancers(
+            "ACTIVE", "ERROR", "PENDING_CREATE", "PENDING_UPDATE", "PENDING_DELETE"
+        )
+
+        self.backend.delete_tenant_load_balancers(self.tenant)
+
+        self.connection.load_balancers.assert_called_once_with(
+            project_id=self.tenant.backend_id
+        )
+        self.assertEqual(
+            self.connection.delete_load_balancer.call_args_list,
+            [
+                mock.call("lb_active", ignore_missing=True, cascade=True),
+                mock.call("lb_error", ignore_missing=True, cascade=True),
+            ],
+        )
+
+    def test_poll_deletes_load_balancer_once_it_settles(self):
+        self.set_backend_load_balancers("PENDING_UPDATE")
+        self.assertFalse(
+            self.backend.are_all_tenant_load_balancers_deleted(self.tenant)
+        )
+        self.connection.delete_load_balancer.assert_not_called()
+
+        self.set_backend_load_balancers("ACTIVE")
+        self.assertFalse(
+            self.backend.are_all_tenant_load_balancers_deleted(self.tenant)
+        )
+        self.connection.delete_load_balancer.assert_called_once_with(
+            "lb_active", ignore_missing=True, cascade=True
+        )
+
+        self.set_backend_load_balancers()
+        self.assertTrue(self.backend.are_all_tenant_load_balancers_deleted(self.tenant))
+
+    def test_load_balancer_in_error_fails_the_poll(self):
+        self.set_backend_load_balancers("PENDING_DELETE", "ERROR")
+
+        with self.assertRaises(OpenStackBackendError):
+            self.backend.are_all_tenant_load_balancers_deleted(self.tenant)
+
+    def test_conflict_on_delete_is_left_to_the_poll(self):
+        self.set_backend_load_balancers("ACTIVE")
+        self.connection.delete_load_balancer.side_effect = (
+            openstack_exceptions.ConflictException()
+        )
+
+        self.backend.delete_tenant_load_balancers(self.tenant)
+        self.assertFalse(
+            self.backend.are_all_tenant_load_balancers_deleted(self.tenant)
+        )
+
+        self.assertEqual(self.connection.delete_load_balancer.call_count, 2)
+
+    def test_octavia_errors_are_raised_as_backend_errors(self):
+        self.set_backend_load_balancers("ACTIVE")
+        self.connection.delete_load_balancer.side_effect = (
+            openstack_exceptions.BadRequestException()
+        )
+        with self.assertRaises(OpenStackBackendError):
+            self.backend.delete_tenant_load_balancers(self.tenant)
+
+        self.connection.load_balancers.side_effect = (
+            keystone_exceptions.ConnectFailure()
+        )
+        with self.assertRaises(OpenStackBackendError):
+            self.backend.are_all_tenant_load_balancers_deleted(self.tenant)
+
+    def test_cleanup_fails_when_octavia_is_not_available_for_known_load_balancers(
+        self,
+    ):
+        self.mock_is_available.return_value = False
+        # The real property refuses the call when Octavia is not in the catalog.
+        self.connection.load_balancers.side_effect = OpenStackBackendError(
+            "Octavia load-balancer service is not available"
+        )
+
+        with self.assertRaises(OpenStackBackendError):
+            self.backend.are_tenant_load_balancers_settled(self.tenant)
+        with self.assertRaises(OpenStackBackendError):
+            self.backend.delete_tenant_load_balancers(self.tenant)
+        with self.assertRaises(OpenStackBackendError):
+            self.backend.are_all_tenant_load_balancers_deleted(self.tenant)
+
+    def test_cleanup_is_skipped_when_octavia_is_not_available_for_unknown_ones(
+        self,
+    ):
+        self.mock_is_available.return_value = False
+        # Never provisioned, so there is nothing to delete in Octavia.
+        self.load_balancer.backend_id = None
+        self.load_balancer.save()
+
+        self.assertTrue(self.backend.are_tenant_load_balancers_settled(self.tenant))
+        self.backend.delete_tenant_load_balancers(self.tenant)
+
+        self.assertTrue(self.backend.are_all_tenant_load_balancers_deleted(self.tenant))
+        self.connection.load_balancers.assert_not_called()
+
+    def test_pull_after_cleanup_frees_the_subnet_of_pool_members(self):
+        self.set_backend_load_balancers()
+
+        self.backend.pull_tenant_load_balancers(self.tenant)
+
+        self.assertFalse(models.PoolMember.objects.exists())
+        self.fixture.subnet.delete()
+        self.assertFalse(
+            models.SubNet.objects.filter(pk=self.fixture.subnet.pk).exists()
+        )
+
+    def test_tenant_row_is_deleted_with_load_balancers(self):
+        self.tenant.delete()
+
+        self.assertFalse(models.Tenant.objects.filter(pk=self.tenant.pk).exists())
+        for model in (
+            models.LoadBalancer,
+            models.Listener,
+            models.Pool,
+            models.PoolMember,
+            models.HealthMonitor,
+        ):
+            self.assertFalse(model.objects.exists())
+
+    def test_subnet_of_pool_member_cannot_be_deleted_alone(self):
+        with self.assertRaises(RestrictedError):
+            self.fixture.subnet.delete()
+
+    def test_unlinking_subnet_of_pool_member_is_a_conflict(self):
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.SubNetFactory.get_url(self.fixture.subnet, action="unlink")
+
+        response = self.client.post(url)
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertTrue(
+            models.SubNet.objects.filter(pk=self.fixture.subnet.pk).exists()
+        )
+
+    def test_unlinking_subnet_of_several_pool_members_is_a_conflict(self):
+        factories.PoolMemberFactory(pool=self.pool, subnet=self.fixture.subnet)
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.SubNetFactory.get_url(self.fixture.subnet, action="unlink")
+
+        response = self.client.post(url)
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(
+            str(response.data["detail"]),
+            "Cannot delete Subnet with existing pool members",
+        )
