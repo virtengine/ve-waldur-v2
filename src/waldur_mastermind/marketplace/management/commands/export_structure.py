@@ -1027,6 +1027,9 @@ class Command(BaseCommand):
                     "end_date": resource.end_date.isoformat()
                     if resource.end_date
                     else None,
+                    "terminated_at": resource.terminated_at.isoformat()
+                    if resource.terminated_at
+                    else None,
                     "report": resource.report,
                     "cost": str(resource.cost) if resource.cost else None,
                     "current_usages": resource.current_usages,

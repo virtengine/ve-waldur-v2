@@ -2235,6 +2235,18 @@ class Resource(
             "date is extended, without lifting a pause set for another reason."
         ),
     )
+    terminated_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        editable=False,
+        help_text=_(
+            "When the resource was terminated. Unlike end_date, which is the "
+            "planned date, this is the moment it happened. It stays set during "
+            "a restore and is cleared once the resource is OK again, so check "
+            "the state before reading it as the end of a live resource. Empty "
+            "if the date is not known."
+        ),
+    )
 
     NON_LOGGABLE_FIELDS = (
         "modified",
@@ -2249,9 +2261,20 @@ class Resource(
         "error_traceback",
         "current_usages",
         "paused_by_grace_period",
+        "terminated_at",
     )
 
     def save(self, *args, **kwargs):
+        update_fields = kwargs.get("update_fields")
+        if update_fields is not None:
+            update_fields = set(update_fields)
+            kwargs["update_fields"] = update_fields
+        if (
+            not self._state.adding
+            and self.tracker.has_changed("state")
+            and (update_fields is None or "state" in update_fields)
+        ):
+            self._update_terminated_at(update_fields)
         end_date_changed = not self._state.adding and self.tracker.has_changed(
             "end_date"
         )
@@ -2260,6 +2283,51 @@ class Resource(
             Resource.objects.filter(pk=self.pk).update(
                 end_date_updated_at=timezone.now()
             )
+
+    def _update_terminated_at(self, update_fields: set[str] | None):
+        # Done here because the transition is not the only way in:
+        # marketplace_remote assigns the state directly.
+        if self.state == self.States.OK:
+            # Only reaching OK means it came back. A restore in progress may be
+            # refused, or fail, and either leaves it as dead as it was.
+            terminated_at = None
+        elif self.state == self.States.TERMINATED and not self._was_already_dead():
+            terminated_at = timezone.now()
+        else:
+            return
+
+        if terminated_at != self.terminated_at:
+            self.terminated_at = terminated_at
+            if update_fields is not None:
+                update_fields.add("terminated_at")
+
+    def _was_already_dead(self):
+        # Coming out of a restore that did not work is not the end of the
+        # resource, which ended at a date that may not be known here.
+        if self.tracker.previous("state") not in (
+            self.States.CREATING,
+            self.States.ERRED,
+            # Retrying an old Terminate order passes through here too.
+            self.States.TERMINATING,
+        ):
+            return False
+        latest_order = self.order_set.order_by("-created").first()
+        if self.terminated_at:
+            # Only a newer order that ran ends it again: an erred resource does
+            # not pass through TERMINATING. An older one is what the date came
+            # from. It may still be EXECUTING, as processors save the resource
+            # before completing it.
+            return not (
+                latest_order
+                and latest_order.type == OrderTypes.TERMINATE
+                and latest_order.state in (OrderStates.EXECUTING, OrderStates.DONE)
+                and latest_order.created > self.terminated_at
+            )
+        return bool(
+            latest_order
+            and latest_order.type == OrderTypes.RESTORE
+            and latest_order.state != OrderStates.DONE
+        )
 
     def generate_slug(self):
         plugin_options = (

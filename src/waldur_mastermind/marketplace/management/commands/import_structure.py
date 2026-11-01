@@ -4998,6 +4998,17 @@ class Command(BaseCommand):
                         "restrict_member_access", False
                     ),
                 }
+                # These defaults also overwrite existing rows, bypassing what
+                # Resource.save() does on a state change: a resource that is OK
+                # has no date, and any other state keeps the one it has unless
+                # the file gives one.
+                if (
+                    "terminated_at" in resource_data
+                    or defaults["state"] == Resource.States.OK
+                ):
+                    defaults["terminated_at"] = self._parse_datetime(
+                        resource_data.get("terminated_at")
+                    )
 
                 if scope_content_type and scope_object_id:
                     defaults["content_type"] = scope_content_type
