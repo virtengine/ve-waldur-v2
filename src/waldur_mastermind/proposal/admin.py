@@ -81,6 +81,14 @@ class ProposalAdmin(admin.ModelAdmin):
     inlines = [RequestedResourceInline]
     list_display = ("__str__", "get_state_display")
 
+    def formfield_for_dbfield(self, db_field, request, **kwargs):
+        # The column's max_length is the API's rule for new input, not a bound
+        # on what is stored: a summary written over it before the limit
+        # existed must stay editable here, and ORM writes are not checked.
+        if db_field.name == "project_summary":
+            kwargs["max_length"] = None
+        return super().formfield_for_dbfield(db_field, request, **kwargs)
+
 
 class ReviewAdmin(admin.ModelAdmin):
     list_display = ("reviewer", "proposal")

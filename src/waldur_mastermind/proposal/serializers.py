@@ -2768,6 +2768,17 @@ class ProposalDetachDocumentsSerializer(serializers.Serializer):
     documents = serializers.ListField(child=serializers.UUIDField())
 
 
+def _normalize_newlines(text: str) -> str:
+    return text.replace("\r\n", "\n")
+
+
+# The limit stays in the schema although the field carries no validator: the
+# serializer's validate_project_summary applies it, minus the grandfather rule.
+@extend_schema_field({"type": "string", "maxLength": models.PROJECT_SUMMARY_LENGTH})
+class GrandfatheredProjectSummaryField(serializers.CharField):
+    pass
+
+
 class ProposalUpdateProjectDetailsSerializer(serializers.ModelSerializer):
     science_sub_domain = serializers.SlugRelatedField(
         slug_field="uuid",
@@ -2775,6 +2786,16 @@ class ProposalUpdateProjectDetailsSerializer(serializers.ModelSerializer):
         allow_null=True,
         required=False,
     )
+    # As on ProposalSerializer: the form saves through this action, so what
+    # create sanitises must be sanitised here too.
+    description = core_serializers.HTMLCleanField(
+        required=False, allow_blank=True, max_length=DESCRIPTION_LENGTH
+    )
+    # Declared without the model's max_length, which would run before
+    # validate_project_summary: a summary stored over the limit before it
+    # existed stays editable as long as it is sent back unchanged. Only a new
+    # or edited value has to fit.
+    project_summary = GrandfatheredProjectSummaryField(required=False, allow_blank=True)
 
     class Meta:
         model = models.Proposal
@@ -2784,6 +2805,21 @@ class ProposalUpdateProjectDetailsSerializer(serializers.ModelSerializer):
             "project_summary",
             "science_sub_domain",
         ]
+
+    def validate_project_summary(self, value):
+        # A textarea hands back LF where the row may hold CRLF (an import, the
+        # API): that is not an edit.
+        stored = (self.instance.project_summary or "") if self.instance else None
+        unchanged = stored is not None and _normalize_newlines(
+            value
+        ) == _normalize_newlines(stored.strip())
+        if len(value) > models.PROJECT_SUMMARY_LENGTH and not unchanged:
+            raise serializers.ValidationError(
+                self.fields["project_summary"]
+                .error_messages["max_length"]
+                .format(max_length=models.PROJECT_SUMMARY_LENGTH)
+            )
+        return value
 
 
 class ProposalComplianceStatusSerializer(serializers.Serializer):
