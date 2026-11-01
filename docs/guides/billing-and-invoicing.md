@@ -278,7 +278,7 @@ When a grace period is used, the effective date for zeroing credits is always th
 
 #### Paying earlier invoices
 
-The compensation run only pays the month it closes. Cost that no credit covered stays uncovered, and a period-Total cost policy keeps counting it however much credit is added later. With `ProjectCredit.pay_earlier_invoices` on, what is left of the allocation also pays that cost (`src/waldur_mastermind/invoices/settlement.py`). Only staff may set it, because it changes what the organization was billed; owners editing the rest of the allocation get a validation error if they change it.
+The compensation run only pays the month it closes. Cost that no credit covered stays uncovered, and a period-Total cost policy that takes credit into account keeps counting it however much credit is added later. With `ProjectCredit.pay_earlier_invoices` on, what is left of the allocation also pays that cost (`src/waldur_mastermind/invoices/settlement.py`). Only staff may set it, because it changes what the organization was billed; owners editing the rest of the allocation get a validation error if they change it.
 
 - **What it pays.** Closed (`created` or `paid`) invoices of the project, oldest month first. `earlier_invoices_from` and `earlier_invoices_until` optionally bound the months, inclusive, each named by its first day.
 - **When it pays.**
@@ -298,7 +298,7 @@ The compensation run only pays the month it closes. Cost that no credit covered 
     - Both writers lock the organization credit's row.
     - Turning the option off stops further payments. It does not reverse the ones made, which takes a staff credit adjustment.
 - **Paying on request.** `POST /api/project-credits/<uuid>/pay_earlier_invoices/` (staff) pays now, turns on `pay_earlier_invoices` and stores `compensate_in` when given. With `dry_run` it returns the compensations it would write (month paid, invoice written on, resource, cost item, amount) and the project and organization credit before and after, and writes nothing. Both run the same plan (`settlement.plan`), so a preview and the payment that follows it agree.
-- **Explaining it.** `GET /api/project-credits/<uuid>/earlier_invoices/` lists every closed month with its `cost`, `covered` and `uncovered`, and `in_period` for the months the credit pays. It also gives the total `uncovered` (what a Total policy counts), `uncovered_in_period`, and `payable_now`, the part the credit would pay now. Staff, support, owners and roles with `CUSTOMER.VIEW_ACCOUNTING` see it, and so do the project's own roles while the organization displays billing info in projects, as they then see the project's invoice items. `in_period` follows the credit's own bounds, which can be previewed with others.
+- **Explaining it.** `GET /api/project-credits/<uuid>/earlier_invoices/` lists every closed month with its `cost`, `covered` and `uncovered`, and `in_period` for the months the credit pays. It also gives the total `uncovered` (what a Total policy that takes credit into account counts), `uncovered_in_period`, and `payable_now`, the part the credit would pay now. Staff, support, owners and roles with `CUSTOMER.VIEW_ACCOUNTING` see it, and so do the project's own roles while the organization displays billing info in projects, as they then see the project's invoice items. `in_period` follows the credit's own bounds, which can be previewed with others.
 
 A payment counts in the month it pays everywhere cost is shown by month: `invoices.utils.month_q` / `annotate_cost_month` are used by the cost policies, the project costs chart, costs for a period and the price estimates. Counted by its invoice's month instead, a payment would take the current month below zero. `consumption_last_month` leaves payments out, since a one-off payment is not a burn rate. `rebill_historical_usage` counts them as credit already drawn for the month.
 
@@ -327,7 +327,7 @@ graph TD
     B -->|Yes| F[Policy fires]
 ```
 
-The cost sums every `InvoiceItem` for the project/customer across the policy's rolling window (1/3/12 months, or all months for Total) via `EstimatedCostPolicyMixin._evaluated_cost` -- cost items and compensation items together, unfiltered by type, since a compensation item is just a negative-priced row on the same invoice. A payment of an earlier invoice (see [Paying earlier invoices](#paying-earlier-invoices)) is counted in the month it pays, not in the month of the invoice it is written on, so it lowers a Total policy's cost and leaves a Month policy's alone. For a month whose invoice has already been finalized -- including one `rebill_historical_usage` has just corrected -- this sum is entirely real, persisted data. There's no simulation involved in reading it. The policy fires when that net cost is strictly greater than `limit_cost`.
+The cost sums every `InvoiceItem` for the project/customer across the policy's rolling window (1/3/12 months, or all months for Total) via `EstimatedCostPolicyMixin._evaluated_cost` -- cost items and compensation items together, unfiltered by type, since a compensation item is just a negative-priced row on the same invoice. A `use_credit=False` project policy and an offering policy leave compensation items out (`invoices.utils.credit_compensation_q`), so they count the full cost and written compensation does not lower it. A payment of an earlier invoice (see [Paying earlier invoices](#paying-earlier-invoices)) is counted in the month it pays, not in the month of the invoice it is written on, so it lowers a Total policy's cost and leaves a Month policy's alone. For a month whose invoice has already been finalized -- including one `rebill_historical_usage` has just corrected -- this sum is entirely real, persisted data. There's no simulation involved in reading it. The policy fires when that net cost is strictly greater than `limit_cost`.
 
 On top of that sum, the evaluation additionally subtracts the credit the customer's *current, still-mutable* invoice will still draw (`_pending_compensation`). That comes from a `MonthlyCompensation(customer, restore_written=True)` simulation, re-run in memory on every evaluation and never saved (it refuses to `save()`). It has no bearing on any past month already reflected in the sum above. The simulation works in credit units, before tax, while a compensation item carries its invoice's tax like the cost it offsets, so the pending draw is taxed at the current invoice's rate before it comes off; otherwise a project its credit fully covers would show the tax as cost all month.
 
@@ -403,10 +403,10 @@ current_cost = cost_before_credit − credit_drawn − credit_pending
 | Field | Meaning |
 |-------|---------|
 | `cost_before_credit` | The invoiced cost within the policy's period before any credit, tax included |
-| `credit_drawn` | Credit compensation already written on the period's invoices |
-| `credit_pending` | Credit the current month will still draw that is not written yet (`_pending_compensation`); 0 for a policy that does not take credit into account, which still counts the compensation already written: that shows in `credit_drawn` |
+| `credit_drawn` | Credit compensation already written on the period's invoices; 0 for a policy that does not take credit into account, which counts the cost credit paid as well |
+| `credit_pending` | Credit the current month will still draw that is not written yet (`_pending_compensation`); 0 for a policy that does not take credit into account |
 
-The period's items are split by `credit__isnull`, the discriminator `_pending_compensation` uses, so the parts add up to `current_cost` exactly. It shares the response's `MonthlyCompensation` with `current_cost`, and a `?field=` selection without `cost_breakdown` skips it.
+The period's items are split by `invoices.utils.credit_compensation_q`, the discriminator `_pending_compensation` uses, so the parts add up to `current_cost` exactly. It shares the response's `MonthlyCompensation` with `current_cost`, and a `?field=` selection without `cost_breakdown` skips it.
 
 ##### What started an evaluation, and who
 
