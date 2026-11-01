@@ -60,7 +60,7 @@ from waldur_openstack.exceptions import (
     OpenStackSessionExpired,
     OpenStackTenantNotFound,
 )
-from waldur_openstack.octavia import get_octavia_client
+from waldur_openstack.octavia import get_octavia_client, octavia_backend_errors
 from waldur_openstack.session import (
     get_cinder_client,
     get_glance_client,
@@ -8266,6 +8266,84 @@ class OpenStackBackend(ServiceBackend):
             [sg.name for sg in security_groups],
             load_balancer.name,
         )
+
+    def _get_tenant_octavia_client_for_cleanup(self, tenant: models.Tenant):
+        """Return None when there is nothing to clean up in Octavia.
+
+        Load balancers known to Waldur must be deleted, so a missing or
+        unreachable Octavia fails the cleanup instead of skipping it.
+        """
+        octavia_client = get_octavia_client(tenant)
+        has_known_load_balancers = (
+            models.LoadBalancer.objects.filter(tenant=tenant)
+            .exclude(backend_id__isnull=True)
+            .exclude(backend_id="")
+            .exists()
+        )
+        if has_known_load_balancers or octavia_client.is_available():
+            return octavia_client
+        return None
+
+    @log_backend_action()
+    def are_tenant_load_balancers_settled(self, tenant: models.Tenant):
+        """Wait for creates and updates in flight, so that a load balancer ending
+        in ERROR still gets a delete instead of failing the poll that follows.
+        """
+        octavia_client = self._get_tenant_octavia_client_for_cleanup(tenant)
+        if octavia_client is None:
+            return True
+        with octavia_backend_errors():
+            backend_load_balancers = octavia_client.get_tenant_load_balancers()
+        return not any(
+            backend_load_balancer.provisioning_status
+            in ("PENDING_CREATE", "PENDING_UPDATE")
+            for backend_load_balancer in backend_load_balancers
+        )
+
+    @log_backend_action()
+    def delete_tenant_load_balancers(self, tenant: models.Tenant):
+        octavia_client = self._get_tenant_octavia_client_for_cleanup(tenant)
+        if octavia_client is None:
+            return
+        with octavia_backend_errors():
+            for backend_load_balancer in octavia_client.get_tenant_load_balancers():
+                # Octavia rejects a delete with 409 while a load balancer is
+                # PENDING_*. One that turned so after the settle check is
+                # deleted by the poll.
+                if backend_load_balancer.provisioning_status.startswith("PENDING_"):
+                    continue
+                octavia_client.delete_load_balancer_with_cascade(
+                    backend_load_balancer.id
+                )
+
+    @log_backend_action()
+    def are_all_tenant_load_balancers_deleted(self, tenant: models.Tenant):
+        octavia_client = self._get_tenant_octavia_client_for_cleanup(tenant)
+        if octavia_client is None:
+            return True
+        with octavia_backend_errors():
+            backend_load_balancers = octavia_client.get_tenant_load_balancers()
+            # A load balancer turns ERROR when its delete fails, and stays so.
+            # One that went PENDING_* after the settle check and ended in ERROR
+            # fails here too; terminating the tenant again deletes it.
+            erred = [
+                backend_load_balancer.id
+                for backend_load_balancer in backend_load_balancers
+                if backend_load_balancer.provisioning_status == "ERROR"
+            ]
+            if erred:
+                raise OpenStackBackendError(
+                    "Load balancers %s of tenant %s are in ERROR state."
+                    % (", ".join(erred), tenant.backend_id)
+                )
+            # A load balancer that was PENDING_* at the first delete, or got
+            # a 409 from it, is ACTIVE once it settles.
+            for backend_load_balancer in backend_load_balancers:
+                if backend_load_balancer.provisioning_status == "ACTIVE":
+                    octavia_client.delete_load_balancer_with_cascade(
+                        backend_load_balancer.id
+                    )
+        return not backend_load_balancers
 
     def pull_tenant_load_balancers(self, tenant: models.Tenant):
         """Sync load balancers from Octavia for the tenant."""

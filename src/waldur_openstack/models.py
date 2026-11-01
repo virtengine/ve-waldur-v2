@@ -1116,8 +1116,10 @@ class PoolMember(structure_models.BaseResource):
         ],
         help_text=_("Port on the backend server"),
     )
+    # RESTRICT, not PROTECT: a tenant delete reaches the member through its
+    # load balancer too, and must not be blocked by the subnet.
     subnet = models.ForeignKey(
-        on_delete=models.PROTECT,
+        on_delete=models.RESTRICT,
         to="SubNet",
         related_name="+",
         null=True,

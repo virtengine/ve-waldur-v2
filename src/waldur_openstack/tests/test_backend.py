@@ -1664,6 +1664,7 @@ class CreateInstanceTest(VolumesBaseTest):
         instance = self.fixture.instance
         second_port = factories.PortFactory(
             instance=instance,
+            backend_id="second_port_backend_id",
             tenant=self.fixture.tenant,
             service_settings=self.fixture.settings,
             project=self.fixture.project,

@@ -3,6 +3,7 @@ Octavia Load Balancer API client.
 """
 
 import logging
+from contextlib import contextmanager
 
 from keystoneauth1 import exceptions as keystone_exceptions
 from openstack import exceptions as openstack_exceptions
@@ -19,11 +20,23 @@ def get_octavia_client(tenant):
     return OctaviaClient(tenant)
 
 
+@contextmanager
+def octavia_backend_errors():
+    try:
+        yield
+    except (
+        openstack_exceptions.SDKException,
+        keystone_exceptions.ClientException,
+    ) as e:
+        raise OpenStackBackendError(e)
+
+
 class OctaviaClient:
     def __init__(self, tenant):
         self.tenant = tenant
         self._connection = None
         self._lb_proxy = None
+        self._is_available = None
 
     def _get_connection(self):
         if not self._connection:
@@ -57,6 +70,11 @@ class OctaviaClient:
 
     def is_available(self):
         """Check whether the Octavia (load-balancer) service is in the catalog."""
+        if self._is_available is None:
+            self._is_available = self._check_availability()
+        return self._is_available
+
+    def _check_availability(self):
         try:
             conn = self._get_connection()
             # Query the keystone catalog directly: Connection.has_service()
@@ -124,6 +142,27 @@ class OctaviaClient:
 
     def get_tenant_load_balancers(self):
         return list(self.connection.load_balancers(project_id=self.tenant.backend_id))
+
+    def delete_load_balancer_with_cascade(self, backend_id):
+        # Cascade removes listeners, pools, members and health monitors in one
+        # call.
+        logger.info(
+            "Deleting load balancer %s from tenant %s",
+            backend_id,
+            self.tenant.backend_id,
+        )
+        try:
+            self.connection.delete_load_balancer(
+                backend_id, ignore_missing=True, cascade=True
+            )
+        except openstack_exceptions.ConflictException:
+            # It turned PENDING_* after it was listed, and Octavia refuses that
+            # with 409. The poll deletes it once it settles.
+            logger.info(
+                "Load balancer %s of tenant %s is busy, leaving it to the poll.",
+                backend_id,
+                self.tenant.backend_id,
+            )
 
     def _backend_load_balancer_to_load_balancer(
         self, backend_load_balancer, load_balancer

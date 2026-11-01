@@ -316,16 +316,50 @@ class TenantDeleteExecutor(core_executors.DeleteExecutor):
         if not tenant.backend_id:
             return state_transition
 
+        cleanup_load_balancers = cls.get_load_balancers_cleanup_tasks(serialized_tenant)
         cleanup_networks = cls.get_networks_cleanup_tasks(serialized_tenant)
         cleanup_instances = cls.get_instances_cleanup_tasks(serialized_tenant)
         cleanup_identities = cls.get_identity_cleanup_tasks(serialized_tenant)
 
         return chain(
             [state_transition]
+            + cleanup_load_balancers
             + cleanup_networks
             + cleanup_instances
             + cleanup_identities
         )
+
+    @classmethod
+    def get_failure_signature(cls, tenant, serialized_tenant, force=False, **kwargs):
+        if force:
+            return super().get_failure_signature(
+                tenant, serialized_tenant, force=force, **kwargs
+            )
+        return core_tasks.ErrorStateTransitionTask().s(serialized_tenant)
+
+    @classmethod
+    def get_load_balancers_cleanup_tasks(cls, serialized_tenant):
+        # Load balancers go first: their VIP ports and pool members hold the
+        # subnets. The final pull drops the Waldur rows, whose pool members
+        # would otherwise break the pull of the networks if a later step fails.
+        return [
+            core_tasks.PollBackendCheckTask().si(
+                serialized_tenant,
+                backend_check_method="are_tenant_load_balancers_settled",
+            ),
+            core_tasks.BackendMethodTask().si(
+                serialized_tenant,
+                backend_method="delete_tenant_load_balancers",
+            ),
+            core_tasks.PollBackendCheckTask().si(
+                serialized_tenant,
+                backend_check_method="are_all_tenant_load_balancers_deleted",
+            ),
+            core_tasks.BackendMethodTask().si(
+                serialized_tenant,
+                backend_method="pull_tenant_load_balancers",
+            ),
+        ]
 
     @classmethod
     def get_networks_cleanup_tasks(cls, serialized_tenant):
