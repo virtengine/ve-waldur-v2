@@ -666,6 +666,21 @@ class ProjectSerializer(
         child=serializers.CharField(),
         required=False,
     )
+    user_nationalities = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        help_text="Allowed nationality codes (ISO 3166-1 alpha-2). User must have one.",
+    )
+    user_organization_types = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        help_text="Allowed organization type URNs (SCHAC). User must match one.",
+    )
+    user_assurance_levels = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        help_text="Required assurance URIs (REFEDS). User must have all of these.",
+    )
     science_sub_domain = serializers.SlugRelatedField(
         slug_field="uuid",
         queryset=models.ScienceSubDomain.objects.all(),
@@ -731,6 +746,9 @@ class ProjectSerializer(
             "user_email_patterns",
             "user_affiliations",
             "user_identity_sources",
+            "user_nationalities",
+            "user_organization_types",
+            "user_assurance_levels",
             "affiliation",
             "affiliation_uuid",
             "affiliation_name",
@@ -829,31 +847,32 @@ class ProjectSerializer(
                 if field_name not in self.Meta.read_only_fields:
                     field.read_only = True
 
-        # Handle user_email_patterns, user_affiliations, and user_identity_sources permissions
         # Only users with CREATE_PROJECT permission on customer can edit these
         restriction_fields = (
             "user_email_patterns",
             "user_affiliations",
             "user_identity_sources",
+            "user_nationalities",
+            "user_organization_types",
+            "user_assurance_levels",
         )
-        for field_name in restriction_fields:
-            if field_name in fields:
-                user = self.context["request"].user
-                is_schema_generation = getattr(
-                    self.context.get("view"), "swagger_fake_view", False
-                )
-                if not is_schema_generation:
-                    customer = (
-                        self.instance.customer
-                        if isinstance(self.instance, models.Project)
-                        else None
-                    )
-                    if customer and not has_permission(
-                        self.context["request"],
-                        PermissionEnum.CREATE_PROJECT,
-                        customer,
-                    ):
-                        fields[field_name].read_only = True
+        restricted = [name for name in restriction_fields if name in fields]
+        is_schema_generation = getattr(
+            self.context.get("view"), "swagger_fake_view", False
+        )
+        if restricted and not is_schema_generation:
+            customer = (
+                self.instance.customer
+                if isinstance(self.instance, models.Project)
+                else None
+            )
+            if customer and not has_permission(
+                self.context["request"],
+                PermissionEnum.CREATE_PROJECT,
+                customer,
+            ):
+                for field_name in restricted:
+                    fields[field_name].read_only = True
 
         return fields
 
@@ -1437,6 +1456,21 @@ class CustomerSerializer(
         child=serializers.CharField(),
         required=False,
     )
+    user_nationalities = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        help_text="Allowed nationality codes (ISO 3166-1 alpha-2). User must have one.",
+    )
+    user_organization_types = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        help_text="Allowed organization type URNs (SCHAC). User must match one.",
+    )
+    user_assurance_levels = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        help_text="Required assurance URIs (REFEDS). User must have all of these.",
+    )
 
     class Meta:
         model = models.Customer
@@ -1468,6 +1502,9 @@ class CustomerSerializer(
             "user_email_patterns",
             "user_affiliations",
             "user_identity_sources",
+            "user_nationalities",
+            "user_organization_types",
+            "user_assurance_levels",
             "default_affiliations",
             "is_service_provider_manager_only",
         ) + CUSTOMER_DETAILS_FIELDS
@@ -1488,6 +1525,9 @@ class CustomerSerializer(
             "user_email_patterns",
             "user_affiliations",
             "user_identity_sources",
+            "user_nationalities",
+            "user_organization_types",
+            "user_assurance_levels",
             "project_slug_template",
         )
         extra_kwargs = {

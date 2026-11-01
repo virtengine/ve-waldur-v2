@@ -168,6 +168,11 @@ def log_customer_delete(sender, instance: Customer, **kwargs):
     )
 
 
+def _literal(value) -> str:
+    """Keep a value out of the placeholders of the event message it is added to."""
+    return str(value).replace("{", "{{").replace("}", "}}")
+
+
 def log_project_save(sender, instance: Project, created=False, **kwargs):
     """Log project creation and updates."""
     if created:
@@ -192,8 +197,8 @@ def log_project_save(sender, instance: Project, created=False, **kwargs):
 
         message = "Project {project_name} has been updated."
         for name in sorted(changed_fields.keys()):
-            previous_value = changed_fields[name]
-            current_value = getattr(instance, name)
+            previous_value = _literal(changed_fields[name])
+            current_value = _literal(getattr(instance, name))
             message = f"{message} {name.capitalize()} has been changed from '{previous_value}' to '{current_value}'."
 
         event_logger.emit(
