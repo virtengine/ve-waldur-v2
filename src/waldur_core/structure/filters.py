@@ -505,7 +505,8 @@ class ProjectFilter(core_filters.CreatedModifiedFilter, NameFilterSet):
 
     user_role = django_filters.CharFilter(
         method="filter_by_user_role",
-        label="Role name or UUID; narrows user_uuid_with_active_role to that role.",
+        label="Role name or UUID; narrows user_uuid_with_active_role to that role "
+        "and its organization copies.",
     )
 
     current_user_has_role = core_filters.CharInFilter(
@@ -619,7 +620,9 @@ class ProjectFilter(core_filters.CreatedModifiedFilter, NameFilterSet):
         role = self.form.cleaned_data.get("user_role")
         if role:
             user_roles = user_roles.filter(
-                Q(role__uuid=role) if is_uuid_like(role) else Q(role__name=role)
+                Q(role__uuid=role) | Q(role__template__uuid=role)
+                if is_uuid_like(role)
+                else Q(role__name=role) | Q(role__template__name=role)
             )
         project_ids = user_roles.values_list("object_id", flat=True)
         return queryset.filter(id__in=project_ids)
