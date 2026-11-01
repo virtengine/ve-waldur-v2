@@ -40,6 +40,7 @@ from waldur_core.configuration import config
 from waldur_core.core import validators as core_validators
 from waldur_core.core.exceptions import IncorrectStateException
 from waldur_core.core.models import User
+from waldur_core.core.permissions import has_staff_access, has_support_access
 from waldur_core.core.utils import SubqueryCount
 from waldur_core.core.views import (
     ActionMethodMixin,
@@ -444,7 +445,7 @@ class CallManagingOrganisationViewSet(
     )
     @decorators.action(detail=False)
     def global_stats_performance(self, request):
-        if not request.user.is_staff:
+        if not has_staff_access(request):
             raise exceptions.PermissionDenied()
         calls = models.Call.objects.all()
         now = timezone.now()
@@ -524,7 +525,7 @@ class CallManagingOrganisationViewSet(
     )
     @decorators.action(detail=False)
     def global_stats_review_progress(self, request):
-        if not request.user.is_staff:
+        if not has_staff_access(request):
             raise exceptions.PermissionDenied()
         reviews = models.Review.objects.all()
         reviewers = User.objects.filter(
@@ -588,7 +589,7 @@ class CallManagingOrganisationViewSet(
     )
     @decorators.action(detail=False)
     def global_stats_resource_demand(self, request):
-        if not request.user.is_staff:
+        if not has_staff_access(request):
             raise exceptions.PermissionDenied()
         requested_offerings = models.RequestedOffering.objects.all()
         offerings = marketplace_models.Offering.objects.filter(
@@ -1990,7 +1991,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     def _check_available_checklists_permission(request, view, obj=None):
         """Check if user has CREATE_CALL permission on call managing organization."""
         user = request.user
-        if user.is_staff or user.is_support:
+        if has_support_access(request):
             return
 
         customer_uuid = request.query_params.get("customer_uuid")
@@ -3518,7 +3519,7 @@ class ProposalViewSet(
             return
 
         user = request.user
-        if user.is_staff:
+        if has_staff_access(request):
             return
 
         # The author always reads the compliance answers they submitted, even
@@ -4001,7 +4002,7 @@ class ProposalViewSet(
             )
         }
         can_view_internal_notes = proposal_permissions.user_can_view_internal_notes(
-            request.user, proposal
+            request.user, proposal, has_staff_access(request)
         )
         serializer = serializers.ProposalWorkflowStepInstanceSerializer(
             instances,
@@ -4088,7 +4089,9 @@ class ProposalViewSet(
         # team treats as internal.
         internal_notes = (
             input_serializer.validated_data.get("internal_notes", "")
-            if proposal_permissions.user_can_view_internal_notes(request.user, proposal)
+            if proposal_permissions.user_can_view_internal_notes(
+                request.user, proposal, has_staff_access(request)
+            )
             else ""
         )
 
@@ -4208,7 +4211,9 @@ class ProposalViewSet(
         # acting on their own step would otherwise leak private text.
         internal_notes = (
             input_serializer.validated_data.get("internal_notes", "")
-            if proposal_permissions.user_can_view_internal_notes(request.user, proposal)
+            if proposal_permissions.user_can_view_internal_notes(
+                request.user, proposal, has_staff_access(request)
+            )
             else ""
         )
 
@@ -4881,7 +4886,7 @@ class ReviewViewSet(ActionsViewSet):
 
         user = request.user
 
-        if user.is_staff or obj.reviewer == user:
+        if has_staff_access(request) or obj.reviewer == user:
             return
 
         raise exceptions.PermissionDenied()
@@ -5313,7 +5318,7 @@ class ExpertiseCategoryViewSet(ReadOnlyActionsViewSet):
 
 def check_reviewer_profile_update_permission(request, view, obj=None):
     """Check if user can update a reviewer profile."""
-    if request.user.is_staff:
+    if has_staff_access(request):
         return
     if obj and obj.user == request.user:
         return
@@ -5438,7 +5443,7 @@ class ReviewerProfileViewSet(ActionsViewSet):
         profile = self.get_object()
 
         # Check if user owns this profile
-        if profile.user != request.user and not request.user.is_staff:
+        if profile.user != request.user and not has_staff_access(request):
             raise exceptions.PermissionDenied(
                 _("You can only connect ORCID to your own profile.")
             )
@@ -5464,7 +5469,7 @@ class ReviewerProfileViewSet(ActionsViewSet):
         """Complete ORCID OAuth flow with authorization code."""
         profile = self.get_object()
 
-        if profile.user != request.user and not request.user.is_staff:
+        if profile.user != request.user and not has_staff_access(request):
             raise exceptions.PermissionDenied(
                 _("You can only connect ORCID to your own profile.")
             )
@@ -5498,7 +5503,7 @@ class ReviewerProfileViewSet(ActionsViewSet):
         """Sync profile data from connected ORCID account."""
         profile = self.get_object()
 
-        if profile.user != request.user and not request.user.is_staff:
+        if profile.user != request.user and not has_staff_access(request):
             raise exceptions.PermissionDenied(
                 _("You can only sync your own ORCID profile.")
             )
@@ -5541,7 +5546,7 @@ class ReviewerProfileViewSet(ActionsViewSet):
         """Disconnect ORCID from profile."""
         profile = self.get_object()
 
-        if profile.user != request.user and not request.user.is_staff:
+        if profile.user != request.user and not has_staff_access(request):
             raise exceptions.PermissionDenied(
                 _("You can only disconnect your own ORCID.")
             )
@@ -5576,7 +5581,7 @@ class ReviewerProfileViewSet(ActionsViewSet):
         """Import publications from various sources."""
         profile = self.get_object()
 
-        if profile.user != request.user and not request.user.is_staff:
+        if profile.user != request.user and not has_staff_access(request):
             raise exceptions.PermissionDenied(
                 _("You can only import publications to your own profile.")
             )
@@ -6510,7 +6515,7 @@ class ReviewerSuggestionViewSet(ReadOnlyActionsViewSet):
         # Check if user has permission to manage this call
         user = request.user
         call = suggestion.call
-        if not user.is_staff and not (
+        if not has_staff_access(request) and not (
             call.id in get_connected_calls(user, CallRole.MANAGER)
             or call.manager.customer_id in get_connected_customers(user)
         ):
@@ -6540,7 +6545,7 @@ class ReviewerSuggestionViewSet(ReadOnlyActionsViewSet):
         # Check if user has permission to manage this call
         user = request.user
         call = suggestion.call
-        if not user.is_staff and not (
+        if not has_staff_access(request) and not (
             call.id in get_connected_calls(user, CallRole.MANAGER)
             or call.manager.customer_id in get_connected_customers(user)
         ):
@@ -6577,7 +6582,7 @@ class ReviewerSuggestionViewSet(ReadOnlyActionsViewSet):
         # Check if user has permission to manage this call
         user = request.user
         call = suggestion.call
-        if not user.is_staff and not (
+        if not has_staff_access(request) and not (
             call.id in get_connected_calls(user, CallRole.MANAGER)
             or call.manager.customer_id in get_connected_customers(user)
         ):
@@ -7016,7 +7021,7 @@ class ReviewerProfileAffiliationViewSet(
         profile = self.get_reviewer_profile()
         user = self.request.user
         # Only profile owner or staff can manage affiliations
-        if not (user.is_staff or profile.user == user):
+        if not (has_staff_access(self.request) or profile.user == user):
             raise exceptions.PermissionDenied(
                 _("You do not have permission to manage this reviewer profile.")
             )
@@ -7123,7 +7128,7 @@ class ReviewerProfileExpertiseViewSet(
         profile = self.get_reviewer_profile()
         user = self.request.user
         # Only profile owner or staff can manage expertise
-        if not (user.is_staff or profile.user == user):
+        if not (has_staff_access(self.request) or profile.user == user):
             raise exceptions.PermissionDenied(
                 _("You do not have permission to manage this reviewer profile.")
             )
@@ -7230,7 +7235,7 @@ class ReviewerProfilePublicationViewSet(
         profile = self.get_reviewer_profile()
         user = self.request.user
         # Only profile owner or staff can manage publications
-        if not (user.is_staff or profile.user == user):
+        if not (has_staff_access(self.request) or profile.user == user):
             raise exceptions.PermissionDenied(
                 _("You do not have permission to manage this reviewer profile.")
             )

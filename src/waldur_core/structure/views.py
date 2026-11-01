@@ -46,7 +46,11 @@ from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
 from waldur_core.core.db_template_cache import add_template_to_cache
 from waldur_core.core.enums import CoreStates, ReviewStates
-from waldur_core.core.permissions import PATScopeAwareIsAdminUser
+from waldur_core.core.permissions import (
+    PATScopeAwareIsAdminUser,
+    has_staff_access,
+    has_support_access,
+)
 from waldur_core.core.serializers import (
     DetailSerializer,
     ReviewCommentSerializer,
@@ -295,7 +299,7 @@ class CustomerViewSet(
         return super().destroy(request, *args, **kwargs)
 
     def perform_create(self, serializer):
-        if not self.request.user.is_staff:
+        if not has_staff_access(self.request):
             raise PermissionDenied()
 
         customer: models.Customer = serializer.save()
@@ -320,7 +324,7 @@ class CustomerViewSet(
         return super().perform_update(serializer)
 
     def perform_destroy(self, instance):
-        if not self.request.user.is_staff:
+        if not has_staff_access(self.request):
             raise PermissionDenied()
 
         utils.check_customer_blocked_or_archived(instance)
@@ -366,7 +370,7 @@ class CustomerViewSet(
     def contact(self, request, uuid=None):
         customer: models.Customer = self.get_object()
         if not (
-            request.user.is_staff
+            has_staff_access(request)
             or has_permission(request, PermissionEnum.UPDATE_CUSTOMER, customer)
             or has_permission(request, PermissionEnum.CUSTOMER_CONTACT_UPDATE, customer)
         ):
@@ -458,7 +462,7 @@ class CustomerViewSet(
     )
     @action(detail=True, methods=["post"])
     def update_organization_groups(self, request, uuid):
-        if not self.request.user.is_staff:
+        if not has_staff_access(request):
             raise PermissionDenied()
         customer: models.Customer = self.get_object()
         serializer = marketplace_serializers.OrganizationGroupsSerializer(
@@ -484,7 +488,7 @@ class CustomerViewSet(
 
         customer = self.get_object()
         if not (
-            request.user.is_staff
+            has_staff_access(request)
             or has_permission(request, PermissionEnum.UPDATE_CUSTOMER, customer)
         ):
             raise PermissionDenied()
@@ -514,7 +518,7 @@ class CustomerViewSet(
 
         customer = self.get_object()
         if not (
-            request.user.is_staff
+            has_staff_access(request)
             or has_permission(request, PermissionEnum.UPDATE_CUSTOMER, customer)
         ):
             raise PermissionDenied()
@@ -551,7 +555,7 @@ class CustomerViewSet(
 
         customer = self.get_object()
         if not (
-            request.user.is_staff
+            has_staff_access(request)
             or has_permission(request, PermissionEnum.UPDATE_CUSTOMER, customer)
         ):
             raise PermissionDenied()
@@ -579,7 +583,7 @@ class CustomerViewSet(
 
         customer = self.get_object()
         if not (
-            request.user.is_staff
+            has_staff_access(request)
             or has_permission(request, PermissionEnum.UPDATE_CUSTOMER, customer)
         ):
             raise PermissionDenied()
@@ -609,7 +613,7 @@ class CustomerViewSet(
     )
     @action(detail=True, methods=["post"])
     def update_default_affiliations(self, request, uuid=None):
-        if not request.user.is_staff:
+        if not has_staff_access(request):
             raise PermissionDenied()
         customer = self.get_object()
         serializer = serializers.CustomerDefaultAffiliationsUpdateSerializer(
@@ -649,7 +653,7 @@ class CustomerUsersViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
         customer = models.Customer.objects.get(uuid=self.kwargs["customer_uuid"])
         if not (
             has_permission(self.request, PermissionEnum.LIST_CUSTOMER_USERS, customer)
-            or self.request.user.is_support
+            or has_support_access(self.request)
         ):
             raise PermissionDenied()
         return customer.get_users()
@@ -741,7 +745,7 @@ class AccessSubnetViewSet(core_views.ActionsViewSet):
                 {"customer_uuid": _("A valid customer_uuid is required.")}
             )
         customer = get_object_or_404(models.Customer, uuid=customer_uuid)
-        if not (request.user.is_staff or request.user.is_support):
+        if not has_support_access(request):
             # Membership is tested with the same `__in` idiom get_queryset uses.
             # `customer in get_connected_customers(...)` looks equivalent and is
             # not: the queryset yields ids, so the comparison never matched and
@@ -853,7 +857,7 @@ class AccessSubnetViewSet(core_views.ActionsViewSet):
         alone and run for every caller, so they could not let staff through.
         """
         subnet = self.get_object()
-        if subnet.is_staff_managed and not request.user.is_staff:
+        if subnet.is_staff_managed and not has_staff_access(request):
             raise ValidationError(
                 _("This entry is managed by staff and cannot be deleted.")
             )
@@ -1146,7 +1150,7 @@ class ProjectViewSet(
         )
         serializer.is_valid(raise_exception=True)
         affiliation = serializer.validated_data.get("affiliation")
-        if affiliation is not None and not request.user.is_staff:
+        if affiliation is not None and not has_staff_access(request):
             if not project.customer.default_affiliations.filter(
                 pk=affiliation.pk
             ).exists():
@@ -1186,7 +1190,7 @@ class ProjectViewSet(
             if new_slug == project.slug:
                 return Response({"status": _("Project slug is not changed.")})
 
-            if not request.user.is_staff:
+            if not has_staff_access(request):
                 live_resources = marketplace_models.Resource.objects.filter(
                     project=project
                 ).exclude(state=marketplace_models.Resource.States.TERMINATED)
@@ -2003,9 +2007,7 @@ class UserViewSet(core_views.HistoryViewSetMixin, core_views.ActionsViewSet):
         user = self.get_object()
 
         # Only allow users to view their own data access, or staff/support
-        if not (
-            request.user == user or request.user.is_staff or request.user.is_support
-        ):
+        if not (request.user == user or has_support_access(request)):
             raise PermissionDenied(
                 _("You do not have permission to view this user's data access.")
             )
@@ -2052,9 +2054,7 @@ class UserViewSet(core_views.HistoryViewSetMixin, core_views.ActionsViewSet):
         user = self.get_object()
 
         # Only allow users to view their own history, or staff/support
-        if not (
-            request.user == user or request.user.is_staff or request.user.is_support
-        ):
+        if not (request.user == user or has_support_access(request)):
             raise PermissionDenied(
                 _("You do not have permission to view this user's data access history.")
             )
@@ -2621,7 +2621,7 @@ class SshKeyViewSet(
         return queryset.filter(Q(user=self.request.user) | Q(is_shared=True))
 
     def perform_destroy(self, instance):
-        if instance.is_shared and not self.request.user.is_staff:
+        if instance.is_shared and not has_staff_access(self.request):
             raise PermissionDenied(
                 _("Only staff users are allowed to delete shared SSH public key.")
             )
@@ -2893,7 +2893,7 @@ class AffiliatedOrganizationViewSet(core_views.ActionsViewSet):
     )
     @action(detail=False, methods=["get"])
     def report(self, request):
-        if not request.user.is_staff:
+        if not has_staff_access(request):
             raise PermissionDenied()
         rows = []
         for org in models.AffiliatedOrganization.objects.all().order_by("name"):

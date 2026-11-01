@@ -5,6 +5,7 @@ from rest_framework import exceptions
 
 from waldur_core.configuration import config
 from waldur_core.core import exceptions as core_exceptions
+from waldur_core.core.permissions import has_staff_access, has_support_access
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CustomerRole, OfferingRole
 from waldur_core.permissions.models import UserRole
@@ -43,7 +44,7 @@ RESOURCE_SLUG_PERMISSION_SOURCES = [
 
 
 def can_register_service_provider(request, customer):
-    if request.user.is_staff:
+    if has_staff_access(request):
         return
 
     if has_permission(request, PermissionEnum.REGISTER_SERVICE_PROVIDER, customer):
@@ -263,8 +264,7 @@ def user_can_list_importable_resources(
     if not offering:
         return
 
-    user = request.user
-    if user.is_staff:
+    if has_staff_access(request):
         return
 
     if offering.shared:
@@ -320,7 +320,7 @@ def check_order_creation_permission(request, view, resource: models.Resource = N
         return
 
     user = request.user
-    if user.is_staff or user.is_support:
+    if has_support_access(request):
         return
 
     project = resource.project
@@ -398,7 +398,7 @@ def user_can_set_end_date_by_provider(
     # non-deprecated action accepts.
     if not obj:
         return
-    if request.user.is_support:
+    if has_support_access(request):
         return
     if any(
         has_permission(request, PermissionEnum.SET_RESOURCE_END_DATE, scope)
@@ -446,7 +446,7 @@ def user_can_update_thumbnail(request, view, obj: models.Offering | None = None)
 
     offering = obj
 
-    if request.user.is_staff:
+    if has_staff_access(request):
         return
 
     if offering.state not in (
@@ -523,7 +523,7 @@ def check_tos_consent_permission(request, view, obj=None):
 
     user = request.user
     offering = obj.offering
-    if user.is_staff or user.is_support:
+    if has_support_access(request):
         return
 
     if not offering.plugin_options.get(
@@ -572,7 +572,7 @@ def can_manage_tag(request, view, tag=None):
     user = request.user
 
     # Staff can manage any tag
-    if user.is_staff:
+    if has_staff_access(request):
         return
 
     # Creator can manage their own tag
@@ -591,7 +591,7 @@ def is_service_provider_or_staff(request, view, obj=None):
 
     user = request.user
 
-    if user.is_staff:
+    if has_staff_access(request):
         return
 
     # Check if user belongs to any service provider organization
@@ -617,7 +617,7 @@ def can_manage_offering_lifecycle(request, view, obj=None):
     When ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT is False,
     only staff can perform offering lifecycle operations.
     """
-    if request.user.is_staff:
+    if has_staff_access(request):
         return
     if not config.ALLOW_SERVICE_PROVIDER_OFFERING_MANAGEMENT:
         raise exceptions.PermissionDenied()
@@ -680,7 +680,9 @@ def can_view_offering_user_attribute_config(request, view, obj=None):
     """
     if not obj:
         return
-    if structure_permissions._has_owner_access(request.user, obj.customer):
+    if structure_permissions._has_owner_access(
+        request.user, obj.customer, has_staff_access(request)
+    ):
         return
     if has_permission_on_any_source(
         request, PermissionEnum.UPDATE_OFFERING_USER, obj, OFFERING_ADMIN_SOURCES

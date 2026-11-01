@@ -2,6 +2,7 @@ from django.conf import settings
 from django.utils.translation import gettext_lazy as _
 from rest_framework import exceptions
 
+from waldur_core.core.permissions import has_staff_access, has_support_access
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import (
     CustomerRole,
@@ -25,7 +26,7 @@ def _check_permissions(permission):
         if not instance:
             return
 
-        if request.user.is_staff:
+        if has_staff_access(request):
             return
 
         if has_permission(request, permission, instance.project):
@@ -58,7 +59,7 @@ def has_permissions_for_console(request, view, instance=None):
     if not instance:
         return
 
-    if request.user.is_staff:
+    if has_staff_access(request):
         return
 
     if settings.WALDUR_OPENSTACK["ALLOW_CUSTOMER_USERS_OPENSTACK_CONSOLE_ACCESS"]:
@@ -83,7 +84,7 @@ def can_diagnose_openstack_instance(request, view, instance=None):
     if not instance:
         return
     user = request.user
-    if user.is_staff or user.is_support:
+    if has_support_access(request):
         return
     service_settings = getattr(instance.tenant, "service_settings", None)
     customer = getattr(service_settings, "customer", None) if service_settings else None
@@ -99,7 +100,7 @@ def can_update_tenant_quotas_as_service_provider(request, view, tenant=None):
     if not tenant:
         return
 
-    if request.user.is_staff:
+    if has_staff_access(request):
         return
 
     service_settings = tenant.service_settings

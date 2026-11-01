@@ -96,6 +96,7 @@ from waldur_core.core.exceptions import IncorrectStateException
 from waldur_core.core.mixins import EagerLoadMixin
 from waldur_core.core.models import User
 from waldur_core.core.pagination import LinkHeaderPagination
+from waldur_core.core.permissions import has_staff_access, has_support_access
 from waldur_core.core.renderers import PlainTextRenderer
 from waldur_core.core.serializers import (
     EmptySerializer,
@@ -2531,7 +2532,7 @@ def can_update_offering(request, view, obj: models.Offering | None = None):
     if not offering:
         return
 
-    if request.user.is_staff:
+    if has_staff_access(request):
         return
 
     has_update_permission = any(
@@ -2916,7 +2917,7 @@ class ProviderOfferingViewSet(
         serializer = serializers.ProviderOfferingSerializer(
             offering, many=False, context=self.get_serializer_context()
         )
-        if self.request.user.is_staff is not True:
+        if not has_staff_access(self.request):
             if serializer.data["resources_count"] != 0:
                 return Response(
                     {"detail": _("Offering was not deleted since it has resources.")},
@@ -6892,7 +6893,7 @@ class ConsumerResourceProjectViewSet(UserRoleMixin, core_views.ActionsViewSet):
             "yes",
         )
         if force:
-            if not self.request.user.is_staff:
+            if not has_staff_access(self.request):
                 raise PermissionDenied(
                     "Force-delete (?force=true) requires staff permissions."
                 )
@@ -7207,7 +7208,7 @@ class OfferingRoleViewSet(core_views.ActionsViewSet):
         availabilities = instance.availability.filter(content_type=offering_ct)
         offering_ids = list(availabilities.values_list("object_id", flat=True))
         if not offering_ids:
-            if not self.request.user.is_staff:
+            if not has_staff_access(self.request):
                 raise PermissionDenied()
             return
         for offering in models.Offering.objects.filter(id__in=offering_ids):
@@ -7267,7 +7268,7 @@ class OfferingRoleViewSet(core_views.ActionsViewSet):
                 ):
                     raise PermissionDenied()
                 self._reject_if_profile_bound(offering, "delete")
-        elif not self.request.user.is_staff:
+        elif not has_staff_access(self.request):
             raise PermissionDenied()
         instance.delete()
 
@@ -7286,7 +7287,7 @@ class OfferingProfileViewSet(core_views.ActionsViewSet):
     lookup_field = "uuid"
 
     def _check_staff(self):
-        if not self.request.user.is_staff:
+        if not has_staff_access(self.request):
             raise PermissionDenied("Only staff can manage service profiles.")
 
     def perform_create(self, serializer):
@@ -8017,7 +8018,7 @@ class OrderViewSet(
     @staticmethod
     def check_create_permissions(request, view, obj=None):
         user = request.user
-        if user.is_staff or user.is_support:
+        if has_support_access(request):
             return
         serializer = view.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -8693,7 +8694,7 @@ class OrderViewSet(
     )
     @action(detail=True, methods=["post"])
     def unlink(self, request, uuid=None):
-        if not request.user.is_staff:
+        if not has_staff_access(request):
             raise PermissionDenied()
         order: models.Order = self.get_object()
         logger.info("Starting unlink for order %s", order.uuid)
@@ -9225,7 +9226,7 @@ class BaseResourceViewSet(
                 )
 
             if (
-                not request.user.is_staff
+                not has_staff_access(request)
                 and models.Resource.objects.filter(pk=resource.pk)
                 .filter(models.slug_locked_q())
                 .exists()
@@ -9798,10 +9799,9 @@ def check_prepaid_resource(resource):
 
 def check_end_date_change_for_prepaid(resource, request):
     """For prepaid resources, only staff can manually change the end date."""
-    if (
-        resource.offering.components.filter(is_prepaid=True).exists()
-        and not request.user.is_staff
-    ):
+    if resource.offering.components.filter(
+        is_prepaid=True
+    ).exists() and not has_staff_access(request):
         raise ValidationError(
             _(
                 "Only staff can manually change the termination date of a prepaid resource. "
@@ -12059,7 +12059,7 @@ class OfferingFileViewSet(core_views.ActionsViewSet):
         user = request.user
         offering = serializer.validated_data["offering"]
 
-        if user.is_staff or (
+        if has_staff_access(request) or (
             offering.customer and offering.customer.has_user(user, CustomerRole.OWNER)
         ):
             return
@@ -13636,8 +13636,7 @@ class ProjectPosixGroupsViewSet(rf_viewsets.ViewSet):
 
         user = request.user
         if not (
-            user.is_staff
-            or user.is_support
+            has_support_access(request)
             or project.id in get_connected_projects(user)
             or project.customer_id in get_connected_customers(user)
         ):
@@ -18913,7 +18912,7 @@ class UserOfferingConsentViewSet(core_views.ActionsViewSet):
         """Revoke consent to Terms of Service."""
         consent = self.get_object()
 
-        if not request.user.is_staff and consent.user != request.user:
+        if not has_staff_access(request) and consent.user != request.user:
             raise PermissionDenied("You don't have permission to revoke this consent.")
 
         consent.revoke()
@@ -19024,9 +19023,7 @@ class CourseAccountViewSet(core_views.ActionsViewSet):
 
         if request.method != "POST" or is_browsable_api_check:
             # For OPTIONS, GET, or browsable API checks, just check if user can create in general
-            if request.user.is_authenticated and (
-                request.user.is_staff or getattr(request.user, "is_support", False)
-            ):
+            if request.user.is_authenticated and (has_support_access(request)):
                 return
             if not request.user.is_authenticated:
                 raise PermissionDenied("Authentication required")
@@ -20406,8 +20403,7 @@ class ProjectOrderAutoApprovalViewSet(core_views.ActionsViewSet):
 
     @staticmethod
     def check_create_permissions(request, view, obj=None):
-        user = request.user
-        if user.is_staff or user.is_support:
+        if has_support_access(request):
             return
         serializer = view.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -20570,7 +20566,7 @@ class OfferingMergeViewSet(core_views.ActionsViewSet):
             raise IncorrectStateException(
                 _("A merge in state %s cannot be previewed.") % merge.state
             )
-        if request.user.is_staff:
+        if has_staff_access(request):
             try:
                 data = offering_merge.preview(merge).preview
             except offering_merge.OfferingMergeError as error:

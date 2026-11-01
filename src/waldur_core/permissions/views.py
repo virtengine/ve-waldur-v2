@@ -32,6 +32,7 @@ from waldur_core.core.permissions import (
     IsAdminOrReadOnly,
     IsStaff,
     PATScopeAwareIsAdminUser,
+    has_staff_access,
 )
 from waldur_core.core.serializers import get_localized_field_names
 from waldur_core.core.utils import get_ip_address, is_uuid_like
@@ -491,8 +492,7 @@ class CustomerRoleConcealmentViewSet(ActionsViewSet):
 
     def get_queryset(self):
         qs = super().get_queryset()
-        user = self.request.user
-        if not (user and user.is_authenticated and user.is_staff):
+        if not has_staff_access(self.request):
             return qs.none()
         return qs
 
@@ -519,8 +519,7 @@ class RoleAvailabilityViewSet(ActionsViewSet):
 
     def get_queryset(self):
         qs = super().get_queryset()
-        user = self.request.user
-        if not (user and user.is_authenticated and user.is_staff):
+        if not has_staff_access(self.request):
             return qs.none()
         return qs
 

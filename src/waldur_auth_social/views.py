@@ -41,7 +41,7 @@ from waldur_core.configuration import config
 from waldur_core.core import permissions as core_permissions
 from waldur_core.core.authentication import refresh_token, set_authentication_method
 from waldur_core.core.models import TokenExchangeCode, User
-from waldur_core.core.permissions import PATScopeAwareIsAdminUser
+from waldur_core.core.permissions import PATScopeAwareIsAdminUser, has_staff_access
 from waldur_core.core.serializers import EmptySerializer
 from waldur_core.core.user_attributes import get_federated_identity_sync_allowed_fields
 from waldur_core.core.views import login_failed
@@ -660,7 +660,7 @@ class RemoteEduteamsView(generics.GenericAPIView):
         responses={200: RemoteEduteamsUUIDSerializer},
     )
     def post(self, request, *args, **kwargs):
-        if not request.user.is_staff and not request.user.is_identity_manager:
+        if not has_staff_access(request) and not request.user.is_identity_manager:
             return Response(
                 "Only staff and identity manager are allowed to sync remote users.",
                 status=status.HTTP_403_FORBIDDEN,
@@ -716,7 +716,7 @@ class IdentityBridgeView(generics.GenericAPIView):
 
         # 2. Check caller permissions
         caller = request.user
-        if not caller.is_staff and not caller.is_identity_manager:
+        if not has_staff_access(request) and not caller.is_identity_manager:
             return Response(
                 "Only staff and identity managers are allowed to use the Identity Bridge.",
                 status=status.HTTP_403_FORBIDDEN,
@@ -732,7 +732,7 @@ class IdentityBridgeView(generics.GenericAPIView):
         source = serializer.validated_data["source"]
 
         # 4. Check ISD scope: non-staff must have source in managed_isds
-        if not caller.is_staff:
+        if not has_staff_access(request):
             managed_isds = getattr(caller, "managed_isds", []) or []
             if source not in managed_isds:
                 return Response(
@@ -790,7 +790,7 @@ class IdentityBridgeRemoveView(generics.GenericAPIView):
 
         # 2. Check caller permissions
         caller = request.user
-        if not caller.is_staff and not caller.is_identity_manager:
+        if not has_staff_access(request) and not caller.is_identity_manager:
             return Response(
                 "Only staff and identity managers are allowed to use the Identity Bridge.",
                 status=status.HTTP_403_FORBIDDEN,
@@ -804,7 +804,7 @@ class IdentityBridgeRemoveView(generics.GenericAPIView):
         source = serializer.validated_data["source"]
 
         # 4. Check ISD scope: non-staff must have source in managed_isds
-        if not caller.is_staff:
+        if not has_staff_access(request):
             managed_isds = getattr(caller, "managed_isds", []) or []
             if source not in managed_isds:
                 return Response(
@@ -846,7 +846,7 @@ class IdentityBridgeStatsView(generics.GenericAPIView):
         responses={200: IdentityBridgeStatsSerializer},
     )
     def get(self, request, *args, **kwargs):
-        if not request.user.is_staff:
+        if not has_staff_access(request):
             return Response(
                 "Only staff users can view Identity Bridge statistics.",
                 status=status.HTTP_403_FORBIDDEN,
@@ -879,7 +879,7 @@ class IdentityBridgeAllowedFieldsView(generics.GenericAPIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
         caller = request.user
-        if not caller.is_staff and not caller.is_identity_manager:
+        if not has_staff_access(request) and not caller.is_identity_manager:
             return Response(
                 "Only staff and identity managers can access this.",
                 status=status.HTTP_403_FORBIDDEN,

@@ -33,6 +33,7 @@ from waldur_core.configuration import config
 from waldur_core.core import filters as core_filters
 from waldur_core.core import permissions as core_permissions
 from waldur_core.core.models import User
+from waldur_core.core.permissions import has_support_access
 from waldur_core.core.views import (
     ActionsViewSet,
     ConstanceCheckExtensionMixin,
@@ -113,7 +114,7 @@ class ChatViewSet(LLMConfigurationMixin, viewsets.ViewSet):
     ViewSet for streaming AI chat interactions.
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, core_permissions.TokenCarriesUserRole]
 
     def get_exception_handler(self):
         # Lets ``CapacityException.headers`` (Retry-After) flow onto the
@@ -466,7 +467,11 @@ class TokenQuotaViewSet(ActionsViewSet):
         "partial_update",
         "destroy",
     ]
-    permission_classes = [IsAuthenticated, core_permissions.ActionsPermission]
+    permission_classes = [
+        IsAuthenticated,
+        core_permissions.TokenCarriesUserRole,
+        core_permissions.ActionsPermission,
+    ]
 
     @extend_schema(
         parameters=[
@@ -499,7 +504,7 @@ class TokenQuotaViewSet(ActionsViewSet):
         if "user_uuid" in request.query_params:
             requested_user_uuid = request.query_params.get("user_uuid")
             if str(user.uuid) != requested_user_uuid and not (
-                user.is_staff or user.is_support
+                has_support_access(request)
             ):
                 raise rf_exceptions.PermissionDenied(
                     "You can only view your own usage."
@@ -558,7 +563,7 @@ class TokenQuotaViewSet(ActionsViewSet):
 
 
 class ToolViewSet(LLMConfigurationMixin, viewsets.ViewSet):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, core_permissions.TokenCarriesUserRole]
 
     @extend_schema(
         request=serializers.ToolExecuteSerializer,
@@ -751,7 +756,11 @@ class ChatSessionViewSet(LLMConfigurationMixin, ActionsViewSet):
     filter_backends = [core_filters.StaffOrUserFilter]
     lookup_field = "uuid"
     http_method_names = ["get", "options"]
-    permission_classes = [IsAuthenticated, core_permissions.ActionsPermission]
+    permission_classes = [
+        IsAuthenticated,
+        core_permissions.TokenCarriesUserRole,
+        core_permissions.ActionsPermission,
+    ]
     disabled_actions = ["create", "update", "partial_update", "destroy"]
 
     def retrieve(self, request, *args, **kwargs):
@@ -783,7 +792,11 @@ class ThreadSessionViewSet(LLMConfigurationMixin, ActionsViewSet):
     serializer_class = serializers.ThreadSessionSerializer
     lookup_field = "uuid"
     http_method_names = ["get", "post", "options"]
-    permission_classes = [IsAuthenticated, core_permissions.ActionsPermission]
+    permission_classes = [
+        IsAuthenticated,
+        core_permissions.TokenCarriesUserRole,
+        core_permissions.ActionsPermission,
+    ]
     disabled_actions = ["create", "destroy", "update", "partial_update"]
     filterset_class = ThreadSessionFilter
 
@@ -1002,7 +1015,11 @@ class MessageViewSet(LLMConfigurationMixin, ActionsViewSet):
     lookup_field = "uuid"
     pagination_class = None  # Messages are thread-scoped; return all in one response
     http_method_names = ["get", "post", "options"]
-    permission_classes = [IsAuthenticated, core_permissions.ActionsPermission]
+    permission_classes = [
+        IsAuthenticated,
+        core_permissions.TokenCarriesUserRole,
+        core_permissions.ActionsPermission,
+    ]
     disabled_actions = ["create", "destroy", "update", "partial_update", "retrieve"]
 
     # Feedback permissions are enforced by thread__chat_session__user filter
@@ -1090,7 +1107,11 @@ class SystemPromptViewSet(ActionsViewSet):
     queryset = models.SystemPrompt.objects.all().order_by("-created")
     serializer_class = serializers.SystemPromptSerializer
     lookup_field = "uuid"
-    permission_classes = [IsAuthenticated, core_permissions.ActionsPermission]
+    permission_classes = [
+        IsAuthenticated,
+        core_permissions.TokenCarriesUserRole,
+        core_permissions.ActionsPermission,
+    ]
 
     create_permissions = [permissions.is_staff]
     update_permissions = [permissions.is_staff]

@@ -15,6 +15,7 @@ from rest_framework.response import Response
 
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
+from waldur_core.core.permissions import has_staff_access, has_support_access
 from waldur_core.core.serializers import DetailSerializer, StatusSerializer
 from waldur_core.core.utils import is_uuid_like
 from waldur_core.logging import event_logger
@@ -1247,9 +1248,10 @@ def can_view_project_costs(request, view, obj=None, **kwargs):
     project = obj.project
     customer = project.customer
     if (
-        user.is_staff
-        or user.is_support
-        or structure_permissions._has_owner_access(user, customer)
+        has_support_access(request)
+        or structure_permissions._has_owner_access(
+            user, customer, has_staff_access(request)
+        )
         or has_permission(request, PermissionEnum.VIEW_CUSTOMER_ACCOUNTING, customer)
         or (customer.display_billing_info_in_projects and project.has_user(user))
     ):

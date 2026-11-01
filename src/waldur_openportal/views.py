@@ -19,7 +19,11 @@ from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
 from waldur_core.core import views as core_views
 from waldur_core.core.enums import ReviewStates
-from waldur_core.core.permissions import IsAdminOrReadOnly
+from waldur_core.core.permissions import (
+    IsAdminOrReadOnly,
+    has_staff_access,
+    has_support_access,
+)
 from waldur_core.core.serializers import ReviewCommentSerializer
 from waldur_core.core.validators import StateValidator
 from waldur_core.permissions.fixtures import ServiceProviderRole
@@ -346,7 +350,7 @@ class UserInfoViewSet(core_views.ActionsViewSet):
 
         user = userinfo.user
 
-        if request.user != user and not request.user.is_staff:
+        if request.user != user and not has_staff_access(request):
             logger.error(
                 f"User {request.user} is not allowed to set shortname for user {user}"
             )
@@ -424,7 +428,7 @@ class ProjectInfoViewSet(core_views.ActionsViewSet):
 
         project = projectinfo.project
 
-        if not request.user.is_staff:
+        if not has_staff_access(request):
             logger.error(
                 f"User {request.user} is not allowed to set shortname for project {project}"
             )
@@ -463,7 +467,7 @@ class ProjectInfoViewSet(core_views.ActionsViewSet):
 
         project = projectinfo.project
 
-        if not request.user.is_staff:
+        if not has_staff_access(request):
             logger.error(
                 f"User {request.user} is not allowed to set allowed_destinations for project {project}"
             )
@@ -485,18 +489,21 @@ class ProjectInfoViewSet(core_views.ActionsViewSet):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
-def _has_owner_or_manager_access(user, customer):
+def _has_owner_or_manager_access(user, customer, staff=None):
     """
     Check if the user has owner or manager access to the project class.
     """
-    return _has_owner_access(user, customer) or customer.has_user(
+    return _has_owner_access(user, customer, staff) or customer.has_user(
         user, role=ServiceProviderRole.MANAGER
     )
 
 
 def user_is_staff_or_service_provider_owner_or_service_provider_manager(
-    user, project: models.ManagedProject | None = None
+    user, project: models.ManagedProject | None = None, staff=None
 ):
+    # `staff` is whether the request acts as staff (`has_staff_access`).
+    if staff is None:
+        staff = user.is_staff
     if not project:
         raise PermissionDenied()
 
@@ -507,7 +514,7 @@ def user_is_staff_or_service_provider_owner_or_service_provider_manager(
     if project_template is None:
         raise PermissionDenied()
 
-    if user.is_staff:
+    if staff:
         return True
 
     if project_template.provider is None:
@@ -517,16 +524,19 @@ def user_is_staff_or_service_provider_owner_or_service_provider_manager(
         raise PermissionDenied()
 
     if _has_owner_or_manager_access(
-        user, project_template.provider
-    ) and _has_owner_access(user, project_template.customer):
+        user, project_template.provider, staff
+    ) and _has_owner_access(user, project_template.customer, staff):
         return True
 
     raise PermissionDenied()
 
 
 def user_is_staff_or_project_template_owner(
-    user, project_template: models.ProjectTemplate | None = None
+    user, project_template: models.ProjectTemplate | None = None, staff=None
 ):
+    # `staff` is whether the request acts as staff (`has_staff_access`).
+    if staff is None:
+        staff = user.is_staff
     if not project_template:
         raise PermissionDenied()
 
@@ -536,10 +546,10 @@ def user_is_staff_or_project_template_owner(
     if project_template.customer is None:
         raise PermissionDenied()
 
-    if user.is_staff:
+    if staff:
         return True
 
-    if _has_owner_access(user, project_template.provider):
+    if _has_owner_access(user, project_template.provider, staff):
         return True
 
     raise PermissionDenied()
@@ -554,13 +564,17 @@ class IsStaffOrProjectTemplateOwner(BasePermission):
         obj = view.get_object() if hasattr(view, "get_object") else None
 
         if isinstance(obj, models.ProjectTemplate):
-            return user_is_staff_or_project_template_owner(request.user, obj)
+            return user_is_staff_or_project_template_owner(
+                request.user, obj, has_staff_access(request)
+            )
         else:
             raise PermissionDenied()
 
     def has_object_permission(self, request, view, obj):
         if isinstance(obj, models.ProjectTemplate):
-            return user_is_staff_or_project_template_owner(request.user, obj)
+            return user_is_staff_or_project_template_owner(
+                request.user, obj, has_staff_access(request)
+            )
         else:
             raise PermissionDenied()
 
@@ -606,17 +620,14 @@ class ProjectTemplateViewSet(core_views.ActionsViewSet):
             serializer.is_valid(raise_exception=True)
             logger.info(f"Validated data: {serializer.validated_data}")
 
-            try:
-                is_staff = request.user.is_staff
-            except AttributeError:
-                is_staff = False
+            is_staff = has_staff_access(request)
 
             # we need to verify that the user has the right permission in the
             # provider organization
             if not (
                 is_staff
                 or _has_owner_access(
-                    request.user, serializer.validated_data.get("provider")
+                    request.user, serializer.validated_data.get("provider"), is_staff
                 )
             ):
                 logger.error(
@@ -665,15 +676,14 @@ class ProjectTemplateViewSet(core_views.ActionsViewSet):
 
             # Check if provider is being changed and validate permissions
             if "provider" in serializer.validated_data:
-                try:
-                    is_staff = request.user.is_staff
-                except AttributeError:
-                    is_staff = False
+                is_staff = has_staff_access(request)
 
                 if not (
                     is_staff
                     or _has_owner_access(
-                        request.user, serializer.validated_data.get("provider")
+                        request.user,
+                        serializer.validated_data.get("provider"),
+                        is_staff,
                     )
                 ):
                     logger.error(
@@ -721,15 +731,14 @@ class ProjectTemplateViewSet(core_views.ActionsViewSet):
 
             # Check if provider is being changed and validate permissions
             if "provider" in serializer.validated_data:
-                try:
-                    is_staff = request.user.is_staff
-                except AttributeError:
-                    is_staff = False
+                is_staff = has_staff_access(request)
 
                 if not (
                     is_staff
                     or _has_owner_access(
-                        request.user, serializer.validated_data.get("provider")
+                        request.user,
+                        serializer.validated_data.get("provider"),
+                        is_staff,
                     )
                 ):
                     logger.error(
@@ -778,7 +787,7 @@ class IsStaffOrServiceProviderOwnerOrManager(BasePermission):
 
         if isinstance(obj, models.ManagedProject):
             return user_is_staff_or_service_provider_owner_or_service_provider_manager(
-                request.user, obj
+                request.user, obj, has_staff_access(request)
             )
         else:
             raise PermissionDenied()
@@ -786,7 +795,7 @@ class IsStaffOrServiceProviderOwnerOrManager(BasePermission):
     def has_object_permission(self, request, view, obj):
         if isinstance(obj, models.ManagedProject):
             return user_is_staff_or_service_provider_owner_or_service_provider_manager(
-                request.user, obj
+                request.user, obj, has_staff_access(request)
             )
         else:
             raise PermissionDenied()
@@ -1398,7 +1407,7 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
         CustomerOwner of the organisation that owns current_project.
         """
         user = request.user
-        if user.is_staff or user.is_support:
+        if has_support_access(request):
             return
         if remote_project.current_project is None:
             raise PermissionDenied(

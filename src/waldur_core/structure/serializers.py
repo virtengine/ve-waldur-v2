@@ -30,9 +30,11 @@ from waldur_core.core import serializers as core_serializers
 from waldur_core.core import template_utils
 from waldur_core.core import utils as core_utils
 from waldur_core.core import validators as core_validators
+from waldur_core.core.auth_utils import is_pat_auth
 from waldur_core.core.enums import CoreStates, ReviewStates
 from waldur_core.core.fields import MappedChoiceField
 from waldur_core.core.models import DESCRIPTION_LENGTH
+from waldur_core.core.permissions import has_staff_access
 from waldur_core.passkeys import policy as passkey_policy
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CustomerRole
@@ -2799,7 +2801,9 @@ class UserSerializer(
             if "notifications_enabled" in fields:
                 fields["notifications_enabled"].read_only = True
 
-        if not self._can_see_token(user):
+        # A personal access token must not hand out the API token, which acts
+        # without the personal access token's scopes, nor extend its lifetime.
+        if is_pat_auth(getattr(request, "auth", None)) or not self._can_see_token(user):
             if "token" in fields:
                 del fields["token"]
             if "token_lifetime" in fields:
@@ -2899,8 +2903,8 @@ class UserSerializer(
         if self._is_impersonated():
             return True
         try:
-            return self.context["request"].user.is_staff
-        except (KeyError, AttributeError):
+            return has_staff_access(self.context["request"])
+        except KeyError:
             return False
 
     def validate_token_lifetime(self, value):

@@ -30,6 +30,7 @@ from waldur_core.configuration.models import Setting, Source
 from waldur_core.core import mixins as core_mixins
 from waldur_core.core import permissions as core_permissions
 from waldur_core.core import views as core_views
+from waldur_core.core.permissions import has_staff_access, has_support_access
 from waldur_core.core.serializers import EmptySerializer, StatusSerializer
 from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
 from waldur_core.structure import (
@@ -257,7 +258,7 @@ class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
 
     def _comment_permission(request, view, obj: models.Issue | None = None):
         user = request.user
-        if user.is_staff or user.is_support or not obj:
+        if has_support_access(request) or not obj:
             return
         issue = obj
         # The caller may reply on their own ticket. Scope is already settled by
@@ -381,7 +382,7 @@ class IssueViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
 
     def _escalate_permission(request, view, obj=None):
         user = request.user
-        if user.is_staff or user.is_support:
+        if has_support_access(request):
             return
         if obj and obj.caller == user:
             return
@@ -1076,7 +1077,7 @@ class ProviderHelpdeskViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
         return self.queryset.filter(service_provider__customer__in=provider_customers)
 
     def _is_owner_or_staff(request, view, obj=None):
-        if request.user.is_staff:
+        if has_staff_access(request):
             return
         # DRF invokes permissions at view-level with obj=None before the object
         # is loaded; defer to the object-level check instead of rejecting owners.
@@ -1142,7 +1143,7 @@ class ProviderSupportUserViewSet(CheckExtensionMixin, core_views.ActionsViewSet)
         )
 
     def _is_owner_or_staff(request, view, obj=None):
-        if request.user.is_staff:
+        if has_staff_access(request):
             return
         # DRF invokes permissions at view-level with obj=None before the object
         # is loaded; defer to the object-level check instead of rejecting owners.
@@ -1198,7 +1199,7 @@ class ProviderCannedResponseViewSet(CheckExtensionMixin, core_views.ActionsViewS
         )
 
     def _is_owner_or_staff(request, view, obj=None):
-        if request.user.is_staff:
+        if has_staff_access(request):
             return
         # DRF invokes permissions at view-level with obj=None before the object
         # is loaded; defer to the object-level check instead of rejecting owners.
@@ -1282,7 +1283,7 @@ class SavedFilterViewSet(CheckExtensionMixin, core_views.ActionsViewSet):
     ]
 
     def _is_owner_or_staff(request, view, obj=None):
-        if request.user.is_staff:
+        if has_staff_access(request):
             return
         if obj and obj.user == request.user:
             return
@@ -1922,9 +1923,7 @@ class SmaxWebHookReceiverView(CheckExtensionMixin, generics.GenericAPIView):
 )
 @decorators.api_view(["GET", "POST"])
 def sync_issues(request):
-    if not request.user.is_active or not (
-        request.user.is_staff or request.user.is_support
-    ):
+    if not request.user.is_active or not has_support_access(request):
         return response.Response(status=status.HTTP_403_FORBIDDEN)
 
     tasks.sync_issues.delay()
@@ -1991,7 +1990,7 @@ class AtlassianSettingsDiscoveryViewSet(CheckExtensionMixin, core_views.ActionsV
     serializer_class = EmptySerializer
 
     def is_staff(request, view, obj=None):
-        if not request.user.is_staff:
+        if not has_staff_access(request):
             raise rf_exceptions.PermissionDenied()
 
     def _get_discovery_service(self, credentials_data: dict):

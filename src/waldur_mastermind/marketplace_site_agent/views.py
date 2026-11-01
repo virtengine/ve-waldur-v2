@@ -16,7 +16,12 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 
 from waldur_core.core import utils as core_utils
-from waldur_core.core.permissions import IsStaff, IsSupport
+from waldur_core.core.permissions import (
+    IsStaff,
+    IsSupport,
+    has_staff_access,
+    has_support_access,
+)
 from waldur_core.core.views import ActionsViewSet
 from waldur_core.logging import backend as logging_backend
 from waldur_core.logging import enums as logging_enums
@@ -126,7 +131,7 @@ class ResourceSyncUserRolesView(generics.GenericAPIView):
 
     def check_object_permissions(self, request, obj):
         super().check_object_permissions(request, obj)
-        if request.user.is_staff:
+        if has_staff_access(request):
             return
         if has_permission(
             request, PermissionEnum.UPDATE_OFFERING, obj.offering
@@ -209,7 +214,7 @@ class AgentIdentityViewSet(ActionsViewSet):
                 raise PermissionDenied("Authentication required")
 
             # For OPTIONS, GET, or browsable API checks, just check if user can create in general
-            if request.user.is_staff or getattr(request.user, "is_support", False):
+            if has_support_access(request):
                 return
 
             # Check if user has permission to any agent-based offerings

@@ -14,6 +14,7 @@ from waldur_core.configuration import config
 from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates
 from waldur_core.core.models import SshPublicKey, User
+from waldur_core.core.permissions import has_staff_access
 from waldur_core.quotas import exceptions as quotas_exceptions
 from waldur_core.quotas.models import QuotaModelMixin
 from waldur_core.structure.models import Project, ServiceSettings
@@ -416,7 +417,7 @@ def get_keycloak_group_scope_and_settings(group: models.KeycloakGroup):
 
 def check_keycloak_group_scope_permissions(request, view, scope):
     """Staff and administrators of the cluster's project manage its role groups."""
-    if request.user.is_staff:
+    if has_staff_access(request):
         return
     cluster = scope if isinstance(scope, models.Cluster) else scope.cluster
     if cluster is None:

@@ -26,6 +26,7 @@ from waldur_core.core import utils as core_utils
 from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
 from waldur_core.core.enums import CoreStates
+from waldur_core.core.permissions import has_staff_access
 from waldur_core.core.serializers import DetailSerializer, StatusSerializer
 from waldur_core.core.utils import SubqueryCount
 from waldur_core.logging import event_logger
@@ -2617,7 +2618,7 @@ class NetworkViewSet(UnmanagedOwnerReadOnlyMixin, structure_views.ResourceViewSe
     # TODO: remove after 1.11.2025
 
     def _check_rbac_policy_permissions(self, user, network, target_tenant):
-        if user.is_staff:
+        if has_staff_access(self.request):
             return
 
         if (
@@ -3981,7 +3982,7 @@ class NetworkRBACPolicyViewSet(core_views.ActionsViewSet):
         ).distinct()
 
     def _check_rbac_policy_permissions(self, user, network, target_tenant):
-        if user.is_staff:
+        if has_staff_access(self.request):
             return
 
         if (

@@ -106,6 +106,22 @@ Key implementation details in `waldur_core.permissions.utils`:
 - If a user loses a role after creating a PAT, the PAT's matching permissions stop working immediately
 - Scope validation at creation ensures users can only request permissions they currently have
 
+### Staff and support checks
+
+A staff user's PAT acts as staff only with the `STAFF.ACCESS` scope, and as
+support only with `STAFF.ACCESS` or `SUPPORT.ACCESS`. A check that lets staff
+or support through must therefore ask the request, not the user:
+
+- `has_staff_access(request)` and `has_support_access(request)` in
+  `waldur_core.core.permissions`, or the permission classes built on them
+  (`IsStaff`, `IsSupport`, `IsStaffOrSupportUser`, `PATScopeAwareIsAdminUser`)
+- the function permissions `structure_permissions.is_staff` and
+  `is_staff_or_support`, which call them
+
+`request.user.is_staff` alone lets a token scoped to, say, `LIST_ORDERS` act as
+full staff. Not yet covered: serializer-level checks and what such a token can
+read, since `filter_queryset_for_user` receives only the user.
+
 ## Security
 
 ### PAT-via-PAT Blocked

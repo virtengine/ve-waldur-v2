@@ -18,6 +18,7 @@ from waldur_core.core import permissions as core_permissions
 from waldur_core.core import serializers as core_serializers
 from waldur_core.core import validators as core_validators
 from waldur_core.core.enums import ReviewStates
+from waldur_core.core.permissions import has_staff_access
 from waldur_core.core.views import (
     ActionsViewSet,
     ReadOnlyActionsViewSet,
@@ -168,9 +169,8 @@ class InvitationViewSet(viewsets.ModelViewSet):
                 return
 
         sender = self.request.user.full_name or self.request.user.username
-        if (
-            settings.WALDUR_CORE["ONLY_STAFF_CAN_INVITE_USERS"]
-            and not self.request.user.is_staff
+        if settings.WALDUR_CORE["ONLY_STAFF_CAN_INVITE_USERS"] and not has_staff_access(
+            self.request
         ):
             invitation.state = InvitationState.REQUESTED
             invitation.save()
@@ -368,7 +368,7 @@ class InvitationViewSet(viewsets.ModelViewSet):
     def delete(self, request, uuid=None):
         invitation: models.Invitation = self.get_object()
 
-        if not self.request.user.is_staff:
+        if not has_staff_access(request):
             raise PermissionDenied()
 
         invitation.delete()
@@ -857,7 +857,9 @@ class PermissionRequestViewSet(ReadOnlyActionsViewSet):
         permission_request: models.PermissionRequest = self.get_object()
 
         # Check that the user canceling is the same user who created the request OR is staff
-        if permission_request.created_by != request.user and not request.user.is_staff:
+        if permission_request.created_by != request.user and not has_staff_access(
+            request
+        ):
             raise PermissionDenied(
                 _("You can only cancel your own permission requests.")
             )
@@ -901,7 +903,7 @@ class PermissionRequestViewSet(ReadOnlyActionsViewSet):
     def destroy(self, request, uuid=None):
         permission_request = self.get_object()
 
-        if not request.user.is_staff:
+        if not has_staff_access(request):
             raise PermissionDenied()
 
         permission_request.delete()

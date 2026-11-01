@@ -16,6 +16,7 @@ from rest_framework.response import Response
 from waldur_core.configuration import config
 from waldur_core.core import views as core_views
 from waldur_core.core.exceptions import IncorrectStateException
+from waldur_core.core.permissions import has_staff_access
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.utils import (
     has_permission,
@@ -52,7 +53,7 @@ class RetentionPolicyViewSet(core_views.ActionsViewSet):
 
 
 def _check_definition_owner(request, owner_customer):
-    if request.user.is_staff:
+    if has_staff_access(request):
         return
     if owner_customer is None or not has_permission_on_any_source(
         request,
@@ -146,7 +147,7 @@ class OfferingMetricViewSet(core_views.ActionsViewSet):
     lookup_field = "uuid"
 
     def check_create_permissions(request, view, obj=None):
-        if request.user.is_staff:
+        if has_staff_access(request):
             return
         offering = marketplace_models.Offering.objects.filter(
             uuid=request.data.get("offering") or None
@@ -398,7 +399,7 @@ class OtlpMetricsView(views.APIView):
 
 
 def _goal_permission(request, goal_offering_metric, project):
-    if request.user.is_staff:
+    if has_staff_access(request):
         return
     if project is not None:
         allowed = has_permission(

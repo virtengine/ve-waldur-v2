@@ -3,7 +3,12 @@ from functools import reduce
 
 from rest_framework import exceptions, permissions
 
-from waldur_core.core.permissions import SAFE_METHODS, IsAdminOrReadOnly
+from waldur_core.core.permissions import (
+    SAFE_METHODS,
+    IsAdminOrReadOnly,
+    has_staff_access,
+    has_support_access,
+)
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import (
     CustomerRole,
@@ -12,7 +17,6 @@ from waldur_core.permissions.fixtures import (
     ServiceProviderRole,
 )
 from waldur_core.permissions.utils import (
-    check_pat_staff_scope,
     check_pat_support_scope,
     has_permission,
     has_permission_on_any_source,
@@ -42,7 +46,7 @@ class IsAdminOrOwner(IsAdminOrReadOnly):
 
     def has_permission(self, request, view):
         user = request.user
-        if user.is_staff or request.method in SAFE_METHODS:
+        if has_staff_access(request) or request.method in SAFE_METHODS:
             return True
         elif view.suffix == "List" or request.method == "DELETE":
             return False
@@ -54,12 +58,12 @@ class IsAdminOrOwner(IsAdminOrReadOnly):
 
 
 def is_staff(request, view, obj=None):
-    if not request.user.is_staff:
+    if not has_staff_access(request):
         raise exceptions.PermissionDenied()
 
 
 def is_staff_or_support(request, view, obj=None):
-    if not (request.user.is_staff or request.user.is_support):
+    if not has_support_access(request):
         raise exceptions.PermissionDenied()
 
 
@@ -67,7 +71,7 @@ def is_owner(request, view, obj=None, **kwargs):
     if not obj:
         return
     customer = _get_customer(obj, **kwargs)
-    if not _has_owner_access(request.user, customer):
+    if not _has_owner_access(request.user, customer, has_staff_access(request)):
         raise exceptions.PermissionDenied()
 
 
@@ -75,7 +79,7 @@ def is_administrator(request, view, obj=None, **kwargs):
     if not obj:
         return
     project = _get_project(obj, **kwargs)
-    if not _has_admin_access(request.user, project):
+    if not _has_admin_access(request.user, project, has_staff_access(request)):
         raise exceptions.PermissionDenied()
 
 
@@ -83,7 +87,9 @@ def is_service_manager(request, view, obj=None, **kwargs):
     if not obj:
         return
     customer = _get_customer(obj, **kwargs)
-    if not _has_service_manager_access(request.user, customer):
+    if not _has_service_manager_access(
+        request.user, customer, has_staff_access(request)
+    ):
         raise exceptions.PermissionDenied()
 
 
@@ -92,30 +98,37 @@ def is_offering_manager(request, view, obj=None, **kwargs):
         return
     customer = _get_customer(obj, **kwargs)
     if not (
-        _has_service_manager_access(request.user, customer)
+        _has_service_manager_access(request.user, customer, has_staff_access(request))
         or obj.has_user(request.user, OfferingRole.MANAGER)
     ):
         raise exceptions.PermissionDenied()
 
 
-def _has_owner_access(user, customer: models.Customer):
-    return user.is_staff or customer.has_user(user, CustomerRole.OWNER)
+# `staff` is whether the user acts as staff; permission checks pass
+# `has_staff_access(request)`, so that a personal access token without the
+# staff scope does not. It defaults to the user's flag.
 
 
-def _has_manager_access(user, project: models.Project):
-    return _has_owner_access(user, project.customer) or project.has_user(
+def _has_owner_access(user, customer: models.Customer, staff=None):
+    if staff is None:
+        staff = user.is_staff
+    return staff or customer.has_user(user, CustomerRole.OWNER)
+
+
+def _has_manager_access(user, project: models.Project, staff=None):
+    return _has_owner_access(user, project.customer, staff) or project.has_user(
         user, ProjectRole.MANAGER
     )
 
 
-def _has_service_manager_access(user, customer: models.Customer):
-    return _has_owner_access(user, customer) or customer.has_user(
+def _has_service_manager_access(user, customer: models.Customer, staff=None):
+    return _has_owner_access(user, customer, staff) or customer.has_user(
         user, ServiceProviderRole.MANAGER
     )
 
 
-def _has_admin_access(user, project: models.Project):
-    return _has_manager_access(user, project) or project.has_user(
+def _has_admin_access(user, project: models.Project, staff=None):
+    return _has_manager_access(user, project, staff) or project.has_user(
         user, ProjectRole.ADMIN
     )
 
@@ -134,7 +147,7 @@ def can_answer_project_metadata(request, view, obj=None, **kwargs):
         return
     project = _get_project(obj, **kwargs)
     if not (
-        _has_manager_access(request.user, project)
+        _has_manager_access(request.user, project, has_staff_access(request))
         or _holds_on_project(request, PermissionEnum.UPDATE_PROJECT_METADATA, project)
     ):
         raise exceptions.PermissionDenied()
@@ -152,12 +165,12 @@ def has_project_access(request, view, obj=None, **kwargs):
     project = _get_project(obj, **kwargs)
     if not (
         _has_admin_access(
-            request.user, project
+            request.user, project, has_staff_access(request)
         )  # Covers customer owner + project admin/manager
         or project.has_user(request.user, ProjectRole.MEMBER)  # Project members
         or _holds_on_project(request, PermissionEnum.UPDATE_PROJECT_METADATA, project)
         or _holds_on_project(request, PermissionEnum.UPDATE_PROJECT, project)
-        or (request.user.is_support and check_pat_support_scope(request))
+        or has_support_access(request)
     ):
         raise exceptions.PermissionDenied()
 
@@ -189,7 +202,7 @@ def can_move_project(request, view, obj=None):
     Regular users can move projects if they have CREATE_PROJECT permission
     in BOTH the source and target organizations.
     """
-    if request.user.is_staff and check_pat_staff_scope(request):
+    if has_staff_access(request):
         return
 
     if not obj:

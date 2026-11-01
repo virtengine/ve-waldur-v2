@@ -26,6 +26,7 @@ from waldur_core.core import validators as core_validators
 from waldur_core.core import views as core_views
 from waldur_core.core.enums import CoreStates
 from waldur_core.core.models import User
+from waldur_core.core.permissions import has_staff_access
 from waldur_core.core.serializers import DetailSerializer
 from waldur_core.structure import exceptions as structure_exceptions
 from waldur_core.structure import filters as structure_filters
@@ -61,7 +62,7 @@ class OptionalReadonlyViewset:
         super().initial(request, *args, **kwargs)
         if not django_settings.WALDUR_RANCHER["READ_ONLY_MODE"]:
             return
-        if self.action in ("import_resource", "pull") and request.user.is_staff:
+        if self.action in ("import_resource", "pull") and has_staff_access(request):
             return
         if self.request.method not in SAFE_METHODS:
             raise MethodNotAllowed(method=request.method)
@@ -431,7 +432,7 @@ class CatalogViewSet(OptionalReadonlyViewset, core_views.ActionsViewSet):
 
     def check_catalog_permissions(self, scope):
         user = cast(User, self.request.user)
-        if user.is_staff:
+        if has_staff_access(self.request):
             return
         if isinstance(scope, ServiceSettings):
             raise ValidationError(_("Only staff is allowed to manage global catalogs."))
@@ -695,7 +696,7 @@ class KeycloakGroupViewSet(core_views.ReadOnlyActionsViewSet):
 
 
 def can_manage_keycloak_group_membership(request, view, obj=None):
-    if obj is None or request.user.is_staff:
+    if obj is None or has_staff_access(request):
         return
     scope, _settings = utils.get_keycloak_group_scope_and_settings(obj.group)
     utils.check_keycloak_group_scope_permissions(request, view, scope)
