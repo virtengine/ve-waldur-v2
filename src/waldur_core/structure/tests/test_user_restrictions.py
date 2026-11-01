@@ -1,9 +1,16 @@
 from rest_framework import status, test
 
+from waldur_core.logging.models import Event
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
-from waldur_core.structure.tests import factories
+from waldur_core.structure.tests import factories, fixtures
 from waldur_core.structure.tests.utils import client_add_user
+
+AAI_RESTRICTIONS = {
+    "user_nationalities": ["EE"],
+    "user_organization_types": ["urn:schac:homeOrganizationType:int:university"],
+    "user_assurance_levels": ["https://refeds.org/assurance/IAP/high"],
+}
 
 
 class CustomerUserRestrictionsTest(test.APITestCase):
@@ -244,6 +251,47 @@ class CustomerRestrictionPermissionTest(test.APITestCase):
         # Field should not be changed (read-only for non-staff)
         self.assertEqual(self.customer.user_email_patterns, [])
 
+    def test_staff_can_set_aai_restrictions(self):
+        self.client.force_authenticate(user=self.staff)
+        response = self.client.patch(
+            factories.CustomerFactory.get_url(self.customer),
+            AAI_RESTRICTIONS,
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.customer.refresh_from_db()
+        for field, value in AAI_RESTRICTIONS.items():
+            self.assertEqual(getattr(self.customer, field), value)
+            self.assertEqual(response.data[field], value)
+
+    def test_non_staff_cannot_set_aai_restrictions(self):
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.patch(
+            factories.CustomerFactory.get_url(self.customer),
+            AAI_RESTRICTIONS,
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.customer.refresh_from_db()
+        for field in AAI_RESTRICTIONS:
+            self.assertEqual(getattr(self.customer, field), [])
+
+    def test_aai_restrictions_set_through_the_api_are_enforced(self):
+        self.client.force_authenticate(user=self.staff)
+        self.client.patch(
+            factories.CustomerFactory.get_url(self.customer),
+            {"user_nationalities": ["EE"]},
+            format="json",
+        )
+
+        target_user = factories.UserFactory(nationality="FI")
+        response = client_add_user(
+            self.client, self.staff, target_user, self.customer, CustomerRole.OWNER
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("restrictions", str(response.data))
+
 
 class ProjectRestrictionPermissionTest(test.APITestCase):
     def setUp(self):
@@ -287,3 +335,78 @@ class ProjectRestrictionPermissionTest(test.APITestCase):
         self.project.refresh_from_db()
         # Field should not be changed (read-only for users without CREATE_PROJECT)
         self.assertEqual(self.project.user_email_patterns, [])
+
+    def test_user_with_create_project_permission_can_set_aai_restrictions(self):
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(self.project),
+            AAI_RESTRICTIONS,
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.project.refresh_from_db()
+        for field, value in AAI_RESTRICTIONS.items():
+            self.assertEqual(getattr(self.project, field), value)
+            self.assertEqual(response.data[field], value)
+
+    def test_user_without_create_project_permission_cannot_set_aai_restrictions(self):
+        admin = factories.UserFactory()
+        self.project.add_user(admin, ProjectRole.ADMIN)
+        ProjectRole.ADMIN.add_permission(PermissionEnum.UPDATE_PROJECT)
+
+        self.client.force_authenticate(user=admin)
+        response = self.client.patch(
+            factories.ProjectFactory.get_url(self.project),
+            AAI_RESTRICTIONS,
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.project.refresh_from_db()
+        for field in AAI_RESTRICTIONS:
+            self.assertEqual(getattr(self.project, field), [])
+
+    def test_aai_restrictions_set_through_the_api_are_enforced(self):
+        self.client.force_authenticate(user=self.owner)
+        self.client.patch(
+            factories.ProjectFactory.get_url(self.project),
+            {"user_nationalities": ["EE"]},
+            format="json",
+        )
+
+        target_user = factories.UserFactory(nationality="FI")
+        response = client_add_user(
+            self.client, self.staff, target_user, self.project, ProjectRole.ADMIN
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("restrictions", str(response.data))
+
+
+class BracesInChangedValuesTest(test.APITestCase):
+    """Changed values are written into an event message that is then formatted."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.project_url = factories.ProjectFactory.get_url(self.fixture.project)
+        self.client.force_authenticate(self.fixture.staff)
+
+    def _patch_project(self, data):
+        response = self.client.patch(self.project_url, data, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_restriction_holding_braces_can_be_set_changed_and_cleared(self):
+        for value in (["{x}"], ["EE"], ["{x}"], []):
+            self._patch_project({"user_nationalities": value})
+
+    def test_email_pattern_with_a_quantifier_can_be_set(self):
+        self._patch_project({"user_email_patterns": [r"[a-z]{2}@example\.com"]})
+
+    def test_project_name_with_braces_can_be_set(self):
+        self._patch_project({"name": "Project {x}"})
+
+    def test_event_shows_the_value_as_entered(self):
+        self._patch_project({"user_nationalities": ["{x}"]})
+        event = Event.objects.filter(event_type="project_update_succeeded").latest(
+            "created"
+        )
+        self.assertIn("'{x}'", event.message)
